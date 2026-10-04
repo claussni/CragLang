@@ -262,18 +262,22 @@ The function lists use Rust syntax. The few notations they need:
 
 Crag tasks are cheap and numerous, so they cannot each be an operating-system thread. The runtime runs them as fibers: each has its own stack and saved registers, and switching between fibers is a function call that saves a handful of registers and swaps the stack pointer. Worker threads (one per core, later in M4) pick fibers to run. M0 builds one worker and the switch itself.
 
+A suspended fiber is a stack and a saved stack pointer; its registers and the address to continue at lie on its own stack, pushed by the routine that suspended it. A fiber stack moves when it grows, so it holds only frames the runtime can relocate: generated code, the entry stub and the save areas of the runtime's assembly routines. Rust code never runs on a fiber stack; the assembly routines switch to the worker's system stack before calling into Rust.
+
 **Data structures**
 
-- `Fiber` — the stack (base, size, current limit), the saved stack pointer and callee-saved registers, the side-stack pointer, a state (runnable, running, waiting, finished) and the task context of Section 10 of the architecture.
+- `TaskContext` — what generated code receives as its implicit first argument: the stack limit first, then the worker, the saved stack pointer, the finished flag and the pending stop reasons. All fields are atomics, since other threads request stops.
+- `Fiber` — the task context, the stack, the real limit, a state (runnable, running, paused, finished), and the arguments and results, which live on the heap so pointers to them survive growth.
 - `StackMemory` — a region from `mmap` with an inaccessible guard page below it, so an unchecked overflow faults instead of corrupting memory.
-- `Worker` — the thread running fibers: its own system stack, the fiber currently running, and a queue of runnable fibers.
+- `Worker` — the thread running fibers: its saved system-stack pointer and a queue of runnable fibers. The thread's own stack is the system stack.
 
 **Functions**
 
-- `fn fiber_new(entry: extern "C" fn(*mut u8), arg: *mut u8) -> Box<Fiber>` — allocates a small stack and side stack and prepares the first frame so that switching to it calls `entry`.
-- `unsafe fn switch_to(from: &mut Fiber, to: &Fiber)` — the context switch in inline assembly: store callee-saved registers and stack pointer of `from`, load those of `to`, return into `to`.
-- `fn fiber_exit() -> !` — marks the fiber finished, releases its stacks and switches back to the worker.
-- `fn worker_run(worker: &mut Worker) -> !` — the loop that takes the next runnable fiber and switches to it.
+- `unsafe fn Fiber::new(stub: usize, func: usize, args: &[u64], config: FiberConfig) -> io::Result<Box<Fiber>>` — allocates a small stack and prepares the first frame so that switching to it calls the entry stub, which calls the Crag function.
+- `unsafe extern "C" fn switch(save_sp: *mut usize, to_sp: usize)` — the context switch in assembly: push the callee-saved registers, store the stack pointer, load the other one, pop its registers, return.
+- `fiber_start` (assembly) — where a new fiber begins. It calls the stub and, when that returns, marks the fiber finished and switches to the worker.
+- `fn Worker::resume(&mut self, fiber: &mut Fiber) -> FiberState` — runs one fiber until it finishes or stops.
+- `fn Worker::run(&mut self) -> Vec<Box<Fiber>>` — the loop that takes the next runnable fiber and resumes it; a preempted fiber goes to the back of the queue.
 
 #### 11.3.2 Stack check and `morestack`
 
@@ -291,8 +295,9 @@ Cranelift writes the prologue itself and its built-in limit check can only trap,
 
 - Margin check (generated code, entry block and loop back-edges) — `if sp < ctx.stack_limit { morestack(ctx, 0) }`.
 - Sized check (generated code, wrapper of a function over the frame budget) — `if sp - frame_size < ctx.stack_limit { morestack(ctx, frame_size) }`, then a tail call to the body.
-- `morestack(ctx: *mut TaskContext, needed: usize)` — an assembly routine that preserves every register, so the passing path of the check pays nothing for it. It switches to the system stack, calls `grow_stack` until `sp - needed` is at or above the new limit, switches back and returns into the same frame on the new stack.
-- `unsafe fn grow_stack(fiber: &mut Fiber, needed: usize)` — allocates at least twice the size, copies the used bytes, adds the address difference to every saved frame pointer in the chain and to the saved stack pointer, then frees the old stack.
+- `rt_morestack(ctx: *const TaskContext, needed: usize)` — an assembly routine that preserves every register, so the passing path of the check pays nothing for it. It saves all registers on the fiber stack, switches to the system stack and calls `morestack_slow`, then restores the registers from the save area, which may have moved, and returns into the same frame.
+- `unsafe extern "C" fn morestack_slow(ctx, needed, sp) -> Resume` — takes pending stop requests, grows the stack if the check fails against the real limit, publishes the limit, and tells the assembly routine whether to continue the fiber or switch to the worker.
+- `unsafe fn grow_stack(fiber: &mut Fiber, needed: usize, sp: usize) -> usize` — allocates at least twice the size, copies the used bytes to the top of the new stack, adds the address difference to every saved frame pointer in the chain, starting at the saved frame pointer in the register save area, and frees the old stack. Every link is checked to point up the stack and inside it.
 - `unsafe fn shrink_stack(fiber: &mut Fiber)` — later: halves a mostly unused stack at a safe point.
 
 #### 11.3.3 Side stack
@@ -319,8 +324,8 @@ The runtime sometimes needs a running fiber to stop at its next safe point: to p
 
 **Functions**
 
-- `fn request_stop(fiber: &Fiber, reason: StopReason)` — sets the flag, then writes `SENTINEL` to the limit with an atomic store.
-- `fn handle_stop(ctx: &mut TaskContext)` — called from `morestack` when the limit is the sentinel: restores the limit and acts on the flags.
+- `fn request_stop(fiber: &Fiber, reason: StopReason)` — sets the flag, then writes `SENTINEL` to the limit with an atomic store. `StopHandle::request_stop` does the same from another thread.
+- Inside `morestack_slow` — the pending flags are taken, the real limit is restored, and a paused or preempted fiber is left with a switch frame on its stack, so resuming it continues after the check. A request that arrives while the limit is being restored puts the sentinel back.
 
 #### 11.3.5 Cranelift facade
 
@@ -387,9 +392,12 @@ Results worth keeping across sessions are stored on disk, keyed by a hash of the
 
 Stack copying bugs hide until a stack happens to grow at the wrong moment. The harness makes growth happen at every call by starting fibers with the smallest possible stack, and runs every fiber test that way in CI.
 
+In the tortured configuration the limit is set so that the check that just failed barely passes. Every later call fails its check again and moves the stack to a fresh mapping, so a stale pointer into the old stack faults at once.
+
 **Functions**
 
-- `fn run_tortured(test: impl FnOnce())` — runs the test with a minimal initial stack and verifies frame-pointer chains after each growth.
+- `fn run_tortured(test: impl FnOnce(FiberConfig))` — runs the test with the tortured configuration; the frame-pointer chain is verified during every move.
+- `FiberConfig::default()` — tortured when the environment variable `CRAG_TORTURE` is set, so CI can stress every fiber test.
 
 ### 11.4 M1 components
 
