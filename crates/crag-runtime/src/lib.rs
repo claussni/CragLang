@@ -5,7 +5,8 @@
 //! stop request and the stress harness.
 //!
 //! Runtime discipline (Compiler Architecture §2.1): no thread-locals, no
-//! callbacks into Crag code from the runtime stack, panics abort.
+//! callbacks into Crag code from the runtime stack, panics abort in images
+//! (see [`abort_on_panic`]).
 //!
 //! # What may be on a fiber stack
 //!
@@ -38,9 +39,30 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
     }
 }
 
+/// Makes every panic in this process end it at once, without unwinding.
+/// Image processes call this first thing at startup.
+///
+/// A panic in an image has nowhere to unwind to: below the runtime's frames
+/// lie generated code and assembly, which carry no unwinding information. The
+/// hook runs before unwinding starts, prints the panic as usual and aborts,
+/// so no destructor runs and no frame is unwound.
+///
+/// The workspace does not set `panic = "abort"`, because the host process
+/// shares it and cancels queries by unwinding. Memory safety does not rest
+/// on this hook: the runtime's entry points from assembly are C-convention
+/// functions, and a panic that tries to leave one aborts anyway. The hook
+/// makes the abort happen at the panic, with its message.
+pub fn abort_on_panic() {
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report(info);
+        std::process::abort();
+    }));
+}
+
 /// Reports a condition the runtime cannot recover from and ends the process.
-/// Panics abort (Compiler Architecture §2.1), and this must not unwind
-/// through assembly frames.
+/// It does not panic, so it behaves the same with or without the hook and
+/// never unwinds through assembly frames.
 pub(crate) fn die(message: &str) -> ! {
     eprintln!("crag runtime: {message}");
     std::process::abort()

@@ -11,9 +11,6 @@ publish = false
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 
-# Architecture §2.1: panics abort. (Cargo ignores this for test builds.)
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
+# No `panic = "abort"` here: the host cancels queries by unwinding. Image
+# processes call `crag_runtime::abort_on_panic` at startup instead
+# (Architecture §2.1).

@@ -44,7 +44,7 @@
 //! The database type, snapshots and cancellation are ours: [`RootDatabase`],
 //! [`Snapshot`], [`check_cancelled`] and [`catch_cancelled`]. Salsa signals
 //! cancellation by unwinding, so a process that cancels queries must be built
-//! with unwinding panics.
+//! with unwinding panics, as the workspace profiles are.
 
 use std::panic::AssertUnwindSafe;
 

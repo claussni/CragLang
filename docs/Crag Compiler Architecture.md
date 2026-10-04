@@ -26,7 +26,8 @@ This document records how the toolchain described in Chapter 20 is built. It is 
 - **System stack.** Runtime code never sits on a fiber stack across a growth or suspension point; it runs on the worker's system stack, as foreign calls do (§13.6).
 - **No callbacks.** The runtime never calls Crag code from its own stack: map operations are generated code, deferred teardown runs on a runtime-owned fiber of ordinary Crag frames, and foreign callbacks run on a fixed stack (Section 10).
 - **Explicit stack check.** Cranelift emits prologues itself and its built-in limit check can only trap, so the check is ordinary code at the start of each function's entry block, run after the frame is allocated. The runtime keeps a fixed margin of usable stack below the limit to make that safe; a function whose frame exceeds the frame budget is entered through a wrapper that checks for the whole frame first (Section 10).
-- **No thread-locals.** Fibers migrate between worker threads, so runtime state is reached through a worker-context pointer, never through `thread_local!`. Panics abort.
+- **No thread-locals.** Fibers migrate between worker threads, so runtime state is reached through a worker-context pointer, never through `thread_local!`.
+- **Panics abort in images.** An image process installs a panic hook at startup that reports the panic and aborts before any unwinding, since generated code and the runtime's assembly carry no unwinding information. The workspace profiles keep unwinding panics, because the host cancels queries by unwinding (Salsa). The runtime archive for release builds is built separately and can set `panic = "abort"` outright.
 
 ## 3 Intermediate representations
 
@@ -151,7 +152,6 @@ Every Crag type occupies zero, one or two machine words, so a parameter or resul
 ## 12 Known risks
 
 - Salsa's API churn: pinned version, thin facade.
-- Salsa cancels queries by unwinding, so the host process needs unwinding panics, while the workspace profiles set `panic = "abort"` for the runtime's sake. Tests are unaffected, since Cargo builds them with unwinding. Open: give the host and the images different panic settings.
 - Release performance stays at Cranelift's level, with MIR optimization carrying the weight.
 - Stack-copy bugs: CI runs fibers with tiny initial stacks so every call forces growth.
 - A JIT inside release binaries that receive code: macOS needs an entitlement; iOS rules it out.
