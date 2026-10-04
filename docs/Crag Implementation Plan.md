@@ -365,16 +365,20 @@ Protection applies to whole pages, so each load fills a region of fresh pages wh
 
 [Salsa](https://github.com/salsa-rs/salsa) is the Rust library that provides incremental queries: it records which inputs each query read, invalidates results when inputs change, applies early cutoff and cancels running queries when an input changes. Its API changes between releases, so the compiler uses it only through a thin facade of our own.
 
+Salsa defines queries through macros, so the facade cannot hide it behind plain traits. It re-exports the macros under its own name and owns the parts with real design content: the database type, snapshots and cancellation. Salsa's macros expand to paths starting with `::salsa`, so each crate that defines queries has the line `extern crate crag_db as salsa;` at its root and writes `crag_db::` everywhere else.
+
 **Data structures**
 
-- `Database` — the facade's handle on all inputs and cached results; snapshots of it can be read from other threads while the main one applies edits.
-- Input, tracked and interned definitions — the three kinds of Salsa item: inputs (file text), tracked results (a query's output), interned values (names, types).
+- `RootDatabase` — the facade's handle on all inputs and cached results; snapshots of it can be read from other threads while the main one applies edits.
+- `Db` — the trait queries take as `&dyn Db`.
+- Input, tracked and interned definitions — the three kinds of Salsa item, declared with `#[crag_db::input]`, `#[crag_db::tracked]` and `#[crag_db::interned]`: inputs (file text), tracked results (a query's output), interned values (names, types). A query returns a reference to its cached result.
 
 **Functions**
 
-- `fn set_input<I: Input>(db: &mut Database, key: I, value: I::Value, durability: Durability)` — changes an input, starting a new revision.
-- `fn snapshot(db: &Database) -> Snapshot` — a consistent read view for the language server and for reload planning.
-- `fn check_cancelled(db: &dyn Db) -> Result<(), Cancelled>` — called in long loops, such as compile-time evaluation, to stop work made obsolete by an edit.
+- Input setters (generated) — `file.set_text(&mut db).with_durability(Durability::HIGH).to(text)` changes an input, starting a new revision. It waits until every snapshot is dropped and asks the queries running on them to stop.
+- `fn RootDatabase::snapshot(&self) -> Snapshot` — a consistent read view for the language server and for reload planning.
+- `fn check_cancelled(db: &dyn Db)` — called in long loops, such as compile-time evaluation, to stop work made obsolete by an edit. It unwinds instead of returning.
+- `fn catch_cancelled<T>(work: impl FnOnce() -> T) -> Result<T, Cancelled>` — where the unwinding ends; the caller drops its snapshot on `Err`.
 
 #### 11.3.8 Artifact store
 

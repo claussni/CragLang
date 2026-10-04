@@ -151,6 +151,7 @@ Every Crag type occupies zero, one or two machine words, so a parameter or resul
 ## 12 Known risks
 
 - Salsa's API churn: pinned version, thin facade.
+- Salsa cancels queries by unwinding, so the host process needs unwinding panics, while the workspace profiles set `panic = "abort"` for the runtime's sake. Tests are unaffected, since Cargo builds them with unwinding. Open: give the host and the images different panic settings.
 - Release performance stays at Cranelift's level, with MIR optimization carrying the weight.
 - Stack-copy bugs: CI runs fibers with tiny initial stacks so every call forces growth.
 - A JIT inside release binaries that receive code: macOS needs an entitlement; iOS rules it out.
