@@ -306,12 +306,14 @@ Some stack values must have an address that other code holds: a closure that doe
 
 **Data structures**
 
-- `SideStack` — a chain of fixed-size chunks with a bump pointer; a new chunk is linked when one fills, so existing addresses never change.
+- `SideStack` — a list of chunks, each allocated once and never moved; a new chunk is added when one fills, so existing addresses never change. A push larger than a chunk gets a chunk of its own. Chunks left behind by calls that returned are kept and reused.
+- `side_ptr` and `side_end` in the task context — the bump pointer and the end of the current chunk. A new fiber has both zero, so it allocates no chunk until its first push.
 
 **Functions**
 
-- `fn side_push(ctx: &mut TaskContext, size: usize, align: usize) -> *mut u8` — bump allocation, inlined into generated code with a slow path for a new chunk.
-- `fn side_mark(ctx: &TaskContext) -> SideMark` and `fn side_pop(ctx: &mut TaskContext, mark: SideMark)` — a function records the mark on entry and restores it on return or tail call.
+- Push (generated code) — `p = align_up(ctx.side_ptr, align); if p + size <= ctx.side_end { ctx.side_ptr = p + size } else { rt_side_grow(ctx, size, align); retry }`.
+- Mark and pop (generated code) — a function that pushes saves both fields on entry and stores them back before it returns or tail-calls, which frees everything it pushed, whichever chunk it ended up in. An address on the side stack must therefore not be returned or passed to a tail call.
+- `rt_side_grow(ctx: *const TaskContext, size: usize, align: usize)` — an assembly routine that preserves every register and runs on the system stack. It points the two fields at the next chunk with enough room, reusing or allocating one, and returns nothing; the generated code repeats the push.
 
 #### 11.3.4 Sentinel
 
@@ -333,8 +335,8 @@ The runtime sometimes needs a running fiber to stop at its next safe point: to p
 
 **Data structures**
 
-- `LirFunction` — our lowered form: typed virtual registers, blocks, calls marked as normal or tail, safepoint markers and a poll for loop back-edges.
-- `CodeObject` — machine code bytes, relocations (places to patch with addresses at load time), stack maps and frame information.
+- `LirFunction` — our lowered form: virtual registers, blocks, calls marked as normal or tail, loads and stores, side-stack pushes, a poll for loop back-edges, and the list of tracked registers that hold owned values.
+- `CodeObject` — machine code bytes, relocations (places to patch with addresses at load time), stack maps and frame information. Every call is a safepoint, the stack check's call included; a stack map gives, for the return address of one call, the stack slots that hold the live tracked values.
 
 **Functions**
 
@@ -380,13 +382,14 @@ Results worth keeping across sessions are stored on disk, keyed by a hash of the
 
 **Data structures**
 
-- Store directory — one file per artifact, named by its [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) hash.
-- `ArtifactKey` — the hash of the inputs that determine an artifact, including the compiler version.
+- Store directory — one file per artifact, named by its key in hex under a two-character subdirectory, plus a directory for files being written. A file holds the [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) hash of the payload, then the payload.
+- `ArtifactKey` — the hash of the inputs that determine an artifact. `Store::key(kind)` starts a `KeyBuilder` seeded with the compiler version and the artifact kind; each further input is hashed with its length, so the key depends on where inputs divide.
 
 **Functions**
 
-- `fn put(store: &Store, key: ArtifactKey, bytes: &[u8]) -> io::Result<()>` — writes to a temporary file and renames it into place, which is atomic, so readers never see half a file.
-- `fn get(store: &Store, key: ArtifactKey) -> io::Result<Option<Vec<u8>>>`.
+- `fn Store::open(dir, version) -> io::Result<Store>` — opens or creates the directory; `version` identifies the compiler build.
+- `fn Store::put(&self, key: ArtifactKey, bytes: &[u8]) -> io::Result<()>` — writes to a temporary file and renames it into place, which is atomic, so readers never see half a file.
+- `fn Store::get(&self, key: ArtifactKey) -> io::Result<Option<Vec<u8>>>` — checks the payload against its hash; a file a crash left incomplete counts as missing and is removed. The store never forces data to disk, since a lost artifact costs only a recompilation.
 
 #### 11.3.9 Stress harness
 

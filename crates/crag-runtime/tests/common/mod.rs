@@ -1,0 +1,66 @@
+//! Shared by the test files: compiles and loads LIR functions and creates
+//! fibers that call them.
+#![allow(dead_code)]
+
+use crag_abi::{FuncId, RuntimeFn};
+use crag_codegen::{
+    CodeObject, CodegenSettings, LirFunction, OptLevel, VReg, compile, compile_entry_stub,
+    target_for,
+};
+use crag_loader::{CodeArena, SymbolTable, load, load_group};
+use crag_runtime::{Fiber, FiberConfig, FiberState, Worker};
+
+/// Loaded functions; `FuncId(i)` is the i-th.
+pub struct Image {
+    pub functions: Vec<usize>,
+    arena: CodeArena,
+    symbols: SymbolTable,
+    pub settings: CodegenSettings,
+}
+
+impl Image {
+    pub fn new(functions: &[LirFunction]) -> Image {
+        let settings = CodegenSettings {
+            target: target_for("x86_64-unknown-linux-gnu").unwrap(),
+            opt: OptLevel::None,
+        };
+        let objects: Vec<CodeObject> = functions
+            .iter()
+            .map(|f| compile(f, &settings).unwrap())
+            .collect();
+        let mut arena = CodeArena::new(1 << 20).unwrap();
+        let mut symbols = SymbolTable::new();
+        for func in RuntimeFn::ALL {
+            symbols.define_runtime(func, crag_runtime::runtime_fn_addr(func));
+        }
+        let group: Vec<_> = (0..).map(FuncId).zip(&objects).collect();
+        let entries = load_group(&mut arena, &mut symbols, &group).unwrap();
+        Image {
+            functions: entries.iter().map(|e| e.addr()).collect(),
+            arena,
+            symbols,
+            settings,
+        }
+    }
+
+    /// A fiber that will call function `func` with `args`, expecting one
+    /// result.
+    pub fn fiber(&mut self, func: usize, args: &[u64], config: FiberConfig) -> Box<Fiber> {
+        let stub = compile_entry_stub(args.len() as u32, 1, &self.settings).unwrap();
+        let stub = load(&mut self.arena, &self.symbols, &stub).unwrap();
+        // SAFETY: the stub was compiled for this argument count and one
+        // result, like every function in these tests, and the image outlives
+        // the fiber in each test.
+        unsafe { Fiber::new(stub.addr(), self.functions[func], args, config).unwrap() }
+    }
+}
+
+pub fn r(i: u32) -> VReg {
+    VReg(i)
+}
+
+/// Runs the fiber to completion on a fresh worker and returns its result.
+pub fn finish(fiber: &mut Fiber) -> u64 {
+    assert_eq!(Worker::new().resume(fiber), FiberState::Finished);
+    fiber.results().unwrap()[0]
+}

@@ -59,6 +59,27 @@ pub enum Inst {
         args: Vec<VReg>,
         dsts: Vec<VReg>,
     },
+    /// Reads the word at `addr + offset`.
+    Load {
+        dst: VReg,
+        addr: VReg,
+        offset: i32,
+    },
+    /// Writes `src` to the word at `addr + offset`.
+    Store {
+        src: VReg,
+        addr: VReg,
+        offset: i32,
+    },
+    /// Allocates `size` bytes on the side stack and puts their address in
+    /// `dst`. The address stays valid when the machine stack moves. The
+    /// function frees everything it pushed when it returns or tail-calls, so
+    /// the address must not be passed to a tail call or returned.
+    SidePush {
+        dst: VReg,
+        size: u32,
+        align: u32,
+    },
     /// The stack check without a frame: a point where the runtime may stop
     /// the fiber. Producers place one on every loop back-edge.
     Poll,
@@ -96,6 +117,12 @@ pub struct LirFunction {
     pub returns: u32,
     /// Number of virtual registers, parameters included.
     pub vregs: u32,
+    /// Registers holding owned values the runtime must be able to find while
+    /// the function is suspended at a call: the unwinder drops them, the
+    /// debugger shows them, hot reload checks them (Compiler Architecture
+    /// §10). At every call the live ones are in stack slots listed in the
+    /// code object's stack maps.
+    pub tracked: Vec<VReg>,
     pub blocks: Vec<Block>,
 }
 
@@ -128,6 +155,7 @@ impl LirFunction {
                 Err(format!("block {} out of range", b.0))
             }
         };
+        self.tracked.iter().try_for_each(reg)?;
         for b in &self.blocks {
             for inst in &b.insts {
                 match inst {
@@ -142,6 +170,20 @@ impl LirFunction {
                             return Err("a call with more than 2 results".into());
                         }
                         args.iter().chain(dsts).try_for_each(reg)?;
+                    }
+                    Inst::Load { dst, addr, .. } => {
+                        reg(dst)?;
+                        reg(addr)?;
+                    }
+                    Inst::Store { src, addr, .. } => {
+                        reg(src)?;
+                        reg(addr)?;
+                    }
+                    Inst::SidePush { dst, align, .. } => {
+                        reg(dst)?;
+                        if !align.is_power_of_two() || *align > 4096 {
+                            return Err(format!("side-stack alignment {align}"));
+                        }
                     }
                     Inst::Poll => {}
                 }
@@ -171,6 +213,14 @@ impl LirFunction {
             }
         }
         Ok(())
+    }
+
+    /// Whether the function allocates on the side stack.
+    pub(crate) fn uses_side_stack(&self) -> bool {
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| matches!(i, Inst::SidePush { .. }))
     }
 
     /// The most arguments any tail call passes, if there is one.

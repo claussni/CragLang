@@ -12,8 +12,9 @@ use std::mem::offset_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use crag_abi::{STACK_LIMIT_OFFSET, STACK_MARGIN};
+use crag_abi::{SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET, STACK_MARGIN};
 
+use crate::side_stack::SideStack;
 use crate::stack::StackMemory;
 
 /// The per-task record generated code receives as its implicit first
@@ -27,6 +28,11 @@ use crate::stack::StackMemory;
 pub struct TaskContext {
     /// Compared with the stack pointer by every stack check.
     pub(crate) stack_limit: AtomicUsize,
+    /// The side stack's bump pointer: the next free byte of its current
+    /// chunk. Generated code reads and writes it.
+    pub(crate) side_ptr: AtomicUsize,
+    /// The end of the side stack's current chunk.
+    pub(crate) side_end: AtomicUsize,
     /// The worker running the fiber. The assembly routines find the system
     /// stack through it.
     pub(crate) worker: AtomicPtr<Worker>,
@@ -41,6 +47,8 @@ pub struct TaskContext {
 }
 
 const _: () = assert!(offset_of!(TaskContext, stack_limit) == STACK_LIMIT_OFFSET as usize);
+const _: () = assert!(offset_of!(TaskContext, side_ptr) == SIDE_PTR_OFFSET as usize);
+const _: () = assert!(offset_of!(TaskContext, side_end) == SIDE_END_OFFSET as usize);
 
 pub(crate) const STATUS_FINISHED: usize = 1;
 
@@ -67,6 +75,8 @@ pub struct FiberConfig {
     /// every call fails its check, and every failure moves the stack to a
     /// fresh mapping and verifies the frame-pointer chain.
     pub torture: bool,
+    /// Bytes per side-stack chunk. A larger push gets a chunk of its own.
+    pub side_chunk: usize,
 }
 
 impl FiberConfig {
@@ -75,12 +85,15 @@ impl FiberConfig {
             initial_stack: 4096,
             max_stack: 1 << 30,
             torture: false,
+            side_chunk: 4096,
         }
     }
 
     pub const fn tortured() -> FiberConfig {
         FiberConfig {
             torture: true,
+            // Small chunks, so pushes cross chunk boundaries often.
+            side_chunk: 128,
             ..FiberConfig::normal()
         }
     }
@@ -108,6 +121,7 @@ pub struct Fiber {
     pub(crate) state: FiberState,
     pub(crate) config: FiberConfig,
     pub(crate) growths: u64,
+    pub(crate) side: SideStack,
     /// The function's arguments and results. They live on the heap, not on
     /// the fiber stack, so the entry stub's pointers to them survive growth.
     _args: Box<[u64]>,
@@ -135,6 +149,10 @@ impl Fiber {
         let mut results = Box::new([0u64; 2]);
         let ctx = Arc::new(TaskContext {
             stack_limit: AtomicUsize::new(0),
+            // No chunk yet: the first push finds no room and asks for one,
+            // so a fiber that never pushes allocates nothing.
+            side_ptr: AtomicUsize::new(0),
+            side_end: AtomicUsize::new(0),
             worker: AtomicPtr::new(std::ptr::null_mut()),
             saved_sp: AtomicUsize::new(0),
             status: AtomicUsize::new(0),
@@ -178,6 +196,7 @@ impl Fiber {
             state: FiberState::Runnable,
             config,
             growths: 0,
+            side: SideStack::new(config.side_chunk),
             _args: args,
             results,
         }))
@@ -196,6 +215,17 @@ impl Fiber {
     /// How often the stack has moved to a new mapping.
     pub fn growths(&self) -> u64 {
         self.growths
+    }
+
+    /// Chunks the side stack holds, in use or kept for reuse.
+    pub fn side_stack_chunks(&self) -> usize {
+        self.side.chunks()
+    }
+
+    /// Whether everything pushed on the side stack has been popped.
+    pub fn side_stack_is_empty(&self) -> bool {
+        self.side
+            .is_empty_at(self.ctx.side_ptr.load(Ordering::Relaxed))
     }
 
     /// Usable bytes of the current stack.

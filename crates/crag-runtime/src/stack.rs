@@ -84,16 +84,58 @@ impl Drop for StackMemory {
     }
 }
 
+/// Pushes all general registers and the sixteen vector registers: the save
+/// area whose layout the constants below describe. The size of the vector
+/// part appears as a literal because the text is shared between routines.
+macro_rules! save_registers {
+    () => {
+        concat!(
+            "push rax\n push rcx\n push rdx\n push rbx\n push rbp\n push rsi\n push rdi\n",
+            "push r8\n push r9\n push r10\n push r11\n push r12\n push r13\n push r14\n push r15\n",
+            "sub rsp, 256\n",
+            "movdqu [rsp + 0x00], xmm0\n movdqu [rsp + 0x10], xmm1\n",
+            "movdqu [rsp + 0x20], xmm2\n movdqu [rsp + 0x30], xmm3\n",
+            "movdqu [rsp + 0x40], xmm4\n movdqu [rsp + 0x50], xmm5\n",
+            "movdqu [rsp + 0x60], xmm6\n movdqu [rsp + 0x70], xmm7\n",
+            "movdqu [rsp + 0x80], xmm8\n movdqu [rsp + 0x90], xmm9\n",
+            "movdqu [rsp + 0xa0], xmm10\n movdqu [rsp + 0xb0], xmm11\n",
+            "movdqu [rsp + 0xc0], xmm12\n movdqu [rsp + 0xd0], xmm13\n",
+            "movdqu [rsp + 0xe0], xmm14\n movdqu [rsp + 0xf0], xmm15\n",
+        )
+    };
+}
+
+/// Undoes `save_registers!`, with the stack pointer at the save area.
+macro_rules! restore_registers {
+    () => {
+        concat!(
+            "movdqu xmm0, [rsp + 0x00]\n movdqu xmm1, [rsp + 0x10]\n",
+            "movdqu xmm2, [rsp + 0x20]\n movdqu xmm3, [rsp + 0x30]\n",
+            "movdqu xmm4, [rsp + 0x40]\n movdqu xmm5, [rsp + 0x50]\n",
+            "movdqu xmm6, [rsp + 0x60]\n movdqu xmm7, [rsp + 0x70]\n",
+            "movdqu xmm8, [rsp + 0x80]\n movdqu xmm9, [rsp + 0x90]\n",
+            "movdqu xmm10, [rsp + 0xa0]\n movdqu xmm11, [rsp + 0xb0]\n",
+            "movdqu xmm12, [rsp + 0xc0]\n movdqu xmm13, [rsp + 0xd0]\n",
+            "movdqu xmm14, [rsp + 0xe0]\n movdqu xmm15, [rsp + 0xf0]\n",
+            "add rsp, 256\n",
+            "pop r15\n pop r14\n pop r13\n pop r12\n pop r11\n pop r10\n pop r9\n pop r8\n",
+            "pop rdi\n pop rsi\n pop rbp\n pop rbx\n pop rdx\n pop rcx\n pop rax\n",
+        )
+    };
+}
+pub(crate) use {restore_registers, save_registers};
+
 // The register save area of `rt_morestack`, from its lowest address:
 // sixteen vector registers, fifteen general registers, the return address.
 const XMM_BYTES: usize = 16 * 16;
+const _: () = assert!(XMM_BYTES == 256); // the literal in the macros
 /// Offset of the saved rdi, the task context.
 const RDI_SLOT: usize = XMM_BYTES + 8 * 8;
 /// Offset of the saved rbp, the head of the frame-pointer chain.
 const RBP_SLOT: usize = XMM_BYTES + 10 * 8;
 /// Size of the whole area: the stack pointer at the failed check was this
 /// much higher.
-const SAVE_BYTES: usize = XMM_BYTES + 15 * 8 + 8;
+pub(crate) const SAVE_BYTES: usize = XMM_BYTES + 15 * 8 + 8;
 /// A switch frame, pushed below the save area when the fiber stops: six
 /// registers and a return address.
 const SWITCH_FRAME_BYTES: usize = 7 * 8;
@@ -124,38 +166,7 @@ struct Resume {
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn rt_morestack(ctx: *const TaskContext, needed: usize) {
     std::arch::naked_asm!(
-        "push rax",
-        "push rcx",
-        "push rdx",
-        "push rbx",
-        "push rbp",
-        "push rsi",
-        "push rdi",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        "sub rsp, {xmm_bytes}",
-        "movdqu [rsp + 0x00], xmm0",
-        "movdqu [rsp + 0x10], xmm1",
-        "movdqu [rsp + 0x20], xmm2",
-        "movdqu [rsp + 0x30], xmm3",
-        "movdqu [rsp + 0x40], xmm4",
-        "movdqu [rsp + 0x50], xmm5",
-        "movdqu [rsp + 0x60], xmm6",
-        "movdqu [rsp + 0x70], xmm7",
-        "movdqu [rsp + 0x80], xmm8",
-        "movdqu [rsp + 0x90], xmm9",
-        "movdqu [rsp + 0xa0], xmm10",
-        "movdqu [rsp + 0xb0], xmm11",
-        "movdqu [rsp + 0xc0], xmm12",
-        "movdqu [rsp + 0xd0], xmm13",
-        "movdqu [rsp + 0xe0], xmm14",
-        "movdqu [rsp + 0xf0], xmm15",
+        save_registers!(),
         // Third argument: the save area. Then continue on the system stack,
         // below the context the worker saved there when it switched to this
         // fiber.
@@ -186,40 +197,8 @@ pub(crate) unsafe extern "C" fn rt_morestack(ctx: *const TaskContext, needed: us
         "ret",
         // Continue the fiber: restore everything and return to the check.
         "2:",
-        "movdqu xmm0, [rsp + 0x00]",
-        "movdqu xmm1, [rsp + 0x10]",
-        "movdqu xmm2, [rsp + 0x20]",
-        "movdqu xmm3, [rsp + 0x30]",
-        "movdqu xmm4, [rsp + 0x40]",
-        "movdqu xmm5, [rsp + 0x50]",
-        "movdqu xmm6, [rsp + 0x60]",
-        "movdqu xmm7, [rsp + 0x70]",
-        "movdqu xmm8, [rsp + 0x80]",
-        "movdqu xmm9, [rsp + 0x90]",
-        "movdqu xmm10, [rsp + 0xa0]",
-        "movdqu xmm11, [rsp + 0xb0]",
-        "movdqu xmm12, [rsp + 0xc0]",
-        "movdqu xmm13, [rsp + 0xd0]",
-        "movdqu xmm14, [rsp + 0xe0]",
-        "movdqu xmm15, [rsp + 0xf0]",
-        "add rsp, {xmm_bytes}",
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rdi",
-        "pop rsi",
-        "pop rbp",
-        "pop rbx",
-        "pop rdx",
-        "pop rcx",
-        "pop rax",
+        restore_registers!(),
         "ret",
-        xmm_bytes = const XMM_BYTES,
         rdi_slot = const RDI_SLOT,
         worker = const offset_of!(TaskContext, worker),
         saved_sp = const offset_of!(TaskContext, saved_sp),

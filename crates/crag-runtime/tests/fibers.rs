@@ -4,64 +4,13 @@
 
 use std::time::Duration;
 
-use crag_abi::{FuncId, RuntimeFn, StackCheck};
-use crag_codegen::{
-    BinOp, Block, BlockId, CodeObject, CodegenSettings, Cond, Inst, LirFunction, OptLevel, Term,
-    VReg, compile, compile_entry_stub, target_for,
-};
-use crag_loader::{CodeArena, SymbolTable, load, load_group};
+mod common;
+
+use common::{Image, finish, r};
+use crag_abi::{FuncId, StackCheck};
+use crag_codegen::{BinOp, Block, BlockId, Cond, Inst, LirFunction, Term, compile};
 use crag_runtime::stress::run_tortured;
-use crag_runtime::{Fiber, FiberConfig, FiberState, StopReason, Worker, request_stop};
-
-/// Loaded functions; `FuncId(i)` is the i-th.
-struct Image {
-    functions: Vec<usize>,
-    arena: CodeArena,
-    symbols: SymbolTable,
-    settings: CodegenSettings,
-}
-
-impl Image {
-    fn new(functions: &[LirFunction]) -> Image {
-        let settings = CodegenSettings {
-            target: target_for("x86_64-unknown-linux-gnu").unwrap(),
-            opt: OptLevel::None,
-        };
-        let objects: Vec<CodeObject> = functions
-            .iter()
-            .map(|f| compile(f, &settings).unwrap())
-            .collect();
-        let mut arena = CodeArena::new(1 << 20).unwrap();
-        let mut symbols = SymbolTable::new();
-        symbols.define_runtime(
-            RuntimeFn::Morestack,
-            crag_runtime::runtime_fn_addr(RuntimeFn::Morestack),
-        );
-        let group: Vec<_> = (0..).map(FuncId).zip(&objects).collect();
-        let entries = load_group(&mut arena, &mut symbols, &group).unwrap();
-        Image {
-            functions: entries.iter().map(|e| e.addr()).collect(),
-            arena,
-            symbols,
-            settings,
-        }
-    }
-
-    /// A fiber that will call function `func` with `args`, expecting one
-    /// result.
-    fn fiber(&mut self, func: usize, args: &[u64], config: FiberConfig) -> Box<Fiber> {
-        let stub = compile_entry_stub(args.len() as u32, 1, &self.settings).unwrap();
-        let stub = load(&mut self.arena, &self.symbols, &stub).unwrap();
-        // SAFETY: the stub was compiled for this argument count and one
-        // result, like every function in these tests, and the image outlives
-        // the fiber in each test.
-        unsafe { Fiber::new(stub.addr(), self.functions[func], args, config).unwrap() }
-    }
-}
-
-fn r(i: u32) -> VReg {
-    VReg(i)
-}
+use crag_runtime::{FiberConfig, FiberState, StopReason, Worker, request_stop};
 
 /// `f(a, b) = a + b`
 fn add_fn() -> LirFunction {
@@ -69,6 +18,7 @@ fn add_fn() -> LirFunction {
         params: 2,
         returns: 1,
         vregs: 3,
+        tracked: vec![],
         blocks: vec![Block {
             insts: vec![Inst::Bin {
                 op: BinOp::Add,
@@ -88,6 +38,7 @@ fn sum_squares_fn(self_id: u32) -> LirFunction {
         params: 1,
         returns: 1,
         vregs: 6, // n, zero, flag, one, n - 1 / n * n, result
+        tracked: vec![],
         blocks: vec![
             Block {
                 insts: vec![
@@ -158,6 +109,7 @@ fn countdown_fn(self_id: u32) -> LirFunction {
         params: 2,
         returns: 1,
         vregs: 5, // n, acc, zero, one, flag
+        tracked: vec![],
         blocks: vec![
             Block {
                 insts: vec![
@@ -216,6 +168,7 @@ fn sum_loop_fn() -> LirFunction {
         params: 1,
         returns: 1,
         vregs: 5, // n, acc, zero, one, flag
+        tracked: vec![],
         blocks: vec![
             Block {
                 insts: vec![
@@ -306,16 +259,12 @@ fn wide_fn(live: u32, add: u32) -> LirFunction {
         params: 1,
         returns: 1,
         vregs: live + 3,
+        tracked: vec![],
         blocks: vec![Block {
             insts,
             term: Term::Return(vec![r(acc)]),
         }],
     }
-}
-
-fn finish(fiber: &mut Fiber) -> u64 {
-    assert_eq!(Worker::new().resume(fiber), FiberState::Finished);
-    fiber.results().unwrap()[0]
 }
 
 #[test]

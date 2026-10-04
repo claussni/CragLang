@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crag_abi::{FRAME_BUDGET, RuntimeFn, STACK_LIMIT_OFFSET};
+use crag_abi::{FRAME_BUDGET, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET};
 use cranelift_codegen::binemit::Reloc as ClifReloc;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::IntCC;
@@ -20,7 +20,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use crate::lir::{BinOp, Cond, Inst, LirFunction, Term};
 use crate::{
     CodeObject, CodegenError, CodegenSettings, FuncId, OptLevel, Reloc, RelocKind, RelocTarget,
-    StackCheck,
+    StackCheck, StackMap,
 };
 
 /// Namespaces of the external names the lowering declares. A relocation's
@@ -108,6 +108,7 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
             relocs: body.relocs,
             footprint,
             stack_check: StackCheck::Margin,
+            stack_maps: body.stack_maps,
         });
     }
 
@@ -141,6 +142,12 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
         ..r
     }));
 
+    let mut stack_maps = wrapper.stack_maps;
+    stack_maps.extend(body.stack_maps.into_iter().map(|m| StackMap {
+        return_offset: m.return_offset + body_offset,
+        ..m
+    }));
+
     Ok(CodeObject {
         code,
         align,
@@ -148,6 +155,7 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
         relocs,
         footprint,
         stack_check: StackCheck::Sized { needed: footprint },
+        stack_maps,
     })
 }
 
@@ -213,6 +221,7 @@ pub fn compile_entry_stub(
         relocs: stub.relocs,
         footprint,
         stack_check: StackCheck::None,
+        stack_maps: stub.stack_maps,
     })
 }
 
@@ -290,6 +299,13 @@ impl Imports {
         sig.params.extend([AbiParam::new(I64); 2]);
         self.get(b, (NS_RUNTIME, RuntimeFn::Morestack as u32), sig)
     }
+
+    /// `rt_side_grow` has the same convention, for the same reason.
+    fn side_grow(&mut self, b: &mut FunctionBuilder) -> FuncRef {
+        let mut sig = Signature::new(CallConv::PreserveAll);
+        sig.params.extend([AbiParam::new(I64); 3]);
+        self.get(b, (NS_RUNTIME, RuntimeFn::SideGrow as u32), sig)
+    }
 }
 
 /// Emits the stack check at the current position and leaves the builder in
@@ -328,6 +344,55 @@ fn emit_stack_check(b: &mut FunctionBuilder, imports: &mut Imports, ctx: Value, 
     b.switch_to_block(done);
 }
 
+/// Emits a side-stack push at the current position, leaves the builder in
+/// the block that follows it and returns the address of the new bytes.
+///
+/// The bump pointer and the chunk end are read from the task context. If the
+/// bytes do not fit, the runtime switches the context to a chunk where they
+/// do and the push is repeated, so the call needs no result.
+fn emit_side_push(
+    b: &mut FunctionBuilder,
+    imports: &mut Imports,
+    ctx: Value,
+    size: u32,
+    align: u32,
+) -> Value {
+    let attempt = b.create_block();
+    let grow = b.create_block();
+    let done = b.create_block();
+    b.set_cold_block(grow);
+    b.ins().jump(attempt, &[]);
+
+    b.switch_to_block(attempt);
+    let ptr = b
+        .ins()
+        .load(I64, MemFlagsData::trusted(), ctx, SIDE_PTR_OFFSET);
+    let end = b
+        .ins()
+        .load(I64, MemFlagsData::trusted(), ctx, SIDE_END_OFFSET);
+    let start = if align > 1 {
+        let bumped = b.ins().iadd_imm_s(ptr, i64::from(align) - 1);
+        b.ins().band_imm_s(bumped, -i64::from(align))
+    } else {
+        ptr
+    };
+    let new_ptr = b.ins().iadd_imm_s(start, i64::from(size));
+    let too_far = b.ins().icmp(IntCC::UnsignedGreaterThan, new_ptr, end);
+    b.ins().brif(too_far, grow, &[], done, &[]);
+
+    b.switch_to_block(grow);
+    let side_grow = imports.side_grow(b);
+    let size = b.ins().iconst(I64, i64::from(size));
+    let align = b.ins().iconst(I64, i64::from(align));
+    b.ins().call(side_grow, &[ctx, size, align]);
+    b.ins().jump(attempt, &[]);
+
+    b.switch_to_block(done);
+    b.ins()
+        .store(MemFlagsData::trusted(), new_ptr, ctx, SIDE_PTR_OFFSET);
+    start
+}
+
 fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
     let sig = crag_signature(lir.params, lir.returns);
     let mut func = Function::with_name_signature(UserFuncName::default(), sig);
@@ -342,12 +407,37 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
     b.switch_to_block(entry);
     let ctx = b.block_params(entry)[0];
     let vars: Vec<Variable> = (0..lir.vregs).map(|_| b.declare_var(I64)).collect();
+    // Before any definition: Cranelift then keeps these values in stack
+    // slots across every call and reports the slots in stack maps.
+    for reg in &lir.tracked {
+        b.declare_var_needs_stack_map(vars[reg.0 as usize]);
+    }
     for (i, &var) in vars.iter().enumerate().take(lir.params as usize) {
         let param = b.block_params(entry)[i + 1];
         b.def_var(var, param);
     }
 
     emit_stack_check(&mut b, &mut imports, ctx, 0);
+
+    // The side-stack mark: both fields as they were on entry. Storing them
+    // back frees what this function pushed, whichever chunk it ended up in.
+    let side_mark = lir.uses_side_stack().then(|| {
+        let ptr = b
+            .ins()
+            .load(I64, MemFlagsData::trusted(), ctx, SIDE_PTR_OFFSET);
+        let end = b
+            .ins()
+            .load(I64, MemFlagsData::trusted(), ctx, SIDE_END_OFFSET);
+        (ptr, end)
+    });
+    let side_pop = |b: &mut FunctionBuilder| {
+        if let Some((ptr, end)) = side_mark {
+            b.ins()
+                .store(MemFlagsData::trusted(), ptr, ctx, SIDE_PTR_OFFSET);
+            b.ins()
+                .store(MemFlagsData::trusted(), end, ctx, SIDE_END_OFFSET);
+        }
+    };
 
     let blocks: Vec<_> = lir.blocks.iter().map(|_| b.create_block()).collect();
     b.ins().jump(blocks[0], &[]);
@@ -400,6 +490,20 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
                         b.def_var(vars[dst.0 as usize], v);
                     }
                 }
+                Inst::Load { dst, addr, offset } => {
+                    let p = b.use_var(vars[addr.0 as usize]);
+                    let v = b.ins().load(I64, MemFlagsData::trusted(), p, *offset);
+                    b.def_var(vars[dst.0 as usize], v);
+                }
+                Inst::Store { src, addr, offset } => {
+                    let p = b.use_var(vars[addr.0 as usize]);
+                    let v = b.use_var(vars[src.0 as usize]);
+                    b.ins().store(MemFlagsData::trusted(), v, p, *offset);
+                }
+                Inst::SidePush { dst, size, align } => {
+                    let p = emit_side_push(&mut b, &mut imports, ctx, *size, *align);
+                    b.def_var(vars[dst.0 as usize], p);
+                }
                 Inst::Poll => emit_stack_check(&mut b, &mut imports, ctx, 0),
             }
         }
@@ -426,12 +530,14 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
                     .iter()
                     .map(|r| b.use_var(vars[r.0 as usize]))
                     .collect();
+                side_pop(&mut b);
                 b.ins().return_(&values);
             }
             Term::TailCall { func, args } => {
                 let callee = imports.crag(&mut b, *func, args.len() as u32, lir.returns);
                 let mut values = vec![ctx];
                 values.extend(args.iter().map(|r| b.use_var(vars[r.0 as usize])));
+                side_pop(&mut b);
                 b.ins().return_call(callee, &values);
             }
         }
@@ -456,6 +562,10 @@ fn build_wrapper(lir: &LirFunction, isa: &dyn TargetIsa, needed: u32) -> Functio
     b.append_block_params_for_function_params(entry);
     b.switch_to_block(entry);
     let args = b.block_params(entry).to_vec();
+    // The wrapper holds the parameters while its check may enter the runtime.
+    for reg in lir.tracked.iter().filter(|reg| reg.0 < lir.params) {
+        b.declare_value_needs_stack_map(args[1 + reg.0 as usize]);
+    }
 
     emit_stack_check(&mut b, &mut imports, args[0], needed);
 
@@ -473,6 +583,7 @@ struct Compiled {
     code: Vec<u8>,
     align: u32,
     relocs: Vec<Reloc>,
+    stack_maps: Vec<StackMap>,
     /// Distance from the frame pointer down to the stack pointer.
     frame_below_fp: u32,
 }
@@ -519,6 +630,16 @@ fn run_backend(isa: &dyn TargetIsa, func: Function) -> Result<Compiled, CodegenE
         });
     }
 
+    let mut stack_maps: Vec<StackMap> = buffer
+        .user_stack_maps()
+        .iter()
+        .map(|(return_offset, _, map)| StackMap {
+            return_offset: *return_offset,
+            slots: map.entries().map(|(_, offset)| offset).collect(),
+        })
+        .collect();
+    stack_maps.sort_by_key(|m| m.return_offset);
+
     let frame = buffer
         .frame_layout()
         .ok_or_else(|| CodegenError::Backend("the backend reported no frame layout".into()))?;
@@ -526,6 +647,7 @@ fn run_backend(isa: &dyn TargetIsa, func: Function) -> Result<Compiled, CodegenE
         code: buffer.data().to_vec(),
         align: buffer.alignment,
         relocs,
+        stack_maps,
         frame_below_fp: frame.frame_to_fp_offset,
     })
 }

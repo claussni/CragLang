@@ -46,10 +46,35 @@
 //!
 //! Loop back-edges repeat the first form, which is what lets the runtime stop
 //! a fiber by storing [`STACK_LIMIT_SENTINEL`] in `stack_limit`.
+//!
+//! # The side stack
+//!
+//! Values whose address is taken live on a per-fiber side stack that never
+//! moves (Compiler Architecture §2.1). It is a chain of chunks; the task
+//! context holds the bump pointer and the end of the current chunk. A push is
+//! inline code:
+//!
+//! ```text
+//! loop {
+//!     p = align_up(ctx.side_ptr, align)
+//!     if p + size <= ctx.side_end { ctx.side_ptr = p + size; break }
+//!     rt_side_grow(ctx, size, align)
+//! }
+//! ```
+//!
+//! A function that pushes saves both fields on entry and stores them back
+//! before it returns or tail-calls, which frees everything it pushed.
 
 /// Offset of `stack_limit` in the task context, in bytes. It is the first
 /// field, so the check loads it with no displacement.
 pub const STACK_LIMIT_OFFSET: i32 = 0;
+
+/// Offset of the side stack's bump pointer in the task context: the next free
+/// byte of the current chunk.
+pub const SIDE_PTR_OFFSET: i32 = 8;
+
+/// Offset of the end of the side stack's current chunk in the task context.
+pub const SIDE_END_OFFSET: i32 = 16;
 
 /// The value the runtime stores in `stack_limit` to force the next check into
 /// the runtime (Plan §11.3.4). The check compares unsigned, so no stack
@@ -86,16 +111,26 @@ pub enum RuntimeFn {
     /// check and the body's footprint for the sized check. It returns into
     /// the same frame, which may have moved to a new stack.
     Morestack = 0,
+
+    /// `rt_side_grow(ctx: *mut TaskContext, size: usize, align: usize)`.
+    ///
+    /// Called when a side-stack push does not fit the current chunk. The
+    /// runtime makes the side-stack fields of the context describe a chunk
+    /// with room for `size` bytes at alignment `align`, and generated code
+    /// then repeats the push. It has the same convention as `rt_morestack`:
+    /// C argument registers, every register preserved, no result.
+    SideGrow = 1,
 }
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 1] = [RuntimeFn::Morestack];
+    pub const ALL: [RuntimeFn; 2] = [RuntimeFn::Morestack, RuntimeFn::SideGrow];
 
     /// The symbol the loader looks up.
     pub fn symbol(self) -> &'static str {
         match self {
             RuntimeFn::Morestack => "rt_morestack",
+            RuntimeFn::SideGrow => "rt_side_grow",
         }
     }
 
@@ -128,6 +163,23 @@ pub struct CodeObject {
     pub footprint: u32,
     /// Which stack check guards the entry.
     pub stack_check: StackCheck,
+    /// Where the tracked values are at each call, ordered by offset.
+    pub stack_maps: Vec<StackMap>,
+}
+
+/// The tracked values of one frame while it is suspended at a call.
+///
+/// Every call in generated code is a safepoint: the runtime may inspect the
+/// stack while the frame waits for the call to return, and `rt_morestack` is
+/// such a call. At a safepoint each live tracked value is in a stack slot,
+/// not in a register.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackMap {
+    /// Offset in `CodeObject::code` of the instruction after the call, which
+    /// is the return address found on the stack.
+    pub return_offset: u32,
+    /// Offsets of the slots from the frame's stack pointer at the call.
+    pub slots: Vec<u32>,
 }
 
 /// The form of the entry stack check.

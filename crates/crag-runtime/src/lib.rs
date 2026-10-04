@@ -34,6 +34,7 @@ use crag_abi::RuntimeFn;
 pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
     match func {
         RuntimeFn::Morestack => stack::rt_morestack as *const () as usize,
+        RuntimeFn::SideGrow => side_stack::rt_side_grow as *const () as usize,
     }
 }
 

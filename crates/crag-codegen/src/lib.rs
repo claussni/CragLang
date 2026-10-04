@@ -7,13 +7,14 @@
 //! in `crag_abi`. The facade emits it; producers of LIR only mark loop
 //! back-edges with [`Inst::Poll`].
 //!
-//! Not built yet: stack maps, frame tables and typed virtual registers. Every
-//! value is one machine word.
+//! Not built yet: frame tables and typed virtual registers. Every value is
+//! one machine word; `LirFunction::tracked` names the registers that hold
+//! owned values and appear in stack maps.
 
 mod lir;
 mod lower;
 
-pub use crag_abi::{CodeObject, FuncId, Reloc, RelocKind, RelocTarget, StackCheck};
+pub use crag_abi::{CodeObject, FuncId, Reloc, RelocKind, RelocTarget, StackCheck, StackMap};
 pub use lir::{BinOp, Block, BlockId, Cond, Inst, LirFunction, Term, VReg};
 pub use lower::{Target, UnknownTarget, compile, compile_entry_stub, target_for};
 
