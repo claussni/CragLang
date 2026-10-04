@@ -27,3 +27,21 @@ so only Docker is needed on the host.
     ./cargo test
     ./cargo clippy --all-targets
     ./cargo fmt
+
+## Use of Claude Code
+
+Crag is designed and implemented with the help of
+[Claude Code](https://claude.com/claude-code), Anthropic's coding agent. This
+covers the documents in `docs/` as well as the code in `crates/`. Ralf
+Claussnitzer directs the work, reviews the results and is responsible for
+them.
+
+## License
+
+Copyright (C) 2026 Ralf Claussnitzer
+
+Crag is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. Crag is distributed without any warranty. See [LICENSE](LICENSE) for
+the full text.
