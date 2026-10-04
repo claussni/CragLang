@@ -1,0 +1,5 @@
+.cargo-home
+target
+.git
+docs
+crates

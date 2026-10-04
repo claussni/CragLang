@@ -1,0 +1,13 @@
+[package]
+name = "crag-db"
+description = "Crag query database: the facade over Salsa"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+salsa = "0.28.5"

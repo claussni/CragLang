@@ -1,0 +1,13 @@
+[package]
+name = "crag-loader"
+description = "Crag code loader: maps code objects into executable memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+libc = "0.2.190"

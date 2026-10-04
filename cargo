@@ -1,0 +1,14 @@
+#!/bin/sh
+# Runs cargo inside the pinned toolchain image (see Dockerfile).
+# Usage: ./cargo build, ./cargo test, ./cargo clippy, ...
+set -eu
+root=$(cd "$(dirname "$0")" && pwd)
+image=crag-dev
+docker image inspect "$image" >/dev/null 2>&1 || docker build -q -t "$image" "$root" >/dev/null
+mkdir -p "$root/.cargo-home"
+tty=; [ -t 0 ] && [ -t 1 ] && tty=-it
+exec docker run --rm $tty \
+  --user "$(id -u):$(id -g)" \
+  -v "$root:$root" -w "$PWD" \
+  -e CARGO_HOME="$root/.cargo-home" \
+  "$image" cargo "$@"
