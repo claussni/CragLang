@@ -86,11 +86,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "crag-abi"
+version = "0.0.0"
+
+[[package]]
 name = "crag-codegen"
 version = "0.0.0"
 dependencies = [
+ "crag-abi",
+ "crag-loader",
  "cranelift-codegen",
  "cranelift-frontend",
+ "target-lexicon",
 ]
 
 [[package]]
@@ -104,6 +111,7 @@ dependencies = [
 name = "crag-loader"
 version = "0.0.0"
 dependencies = [
+ "crag-abi",
  "libc",
 ]
 

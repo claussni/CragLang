@@ -1,6 +1,6 @@
 [package]
-name = "crag-loader"
-description = "Crag code loader: maps code objects into executable memory"
+name = "crag-abi"
+description = "Crag ABI: constants shared by generated code and the runtime"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,5 +10,3 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-crag-abi = { path = "../crag-abi" }
-libc = "0.2.190"

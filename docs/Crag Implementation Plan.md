@@ -57,7 +57,7 @@ The runtime pieces carry every later milestone, so they are built and stress-tes
 **Components and algorithms**
 
 - **Fiber runtime.** Fiber records, a context switch in inline assembly (save the callee-saved registers, swap the stack pointer), stacks mapped with a guard page, and a minimal run loop on one worker.
-- **Stack check and `morestack`.** Each prologue compares the stack pointer with the limit in the task context. On failure, `morestack` runs on the system stack: it allocates a stack twice the size, copies the used part, rewrites the frame-pointer chain and frees the old stack.
+- **Stack check and `morestack`.** Each function's entry block compares the stack pointer with the limit in the task context, after the prologue has allocated the frame; a margin below the limit makes that safe, and a function with a frame over the budget gets a wrapper that checks its size first. On failure, `morestack` runs on the system stack: it allocates a stack twice the size, copies the used part, rewrites the frame-pointer chain and frees the old stack.
 - **Side stack.** A per-fiber bump region that never moves, pushed on entry and popped on return. It holds every address-taken value, so the machine stack holds no pointers into itself.
 - **Sentinel.** Setting the limit to a sentinel forces the next check into the runtime; the spike uses it to pause and resume a fiber.
 - **Cranelift facade.** A builder over a small subset of our lowered IR, Cranelift's tail calling convention with `return_call`, frame pointers kept, and stack maps at call sites.
@@ -277,17 +277,21 @@ Crag tasks are cheap and numerous, so they cannot each be an operating-system th
 
 #### 11.3.2 Stack check and `morestack`
 
-Fibers start with small stacks and grow them on demand by copying, as Go does ([Go's contiguous-stacks design](https://docs.google.com/document/d/1wAaf1rYoM4S4gtnPh0zOlGzWtrZFQ5suE8qr2sD8uWQ/pub)). Every Crag function begins with a check that its frame fits below the current limit; if not, it calls `morestack`, which runs on the worker's system stack, allocates a larger stack, copies the used part and continues. Copying is safe only if nothing points into the old stack, which the side stack guarantees.
+Fibers start with small stacks and grow them on demand by copying, as Go does ([Go's contiguous-stacks design](https://docs.google.com/document/d/1wAaf1rYoM4S4gtnPh0zOlGzWtrZFQ5suE8qr2sD8uWQ/pub)). Every Crag function begins with a check against the current limit; if it fails, the function calls `morestack`, which runs on the worker's system stack, allocates a larger stack, copies the used part and continues. Copying is safe only if nothing points into the old stack, which the side stack guarantees.
+
+Cranelift writes the prologue itself and its built-in limit check can only trap, so the check is ordinary code at the start of the entry block and runs after the frame is allocated. To make that safe, the limit is not the end of the stack: the runtime keeps a margin of usable bytes below it. A caller that passed its check has its stack pointer at or above the limit, so a callee's frame of at most the frame budget lands inside the margin, and the rest of the margin is reserved for the call into the runtime. The facade reads the frame size of every function it compiles. A function over the budget is entered through a wrapper with a small frame, which checks that the whole frame fits and then tail-calls the body.
 
 **Data structures**
 
-- `stack_limit` in the task context — the lowest address the current function may use, read by every prologue.
+- `stack_limit` in the task context — the first field, read by every check. A passed check means the stack pointer is at or above it.
+- `STACK_MARGIN`, `FRAME_BUDGET` and `RUNTIME_RESERVE` in `crag-abi` — the usable bytes below the limit (1024), the largest frame a function may allocate before its check (512), and what an entry into the runtime may use before it switches stacks (512). The smallest stack is therefore larger than the margin.
 - Frame-pointer chain — each frame stores the caller's frame pointer, forming a linked list through the stack that the runtime walks and rewrites.
 
 **Functions**
 
-- Prologue check (generated code) — `if sp - frame_size < ctx.stack_limit { morestack(frame_size) }`.
-- `extern "C" fn morestack(needed: usize)` — switches to the system stack, calls `grow_stack`, switches back and retries the function entry.
+- Margin check (generated code, entry block and loop back-edges) — `if sp < ctx.stack_limit { morestack(ctx, 0) }`.
+- Sized check (generated code, wrapper of a function over the frame budget) — `if sp - frame_size < ctx.stack_limit { morestack(ctx, frame_size) }`, then a tail call to the body.
+- `morestack(ctx: *mut TaskContext, needed: usize)` — an assembly routine that preserves every register, so the passing path of the check pays nothing for it. It switches to the system stack, calls `grow_stack` until `sp - needed` is at or above the new limit, switches back and returns into the same frame on the new stack.
 - `unsafe fn grow_stack(fiber: &mut Fiber, needed: usize)` — allocates at least twice the size, copies the used bytes, adds the address difference to every saved frame pointer in the chain and to the saved stack pointer, then frees the old stack.
 - `unsafe fn shrink_stack(fiber: &mut Fiber)` — later: halves a mostly unused stack at a safe point.
 
@@ -310,7 +314,7 @@ The runtime sometimes needs a running fiber to stop at its next safe point: to p
 
 **Data structures**
 
-- `SENTINEL` — a constant above every possible stack address.
+- `SENTINEL` — the largest address, so the unsigned comparison of both checks fails for every stack pointer.
 - `pending` flags in the task context — why the fiber was stopped (preempt, pause, reload, cancel).
 
 **Functions**
@@ -324,27 +328,31 @@ The runtime sometimes needs a running fiber to stop at its next safe point: to p
 
 **Data structures**
 
-- `LirFunction` — our lowered form: typed virtual registers, blocks, calls marked as normal or tail, and safepoint markers.
+- `LirFunction` — our lowered form: typed virtual registers, blocks, calls marked as normal or tail, safepoint markers and a poll for loop back-edges.
 - `CodeObject` — machine code bytes, relocations (places to patch with addresses at load time), stack maps and frame information.
 
 **Functions**
 
-- `fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObject, CodegenError>` — translates to CLIF using Cranelift's `tail` calling convention and `return_call` for tail calls, keeps frame pointers, requests stack maps at calls, and runs Cranelift.
+- `fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObject, CodegenError>` — translates to CLIF using Cranelift's `tail` calling convention and `return_call` for tail calls, emits the stack check, keeps frame pointers, requests stack maps at calls, runs Cranelift, and adds the sized-check wrapper when the frame exceeds the budget.
+- `fn compile_entry_stub(params: u32, returns: u32, settings: &CodegenSettings) -> Result<CodeObject, CodegenError>` — the C-callable stub through which the runtime enters Crag code.
 - `fn target_for(triple: &str) -> Result<Target, UnknownTarget>` — picks the instruction set and settings.
 
 #### 11.3.6 Code loader
 
 Code objects must become runnable memory. The loader copies code into pages, resolves relocations against runtime functions and other code objects, and flips the pages from writable to executable, never both at once ([W^X](https://en.wikipedia.org/wiki/W%5EX)).
 
+Protection applies to whole pages, so each load fills a region of fresh pages while they are writable and then makes them executable for good. A later load never reopens a region, so no thread finds code it is running made non-executable under it. Every load therefore uses at least one page, and code compiled together is loaded together.
+
 **Data structures**
 
-- `CodeArena` — pages of code with a free list, so retired code can be reused later.
-- `SymbolTable` — names of runtime functions and loaded instances to addresses.
+- `CodeArena` — one reserved address range, so all code stays within reach of relative branches, with pages committed on demand and a free list of returned page runs, so retired code can be reused later.
+- `SymbolTable` — runtime functions and loaded functions to addresses.
 
 **Functions**
 
-- `fn load(arena: &mut CodeArena, code: &CodeObject) -> Result<CodeAddr, LoadError>` — allocate, copy, relocate, protect.
-- `fn unload(arena: &mut CodeArena, entry: CodeAddr)` — return the pages once no frame uses the code (used from M5).
+- `fn load(arena: &mut CodeArena, symbols: &SymbolTable, code: &CodeObject) -> Result<CodeAddr, LoadError>` — allocate, copy, relocate, protect. For code nothing refers to by number, such as an entry stub.
+- `fn load_group(arena: &mut CodeArena, symbols: &mut SymbolTable, group: &[(FuncId, &CodeObject)]) -> Result<Vec<CodeAddr>, LoadError>` — loads functions into one region and enters them in the symbol table. They may refer to each other, to themselves and to functions already loaded. Either all are loaded or none.
+- `unsafe fn unload(arena: &mut CodeArena, symbols: &mut SymbolTable, entry: CodeAddr) -> Result<(), LoadError>` — removes one code object once no frame uses it; the pages return to the free list with the region's last object (used from M5).
 
 #### 11.3.7 Salsa facade
 

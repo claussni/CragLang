@@ -11,6 +11,7 @@ Compiler, host and runtime for the Crag language, written in Rust.
 | Crate | M0 component |
 | --- | --- |
 | `crates/crag-runtime` | Fiber runtime, stack growth, side stack, sentinel, stress harness |
+| `crates/crag-abi` | Constants shared by generated code and the runtime |
 | `crates/crag-codegen` | Cranelift facade |
 | `crates/crag-loader` | Code loader |
 | `crates/crag-db` | Salsa facade |

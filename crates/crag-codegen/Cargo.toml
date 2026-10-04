@@ -10,5 +10,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+crag-abi = { path = "../crag-abi" }
 cranelift-codegen = "0.136.2"
 cranelift-frontend = "0.136.2"
+target-lexicon = "0.13.5"
+
+[dev-dependencies]
+crag-loader = { path = "../crag-loader" }

@@ -1,0 +1,170 @@
+//! The boundary between generated code and the runtime (Compiler
+//! Architecture §10): the constants both sides must agree on.
+//!
+//! The code generator bakes these values into machine code and the runtime
+//! lays out its memory to match, so neither crate depends on the other. The
+//! code object, which the host compiles and an image loads, is defined here
+//! for the same reason.
+//!
+//! # The stack check
+//!
+//! Cranelift emits the prologue itself, so a function's frame is already
+//! allocated when its first instruction runs. The check is therefore explicit
+//! code at the start of the entry block, and it runs *after* the frame exists:
+//!
+//! ```text
+//! if sp < ctx.stack_limit { rt_morestack(ctx, 0) }
+//! ```
+//!
+//! That is sound because `stack_limit` is not the end of the stack. The
+//! runtime keeps [`STACK_MARGIN`] usable bytes below it:
+//!
+//! ```text
+//! high addresses
+//!   | frames of callers                          |
+//!   | ...                                        |  sp >= stack_limit after
+//!   +--------------------------------------------+  every passed check
+//!   | stack_limit                                |
+//!   |   FRAME_BUDGET: one unchecked frame        |
+//!   |   RUNTIME_RESERVE: entry into the runtime  |
+//!   +--------------------------------------------+  stack_limit - STACK_MARGIN
+//!   | guard page                                 |
+//! low addresses
+//! ```
+//!
+//! A function whose frame footprint is at most [`FRAME_BUDGET`] may allocate
+//! its frame before checking: its caller passed a check, so the frame lands
+//! inside the margin, and [`RUNTIME_RESERVE`] bytes remain for the call into
+//! the runtime if the check fails.
+//!
+//! A function with a larger footprint is entered through a small wrapper that
+//! checks the size first and then tail-calls the body:
+//!
+//! ```text
+//! if sp - footprint < ctx.stack_limit { rt_morestack(ctx, footprint) }
+//! ```
+//!
+//! Loop back-edges repeat the first form, which is what lets the runtime stop
+//! a fiber by storing [`STACK_LIMIT_SENTINEL`] in `stack_limit`.
+
+/// Offset of `stack_limit` in the task context, in bytes. It is the first
+/// field, so the check loads it with no displacement.
+pub const STACK_LIMIT_OFFSET: i32 = 0;
+
+/// The value the runtime stores in `stack_limit` to force the next check into
+/// the runtime (Plan §11.3.4). The check compares unsigned, so no stack
+/// pointer passes it.
+pub const STACK_LIMIT_SENTINEL: usize = usize::MAX;
+
+/// Largest frame footprint a function may allocate before its check has run.
+/// The footprint counts everything a call adds below the caller's stack
+/// pointer: the return address, the saved frame pointer, the frame itself and
+/// any growth of the argument area for tail calls.
+pub const FRAME_BUDGET: u32 = 512;
+
+/// Bytes a runtime entry point may use on the fiber stack before it switches
+/// to the system stack.
+pub const RUNTIME_RESERVE: u32 = 512;
+
+/// Usable bytes the runtime keeps below `stack_limit`.
+pub const STACK_MARGIN: u32 = FRAME_BUDGET + RUNTIME_RESERVE;
+
+/// Runtime functions that generated code calls. Code objects name them in
+/// relocations; the loader resolves them to addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum RuntimeFn {
+    /// `rt_morestack(ctx: *mut TaskContext, needed: usize)`.
+    ///
+    /// Called when a stack check fails. It takes its arguments in the first
+    /// two argument registers of the C calling convention and preserves every
+    /// register, vector registers included, so the call costs the passing
+    /// path nothing. It is therefore an assembly routine, not a Rust function.
+    /// The runtime handles a pending stop
+    /// request if `stack_limit` holds the sentinel, then grows the stack
+    /// until `sp - needed >= stack_limit`. `needed` is zero for the ordinary
+    /// check and the body's footprint for the sized check. It returns into
+    /// the same frame, which may have moved to a new stack.
+    Morestack = 0,
+}
+
+impl RuntimeFn {
+    /// Every runtime function, indexed by its discriminant.
+    pub const ALL: [RuntimeFn; 1] = [RuntimeFn::Morestack];
+
+    /// The symbol the loader looks up.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            RuntimeFn::Morestack => "rt_morestack",
+        }
+    }
+
+    /// The function with this discriminant, if any.
+    pub fn from_index(index: u32) -> Option<RuntimeFn> {
+        Self::ALL.get(index as usize).copied()
+    }
+}
+
+/// Another Crag function, as generated code refers to it. The loader resolves
+/// it to an address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FuncId(pub u32);
+
+/// The machine code of one function plus what the loader needs to place it.
+#[derive(Clone, Debug)]
+pub struct CodeObject {
+    /// Machine code. It may hold more than one routine; execution starts at
+    /// `entry`.
+    pub code: Vec<u8>,
+    /// Required alignment of `code` in bytes, a power of two.
+    pub align: u32,
+    /// Offset of the entry point in `code`.
+    pub entry: u32,
+    /// Places the loader patches with addresses.
+    pub relocs: Vec<Reloc>,
+    /// Bytes one call of this function adds below its caller's stack pointer:
+    /// return address, saved frame pointer, frame, and growth of the argument
+    /// area for tail calls. The last part is an upper bound.
+    pub footprint: u32,
+    /// Which stack check guards the entry.
+    pub stack_check: StackCheck,
+}
+
+/// The form of the entry stack check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StackCheck {
+    /// No check: the entry stub, which runs on the system stack.
+    None,
+    /// `sp < limit` after the frame is allocated. Used when the footprint
+    /// fits [`FRAME_BUDGET`].
+    Margin,
+    /// `sp - needed < limit` in a wrapper, before the frame is allocated.
+    Sized { needed: u32 },
+}
+
+/// One place in the code to patch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reloc {
+    /// Offset in `CodeObject::code` of the bytes to patch.
+    pub offset: u32,
+    pub kind: RelocKind,
+    pub target: RelocTarget,
+    /// Added to the target's address.
+    pub addend: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelocKind {
+    /// Write the 64-bit absolute address, little-endian.
+    Abs64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelocTarget {
+    /// The entry point of another Crag function.
+    Function(FuncId),
+    /// A runtime function.
+    Runtime(RuntimeFn),
+    /// An offset into this code object's own `code`.
+    Local(u32),
+}
