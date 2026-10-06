@@ -6,28 +6,28 @@ This is working draft 0.1 of Crag, a fast, type-safe, REPL-friendly language: im
 
 ## Contents
 
-1. [Introduction](#mcw4g9fkasf.361) — goals, status, notation, conformance
-2. [Lexical structure](#mcw4g9fkasf.2281) — comments, newlines, literals, prefixes
-3. [Types](#mcw4g9fkasf.4797) — primitives, records, unions, parents, modifiers, clauses, markers
-4. [Forms and generics](#mcw4g9fkasf.10287) — forms, bounds, `where`, dispatch
-5. [Declarations and bindings](#mcw4g9fkasf.12793) — `let`, `var`, `ref`, `ext`, functions, overloading
-6. [Expressions](#mcw4g9fkasf.15402) — blocks, operators, UFCS, closures, partial application, updates, options, patterns
-7. [Control flow](#mcw4g9fkasf.18821) — `if`, narrowing, `case`, `for`, ranges
-8. [Errors and type mappings](#mcw4g9fkasf.20679) — error unions, `pass`, traps, `discard`, prefixes
-9. [Shared state: ref and ext](#mcw4g9fkasf.23179) — access functions, optimistic updates, transactions
-10. [Concurrency](#mcw4g9fkasf.26074) — structured tasks, combinators, cancellation, streams
-11. [Signals and lifecycle](#mcw4g9fkasf.28765) — `emit`, `on`, `Dispose[T]`, debugging
-12. [Collections and strings](#mcw4g9fkasf.31220) — lists, maps, grids, slices, `Str`, `CodePoint`
-13. [Memory model](#mcw4g9fkasf.33251) — reference counting, runtime structures, disposal
-14. [Modules and packages](#mcw4g9fkasf.34349) — imports, merging, versions
-15. [Runtime I/O](#mcw4g9fkasf.36845) — abstract I/O types, cryptography
-16. [Foreign function interface](#mcw4g9fkasf.38289) — C imports, pointers, threading, native versions
-17. [The REPL](#mcw4g9fkasf.40649) — discovery, rebind
-18. [Introspection and code transport](#mcw4g9fkasf.48242) — generics over fields, type functions, compile-time evaluation, `Expr`, codecs
+1. [Introduction](#1-introduction) — goals, status, notation, conformance
+2. [Lexical structure](#2-lexical-structure) — comments, newlines, literals, prefixes
+3. [Types](#3-types) — primitives, records, unions, parents, modifiers, clauses, markers
+4. [Forms and generics](#4-forms-and-generics) — forms, bounds, `where`, dispatch
+5. [Declarations and bindings](#5-declarations-and-bindings) — `let`, `var`, `ref`, `ext`, functions, overloading
+6. [Expressions](#6-expressions) — blocks, operators, UFCS, closures, partial application, updates, options, patterns
+7. [Control flow](#7-control-flow) — `if`, narrowing, `case`, `for`, ranges
+8. [Errors and type mappings](#8-errors-and-type-mappings) — error unions, `pass`, traps, `discard`, prefixes
+9. [Shared state: ref and ext](#9-shared-state-ref-and-ext) — access functions, optimistic updates, transactions
+10. [Concurrency](#10-concurrency) — structured tasks, combinators, cancellation, streams
+11. [Signals and lifecycle](#11-signals-and-lifecycle) — `emit`, `on`, `Dispose[T]`, debugging
+12. [Collections and strings](#12-collections-and-strings) — lists, maps, grids, slices, `Str`, `CodePoint`
+13. [Memory model](#13-memory-model) — reference counting, runtime structures, disposal
+14. [Modules and packages](#14-modules-and-packages) — imports, merging, versions
+15. [Runtime I/O](#15-runtime-io) — abstract I/O types, cryptography
+16. [Foreign function interface](#16-foreign-function-interface) — C imports, pointers, threading, native versions
+17. [The REPL](#17-the-repl) — discovery, rebind
+18. [Introspection and code transport](#18-introspection-and-code-transport) — generics over fields, type functions, compile-time evaluation, `Expr`, codecs
 19. The standard library — compiler-owned types, the prelude, module layout
 20. Runtime and tooling — processes, hot reload, debugger, registries, commands, release builds
 
-Appendices: [A Glossary](#mcw4g9fkasf.41996) · [B Reserved words and markers](#mcw4g9fkasf.44250) · [C Open questions](#mcw4g9fkasf.45402)
+Appendices: [A Glossary](#appendix-a-glossary) · [B Reserved words and markers](#appendix-b-reserved-words-and-standard-markers) · [C Open questions](#appendix-c-open-questions-and-provisional-syntax)
 
 ## 1 Introduction
 
