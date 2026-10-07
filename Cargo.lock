@@ -108,6 +108,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "crag-hir"
+version = "0.0.0"
+dependencies = [
+ "crag-db",
+ "crag-syntax",
+]
+
+[[package]]
 name = "crag-loader"
 version = "0.0.0"
 dependencies = [

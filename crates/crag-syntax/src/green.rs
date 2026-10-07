@@ -55,6 +55,34 @@ pub enum GreenElement {
 }
 
 impl GreenNode {
+    /// A node outside any tree being built, without deduplication.
+    pub fn new(kind: SyntaxKind, children: Vec<GreenElement>) -> GreenNode {
+        GreenNode(Arc::new(NodeData {
+            kind,
+            len: children.iter().map(GreenElement::len).sum(),
+            children: children.into(),
+        }))
+    }
+
+    /// A copy without trivia, and without nodes left empty by that: the
+    /// node's shape and tokens, compared regardless of layout and comments.
+    pub fn without_trivia(&self) -> GreenNode {
+        let children = self
+            .children()
+            .iter()
+            .filter_map(|child| match child {
+                GreenElement::Node(node) => {
+                    let node = node.without_trivia();
+                    (!node.children().is_empty()).then_some(GreenElement::Node(node))
+                }
+                GreenElement::Token(token) => {
+                    matches!(token.kind(), LeafKind::Token(_)).then(|| child.clone())
+                }
+            })
+            .collect();
+        GreenNode::new(self.kind(), children)
+    }
+
     pub fn kind(&self) -> SyntaxKind {
         self.0.kind
     }
@@ -92,11 +120,7 @@ impl GreenNode {
     pub(crate) fn replace_child(&self, index: usize, child: GreenElement) -> GreenNode {
         let mut children = self.children().to_vec();
         children[index] = child;
-        GreenNode(Arc::new(NodeData {
-            kind: self.kind(),
-            len: children.iter().map(GreenElement::len).sum(),
-            children: children.into(),
-        }))
+        GreenNode::new(self.kind(), children)
     }
 
     fn addr(&self) -> usize {
@@ -105,6 +129,14 @@ impl GreenNode {
 }
 
 impl GreenToken {
+    /// A leaf outside any tree being built, without deduplication.
+    pub fn new(kind: LeafKind, text: &str) -> GreenToken {
+        GreenToken(Arc::new(TokenData {
+            kind,
+            text: text.into(),
+        }))
+    }
+
     pub fn kind(&self) -> LeafKind {
         self.0.kind
     }
@@ -190,22 +222,13 @@ impl NodeCache {
         if let Some(token) = bucket.iter().find(|t| t.kind() == kind && t.text() == text) {
             return token.clone();
         }
-        let token = GreenToken(Arc::new(TokenData {
-            kind,
-            text: text.into(),
-        }));
+        let token = GreenToken::new(kind, text);
         bucket.push(token.clone());
         token
     }
 
     pub fn node(&mut self, kind: SyntaxKind, children: Vec<GreenElement>) -> GreenNode {
-        let make = |children: Vec<GreenElement>| {
-            GreenNode(Arc::new(NodeData {
-                kind,
-                len: children.iter().map(GreenElement::len).sum(),
-                children: children.into(),
-            }))
-        };
+        let make = |children| GreenNode::new(kind, children);
         if children.len() > MAX_SHARED_CHILDREN {
             return make(children);
         }

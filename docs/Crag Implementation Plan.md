@@ -453,13 +453,13 @@ Most queries need only the shape of a module: which functions, types and imports
 
 **Data structures**
 
-- `ItemTree` — per module: lists of functions, types, imports, `embed` declarations, each with its signature syntax.
-- `ItemId` — module plus name plus kind, stable across body edits.
+- `ItemTree` — per module: lists of functions, types, imports, `embed` declarations, each with its signature syntax. A signature is the declaration's green node without its body and without trivia, and the tree holds no positions: a declaration is found again by its index among the module's declarations. So edits to bodies, comments and layout leave the tree equal.
+- `ItemId` — module plus name plus kind, stable across body edits, plus an ordinal among the items of the same name and kind, since overloads share a name.
 - [Interned](https://en.wikipedia.org/wiki/String_interning) `Name` — identifiers stored once.
 
 **Functions**
 
-- `fn item_tree(db: &dyn Db, module: ModuleId) -> Arc<ItemTree>` — a query reading the module's CST.
+- `fn item_tree(db: &dyn Db, module: ModuleId) -> &ItemTree` — a query reading the module's CST, from `fn parse(db: &dyn Db, file: SourceFile) -> &Parse`. `SourceFile` (text) and `ModuleId` (path and file) are inputs.
 
 #### 11.4.5 Names and imports
 
