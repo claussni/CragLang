@@ -88,6 +88,17 @@ impl GreenNode {
         }
     }
 
+    /// A copy of the node with child `index` replaced.
+    pub(crate) fn replace_child(&self, index: usize, child: GreenElement) -> GreenNode {
+        let mut children = self.children().to_vec();
+        children[index] = child;
+        GreenNode(Arc::new(NodeData {
+            kind: self.kind(),
+            len: children.iter().map(GreenElement::len).sum(),
+            children: children.into(),
+        }))
+    }
+
     fn addr(&self) -> usize {
         Arc::as_ptr(&self.0) as usize
     }

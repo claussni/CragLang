@@ -22,7 +22,7 @@ mod expr;
 mod pattern;
 mod ty;
 
-pub(crate) use expr::{block, expr};
+pub(crate) use expr::{block, closure_ahead, expr};
 pub(crate) use pattern::pattern;
 pub(crate) use ty::ty;
 

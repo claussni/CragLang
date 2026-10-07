@@ -29,7 +29,7 @@
 
 use std::ops::Range;
 
-use crate::green::{Builder, Checkpoint, GreenNode, NodeCache};
+use crate::green::{Builder, Checkpoint, GreenElement, GreenNode, NodeCache};
 use crate::kind::{LeafKind, SyntaxKind};
 use crate::token::{Token, TokenKind};
 
@@ -47,6 +47,36 @@ pub fn parse(text: &str, tokens: &[Token]) -> (GreenNode, Vec<ParseError>) {
     p.finish()
 }
 
+/// Parses `text`, which must be one block `{ … }`, as the parser would at
+/// `depth` in a file, for the incremental reparse. `None` if the text does
+/// not parse as exactly that block: if it opens a closure instead, if the
+/// block ends early or lacks its `}`, or if the nesting limit was reached,
+/// which `depth` only bounds from above.
+pub(crate) fn parse_block(
+    text: &str,
+    tokens: &[Token],
+    depth: usize,
+) -> Option<(GreenNode, Vec<ParseError>)> {
+    let mut p = Parser::new(text, tokens);
+    p.depth = depth;
+    if !p.at(TokenKind::LBrace) || crate::grammar::closure_ahead(&p) {
+        return None;
+    }
+    crate::grammar::block(&mut p);
+    if p.too_deep || !p.at(TokenKind::Eof) {
+        return None;
+    }
+    let (module, errors) = p.finish();
+    let [GreenElement::Node(block)] = module.children() else {
+        return None;
+    };
+    let closed = matches!(
+        block.children().last(),
+        Some(GreenElement::Token(t)) if t.kind() == LeafKind::Token(TokenKind::RBrace)
+    );
+    closed.then(|| (block.clone(), errors))
+}
+
 pub(crate) struct Parser<'a> {
     text: &'a str,
     tokens: &'a [Token],
@@ -57,6 +87,8 @@ pub(crate) struct Parser<'a> {
     errors: Vec<ParseError>,
     /// The number of open nodes, which bounds the parser's recursion.
     depth: usize,
+    /// Whether the nesting limit cut the input short somewhere.
+    too_deep: bool,
 }
 
 /// How deeply nodes may nest. Deeper input is reported and skipped, so a
@@ -111,6 +143,7 @@ impl<'a> Parser<'a> {
             builder,
             errors: Vec::new(),
             depth: 0,
+            too_deep: false,
         }
     }
 
@@ -277,6 +310,7 @@ impl<'a> Parser<'a> {
         if self.depth < MAX_DEPTH {
             return true;
         }
+        self.too_deep = true;
         self.bump_error("nesting too deep");
         false
     }

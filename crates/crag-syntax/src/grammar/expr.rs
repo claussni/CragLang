@@ -225,7 +225,7 @@ fn postfix(p: &mut Parser, cx: Context) {
 
 /// Whether the `{` at the current token opens a closure: `{ ->` or
 /// `{ params ->` (D.4). Any other `{` opens a block.
-fn closure_ahead(p: &Parser) -> bool {
+pub(crate) fn closure_ahead(p: &Parser) -> bool {
     if !p.at(T::LBrace) {
         return false;
     }

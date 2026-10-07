@@ -445,7 +445,7 @@ Reparsing a whole file on every keystroke wastes time on large files. Most edits
 
 **Functions**
 
-- `fn reparse(old: &GreenNode, edit: &TextEdit) -> GreenNode` — finds the innermost block containing the edit, reparses its text, and falls back to a full parse when the block's braces no longer balance.
+- `fn reparse(old: &GreenNode, errors: &[ParseError], edit: &TextEdit) -> (GreenNode, Vec<ParseError>)` — finds the innermost block containing the edit, relexes and reparses its text, splices the new block into the old tree and keeps the errors outside it, shifted. A block qualifies when its braces still balance on their own, it does not turn into a closure, and the nesting limit stays out of reach; otherwise the next block out is tried, and without one the file is parsed in full. The result always equals a full parse.
 
 #### 11.4.4 Item tree
 

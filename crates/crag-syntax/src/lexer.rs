@@ -46,6 +46,49 @@ pub fn lex(text: &str) -> Vec<Token> {
     }
 }
 
+/// Lexes `text` as one block `{ … }` for the incremental reparse, or `None`
+/// if it is not one: the `{` at its start must be closed by the last token,
+/// and every closer in between must close the innermost open bracket or
+/// interpolation. Then the lexer never looks past the block's own `{` into
+/// its state, so the tokens are those the block would get in any file.
+pub(crate) fn lex_block(text: &str) -> Option<Vec<Token>> {
+    use TokenKind::*;
+    let tokens = lex(text);
+    let (eof, body) = tokens.split_last()?;
+    if body.first()?.trivia_start != 0 || eof.trivia_start != eof.end {
+        return None;
+    }
+    let mut open = Vec::new();
+    for (i, token) in body.iter().enumerate() {
+        if i > 0 && open.is_empty() {
+            return None;
+        }
+        let closes = match token.kind {
+            LParen | LBracket | LBrace | StrStart | TripleStrStart => {
+                open.push(token.kind);
+                continue;
+            }
+            RParen => LParen,
+            RBracket => LBracket,
+            RBrace => LBrace,
+            StrMid | StrEnd => match open.last() {
+                Some(StrStart | TripleStrStart) => {
+                    if token.kind == StrEnd {
+                        open.pop();
+                    }
+                    continue;
+                }
+                _ => return None,
+            },
+            _ => continue,
+        };
+        if open.pop() != Some(closes) {
+            return None;
+        }
+    }
+    (body[0].kind == LBrace && open.is_empty()).then_some(tokens)
+}
+
 /// How far past its end the lexer may look to decide a token, in bytes:
 /// `1..` needs two to tell a range from `1.5`, `???` two to tell it from `?`.
 const LOOKAHEAD: usize = 2;
