@@ -8,7 +8,7 @@ Compiler, host and runtime for the Crag language, written in Rust.
 
 ## Layout
 
-| Crate | M0 component |
+| Crate | Components |
 | --- | --- |
 | `crates/crag-runtime` | Fiber runtime, stack growth, side stack, sentinel, stress harness |
 | `crates/crag-abi` | Constants shared by generated code and the runtime |
@@ -16,6 +16,7 @@ Compiler, host and runtime for the Crag language, written in Rust.
 | `crates/crag-loader` | Code loader |
 | `crates/crag-db` | Salsa facade |
 | `crates/crag-store` | Artifact store skeleton |
+| `crates/crag-syntax` | Lexer (M1) |
 
 ## Build
 

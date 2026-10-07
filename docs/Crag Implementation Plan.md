@@ -420,7 +420,7 @@ The lexer cuts source text into tokens (names, numbers, strings, operators, brac
 **Functions**
 
 - `fn lex(text: &str) -> Vec<Token>` — a hand-written loop over bytes; string interpolation is lexed by tracking nesting depth inside `{ }`.
-- `fn relex(old: &[Token], edit: &TextEdit) -> Vec<Token>` — relexes from the token before the edit until the token stream matches the old one again.
+- `fn relex(text: &str, old: &[Token], edit: &TextEdit) -> Vec<Token>` — given the new text, relexes from the token before the edit until the token stream matches the old one again. The lexer's state (open brackets and interpolations, the last token kind) changes only by token kind, so replaying the old kinds recovers it at the restart point.
 
 #### 11.4.2 Parser and CST
 
