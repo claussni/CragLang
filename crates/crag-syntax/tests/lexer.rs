@@ -255,8 +255,12 @@ fn newlines_end_statements_except_where_lines_continue() {
     // After a binary operator, `,` or `->`, but not before one.
     assert_eq!(kinds("a +\n\nb"), [Ident, Plus, Ident, Eof]);
     assert_eq!(kinds("a and\nb"), [Ident, And, Ident, Eof]);
-    // `..` may end a line as an open range.
-    assert_eq!(kinds("a..\nb"), [Ident, DotDot, Newline, Ident, Eof]);
+    // `..` too, so an open range at the end of a line needs parentheses (§7.4).
+    assert_eq!(kinds("a..\nb"), [Ident, DotDot, Ident, Eof]);
+    assert_eq!(
+        kinds("(a..)\nb"),
+        [LParen, Ident, DotDot, RParen, Newline, Ident, Eof]
+    );
     assert_eq!(
         kinds("{ x ->\n x }"),
         [LBrace, Ident, Arrow, Ident, RBrace, Eof]

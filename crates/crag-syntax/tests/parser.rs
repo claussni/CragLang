@@ -74,7 +74,7 @@ test "addition works" {
   let map = ["a": 1, "b": 2]
   let none = [:]
   let list = [1, 2, 3,]
-  let r = 1..
+  let r = (1..)
   let msg = "sum {a + b} of {names.join(", ")}"
   let f = { x: Int, y -> x + y }
   let g = { -> 42 }
