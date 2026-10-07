@@ -30,6 +30,7 @@ use crag_db::Db;
 use crag_syntax::{GreenElement, GreenNode, LeafKind, SyntaxKind as S, SyntaxNode, TokenKind as T};
 
 use crate::input::{ModuleId, parse};
+use crate::patterns;
 
 /// An identifier, stored once.
 #[crag_db::interned(debug)]
@@ -301,27 +302,11 @@ fn without(node: &SyntaxNode, mut drop: impl FnMut(&GreenElement) -> bool) -> Gr
     GreenNode::new(node.kind(), children).without_trivia()
 }
 
-/// The names a `let` pattern may bind, each once. A bare name binds unless
-/// a type of that name is visible (§6.9), which only names resolution
-/// knows, so every bare name is listed here.
+/// The names a `let` pattern may bind. A bare name binds unless a type of
+/// that name is visible (§6.9), which only the module's scope knows, so
+/// every bare name is listed here.
 fn bound_names(pattern: &SyntaxNode, out: &mut Vec<String>) {
-    let mut add = |name: String| {
-        if !out.contains(&name) {
-            out.push(name);
-        }
-    };
-    match pattern.kind() {
-        S::NamePat | S::RestPat => idents(pattern).for_each(&mut add),
-        S::BindPat => idents(pattern).take(1).for_each(&mut add),
-        // `name:` alone binds the field's name.
-        S::PatField if pattern.children().next().is_none() => {
-            idents(pattern).take(1).for_each(&mut add)
-        }
-        // The name in front of a record pattern is its type.
-        S::PatField | S::RecordPat | S::ListPat | S::OrPat => {}
-        _ => return,
-    }
-    for child in pattern.children() {
-        bound_names(&child, out);
-    }
+    let mut bindings = Vec::new();
+    patterns::bindings(pattern, false, &mut bindings);
+    out.extend(bindings.iter().map(|b| b.name().to_string()));
 }

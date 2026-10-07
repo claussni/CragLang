@@ -14,7 +14,8 @@
 // You should have received a copy of the GNU General Public License along with
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
-//! The inputs: source files and modules, and the parse of a file.
+//! The inputs: source files, the modules they make and the program the
+//! modules belong to, and the parse of a file.
 
 use crag_syntax::{GreenNode, ParseError, lex};
 
@@ -31,6 +32,15 @@ pub struct ModuleId {
     #[returns(ref)]
     pub path: String,
     pub file: SourceFile,
+}
+
+/// The modules of a program: an application with its dependencies, or a
+/// REPL session. Paths are unique; of two modules with one path, the first
+/// counts.
+#[crag_db::input(debug)]
+pub struct Program {
+    #[returns(ref)]
+    pub modules: Vec<ModuleId>,
 }
 
 /// A file's syntax tree and syntax errors.

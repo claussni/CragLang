@@ -463,18 +463,23 @@ Most queries need only the shape of a module: which functions, types and imports
 
 #### 11.4.5 Names and imports
 
-Every name in the program must be connected to the declaration it refers to. A module's scope holds its own items and what it imports; overloaded functions share a name, so lookups return sets. This stage reports name collisions and violations of the no-shadowing rule (§5.4, §14.2–14.3).
+Every name in the program must be connected to the declaration it refers to. A module's scope holds its own items and the public items of the modules it imports, with the prelude imported into every module but itself; overloaded functions share a name, so a name can resolve to a set. This stage reports bad import paths, name collisions, import cycles and violations of the no-shadowing rule (§5.4, §6.9, §14.1–14.3, §19.3).
+
+Imports are not passed on, so a scope is made from item trees alone: the module's own and those of the modules it imports. Only the types visible in an imported module are needed one step further, to tell which bare names in its `let` patterns bind. No scope query therefore depends on another, and an import cycle never becomes a query cycle. Modules are not names in a scope, since there are no module-qualified references (§14.2).
 
 **Data structures**
 
-- `ModuleScope` — name to `Resolution` (a type, a module, or an overload set of functions).
-- `ImportGraph` — which module imports which, for cycle and visibility checks.
+- `Program` — an input: the modules of an application or a session, each `ModuleId` with its dotted path.
+- `ModuleIndex` — modules by path, and the directories the paths imply.
+- `ModuleScope` — name to `Resolution` (a type, a form, or a value and an overload set of functions), plus the errors found making it. Indistinguishable types merge; functions with the same name but an identical signature, and any other two items that meet, collide (§14.3).
+- `ImportGraph` — which module imports which, with one `ImportCycle` reported for every group of modules that import each other.
 
 **Functions**
 
-- `fn module_scope(db: &dyn Db, module: ModuleId) -> Arc<ModuleScope>` — a query combining the item tree with the scopes of imported modules.
-- `fn resolve_path(scope: &ModuleScope, path: &Path) -> Result<Resolution, NameError>`.
-- `fn check_shadowing(body: &Body) -> Vec<Diagnostic>` — walks nested scopes in a body.
+- `fn module_scope(db: &dyn Db, program: Program, module: ModuleId) -> &ModuleScope` — a query over `imports` (the resolved import paths) and `scope_entries` (every candidate with its origin).
+- `fn resolve_path(db: &dyn Db, index: &ModuleIndex, path: &[Name]) -> Result<PathTarget, PathError>` — a directory, a module, or an element of a module (§14.1).
+- `fn import_graph(db: &dyn Db, program: Program) -> &ImportGraph` — Tarjan's algorithm over the resolved imports.
+- `fn check_shadowing(db: &dyn Db, program: Program, module: ModuleId) -> &Vec<Redeclaration>` — walks the nested scopes of the bodies on the syntax tree, until HIR lowering resolves local names itself.
 
 #### 11.4.6 HIR lowering
 
