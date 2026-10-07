@@ -165,7 +165,8 @@ impl TokenKind {
     }
 
     /// Whether a line ending in this token continues on the next line: a
-    /// binary operator, `,` or `->` (§2.3).
+    /// binary operator, `,` or `->` (§2.3). `..` is the exception, since a
+    /// line may end in an open range `a..` (§7.4).
     pub fn continues_line(self) -> bool {
         use TokenKind::*;
         matches!(
@@ -177,7 +178,6 @@ impl TokenKind {
                 | StarPercent
                 | Slash
                 | Percent
-                | DotDot
                 | EqEq
                 | BangEq
                 | Lt

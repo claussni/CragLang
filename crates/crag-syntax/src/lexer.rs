@@ -21,8 +21,8 @@
 //! state decides three things:
 //!
 //! - whether a newline ends a statement (§2.3): not inside `( )` or `[ ]`
-//!   or an interpolation, not after a binary operator, `,` or `->`, and not
-//!   before a line that begins with `.`, `?.` or `else`;
+//!   or an interpolation, not after a binary operator other than `..`, `,`
+//!   or `->`, and not before a line that begins with `.`, `?.` or `else`;
 //! - whether a `}` closes a block or an interpolation, which continues the
 //!   string;
 //! - whether a keyword is a field name, after `.` or `?.`.
