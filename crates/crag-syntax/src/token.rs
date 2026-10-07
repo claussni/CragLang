@@ -164,6 +164,10 @@ impl TokenKind {
         })
     }
 
+    pub fn is_keyword(self) -> bool {
+        (TokenKind::Let as u8..=TokenKind::Not as u8).contains(&(self as u8))
+    }
+
     /// Whether a line ending in this token continues on the next line: a
     /// binary operator, `,` or `->` (§2.3). `..` is the exception, since a
     /// line may end in an open range `a..` (§7.4).
@@ -232,7 +236,7 @@ impl Token {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TriviaKind {
     /// Spaces, tabs and carriage returns.
     Whitespace,

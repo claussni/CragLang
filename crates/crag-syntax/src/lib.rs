@@ -18,11 +18,24 @@
 //!
 //! The lexer cuts source text into tokens. It is lossless: every byte of the
 //! source belongs to exactly one token or to the trivia in front of one, and
-//! a final `Eof` token carries the trivia at the end of the file. The parser
-//! and the concrete syntax tree build on it.
+//! a final `Eof` token carries the trivia at the end of the file.
+//!
+//! The parser turns the tokens into a concrete syntax tree, lossless as
+//! well: its leaves, trivia included, spell out the source exactly. A green
+//! tree holds the shape and the text; a red tree over it adds parents and
+//! positions while walking.
 
+mod grammar;
+mod green;
+mod kind;
 mod lexer;
+mod parser;
+mod red;
 mod token;
 
+pub use green::{GreenElement, GreenNode, GreenToken};
+pub use kind::{LeafKind, SyntaxKind};
 pub use lexer::{lex, relex};
+pub use parser::{ParseError, parse};
+pub use red::{SyntaxElement, SyntaxNode, SyntaxToken};
 pub use token::{TextEdit, Token, TokenKind, Trivia, TriviaKind};

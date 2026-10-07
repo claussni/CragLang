@@ -428,14 +428,14 @@ The parser builds a tree from tokens. It must never give up on broken input, bec
 
 **Data structures**
 
-- `GreenNode`, `GreenToken` — kind, text length, children; deduplicated so identical subtrees share memory.
+- `GreenNode`, `GreenToken` — a node holds its kind, text length and children, a token its kind and text, so a green tree is a complete copy of the source; deduplicated so identical leaves and small subtrees share memory.
 - `SyntaxNode` — the red view: a green node plus parent and offset.
-- `SyntaxKind` — node kinds (`FnDecl`, `CallExpr`, `Block`, `Error`, …).
+- `SyntaxKind` — node kinds (`FnDecl`, `CallExpr`, `Block`, `Error`, …). Leaves are tokens or pieces of trivia.
 - `ParseError` — message and range.
 
 **Functions**
 
-- `fn parse(tokens: &[Token]) -> (GreenNode, Vec<ParseError>)` — recursive descent: one method per grammar rule, such as `parse_fn`, `parse_block`, `parse_statement`.
+- `fn parse(text: &str, tokens: &[Token]) -> (GreenNode, Vec<ParseError>)` — recursive descent: one function per grammar rule, such as `fn_decl`, `block`, `statement`. Nesting deeper than a fixed limit is reported and skipped, so no input overflows the stack.
 - `fn parse_expr(p: &mut Parser, min_binding_power: u8)` — the Pratt loop for operators and calls.
 - `fn recover(p: &mut Parser, anchors: TokenSet)` — on an unexpected token, wraps tokens in an `Error` node until a closing brace or statement newline, then resumes (§2.3).
 
