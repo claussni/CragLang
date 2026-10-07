@@ -27,4 +27,5 @@ exec docker run --rm $tty \
   --user "$(id -u):$(id -g)" \
   -v "$root:$root" -w "$PWD" \
   -e CARGO_HOME="$root/.cargo-home" \
+  -e CRAG_TORTURE \
   "$image" cargo "$@"
