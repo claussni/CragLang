@@ -68,7 +68,7 @@ pub struct ItemTree<'db> {
     /// Types, forms, functions, values and `embed` declarations, in source
     /// order.
     pub items: Vec<Item<'db>>,
-    pub tests: Vec<Test>,
+    pub tests: Vec<Test<'db>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -108,11 +108,20 @@ pub struct ImportItem<'db> {
 }
 
 /// A `test` declaration (§5.7).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Test {
-    /// The test's string literal as written.
-    pub label: String,
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct Test<'db> {
+    pub id: TestId<'db>,
     pub decl: u32,
+}
+
+/// A test, stable across edits to bodies: its module, its string literal
+/// as written, and its place among the module's tests with that literal.
+#[crag_db::interned(debug)]
+pub struct TestId<'db> {
+    pub module: ModuleId,
+    #[returns(ref)]
+    pub label: String,
+    pub ordinal: u32,
 }
 
 /// Reads a module's declarations from its syntax tree. Declarations whose
@@ -199,10 +208,15 @@ impl<'db> Collector<'db> {
                     .children()
                     .find(|n| matches!(n.kind(), S::Literal | S::StrExpr))
                 {
-                    self.tree.tests.push(Test {
-                        label: label.text(),
-                        decl,
-                    });
+                    let label = label.text();
+                    let ordinal = self
+                        .tree
+                        .tests
+                        .iter()
+                        .filter(|t| *t.id.label(self.db) == label)
+                        .count();
+                    let id = TestId::new(self.db, self.module, label, ordinal as u32);
+                    self.tree.tests.push(Test { id, decl });
                 }
             }
             _ => {}

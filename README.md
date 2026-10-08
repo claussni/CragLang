@@ -17,7 +17,7 @@ Compiler, host and runtime for the Crag language, written in Rust.
 | `crates/crag-db` | Salsa facade |
 | `crates/crag-store` | Artifact store skeleton |
 | `crates/crag-syntax` | Lexer, parser and syntax tree (M1) |
-| `crates/crag-hir` | Item trees, names and imports, and later HIR (M1) |
+| `crates/crag-hir` | Item trees, names and imports, and HIR lowering (M1) |
 
 ## Build
 

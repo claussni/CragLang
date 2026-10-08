@@ -157,7 +157,7 @@ fn the_item_tree_lists_declarations_with_their_signatures() {
     );
 
     assert_eq!(tree.tests.len(), 1);
-    assert_eq!(tree.tests[0].label, "\"addition works\"");
+    assert_eq!(*tree.tests[0].id.label(&db), "\"addition works\"");
     assert_eq!(tree.tests[0].decl, 13);
 }
 

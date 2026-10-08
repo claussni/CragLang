@@ -479,20 +479,25 @@ Imports are not passed on, so a scope is made from item trees alone: the module'
 - `fn module_scope(db: &dyn Db, program: Program, module: ModuleId) -> &ModuleScope` — a query over `imports` (the resolved import paths) and `scope_entries` (every candidate with its origin).
 - `fn resolve_path(db: &dyn Db, index: &ModuleIndex, path: &[Name]) -> Result<PathTarget, PathError>` — a directory, a module, or an element of a module (§14.1).
 - `fn import_graph(db: &dyn Db, program: Program) -> &ImportGraph` — Tarjan's algorithm over the resolved imports.
-- `fn check_shadowing(db: &dyn Db, program: Program, module: ModuleId) -> &Vec<Redeclaration>` — walks the nested scopes of the bodies on the syntax tree, until HIR lowering resolves local names itself.
+- `fn check_shadowing(db: &dyn Db, program: Program, module: ModuleId) -> &Vec<Redeclaration>` — the redeclarations HIR lowering finds in the module's bodies, which it checks while it resolves local names (§11.4.6).
 
 #### 11.4.6 HIR lowering
 
-The CST mirrors the text; later stages want something simpler. HIR lowering turns each body into a resolved, desugared tree: names become references to declarations, operators become calls, named arguments become records, and `for` and `let … else` get explicit forms.
+The CST mirrors the text; later stages want something simpler. HIR lowering turns each body into a resolved, desugared tree: names become references to bindings or items, operators and prefixes become calls of their functions, named arguments form one field list on their call, `_` arguments become closures that evaluate their supplied arguments once, and `for`, `let … else` and patterns get explicit forms. Bodies belong to functions, module-level `let`s and tests.
+
+Lowering resolves local names itself, so it also checks the no-shadowing rule, that only a `var` is assigned, and that no closure writes a captured `var` (§5.2, §5.4, §6.4.1). Literals are decoded here: digits, escapes, doubled braces and the indentation of triple-quoted strings (§2.6).
 
 **Data structures**
 
-- `Body` — arenas of `Expr`, `Pattern` and `Stmt` nodes indexed by small integers, plus a map from each node back to its CST range for diagnostics.
+- `Owner` — what has a body: an `ItemId`, or a `TestId` made of the module, the test's label and its place among the tests with that label.
+- `Body` — arenas of `Expr`, `Pat`, `TypeRef` and `Binding` nodes indexed by small integers, plus the parameters, the result type and the root. It holds no positions.
+- `BodySourceMap` — the CST range of every node, beside the body.
 
 **Functions**
 
-- `fn hir_body(db: &dyn Db, function: FunctionId) -> Arc<Body>` — a query.
-- `fn lower_expr(ctx: &mut LowerCtx, node: &SyntaxNode) -> ExprId` and `fn lower_pattern(ctx: &mut LowerCtx, node: &SyntaxNode) -> PatId` — one case per syntax kind.
+- `fn lower_body(db: &dyn Db, program: Program, owner: Owner) -> &LoweredBody` — a query: the body, its source map and its errors. It reruns on every edit of the file.
+- `fn hir_body(db: &dyn Db, program: Program, owner: Owner) -> &Body` — the body alone, which stays equal when an edit only moves it, so it stops recomputation of inference.
+- `Lowerer::expr`, `Lowerer::pattern` and `Lowerer::type_node` — one case per syntax kind.
 
 #### 11.4.7 Core inference
 
