@@ -797,12 +797,12 @@ Every operator is syntactic sugar for an ordinary standard-library function on t
 | Operator | Function | Notes |
 | --- | --- | --- |
 | `a + b`, `a - b`, `a * b`, `a / b` | `add`, `subtract`, `multiply`, `divide` | Trap on `Int` overflow |
-| `a +% b`, `a -% b`, `a *% b` | wrapping variants | Never trap |
+| `a +% b`, `a -% b`, `a *% b` | `addWrapping`, `subtractWrapping`, `multiplyWrapping` | Never trap |
 | `a == b`, `a != b` | `equals` | IEEE semantics on `Float` |
 | `a < b`, `a <= b`, `a > b`, `a >= b` | `lessThan`, `lessOrEqual`, `greaterThan`, `greaterOrEqual` | Return `Bool`; IEEE semantics on `Float` |
 | `and`, `or`, `not` | boolean keywords | Short-circuiting |
 
-The operator functions are `add`, `subtract`, `multiply`, `divide`, `remainder`, `negate`, `equals`, `lessThan`, `lessOrEqual`, `greaterThan` and `greaterOrEqual`. Each comparison operator calls its own function, which returns a `Bool`.
+The operator functions are `add`, `subtract`, `multiply`, `divide`, `remainder`, `negate`, `addWrapping`, `subtractWrapping`, `multiplyWrapping`, `equals`, `lessThan`, `lessOrEqual`, `greaterThan` and `greaterOrEqual`. Each comparison operator calls its own function, which returns a `Bool`.
 
 General-purpose ordering, as used by sorting and `SortedMap`, goes through `compare`, the function of the `Ordered` form (§4.7). It returns an `Ordering`, one of the prelude tags `Less`, `Equal` and `Greater`. For every `Ordered` type the prelude defines the comparison functions from `compare`, so `a < b` there means `compare(a, b) is Less`. A type defines a comparison function itself only when it orders values without `compare`, or more cheaply.
 
