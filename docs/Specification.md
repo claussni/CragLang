@@ -165,7 +165,7 @@ Crag is structurally typed: a type is identified by its shape, and a named type 
 | Type | Meaning | Key rules |
 | --- | --- | --- |
 | `Int` | Signed 64-bit integer on every platform | Overflow traps; `+%` style operators wrap |
-| `Float` | IEEE 754 binary float | `==` and `<` follow IEEE (so `NaN != NaN`); not `Ordered` (§6.2); not usable as a map key |
+| `Float` | IEEE 754 binary float, without NaN | Holds the numbers and ±∞; operations that can produce NaN return `Float \| NaN` (§3.1.4); `Ordered` |
 | `Fixed[S]` | Decimal fixed point, `S` fractional digits | Multiplying or dividing two fixed values requires explicit rounding |
 | `Bool` | `type Bool = True \| False` | An ordinary union of two tag types |
 | `Str` | UTF-8 text | No integer indexing, no list interface (§12.5) |
@@ -202,6 +202,26 @@ Each rounding mode is its own function, taking the target scale: `roundHalfEven(
 - The runtime may store lists of sized integers packed; a `List[UInt8]` takes one byte per element.
 
 The `C…` types of `std.c` (Ch. 16) exist for the C calling convention, not for general use.
+
+#### 3.1.4 Floating point
+
+A `Float` is an IEEE 754 double that is a number: a finite value or ±∞, never NaN. NaN is the prelude tag `type NaN`, and every operation that can produce it says so in its result type, `Float | NaN`. The union costs nothing: NaN keeps its IEEE bit patterns, a `Float | NaN` is one double, and `x is NaN` is the hardware check.
+
+- An operation returns `Float | NaN` when it can produce NaN from numbers: the arithmetic operators (`∞ - ∞`, `0 * ∞`, `0 / 0`, `x % 0`), `sqrt`, `log`, `pow` and the trigonometric functions of `std.math`, and `Float.fromBits`. The others return `Float`: `negate`, `abs`, `min`, `max`, the comparisons, `floor`, `ceil`, `round`, `Float(n)` from an integer and literals.
+- The arithmetic operators take `Float | NaN` operands and propagate NaN, so `a + b * c` is checked once, at the end, not after each step.
+- `x.number()` turns a `Float | NaN` into a `Float` and traps on NaN, as integer overflow does (§3.1.1). `case` and `is` narrow it without a trap.
+- Without NaN, `Float` is totally ordered and fits `Ordered` (§6.2). `-0.0` and `0.0` compare `Equal` and hash alike, so a `Float` can be a map key or a set member.
+- `NaN` is one value. Its payload bits are not observable, so `NaN == NaN` is `True`, as for every tag.
+- `Float.parse` never returns NaN; the text `"NaN"` is a `ParseError`.
+
+```
+fn ratio(a: Float, b: Float) -> Float | NaN { a / b }  // NaN for 0 / 0
+fn hypot(a: Float, b: Float) -> Float { sqrt(a * a + b * b).number() }
+let r = case ratio(hits, total) {
+  NaN -> 0.0
+  x -> x
+}
+```
 
 ### 3.2 Tag types
 
@@ -336,7 +356,7 @@ Accepting records with extra fields is opt-in and must be requested explicitly a
 A trailing `..` in a record type accepts records with any further fields. A named type is opened by spreading it into such a record: `(..Point, ..)` accepts `Point`'s fields plus any others.
 
 ```
-fn norm(p: (x: Float, y: Float, ..)) -> Float { sqrt(p.x * p.x + p.y * p.y) }
+fn norm(p: (x: Float, y: Float, ..)) -> Float { sqrt(p.x * p.x + p.y * p.y).number() }
 fn label(p: (..Point, ..)) -> Str { "{p.x}, {p.y}" }
 ```
 
@@ -584,11 +604,11 @@ Dispatch is static. The compiler keeps concrete types through inference and reso
 When a function is called with a union value and an overload exists for every member, the call dispatches on the value's tag. The compiler generates the `case`, and a missing overload is a compile error.
 
 ```
-fn area(c: Circle) -> Float { 3.14159 * c.r * c.r }
-fn area(r: Rect) -> Float { r.w * r.h }
+fn area(c: Circle) -> Float | NaN { 3.14159 * c.r * c.r }
+fn area(r: Rect) -> Float | NaN { r.w * r.h }
 
 let shapes: List[Circle | Rect] = [c, r]
-let areas = shapes.map(area)  // List[Float]
+let areas = shapes.map(area)  // List[Float | NaN]
 ```
 
 - For each member, the most specific overload is chosen (§5.6.1). The result type is the union of the chosen overloads' results.
@@ -596,7 +616,7 @@ let areas = shapes.map(area)  // List[Float]
 - Lifting applies to unions only. A value of a parent type may hold subtypes from other packages, a set that is never closed, so subtypes are still matched with `case`:
 
 ```
-fn area(s: Shape) -> Float {
+fn area(s: Shape) -> Float | NaN {
   case s {
     c: Circle -> 3.14159 * c.r * c.r
     r: Rect -> r.w * r.h
@@ -685,7 +705,7 @@ Only `let` bindings and embed declarations with `Solid` values are allowed at mo
 fn distance(a: Point, b: Point) -> Float {
   let dx = a.x - b.x
   let dy = a.y - b.y
-  sqrt(Float(dx * dx + dy * dy))
+  sqrt(Float(dx * dx + dy * dy)).number()
 }
 ```
 
@@ -796,10 +816,10 @@ Every operator is syntactic sugar for an ordinary standard-library function on t
 
 | Operator | Function | Notes |
 | --- | --- | --- |
-| `a + b`, `a - b`, `a * b`, `a / b` | `add`, `subtract`, `multiply`, `divide` | Trap on `Int` overflow |
+| `a + b`, `a - b`, `a * b`, `a / b` | `add`, `subtract`, `multiply`, `divide` | Trap on `Int` overflow; `Float \| NaN` on `Float` (§3.1.4) |
 | `a +% b`, `a -% b`, `a *% b` | `addWrapping`, `subtractWrapping`, `multiplyWrapping` | Never trap |
-| `a == b`, `a != b` | `equals` | IEEE semantics on `Float` |
-| `a < b`, `a <= b`, `a > b`, `a >= b` | `lessThan`, `lessOrEqual`, `greaterThan`, `greaterOrEqual` | Return `Bool`; IEEE semantics on `Float` |
+| `a == b`, `a != b` | `equals` | |
+| `a < b`, `a <= b`, `a > b`, `a >= b` | `lessThan`, `lessOrEqual`, `greaterThan`, `greaterOrEqual` | Return `Bool` |
 | `and`, `or`, `not` | boolean keywords | Short-circuiting |
 
 The operator functions are `add`, `subtract`, `multiply`, `divide`, `remainder`, `negate`, `addWrapping`, `subtractWrapping`, `multiplyWrapping`, `equals`, `lessThan`, `lessOrEqual`, `greaterThan` and `greaterOrEqual`. Each comparison operator calls its own function, which returns a `Bool`.
@@ -817,7 +837,7 @@ fn lessThan[T: Ordered](a: T, b: T) -> Bool { compare(a, b) is Less }
 fn lessOrEqual[T: Ordered](a: T, b: T) -> Bool { not (compare(a, b) is Greater) }
 ```
 
-`Float` is not `Ordered`. Its `compare` returns `Ordering | Unordered`, and `Unordered` when either operand is NaN. Its comparison functions follow IEEE 754, so every comparison with NaN is `False`, as `==` is. Sorting floats takes an explicit comparator.
+`Float` is `Ordered`, since it holds no NaN (§3.1.4); `-∞` is its least value and `∞` its greatest. A `Float | NaN` is not, so sorting values that may be NaN first narrows them or takes an explicit comparator.
 
 `a % b` calls `remainder`, and unary `-a` calls `negate`.
 
@@ -1016,7 +1036,7 @@ let firstSquares = range(1..).map { n -> n * n }.take(10)
 `???` is a type hole: an expression standing in for code not yet written. It is a single token and may appear wherever an expression may.
 
 ```
-fn area(s: Shape) -> Float {
+fn area(s: Shape) -> Float | NaN {
   case s {
     Circle(r:) -> 3.14159 * r * r
     Rect(w:, h:) -> ???
@@ -1167,7 +1187,7 @@ type RangeFrom[T: Discrete](first: T)
 - `next(t)` is the least value greater than `t`. A type whose `compare` and `next` disagree breaks iteration; the compiler cannot check this.
 - `a..b` requires `a <= b`, so a range is never empty and `a..a` holds one value. A range whose ends are both constants and decrease is a compile error; otherwise `a..b` traps when `a > b`, since a decreasing range is almost always a mistake.
 - Iterating `a..b` yields `a` and applies `next` until it reaches `b`; it never calls `next(b)`, so `0..UInt8.max` is safe. Iterating `a..` applies `next` without end: the loop runs until it is left, and `next` traps when the type runs out of values, as integer overflow does.
-- `Int`, the sized integers, `CodePoint` and `Fixed[S]` fit `Discrete` through the prelude, and the compiler handles their ranges directly. `Float` is not `Ordered`, so it forms no range.
+- `Int`, the sized integers, `CodePoint` and `Fixed[S]` fit `Discrete` through the prelude, and the compiler handles their ranges directly. `Float` is `Ordered` but has no `next`, since the gap between neighbouring floats depends on their magnitude, so it forms no range.
 - A range over `Fixed[S]` steps by one unit of its scale, 10⁻ˢ: `0.00..2.00` holds 0.00, 0.01, …, 2.00. A decimal literal at an end has exactly the scale it is written with, so the step shows in the range itself. `0.0..2.00` is a compile error, since its ends are a `Fixed[1]` and a `Fixed[2]`, and so is `0.0..p` for a `p: Fixed[2]`.
 - Any type fits `Discrete` once it has `compare` and `next`, so ranges work over the program's own types.
 - A range pattern `lo..hi` in a `case` arm (§7.2) follows the same rules: its ends are literals of a discrete type, decimal ends are written with the scale of the subject's `Fixed[S]`, and `lo > hi` is a compile error.
@@ -1843,7 +1863,6 @@ let older = ages.set("ada", 37)
 ```
 
 - Map indexing returns an `Option`.
-- `Float` cannot be a map key.
 - Merging two `SortedMap`s requires an explicit comparator.
 - `Map` iteration order is unspecified. `SortedMap` iterates in key order, given by the `Ordered` form or by an optional comparator.
 - `Set` and `SortedSet` mirror the two map types. There is no set literal; a list literal becomes a set by context, as in `let s: Set[Int] = [1, 2]`.
@@ -2506,10 +2525,10 @@ The module `std.core` is the prelude. The runtime defines it and imports it into
 
 | Group | Contents | Required by |
 | --- | --- | --- |
-| Numbers | `Int`, `Int8`, `Int16`, `Int32`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, `Float`, `Fixed[S]` with `roundHalfEven`, `roundHalfUp`, `roundUp`, `roundDown`, `floor` and `ceil`; `Int.trunc`, `Int.round`, `Int.floor`, `Int.ceil` | Numeric literals; explicit rounding of fixed-point products and quotients (§3.1.2); float-to-integer conversion |
+| Numbers | `Int`, `Int8`, `Int16`, `Int32`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, `Float`, `NaN` and `number`, `Fixed[S]` with `roundHalfEven`, `roundHalfUp`, `roundUp`, `roundDown`, `floor` and `ceil`; `Int.trunc`, `Int.round`, `Int.floor`, `Int.ceil` | Numeric literals; explicit rounding of fixed-point products and quotients (§3.1.2); float-to-integer conversion |
 | Text and bytes | `Str`, `CodePoint`, `Bytes` | String literals; the default type of `embed` (§18.4.1) |
 | Collections | `List`, `Map`, `Set`, `Grid` | List, map and grid literals; sets by context (§12.2) |
-| Tags and unions | `Bool`, `True`, `False`, `Option[T]`, `Empty`, `.then`; `Ordering`, `Less`, `Equal`, `Greater`, `Unordered` | `if`, `case` guards, `and`/`or`/`not`; map indexing, `get`, `?.`; the `Ordered` form |
+| Tags and unions | `Bool`, `True`, `False`, `Option[T]`, `Empty`, `.then`; `Ordering`, `Less`, `Equal`, `Greater` | `if`, `case` guards, `and`/`or`/`not`; map indexing, `get`, `?.`; the `Ordered` form |
 | Forms and operators | `Eq`, `Ordered`, `Show`, `Hash`, `Iterable`; `add`, `equals`, `lessThan`, `compare` and the other operator functions | Operators (§6.2); `for` and collectors |
 | Ranges | `Range[T]`, `RangeFrom[T]`, `Discrete`, `next` | `a..b` and `a..` (§7.4) |
 | Type mappings | `discard`, `check`, `expect` and their prefixes | Prefixes (§8.5) |
@@ -2812,7 +2831,7 @@ The built-in editor is modeless. Basic navigation uses the arrow keys with modif
 ├ Files ─────────┤ 15 │     Rect(w:, h:) -> w * h  │               │
 │▾ hello         ├────────────────────────────────┤               │
 │  main.crag     │ scratch> area(Rect(w: 2, h: 3))│               │
-│ ▸ geo          │ 6.0 : Float                    │               │
+│ ▸ geo          │ 6.0 : Float | NaN              │               │
 │▸ dependencies  │ scratch> █                     │               │
 └ hello │ geo/shape.crag │ Editor │ Debug: 1 paused ──────────────┘
 ```
