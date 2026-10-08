@@ -125,7 +125,7 @@ The reserved words are listed in Appendix B. Boolean operators are keywords: `an
 | List | `[1, 2, 3]`, `[]` | Type `List[T]` |
 | Map | `["a": 1, "b": 2]`, `[:]` | Type `Map[K, V]`; `[:]` is the empty map |
 | Grid | `[1, 2; 3, 4]` | Type `Grid[T]`; `;` separates rows |
-| Range | `1..10` | Inclusive on both ends; 1.. is open (§7.4) |
+| Range | `1..10` | `Range[T]`, inclusive on both ends; `1..` is open, `RangeFrom[T]` (§7.4) |
 
 A `CodePoint` literal uses single quotes: `'a'`. Single quotes are reserved for code points. A byte literal is a string-like literal with a `b` prefix, typed `Bytes`: `b"\x00\xff"`. A decimal literal such as `19.99` is a `Fixed[S]` when the expected type is `Fixed`, and a `Float` otherwise; more decimals than the scale `S` allows is a compile error.
 
@@ -145,7 +145,7 @@ Integer literals may be written in hexadecimal, binary or octal: `0x1F`, `0b1010
 
 ### 2.7 Operators and punctuation
 
-`..` is both the range operator and the spread marker; context always decides which. `->` separates closure parameters from the body and function parameters from the return type. `?.` is optional chaining. `e[...]` is bracket application (§6.5).
+`..` is both the range syntax (§7.4) and the spread marker; context always decides which. `->` separates closure parameters from the body and function parameters from the return type. `?.` is optional chaining. `e[...]` is bracket application (§6.5).
 
 ### 2.8 Prefixes
 
@@ -1153,13 +1153,38 @@ for (key, _) in ages { print(key) }
 
 ### 7.4 Ranges
 
-A range `a..b` is inclusive at both ends. An open range `a..` has no upper end; it is infinite and fits only where an unbounded sequence is accepted, as in `range(1..)` (§6.10.1). At the end of a line an open range must be parenthesized, since a line ending in `..` continues (§2.3). `..` also serves as the spread marker; the two uses never collide because a range always has an operand on its left, while a spread, an open-record marker and a rest pattern never do.
+A range is an increasing sequence of values of a discrete type. `a..b` runs from `a` to `b`, inclusive at both ends, and has type `Range[T]`. An open range `a..` has no upper end and has type `RangeFrom[T]`. `..` is syntax, not an operator: no function stands behind it, and it cannot be overloaded. Both ends must have the same type `T`, and `T` must fit `Discrete`:
+
+```
+form Discrete[T] where Ordered[T] {
+  next(t: T) -> T
+}
+
+type Range[T: Discrete](first: T, last: T)
+type RangeFrom[T: Discrete](first: T)
+```
+
+- `next(t)` is the least value greater than `t`. A type whose `compare` and `next` disagree breaks iteration; the compiler cannot check this.
+- `a..b` requires `a <= b`, so a range is never empty and `a..a` holds one value. A range whose ends are both constants and decrease is a compile error; otherwise `a..b` traps when `a > b`, since a decreasing range is almost always a mistake.
+- Iterating `a..b` yields `a` and applies `next` until it reaches `b`; it never calls `next(b)`, so `0..UInt8.max` is safe. Iterating `a..` applies `next` without end: the loop runs until it is left, and `next` traps when the type runs out of values, as integer overflow does.
+- `Int`, the sized integers and `CodePoint` fit `Discrete` through the prelude, and the compiler handles their ranges directly. `Float` is not `Ordered` and `Fixed[S]` has no `next`, so neither forms ranges.
+- Any type fits `Discrete` once it has `compare` and `next`, so ranges work over the program's own types.
+- A range pattern `lo..hi` in a `case` arm (§7.2) follows the same rules: its ends are literals of a discrete type, and `lo > hi` is a compile error.
+- An open range fits only where an unbounded sequence is accepted, as in `range(1..)` (§6.10.1).
+
+At the end of a line an open range must be parenthesized, since a line ending in `..` continues (§2.3). `..` also serves as the spread marker; the two uses never collide because a range always has an operand on its left, while a spread, an open-record marker and a rest pattern never do.
 
 ```
 for i in 1..3 { print("{i}") }  // prints 1, 2, 3
+for c in 'a'..'e' { print("{c}") }  // prints a to e
+
+distinct type Grade(rank: Int)
+fn compare(a: Grade, b: Grade) -> Ordering { compare(a.rank, b.rank) }
+fn next(g: Grade) -> Grade { Grade(rank: g.rank + 1) }
+for g in Grade(rank: 1)..Grade(rank: 6) { … }
 ```
 
-> **Hint.** For a half-open range, write `a..b - 1`; ranges bind looser than arithmetic (§6.2.1).
+> **Hint.** Ranges bind looser than arithmetic, so `0..n - 1` means `0..(n - 1)` (§6.2.1). It traps when `n` is 0; to visit the indices of a possibly empty list, iterate the list itself or guard the loop.
 
 ## 8 Errors and type mappings
 
@@ -2484,6 +2509,7 @@ The module `std.core` is the prelude. The runtime defines it and imports it into
 | Collections | `List`, `Map`, `Set`, `Grid` | List, map and grid literals; sets by context (§12.2) |
 | Tags and unions | `Bool`, `True`, `False`, `Option[T]`, `Empty`, `.then`; `Ordering`, `Less`, `Equal`, `Greater`, `Unordered` | `if`, `case` guards, `and`/`or`/`not`; map indexing, `get`, `?.`; the `Ordered` form |
 | Forms and operators | `Eq`, `Ordered`, `Show`, `Hash`, `Iterable`; `add`, `equals`, `lessThan`, `compare` and the other operator functions | Operators (§6.2); `for` and collectors |
+| Ranges | `Range[T]`, `RangeFrom[T]`, `Discrete`, `next` | `a..b` and `a..` (§7.4) |
 | Type mappings | `discard`, `check`, `expect` and their prefixes | Prefixes (§8.5) |
 | Shared state | `Ref[T]`, `update`, `use`, `swap`, `empty` | `ref` and `ext` bindings and their sugar (§9.3) |
 | Laziness | `Lazy[T]` | `lazy` (§6.10) |
@@ -3151,7 +3177,7 @@ orExpr     = andExpr ("or" andExpr)*
 andExpr    = notExpr ("and" notExpr)*
 notExpr    = "not" notExpr | cmpExpr
 cmpExpr    = rangeExpr (("==" | "!=" | "<" | "<=" | ">" | ">=") rangeExpr | "is" type)?
-rangeExpr  = addExpr (".." addExpr?)?                // a.. is an open range, §7.4
+rangeExpr  = addExpr (".." addExpr?)?                // Range or RangeFrom, not an operator, §7.4
 addExpr    = mulExpr (("+" | "-" | "+%" | "-%") mulExpr)*
 mulExpr    = unary (("*" | "/" | "%" | "*%") unary)*
 unary      = (prefix | "-") unary | postfix
@@ -3189,7 +3215,7 @@ atomicExpr = "atomic" block
 ```
 pattern    = altPat ("|" altPat)*
 altPat     = name ":" altPat                          // bind and match, n: Int
-           | "_" | name | literal (".." literal)?
+           | "_" | name | literal (".." literal)?          // range pattern, §7.4
            | name typeArgs                             // Empty[Int], List[Str]
            | name typeArgs? "(" patFields? ")"         // Circle(r:), Point(a, b)
            | "(" patFields ")"                         // anonymous record, by name

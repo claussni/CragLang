@@ -186,6 +186,12 @@ pub enum ErrorKind<'db> {
     NotAValue {
         name: Name<'db>,
     },
+    /// A range over a type that does not fit `Discrete` (§7.4).
+    NotDiscrete {
+        ty: Ty<'db>,
+    },
+    /// A range whose constant ends decrease (§7.4).
+    Decreasing,
     /// Something core inference does not handle yet; later milestones of
     /// the Implementation Plan add it.
     Unsupported(&'static str),
@@ -259,6 +265,12 @@ impl<'db> ErrorKind<'db> {
             }
             ErrorKind::MustLeave => "the `else` of a `let … else` must leave".into(),
             ErrorKind::NotAValue { name: n } => format!("`{}` is not a value", name(n)),
+            ErrorKind::NotDiscrete { ty } => {
+                format!("{} is not Discrete, so it forms no range", ty.display(db))
+            }
+            ErrorKind::Decreasing => {
+                "the range decreases; its first end must not exceed its last".into()
+            }
             ErrorKind::Unsupported(what) => format!("{what} are not supported yet"),
         }
     }

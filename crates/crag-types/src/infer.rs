@@ -26,9 +26,9 @@
 
 use crag_db::Db;
 use crag_hir::{
-    BindingId, Body, Expr, ExprId, FieldArg, ItemId, ItemKind, Literal, LocalFn, Name, Owner, Pat,
-    PatId, Program, Resolution, Stmt, TypeArg, TypeRef, TypeRefId, TypeTarget, hir_body,
-    type_identity,
+    BindingId, Body, Expr, ExprId, FieldArg, ItemId, ItemKind, Literal, LocalFn, ModuleId, Name,
+    Owner, Pat, PatId, Program, Resolution, Stmt, TypeArg, TypeRef, TypeRefId, TypeTarget,
+    hir_body, module_scope, type_identity,
 };
 
 use crate::def::{
@@ -61,6 +61,9 @@ pub fn infer<'db>(db: &'db dyn Db, program: Program, owner: Owner<'db>) -> Infer
         negative: false,
         bool_ty: prelude_type(db, program, "Bool"),
         empty: prelude_item(db, program, "Empty").map(|e| type_identity(db, program, e)),
+        range: prelude_item(db, program, "Range").map(|e| type_identity(db, program, e)),
+        range_from: prelude_item(db, program, "RangeFrom").map(|e| type_identity(db, program, e)),
+        module: owner.module(db),
     };
     let result = match owner {
         Owner::Item(item) => match *item.kind(db) {
@@ -123,6 +126,11 @@ struct Infer<'a, 'db> {
     negative: bool,
     bool_ty: Ty<'db>,
     empty: Option<ItemId<'db>>,
+    /// The prelude's `Range` and `RangeFrom` (§7.4).
+    range: Option<ItemId<'db>>,
+    range_from: Option<ItemId<'db>>,
+    /// The module of the body, whose scope says which types are discrete.
+    module: ModuleId,
 }
 
 struct Frame<'db> {
@@ -445,15 +453,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                 self.check(*a, bool_ty);
                 bool_ty
             }
-            Expr::Range { start, end } => {
-                self.synth(*start);
-                if let Some(end) = end {
-                    self.synth(*end);
-                }
-                let kind = ErrorKind::Unsupported("ranges outside `for` and patterns");
-                self.error(Site::Expr(id), kind);
-                self.err_ty()
-            }
+            Expr::Range { start, end } => self.range(id, *start, *end, expected),
             Expr::Is { expr, ty } => {
                 self.synth(*expr);
                 self.lower_type(*ty);
@@ -906,6 +906,9 @@ impl<'a, 'db> Infer<'a, 'db> {
             | Expr::Grid(_)
             | Expr::Record(_)
             | Expr::Lazy(_) => true,
+            Expr::Range { start, end } => {
+                self.is_pending(*start) && end.is_none_or(|end| self.is_pending(end))
+            }
             Expr::Name {
                 local: None,
                 item: Some(Resolution::Type(item)),
@@ -955,6 +958,16 @@ impl<'a, 'db> Infer<'a, 'db> {
             Expr::Grid(_) => builtin(&[Builtin::Grid]),
             Expr::Lazy(_) => builtin(&[Builtin::Lazy]),
             Expr::Record(_) => any(&|k| matches!(k, TyKind::Record { .. })),
+            Expr::Range { start, end } => {
+                let range = if end.is_some() {
+                    self.range
+                } else {
+                    self.range_from
+                };
+                any(
+                    &|k| matches!(k, TyKind::Named(i, args) if Some(*i) == range && self.could_fit(*start, args[0])),
+                )
+            }
             Expr::Name {
                 item: Some(Resolution::Type(item)),
                 ..
@@ -978,6 +991,11 @@ impl<'a, 'db> Infer<'a, 'db> {
                 param.members(db).contains(&self.builtin(Builtin::Float))
             }
             Expr::Call { args, .. } => self.default_fits(args[0], param),
+            Expr::Range { start, .. } => param
+                .members(db)
+                .into_iter()
+                .filter_map(|m| self.range_element(m))
+                .any(|element| self.default_fits(*start, element)),
             _ => true,
         }
     }
@@ -1892,27 +1910,138 @@ impl<'a, 'db> Infer<'a, 'db> {
         Site::Expr(self.body.root.unwrap_or(ExprId(0)))
     }
 
+    /// `a..b` or `a..` (§7.4): a `Range[T]` or `RangeFrom[T]` whose ends
+    /// have the same discrete type `T`.
+    fn range(
+        &mut self,
+        id: ExprId,
+        start: ExprId,
+        end: Option<ExprId>,
+        expected: Option<Ty<'db>>,
+    ) -> Ty<'db> {
+        let db = self.db;
+        let element = expected
+            .into_iter()
+            .flat_map(|e| e.members(db))
+            .find_map(|m| self.range_element(m));
+        let element = match (element, end) {
+            (Some(element), _) => {
+                self.check(start, element);
+                if let Some(end) = end {
+                    self.check(end, element);
+                }
+                element
+            }
+            // `1..n` takes the type of `n`, if it is discrete.
+            (None, Some(end)) if self.is_pending(start) && !self.is_pending(end) => {
+                let end_ty = self.synth(end);
+                if self.is_discrete(end_ty) {
+                    self.check(start, end_ty);
+                    end_ty
+                } else {
+                    let element = self.synth(start);
+                    self.expect(Site::Expr(end), end_ty, element);
+                    element
+                }
+            }
+            (None, _) => {
+                let element = self.synth(start);
+                if let Some(end) = end {
+                    self.check(end, element);
+                }
+                element
+            }
+        };
+        if !self.is_discrete(element) {
+            self.error(Site::Expr(id), ErrorKind::NotDiscrete { ty: element });
+            return self.err_ty();
+        }
+        if let Some(end) = end
+            && let (Some(lo), Some(hi)) = (self.constant_expr(start), self.constant_expr(end))
+            && lo > hi
+        {
+            self.error(Site::Expr(id), ErrorKind::Decreasing);
+        }
+        let range = if end.is_some() {
+            self.range
+        } else {
+            self.range_from
+        };
+        match range {
+            Some(range) => Ty::new(db, TyKind::Named(range, vec![element])),
+            None => self.err_ty(),
+        }
+    }
+
+    /// The `T` of a `Range[T]` or `RangeFrom[T]`.
+    fn range_element(&self, ty: Ty<'db>) -> Option<Ty<'db>> {
+        match ty.kind(self.db) {
+            TyKind::Named(item, args)
+                if args.len() == 1 && [self.range, self.range_from].contains(&Some(*item)) =>
+            {
+                Some(args[0])
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `ty` fits `Discrete` (§7.4): the built-in integers and
+    /// `CodePoint`, and types with a `compare` and a `next` in scope.
+    /// Type parameters pass; their bounds are checked with M2.
+    fn is_discrete(&self, ty: Ty<'db>) -> bool {
+        let db = self.db;
+        match ty.kind(db) {
+            TyKind::Error | TyKind::Param(..) => true,
+            TyKind::Builtin(b, _) => b.int_range().is_some() || *b == Builtin::CodePoint,
+            TyKind::Named(..) => {
+                let ordering = prelude_type(db, self.program, "Ordering");
+                self.has_function("compare", &[ty, ty], ordering)
+                    && self.has_function("next", &[ty], ty)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a function `name` in the body's scope that is not generic
+    /// takes `params` and returns a `result`.
+    fn has_function(&self, name: &str, params: &[Ty<'db>], result: Ty<'db>) -> bool {
+        let db = self.db;
+        let scope = module_scope(db, self.program, self.module);
+        let Some(Resolution::Value { functions, .. }) =
+            scope.resolve(Name::new(db, name.to_string()))
+        else {
+            return false;
+        };
+        functions.iter().any(|&function| {
+            let sig = signature(db, self.program, function);
+            sig.type_params == 0
+                && sig.params.len() == params.len()
+                && params
+                    .iter()
+                    .zip(&sig.params)
+                    .all(|(&p, s)| self.fits(p, s.ty))
+                && success_type(db, self.program, function).is_some_and(|r| self.fits(r, result))
+        })
+    }
+
+    /// The value of a range end written as a literal, possibly negated.
+    fn constant_expr(&self, id: ExprId) -> Option<i128> {
+        match self.body.expr(id) {
+            Expr::Literal(literal) => constant(literal),
+            Expr::Call { callee, args, .. } if args.len() == 1 && self.is_negation(*callee) => {
+                self.constant_expr(args[0]).map(|n| -n)
+            }
+            _ => None,
+        }
+    }
+
     /// The element type of what `for` iterates (§7.3).
     fn iterable(&mut self, iterable: ExprId) -> Ty<'db> {
         let db = self.db;
-        if let Expr::Range { start, end } = self.body.expr(iterable) {
-            let start_ty = self.synth(*start);
-            if let Some(end) = end {
-                self.check(*end, start_ty);
-            }
-            let integer = start_ty
-                .as_builtin(db)
-                .is_some_and(|(b, _)| b.int_range().is_some() || b == Builtin::CodePoint);
-            if !integer && !start_ty.is_error(db) {
-                self.error(
-                    Site::Expr(iterable),
-                    ErrorKind::NotIterable { ty: start_ty },
-                );
-            }
-            self.exprs[iterable.index()] = Some(self.err_ty());
-            return start_ty;
-        }
         let ty = self.synth(iterable);
+        if let Some(element) = self.range_element(ty) {
+            return element;
+        }
         match ty.kind(db) {
             TyKind::Builtin(Builtin::List | Builtin::Set | Builtin::Grid, args) => args[0],
             TyKind::Builtin(Builtin::Map, args) => {
@@ -2078,10 +2207,16 @@ impl<'a, 'db> Infer<'a, 'db> {
                 if !self.literal_fits(literal, ty) {
                     self.error(Site::Pat(id), ErrorKind::Literal { ty });
                 }
-                if let Pat::Range { end, .. } = body.pat(id)
-                    && !self.literal_fits(end, ty)
-                {
-                    self.error(Site::Pat(id), ErrorKind::Literal { ty });
+                if let Pat::Range { start, end } = body.pat(id) {
+                    if !self.literal_fits(end, ty) {
+                        self.error(Site::Pat(id), ErrorKind::Literal { ty });
+                    } else if !self.is_discrete(ty) {
+                        self.error(Site::Pat(id), ErrorKind::NotDiscrete { ty });
+                    } else if let (Some(lo), Some(hi)) = (constant(start), constant(end))
+                        && lo > hi
+                    {
+                        self.error(Site::Pat(id), ErrorKind::Decreasing);
+                    }
                 }
                 self.narrow(id, ty, subject)
             }
@@ -2148,6 +2283,15 @@ impl<'a, 'db> Infer<'a, 'db> {
         };
         self.error(Site::Pat(id), kind);
         ty
+    }
+}
+
+/// The value of an integer or code point literal, which a range compares.
+fn constant(literal: &Literal) -> Option<i128> {
+    match literal {
+        Literal::Int(n) => i128::try_from(*n).ok(),
+        Literal::CodePoint(c) => Some(i128::from(u32::from(*c))),
+        _ => None,
     }
 }
 

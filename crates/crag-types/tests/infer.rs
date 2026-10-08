@@ -38,6 +38,12 @@ pub type False
 pub type Bool = True | False
 pub type Empty[T]
 pub type Option[T] = T | Empty[T]
+pub type Less
+pub type Equal
+pub type Greater
+pub type Ordering = Less | Equal | Greater
+pub type Range[T](first: T, last: T)
+pub type RangeFrom[T](first: T)
 pub fn add(a: Int, b: Int) -> Int
 pub fn add(a: Int8, b: Int8) -> Int8
 pub fn add(a: Float, b: Float) -> Float
@@ -53,6 +59,9 @@ pub fn lessThan(a: Int, b: Int) -> Bool
 pub fn size(xs: List[Int]) -> Int
 pub fn size(s: Str) -> Int
 pub fn map[T, U](xs: List[T], f: (T) -> U) -> List[U]
+pub fn slice(xs: List[Int], r: Range[Int]) -> List[Int]
+pub fn draw(r: Range[Int]) -> Int
+pub fn draw(r: Range[Int8]) -> Int8
 "#;
 
 struct Checked {
@@ -94,14 +103,24 @@ fn check(text: &str) -> Checked {
         }
         bindings.push(line.join(", "));
     }
-    let errors = module_type_errors(&db, program, module)
-        .into_iter()
-        .map(|(owner, error)| {
-            let map = &lower_body(&db, program, owner).source_map;
-            let range = error.site.range(map).unwrap_or(0..0);
-            let snippet = &text[range.start as usize..range.end as usize];
-            format!("`{snippet}`: {}", error.kind.message(&db))
-        })
+    let syntax = crag_hir::parse(&db, *module.file(&db))
+        .errors
+        .iter()
+        .map(|e| {
+            let snippet = &text[e.range.start as usize..e.range.end as usize];
+            format!("`{snippet}`: {}", e.message)
+        });
+    let errors = syntax
+        .chain(
+            module_type_errors(&db, program, module)
+                .into_iter()
+                .map(|(owner, error)| {
+                    let map = &lower_body(&db, program, owner).source_map;
+                    let range = error.site.range(map).unwrap_or(0..0);
+                    let snippet = &text[range.start as usize..range.end as usize];
+                    format!("`{snippet}`: {}", error.kind.message(&db))
+                }),
+        )
         .collect();
     // The prelude itself must check.
     let prelude: Vec<String> = module_type_errors(&db, program, core)
@@ -412,6 +431,64 @@ let b = a
             "`1`: expected Str, found Int",
             "`b`: the value `b` depends on itself",
             "`a`: the value `a` depends on itself",
+        ]
+    );
+}
+
+#[test]
+fn ranges_are_increasing_sequences_of_discrete_values() {
+    let text = "distinct type Grade(rank: Int)
+fn compare(a: Grade, b: Grade) -> Ordering { Less }
+fn next(g: Grade) -> Grade { Grade(rank: g.rank + 1) }
+fn f(xs: List[Int], n: Int8, lo: Grade, hi: Grade) {
+  let a = 1..3
+  let b = 1..n
+  let c: RangeFrom[Int8] = (-1..)
+  let d = xs.slice(0..1)
+  let e = draw(1..6)
+  let g: Int8 = draw(1..6)
+  for c in 'a'..'e' { }
+  for x in a { }
+  for y in lo..hi { }
+  let k = case n {
+    1..5 -> 1
+    _ -> 2
+  }
+}";
+    assert_eq!(
+        ok(text),
+        [
+            "a: Grade, b: Grade, -> Equal | Greater | Less",
+            "g: Grade, -> Grade",
+            "xs: List[Int], n: Int8, lo: Grade, hi: Grade, a: Range[Int], b: Range[Int8], \
+             c: RangeFrom[Int8], d: List[Int], e: Int, g: Int8, c: CodePoint, x: Int, \
+             y: Grade, k: Int, -> ()",
+        ]
+    );
+    let text = "type Grade(rank: Int)
+fn f(x: Float, g: Grade) {
+  let a = 1.5..2.5
+  let b = g..g
+  let c = 3..1
+  let d = 1..\"z\"
+  let e = case x {
+    1.0..2.0 -> 1
+    _ -> 2
+  }
+  let h = case 3 {
+    5..1 -> 1
+    _ -> 2
+  }
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`1.5..2.5`: Float is not Discrete, so it forms no range",
+            "`g..g`: Grade is not Discrete, so it forms no range",
+            "`3..1`: the range decreases; its first end must not exceed its last",
+            "`\"z\"`: expected Int, found Str",
+            "`1.0..2.0`: Float is not Discrete, so it forms no range",
+            "`5..1`: the range decreases; its first end must not exceed its last",
         ]
     );
 }
