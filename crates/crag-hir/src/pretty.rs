@@ -374,15 +374,20 @@ impl Printer<'_, '_> {
                 items.extend(after.iter().map(|&p| self.pat(p)));
                 format!("[{}]", items.join(", "))
             }
-            Pat::Literal(literal) => self.literal(literal),
+            Pat::Literal(literal) => self.pat_literal(literal),
             Pat::Range { start, end } => {
-                format!("{}..{}", self.literal(start), self.literal(end))
+                format!("{}..{}", self.pat_literal(start), self.pat_literal(end))
             }
             Pat::Or(alternatives) => {
                 let alternatives: Vec<String> = alternatives.iter().map(|&p| self.pat(p)).collect();
                 format!("({})", alternatives.join(" | "))
             }
         }
+    }
+
+    fn pat_literal(&self, literal: &PatLiteral) -> String {
+        let sign = if literal.negative { "-" } else { "" };
+        format!("{sign}{}", self.literal(&literal.literal))
     }
 
     fn literal(&self, literal: &Literal) -> String {

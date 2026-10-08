@@ -27,9 +27,9 @@
 //! the rest. List patterns split a list by length.
 
 use crag_db::Db;
-use crag_hir::{Body, Literal, Name, Pat, PatId, Program};
+use crag_hir::{Body, Literal, Name, Pat, PatId, PatLiteral, Program};
 
-use crate::infer::{constant, fixed_scale};
+use crate::infer::{fixed_scale, signed};
 use crate::relate::{declared_fields, fields_of, is_subtype};
 use crate::ty::{Builtin, Ty, TyKind};
 
@@ -69,7 +69,8 @@ pub(crate) enum Pattern<'db> {
 pub(crate) enum Value {
     Str(String),
     Bytes(Vec<u8>),
-    /// By its bits; Float has no NaN and -0.0 cannot be written.
+    /// By its bits; Float has no NaN, and -0.0 is kept as 0.0, which it
+    /// equals.
     Float(u64),
 }
 
@@ -360,17 +361,20 @@ impl<'db> Checker<'db> {
         })
     }
 
-    fn literal(&self, ty: Ty<'db>, start: &Literal, end: &Literal) -> Option<Pattern<'db>> {
+    fn literal(&self, ty: Ty<'db>, start: &PatLiteral, end: &PatLiteral) -> Option<Pattern<'db>> {
         if domain(self.db, ty).is_some() {
             let scale = fixed_scale(self.db, ty);
-            let (lo, hi) = (constant(start, scale)?, constant(end, scale)?);
+            let (lo, hi) = (signed(start, scale)?, signed(end, scale)?);
             return Some(Pattern::Range { ty, lo, hi });
         }
-        let value = match start {
+        let sign = if start.negative { -1.0 } else { 1.0 };
+        let value = match &start.literal {
             Literal::Str(s) => Value::Str(s.clone()),
             Literal::Bytes(b) => Value::Bytes(b.clone()),
-            Literal::Float(text) => Value::Float(text.parse::<f64>().ok()?.to_bits()),
-            Literal::Int(n) => Value::Float((*n as f64).to_bits()),
+            Literal::Float(text) => {
+                Value::Float((sign * text.parse::<f64>().ok()? + 0.0).to_bits())
+            }
+            Literal::Int(n) => Value::Float((sign * *n as f64 + 0.0).to_bits()),
             Literal::CodePoint(_) => return None,
         };
         Some(Pattern::Value { ty, value })

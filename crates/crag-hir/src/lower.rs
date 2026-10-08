@@ -1365,23 +1365,33 @@ impl<'a, 'db> Lowerer<'a, 'db> {
         PatField { name, pat }
     }
 
-    fn pattern_literals(&mut self, node: &SyntaxNode) -> Vec<Literal> {
+    fn pattern_literals(&mut self, node: &SyntaxNode) -> Vec<PatLiteral> {
         let tokens: Vec<SyntaxToken> = node
             .tokens()
             .filter(|t| {
                 matches!(
                     t.kind(),
-                    LeafKind::Token(T::Int | T::Float | T::Str | T::Bytes | T::CodePoint)
+                    LeafKind::Token(
+                        T::Minus | T::Int | T::Float | T::Str | T::Bytes | T::CodePoint
+                    )
                 )
             })
             .collect();
-        tokens
-            .iter()
-            .filter_map(|t| match t.kind() {
-                LeafKind::Token(kind) => self.literal_token(kind, t),
-                LeafKind::Trivia(_) => None,
-            })
-            .collect()
+        let mut literals = Vec::new();
+        let mut negative = false;
+        for token in &tokens {
+            match token.kind() {
+                LeafKind::Token(T::Minus) => negative = true,
+                LeafKind::Token(kind) => {
+                    if let Some(literal) = self.literal_token(kind, token) {
+                        literals.push(PatLiteral { negative, literal });
+                    }
+                    negative = false;
+                }
+                LeafKind::Trivia(_) => {}
+            }
+        }
+        literals
     }
 
     /// The binding a pattern makes for `token`: a new one, or within an

@@ -358,13 +358,21 @@ pub enum Pat<'db> {
         rest: Option<Option<BindingId>>,
         after: Vec<PatId>,
     },
-    Literal(Literal),
+    Literal(PatLiteral),
     Range {
-        start: Literal,
-        end: Literal,
+        start: PatLiteral,
+        end: PatLiteral,
     },
     /// Alternatives, which bind the same names to the same bindings.
     Or(Vec<PatId>),
+}
+
+/// A literal of a pattern, which unlike one of an expression carries its
+/// sign: `-1` is a literal pattern, not a call of `negate`.
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct PatLiteral {
+    pub negative: bool,
+    pub literal: Literal,
 }
 
 /// A field of a record pattern: by name, or by position for a named type.

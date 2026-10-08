@@ -22,6 +22,7 @@ use crate::parser::{Parser, TokenSet};
 use crate::token::TokenKind as T;
 
 const LITERALS: TokenSet = TokenSet::new(&[T::Int, T::Float, T::Str, T::Bytes, T::CodePoint]);
+const NUMBERS: TokenSet = TokenSet::new(&[T::Int, T::Float]);
 
 /// Tokens a missing pattern leaves alone.
 const NOT_A_PATTERN: TokenSet = TokenSet::new(&[
@@ -64,12 +65,10 @@ fn alternative(p: &mut Parser, binds: bool) {
             p.bump();
             p.finish_node();
         }
-        kind if LITERALS.contains(kind) => {
-            p.bump();
+        kind if LITERALS.contains(kind) || (kind == T::Minus && NUMBERS.contains(p.nth(1))) => {
+            literal(p);
             let kind = if p.eat(T::DotDot) {
-                if p.at_set(LITERALS) {
-                    p.bump();
-                } else {
+                if !literal(p) {
                     p.error("expected a literal");
                 }
                 S::RangePat
@@ -126,6 +125,17 @@ fn alternative(p: &mut Parser, binds: bool) {
         _ if p.at_set(NOT_A_PATTERN) => p.error("expected a pattern"),
         _ => p.bump_error("expected a pattern"),
     }
+}
+
+/// A literal, or a number with a minus sign; false when there is none.
+fn literal(p: &mut Parser) -> bool {
+    if p.at(T::Minus) && NUMBERS.contains(p.nth(1)) {
+        p.bump();
+    } else if !p.at_set(LITERALS) {
+        return false;
+    }
+    p.bump();
+    true
 }
 
 /// `( field, … )`, where a field is `name: pattern?` or a pattern.

@@ -146,6 +146,7 @@ fn patterns_get_explicit_forms() {
   case v {
     0 -> 1
     1..9 -> 2
+    -1 | -9..-2 -> 4
     n: Int where n > 10 -> n
     Point(x:, y: 0) | Point(x, y: 1) -> x
     [first, ..rest, last] -> first
@@ -160,7 +161,7 @@ let (left, right) = (left: 1, right: 2)
     assert_eq!(
         bodies,
         [
-            "(params v$0: Int) -> Int {(case v$0 [0 -> 1] [1..9 -> 2] \
+            "(params v$0: Int) -> Int {(case v$0 [0 -> 1] [1..9 -> 2] [(-1 | -9..-2) -> 4] \
              [n$1 @ Int where (call greaterThan/1 n$1 10) -> n$1] \
              [(Point(x: x$2, y: 0) | Point(x$2, y: 1)) -> x$2] \
              [[first$3, ..rest$4, last$5] -> first$3] [Done -> 3] [_ -> pass])}",

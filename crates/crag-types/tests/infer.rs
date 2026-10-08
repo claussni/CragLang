@@ -461,6 +461,7 @@ fn f(xs: List[Int], n: Int8, lo: Grade, hi: Grade, p: Fixed[2]) {
   for z in 0.0..0.5 { }
   let t = case p {
     0.00..9.99 -> 1
+    -9.99..-0.01 -> 3
     _ -> 2
   }
 }";
@@ -476,7 +477,7 @@ fn f(xs: List[Int], n: Int8, lo: Grade, hi: Grade, p: Fixed[2]) {
         ]
     );
     let text = "type Grade(rank: Int)
-fn f(x: Float, g: Grade, p: Fixed[2]) {
+fn f(x: Float, g: Grade, p: Fixed[2], t: Int8) {
   let a = x..2.5
   let b = g..g
   let c = 3..1
@@ -498,6 +499,15 @@ fn f(x: Float, g: Grade, p: Fixed[2]) {
     2.00..1.00 -> 2
     _ -> 3
   }
+  let n = case t {
+    -129 -> 1
+    -1..-5 -> 2
+    _ -> 3
+  }
+  let o = case p {
+    -0.5..0.50 -> 1
+    _ -> 2
+  }
 }";
     assert_eq!(
         errors(text),
@@ -514,6 +524,9 @@ fn f(x: Float, g: Grade, p: Fixed[2]) {
             "`2.50..-1.00`: the range decreases; its first end must not exceed its last",
             "`0.0..1.00`: expected Fixed[2], found Fixed[1]",
             "`2.00..1.00`: the range decreases; its first end must not exceed its last",
+            "`-129`: the literal does not fit Int8",
+            "`-1..-5`: the range decreases; its first end must not exceed its last",
+            "`-0.5..0.50`: expected Fixed[2], found Fixed[1]",
         ]
     );
 }
@@ -631,6 +644,11 @@ fn f(r: Int | Error, b: Bool, t: Int8, c: CodePoint, s: Str, xs: List[Int], p: P
     1 | 2 -> 2
     0..127 -> 1
     _ -> 3
+  }
+  let g = case t {
+    -128..-1 -> 0
+    0 -> 1
+    1..127 -> 2
   }
   let h = case c {
     '\\u{0}'..'\\u{d7ff}' -> 1

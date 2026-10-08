@@ -27,8 +27,8 @@
 use crag_db::Db;
 use crag_hir::{
     Arm, BindingId, Body, Expr, ExprId, FieldArg, ItemId, ItemKind, Literal, LocalFn, ModuleId,
-    Name, Owner, Pat, PatId, Program, Resolution, Stmt, TypeArg, TypeRef, TypeRefId, TypeTarget,
-    hir_body, module_scope, type_identity,
+    Name, Owner, Pat, PatId, PatLiteral, Program, Resolution, Stmt, TypeArg, TypeRef, TypeRefId,
+    TypeTarget, hir_body, module_scope, type_identity,
 };
 
 use crate::case::{Checker, PatternMatrix};
@@ -2258,21 +2258,22 @@ impl<'a, 'db> Infer<'a, 'db> {
                 list
             }
             Pat::Literal(literal) | Pat::Range { start: literal, .. } => {
-                let ty = self.literal_ty(literal, Some(subject));
-                if !self.literal_fits(literal, ty) {
+                let ty = self.literal_ty(&literal.literal, Some(subject));
+                if !self.pattern_literal_fits(literal, ty) {
                     self.error(Site::Pat(id), ErrorKind::Literal { ty });
                 }
                 if let Pat::Range { start, end } = body.pat(id) {
                     let scale = fixed_scale(self.db, ty);
-                    if !self.literal_fits(end, ty) {
+                    if !self.pattern_literal_fits(end, ty) {
                         self.error(Site::Pat(id), ErrorKind::Literal { ty });
                     } else if !self.is_discrete(ty) {
                         self.error(Site::Pat(id), ErrorKind::NotDiscrete { ty });
                     } else if let Some(scale) = scale
-                        && let Some(written) = [start, end].into_iter().find_map(|l| match l {
-                            Literal::Float(text) => decimals(text).filter(|&d| d != scale),
-                            _ => None,
-                        })
+                        && let Some(written) =
+                            [start, end].into_iter().find_map(|l| match &l.literal {
+                                Literal::Float(text) => decimals(text).filter(|&d| d != scale),
+                                _ => None,
+                            })
                     {
                         let found = self.builtin(Builtin::Fixed(written));
                         let kind = ErrorKind::Mismatch {
@@ -2280,8 +2281,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                             found,
                         };
                         self.error(Site::Pat(id), kind);
-                    } else if let (Some(lo), Some(hi)) =
-                        (constant(start, scale), constant(end, scale))
+                    } else if let (Some(lo), Some(hi)) = (signed(start, scale), signed(end, scale))
                         && lo > hi
                     {
                         self.error(Site::Pat(id), ErrorKind::Decreasing);
@@ -2371,6 +2371,14 @@ impl<'a, 'db> Infer<'a, 'db> {
         }
     }
 
+    /// Whether a literal of a pattern, with its sign, fits `ty`.
+    fn pattern_literal_fits(&mut self, literal: &PatLiteral, ty: Ty<'db>) -> bool {
+        let outer = std::mem::replace(&mut self.negative, literal.negative);
+        let fits = self.literal_fits(&literal.literal, ty);
+        self.negative = outer;
+        fits
+    }
+
     /// The type a type pattern names. A generic tag without arguments takes
     /// them from the one member of the subject it can be (§3.6.1).
     fn pattern_type(&mut self, tref: TypeRefId, subject: Ty<'db>) -> Ty<'db> {
@@ -2438,6 +2446,12 @@ pub(crate) fn constant(literal: &Literal, scale: Option<u32>) -> Option<i128> {
         (Literal::CodePoint(c), None) => Some(i128::from(u32::from(*c))),
         _ => None,
     }
+}
+
+/// The value of a literal of a pattern, with its sign.
+pub(crate) fn signed(literal: &PatLiteral, scale: Option<u32>) -> Option<i128> {
+    let value = constant(&literal.literal, scale)?;
+    Some(if literal.negative { -value } else { value })
 }
 
 /// The scale `S` of a `Fixed[S]`.

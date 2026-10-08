@@ -326,6 +326,12 @@ fn patterns() {
          (CaseArm (BindPat n : (NamePat Int)) -> (Literal 2)) \
          (CaseArm (ListPat [ (NamePat a) , (RestPat ..) ]) -> (Literal 3)) })"
     );
+    assert_eq!(
+        expr("case n { -1 -> 1\n -9..-2 -> 2\n -0.5..0.5 -> 3 }"),
+        "(CaseExpr case (NameRef n) { (CaseArm (LiteralPat - 1) -> (Literal 1)) \
+         (CaseArm (RangePat - 9 .. - 2) -> (Literal 2)) \
+         (CaseArm (RangePat - 0.5 .. 0.5) -> (Literal 3)) })"
+    );
 }
 
 #[test]

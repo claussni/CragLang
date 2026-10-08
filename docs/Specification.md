@@ -1193,7 +1193,7 @@ type RangeFrom[T: Discrete](first: T)
 - `Int`, the sized integers, `CodePoint` and `Fixed[S]` fit `Discrete` through the prelude, and the compiler handles their ranges directly. `Float` is `Ordered` but has no `next`, since the gap between neighbouring floats depends on their magnitude, so it forms no range.
 - A range over `Fixed[S]` steps by one unit of its scale, 10⁻ˢ: `0.00..2.00` holds 0.00, 0.01, …, 2.00. A decimal literal at an end has exactly the scale it is written with, so the step shows in the range itself. `0.0..2.00` is a compile error, since its ends are a `Fixed[1]` and a `Fixed[2]`, and so is `0.0..p` for a `p: Fixed[2]`.
 - Any type fits `Discrete` once it has `compare` and `next`, so ranges work over the program's own types.
-- A range pattern `lo..hi` in a `case` arm (§7.2) follows the same rules: its ends are literals of a discrete type, decimal ends are written with the scale of the subject's `Fixed[S]`, and `lo > hi` is a compile error.
+- A range pattern `lo..hi` in a `case` arm (§7.2) follows the same rules: its ends are literals of a discrete type, numbers possibly with a minus sign, as in `-9..-2`; decimal ends are written with the scale of the subject's `Fixed[S]`, and `lo > hi` is a compile error.
 - An open range fits only where an unbounded sequence is accepted, as in `range(1..)` (§6.10.1).
 
 At the end of a line an open range must be parenthesized, since a line ending in `..` continues (§2.3). `..` also serves as the spread marker; the two uses never collide because a range always has an operand on its left, while a spread, an open-record marker and a rest pattern never do.
@@ -3239,7 +3239,7 @@ atomicExpr = "atomic" block
 ```
 pattern    = altPat ("|" altPat)*
 altPat     = name ":" altPat                          // bind and match, n: Int
-           | "_" | name | literal (".." literal)?          // range pattern, §7.4
+           | "_" | name | patLit (".." patLit)?            // range pattern, §7.4
            | name typeArgs                             // Empty[Int], List[Str]
            | name typeArgs? "(" patFields? ")"         // Circle(r:), Point(a, b)
            | "(" patFields ")"                         // anonymous record, by name
@@ -3247,8 +3247,10 @@ altPat     = name ":" altPat                          // bind and match, n: Int
 patFields  = patField ("," patField)* ","?
 patField   = name ":" pattern? | pattern
 listPat    = pattern | ".." name?
-literal    = intLit | floatLit | strLit | codeLit | bytesLit
+patLit     = "-"? (intLit | floatLit) | strLit | codeLit | bytesLit
 ```
+
+A pattern's numeric literal carries its sign, as in `-1` or `-9..-2`; in an expression, `-` is a call of `negate` (§6.2).
 
 Whether a bare `name` is a type or a binding is decided by position (§6.9).
 
