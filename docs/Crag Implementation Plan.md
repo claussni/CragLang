@@ -525,16 +525,19 @@ Builtin types are declarations of the prelude with a builtin's name and number o
 
 #### 11.4.8 `case` checking
 
-Every `case` must cover all possible values (exhaustiveness), and no arm may be unreachable (redundancy). The standard method is the pattern-matrix algorithm from [Warnings for pattern matching](https://doi.org/10.1017/S0956796807006223): rows are arms, columns are positions in the value, and a recursive "usefulness" test answers both questions and produces an example of a missing case.
+Every `case` must cover all possible values (exhaustiveness), and no arm may be unreachable (redundancy). The standard method is the pattern-matrix algorithm from [Warnings for pattern matching](https://doi.org/10.1017/S0956796807006223): rows are arms, columns are positions in the value, and a recursive "usefulness" test answers both questions and produces an example of a missing case. The same test checks that the pattern of a `let` without `else` and of a `for` matches every value (§7.1.1).
+
+The test splits the values of a column into constructors that each pattern covers whole or not at all. A type pattern splits a union into its members, and a member into the subtypes the column names and the rest of it: a record type can have subtypes no pattern names, so only the type itself, or a wildcard, covers that rest. Literals and ranges split a discrete type into intervals at their ends; literals of other types split it into their values and the rest. List patterns split a list by its length, up to the longest they name, and a constructor for all longer lists. A guarded arm is checked for redundancy but covers nothing. An unreachable alternative of an or-pattern is reported by itself, and an arm when all its alternatives are. Patterns that failed to type are not checked, so that one error is reported once. The checker lives in `crag-types` and runs during inference.
 
 **Data structures**
 
-- `PatternMatrix` — rows of patterns with the arm each belongs to.
+- `Pattern` — a pattern as the test sees it: bindings dropped, fields by name, literals as intervals or values.
+- `PatternMatrix` — rows of patterns, one per unguarded arm or alternative.
 
 **Functions**
 
-- `fn is_useful(matrix: &PatternMatrix, row: &[Pattern]) -> bool` — the core recursion; exhaustiveness asks whether a wildcard row is useful.
-- `fn missing_example(matrix: &PatternMatrix) -> Option<Pattern>` — for the diagnostic.
+- `fn is_useful(&self, matrix: &PatternMatrix, pattern: &Pattern, ty: Ty) -> bool` — the core recursion; exhaustiveness asks whether a wildcard row is useful.
+- `fn missing_example(&self, matrix: &PatternMatrix, ty: Ty) -> Option<Witness>` — for the diagnostic, written as a pattern, such as `Int8.min..0` or `Point(x: 0, y: _)`.
 
 #### 11.4.9 MIR builder
 

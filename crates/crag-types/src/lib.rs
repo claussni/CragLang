@@ -24,6 +24,7 @@
 
 extern crate crag_db as salsa;
 
+mod case;
 mod def;
 mod infer;
 mod relate;

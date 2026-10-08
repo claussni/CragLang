@@ -26,11 +26,12 @@
 
 use crag_db::Db;
 use crag_hir::{
-    BindingId, Body, Expr, ExprId, FieldArg, ItemId, ItemKind, Literal, LocalFn, ModuleId, Name,
-    Owner, Pat, PatId, Program, Resolution, Stmt, TypeArg, TypeRef, TypeRefId, TypeTarget,
+    Arm, BindingId, Body, Expr, ExprId, FieldArg, ItemId, ItemKind, Literal, LocalFn, ModuleId,
+    Name, Owner, Pat, PatId, Program, Resolution, Stmt, TypeArg, TypeRef, TypeRefId, TypeTarget,
     hir_body, module_scope, type_identity,
 };
 
+use crate::case::{Checker, PatternMatrix};
 use crate::def::{
     HeaderKind, TypeLowerer, alias_target, prelude_item, signature, success_type, type_header,
     value_type,
@@ -502,13 +503,17 @@ impl<'a, 'db> Infer<'a, 'db> {
             Expr::Case { subject, arms } => {
                 let subject_ty = self.synth(*subject);
                 let mut types = Vec::new();
+                let mut typed = true;
                 for arm in arms {
-                    self.pattern(arm.pat, subject_ty);
+                    typed &= self.pattern_checks(arm.pat, subject_ty);
                     if let Some(guard) = arm.guard {
                         let bool_ty = self.bool_ty;
                         self.check(guard, bool_ty);
                     }
                     types.push(self.infer(arm.body, expected));
+                }
+                if typed {
+                    self.coverage(*subject, subject_ty, arms);
                 }
                 self.join_all(types)
             }
@@ -1807,7 +1812,9 @@ impl<'a, 'db> Infer<'a, 'db> {
                     }
                     None => self.synth(*value),
                 };
-                self.pattern(*pat, ty);
+                if self.pattern_checks(*pat, ty) {
+                    self.irrefutable(*pat, ty);
+                }
                 if ty.is_never(db) { ty } else { unit }
             }
             Stmt::LetElse {
@@ -1860,7 +1867,9 @@ impl<'a, 'db> Infer<'a, 'db> {
                 body,
             } => {
                 let element = self.iterable(*iterable);
-                self.pattern(*pat, element);
+                if self.pattern_checks(*pat, element) {
+                    self.irrefutable(*pat, element);
+                }
                 self.synth(*body);
                 unit
             }
@@ -2290,6 +2299,78 @@ impl<'a, 'db> Infer<'a, 'db> {
         }
     }
 
+    /// Checks a pattern as `pattern` does and says whether it typed
+    /// without errors, so that coverage is only checked for patterns that
+    /// did.
+    fn pattern_checks(&mut self, id: PatId, subject: Ty<'db>) -> bool {
+        let before = self.lower.errors.len();
+        self.pattern(id, subject);
+        self.lower.errors.len() == before && !subject.is_error(self.db)
+    }
+
+    /// Reports the arms of a `case` that earlier arms cover, and a value
+    /// no arm covers (§7.2).
+    fn coverage(&mut self, subject: ExprId, ty: Ty<'db>, arms: &[Arm]) {
+        let checker = Checker::new(self.db, self.program);
+        let body = self.body;
+        let mut lowered = Vec::new();
+        for arm in arms {
+            let alternatives = match body.pat(arm.pat) {
+                Pat::Or(alternatives) => alternatives.clone(),
+                _ => vec![arm.pat],
+            };
+            let mut patterns = Vec::new();
+            for id in alternatives {
+                let Some(pattern) = checker.lower(body, &self.pats, id) else {
+                    return;
+                };
+                patterns.push((id, pattern));
+            }
+            lowered.push(patterns);
+        }
+        let mut matrix = PatternMatrix::default();
+        for (arm, alternatives) in arms.iter().zip(lowered) {
+            let mut covered = matrix.clone();
+            let mut unreachable = Vec::new();
+            let count = alternatives.len();
+            for (id, pattern) in alternatives {
+                if !checker.is_useful(&covered, &pattern, ty) {
+                    unreachable.push(id);
+                }
+                covered.push(pattern);
+            }
+            if unreachable.len() == count {
+                self.error(Site::Pat(arm.pat), ErrorKind::Unreachable);
+            } else {
+                for id in unreachable {
+                    self.error(Site::Pat(id), ErrorKind::Unreachable);
+                }
+            }
+            if arm.guard.is_none() {
+                matrix = covered;
+            }
+        }
+        if let Some(missing) = checker.missing_example(&matrix, ty) {
+            let missing = missing.display(self.db);
+            self.error(Site::Expr(subject), ErrorKind::NotExhaustive { missing });
+        }
+    }
+
+    /// Reports a value of `ty` the pattern of a `let` or a `for` does not
+    /// match.
+    fn irrefutable(&mut self, id: PatId, ty: Ty<'db>) {
+        let checker = Checker::new(self.db, self.program);
+        let Some(pattern) = checker.lower(self.body, &self.pats, id) else {
+            return;
+        };
+        let mut matrix = PatternMatrix::default();
+        matrix.push(pattern);
+        if let Some(missing) = checker.missing_example(&matrix, ty) {
+            let missing = missing.display(self.db);
+            self.error(Site::Pat(id), ErrorKind::Refutable { missing });
+        }
+    }
+
     /// The type a type pattern names. A generic tag without arguments takes
     /// them from the one member of the subject it can be (§3.6.1).
     fn pattern_type(&mut self, tref: TypeRefId, subject: Ty<'db>) -> Ty<'db> {
@@ -2348,7 +2429,7 @@ impl<'a, 'db> Infer<'a, 'db> {
 
 /// The value of a literal a range compares, in units of `scale` for a
 /// `Fixed` range.
-fn constant(literal: &Literal, scale: Option<u32>) -> Option<i128> {
+pub(crate) fn constant(literal: &Literal, scale: Option<u32>) -> Option<i128> {
     match (literal, scale) {
         (Literal::Int(n), scale) => i128::try_from(*n)
             .ok()?
@@ -2360,7 +2441,7 @@ fn constant(literal: &Literal, scale: Option<u32>) -> Option<i128> {
 }
 
 /// The scale `S` of a `Fixed[S]`.
-fn fixed_scale(db: &dyn Db, ty: Ty<'_>) -> Option<u32> {
+pub(crate) fn fixed_scale(db: &dyn Db, ty: Ty<'_>) -> Option<u32> {
     match ty.as_builtin(db) {
         Some((Builtin::Fixed(scale), _)) => Some(scale),
         _ => None,

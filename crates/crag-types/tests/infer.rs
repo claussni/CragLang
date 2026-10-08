@@ -607,6 +607,128 @@ impl Rng {
 }
 
 #[test]
+fn case_arms_cover_every_value_once() {
+    let text = "type Error(message: Str)
+type LookupError(..Error)
+type NotFound(..LookupError)
+type Timeout(..Error, after: Int)
+type Rejected(..Error, code: Int, reason: Str)
+type Point(x: Int, y: Int)
+fn f(r: Int | Error, b: Bool, t: Int8, c: CodePoint, s: Str, xs: List[Int], p: Point, o: Option[Int]) {
+  let a = case r {
+    n: Int -> 1
+    NotFound -> 2
+    Timeout(after:) -> after
+    Rejected(code: 404, reason) -> 3
+    Rejected(code, reason:) -> code
+    _ -> 4
+  }
+  let d = case b {
+    True -> 1
+    False -> 2
+  }
+  let e = case t {
+    1 | 2 -> 2
+    0..127 -> 1
+    _ -> 3
+  }
+  let h = case c {
+    '\\u{0}'..'\\u{d7ff}' -> 1
+    '\\u{e000}'..'\\u{10ffff}' -> 2
+  }
+  let i = case s {
+    \"a\" -> 1
+    \"b\" -> 2
+    _ -> 3
+  }
+  let j = case xs {
+    [] -> 0
+    [x] -> x
+    [x, y, ..] -> y
+  }
+  let k = case p {
+    Point(x: 0, y:) -> y
+    Point(x:, y: 0) -> x
+    Point(x:, y:) -> x + y
+  }
+  let l = case o {
+    n: Int where n > 0 -> n
+    n: Int -> 0
+    Empty -> 1
+  }
+  let m = case (q: p, u: b) {
+    (q: Point(x: 0), u: True) -> 1
+    (q: _, u: False) -> 2
+    (q: _, u: True) -> 3
+  }
+  let Point(x:, y:) = p
+  for (key, value) in [\"a\": 1] { }
+}";
+    assert_eq!(check(text).errors, Vec::<String>::new());
+    let text = "type Error(message: Str)
+type LookupError(..Error)
+type NotFound(..LookupError)
+type Point(x: Int, y: Int)
+fn f(r: Int | Error, b: Bool, t: Int8, c: CodePoint, s: Str, xs: List[Int], p: Point, o: Option[Int]) {
+  let a = case r {
+    n: Int -> 1
+    LookupError -> 2
+    NotFound -> 3
+  }
+  let d = case b {
+    True -> 1
+    True | False -> 2
+    _ -> 3
+  }
+  let e = case t {
+    1..5 -> 1
+    3 -> 2
+    6..127 -> 3
+  }
+  let g = case c {
+    'a'..'z' -> 1
+  }
+  let h = case s {
+    \"a\" -> 1
+    \"a\" -> 2
+  }
+  let i = case xs {
+    [] -> 0
+    [x, y, ..] -> y
+  }
+  let j = case p {
+    Point(x: 0, y:) -> y
+    Point(x:, y: 0) -> x
+  }
+  let k = case o {
+    n: Int where n > 0 -> n
+    Empty -> 1
+  }
+  let Point(x: 1, y:) = p
+  for [z] in [xs] { }
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`NotFound`: the pattern is unreachable; earlier arms cover it",
+            "`r`: the `case` does not cover `Error`",
+            "`True`: the pattern is unreachable; earlier arms cover it",
+            "`_`: the pattern is unreachable; earlier arms cover it",
+            "`3`: the pattern is unreachable; earlier arms cover it",
+            "`t`: the `case` does not cover `Int8.min..0`",
+            "`c`: the `case` does not cover `'\\0'..'`'`",
+            "`\"a\"`: the pattern is unreachable; earlier arms cover it",
+            "`s`: the `case` does not cover `Str`",
+            "`xs`: the `case` does not cover `[_]`",
+            "`p`: the `case` does not cover `Point(x: Int.min..-1, y: Int.min..-1)`",
+            "`o`: the `case` does not cover `Int`",
+            "`Point(x: 1, y:)`: the pattern does not cover `Point(x: Int.min..0, y: _)`",
+            "`[z]`: the pattern does not cover `[]`",
+        ]
+    );
+}
+
+#[test]
 fn broken_code_types_without_panicking() {
     let base = r#"type Point(x: Int, y: Int = 0)
 type Shape = Point | Empty[Int]
@@ -619,6 +741,7 @@ fn s(pairs: List[Int], p: Point, m: Map[Str, Int]) -> Int {
   case o {
     n: Int where n < 10 -> n
     Empty -> -1
+    _ -> 10
   }
   fn go(k: Int) -> Int { if k == 0 { 0 } else { go(k - 1) } }
   let f = { z: Int -> z * 2 }

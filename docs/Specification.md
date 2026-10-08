@@ -1092,7 +1092,7 @@ let sizes = files.map { f ->
 
 #### 7.1.1 `let … else`
 
-A `let` with `else` binds only when the value matches its pattern; otherwise the `else` part runs, and it must leave: by `return`, a trap, or a call that returns `Never`. The compiler rejects an `else` part that can complete normally, so the binding is never left unbound. With `else`, a type annotation on the pattern is a type test instead of a requirement.
+A `let` with `else` binds only when the value matches its pattern; otherwise the `else` part runs, and it must leave: by `return`, a trap, or a call that returns `Never`. The compiler rejects an `else` part that can complete normally, so the binding is never left unbound. With `else`, a type annotation on the pattern is a type test instead of a requirement. Without `else`, the pattern of a `let` must match every value of its type, and so must the pattern of a `for` (§7.3); a pattern that can fail is a compile error that names a value it misses.
 
 The `else` part is a block, or a closure whose parameter receives the unmatched value, narrowed to the members the pattern did not match:
 

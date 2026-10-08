@@ -192,6 +192,16 @@ pub enum ErrorKind<'db> {
     },
     /// A range whose constant ends decrease (§7.4).
     Decreasing,
+    /// An arm, or an alternative of one, that earlier arms cover (§7.2).
+    Unreachable,
+    /// A `case` that misses a value, shown as a pattern.
+    NotExhaustive {
+        missing: String,
+    },
+    /// The pattern of a `let` or a `for` that misses a value.
+    Refutable {
+        missing: String,
+    },
     /// Something core inference does not handle yet; later milestones of
     /// the Implementation Plan add it.
     Unsupported(&'static str),
@@ -270,6 +280,13 @@ impl<'db> ErrorKind<'db> {
             }
             ErrorKind::Decreasing => {
                 "the range decreases; its first end must not exceed its last".into()
+            }
+            ErrorKind::Unreachable => "the pattern is unreachable; earlier arms cover it".into(),
+            ErrorKind::NotExhaustive { missing } => {
+                format!("the `case` does not cover `{missing}`")
+            }
+            ErrorKind::Refutable { missing } => {
+                format!("the pattern does not cover `{missing}`")
             }
             ErrorKind::Unsupported(what) => format!("{what} are not supported yet"),
         }
