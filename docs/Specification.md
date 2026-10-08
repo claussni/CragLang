@@ -118,7 +118,7 @@ The reserved words are listed in Appendix B. Boolean operators are keywords: `an
 | Kind | Examples | Notes |
 | --- | --- | --- |
 | Integer | `0`, `42`, `1_000_000` | Typed by context, `Int` by default; a value that does not fit its type is a compile error |
-| Float | `3.14`, `1e-9` | Type `Float`, IEEE 754 |
+| Float | `3.14`, `1e-9` | Type `Float`, finite IEEE 754 (§3.1.4) |
 | String | `"hello"` | Type `Str`, UTF-8 |
 | Unit | `()` | The empty record, type `()` |
 | Record | `(x: 1, y: 2)` | Anonymous record, named fields only |
@@ -165,7 +165,7 @@ Crag is structurally typed: a type is identified by its shape, and a named type 
 | Type | Meaning | Key rules |
 | --- | --- | --- |
 | `Int` | Signed 64-bit integer on every platform | Overflow traps; `+%` style operators wrap |
-| `Float` | IEEE 754 binary float, without NaN | Holds the numbers and ±∞; operations that can produce NaN return `Float \| NaN` (§3.1.4); `Ordered` |
+| `Float` | IEEE 754 binary float, finite values only | Overflow and division by zero trap; partial functions of `std.math` return `Float \| NaN` (§3.1.4); `Ordered` |
 | `Fixed[S]` | Decimal fixed point, `S` fractional digits | Multiplying or dividing two fixed values requires explicit rounding |
 | `Bool` | `type Bool = True \| False` | An ordinary union of two tag types |
 | `Str` | UTF-8 text | No integer indexing, no list interface (§12.5) |
@@ -174,7 +174,7 @@ Crag is structurally typed: a type is identified by its shape, and a named type 
 
 #### 3.1.1 Integer overflow
 
-Arithmetic overflow on `Int` traps and raises a catchable runtime error. Traps are handled by trap handlers (§8.3.1). Overflow in an expression the compiler can evaluate is a compile error.
+Arithmetic overflow on `Int` traps and raises a catchable runtime error, as do division and remainder by zero. Traps are handled by trap handlers (§8.3.1). Overflow in an expression the compiler can evaluate is a compile error.
 
 ```
 let big = 9_223_372_036_854_775_807 + 1  // error: constant overflow
@@ -205,21 +205,24 @@ The `C…` types of `std.c` (Ch. 16) exist for the C calling convention, not for
 
 #### 3.1.4 Floating point
 
-A `Float` is an IEEE 754 double that is a number: a finite value or ±∞, never NaN. NaN is the prelude tag `type NaN`, and every operation that can produce it says so in its result type, `Float | NaN`. The union costs nothing: NaN keeps its IEEE bit patterns, a `Float | NaN` is one double, and `x is NaN` is the hardware check.
+A `Float` is a finite IEEE 754 double: never ±∞ and never NaN. Where IEEE 754 would produce an infinity, Crag traps; where it would produce NaN, the operation returns the prelude tag `type NaN`, and its result type says so.
 
-- An operation returns `Float | NaN` when it can produce NaN from numbers: the arithmetic operators (`∞ - ∞`, `0 * ∞`, `0 / 0`, `x % 0`), `sqrt`, `log`, `pow` and the trigonometric functions of `std.math`, and `Float.fromBits`. The others return `Float`: `negate`, `abs`, `min`, `max`, the comparisons, `floor`, `ceil`, `round`, `Float(n)` from an integer and literals.
-- The arithmetic operators take `Float | NaN` operands and propagate NaN, so `a + b * c` is checked once, at the end, not after each step.
-- `x.number()` turns a `Float | NaN` into a `Float` and traps on NaN, as integer overflow does (§3.1.1). `case` and `is` narrow it without a trap.
-- Without NaN, `Float` is totally ordered and fits `Ordered` (§6.2). `-0.0` and `0.0` compare `Equal` and hash alike, so a `Float` can be a map key or a set member.
-- `NaN` is one value. Its payload bits are not observable, so `NaN == NaN` is `True`, as for every tag.
-- `Float.parse` never returns NaN; the text `"NaN"` is a `ParseError`.
+- Overflow traps, as on `Int` (§3.1.1): a result whose magnitude exceeds `Float.max` raises the same catchable runtime error, and overflow the compiler can evaluate is a compile error. So is a literal beyond `Float.max`. Underflow does not trap: a result too small to represent becomes a subnormal or zero.
+- Division and remainder by zero trap, whatever the dividend. So the arithmetic operators of two `Float`s return a `Float`, as do `negate`, `abs`, `min`, `max`, `floor`, `ceil`, `round`, the comparisons and `Float(n)` from an integer.
+- A function of `std.math` whose domain is not all of `Float` returns `Float | NaN`, and `NaN` outside its domain: `sqrt(-1.0)`, `log(-1.0)`, `asin(2.0)`, `pow(-8.0, 0.5)`. At a pole, where the IEEE result is infinite, as for `log(0.0)` or `pow(0.0, -1.0)`, it traps. `Float.fromBits` returns `NaN` for the bit patterns of ∞ and NaN.
+- `x.number()` turns a `Float | NaN` into a `Float` and traps on NaN. `case` and `is` narrow it without a trap. The arithmetic operators take only `Float`s, so a `NaN` is handled where it arises.
+- `Float` is totally ordered and fits `Ordered` (§6.2), with `Float.min` its least value and `Float.max` its greatest. `-0.0` and `0.0` compare `Equal` and hash alike, so a `Float` can be a map key or a set member.
+- `Float | NaN` costs nothing: `NaN` keeps its IEEE bit patterns, the union is one double, and `x is NaN` is the hardware check. `NaN` is one value; its payload bits are not observable, so `NaN == NaN` is `True`, as for every tag.
+- `Float.parse` never returns ∞ or NaN: `"inf"`, `"NaN"` and `"1e400"` are `ParseError`s.
+
+The compiler may check a sequence of operations once, through the hardware's sticky overflow flag, before their result is stored, passed, returned or compared. The trap then reports the expression rather than the operation.
 
 ```
-fn ratio(a: Float, b: Float) -> Float | NaN { a / b }  // NaN for 0 / 0
+fn area(r: Float) -> Float { 3.14159 * r * r }  // traps only if it overflows
 fn hypot(a: Float, b: Float) -> Float { sqrt(a * a + b * b).number() }
-let r = case ratio(hits, total) {
+let angle = case asin(ratio) {
   NaN -> 0.0
-  x -> x
+  a -> a
 }
 ```
 
@@ -604,11 +607,11 @@ Dispatch is static. The compiler keeps concrete types through inference and reso
 When a function is called with a union value and an overload exists for every member, the call dispatches on the value's tag. The compiler generates the `case`, and a missing overload is a compile error.
 
 ```
-fn area(c: Circle) -> Float | NaN { 3.14159 * c.r * c.r }
-fn area(r: Rect) -> Float | NaN { r.w * r.h }
+fn area(c: Circle) -> Float { 3.14159 * c.r * c.r }
+fn area(r: Rect) -> Float { r.w * r.h }
 
 let shapes: List[Circle | Rect] = [c, r]
-let areas = shapes.map(area)  // List[Float | NaN]
+let areas = shapes.map(area)  // List[Float]
 ```
 
 - For each member, the most specific overload is chosen (§5.6.1). The result type is the union of the chosen overloads' results.
@@ -616,7 +619,7 @@ let areas = shapes.map(area)  // List[Float | NaN]
 - Lifting applies to unions only. A value of a parent type may hold subtypes from other packages, a set that is never closed, so subtypes are still matched with `case`:
 
 ```
-fn area(s: Shape) -> Float | NaN {
+fn area(s: Shape) -> Float {
   case s {
     c: Circle -> 3.14159 * c.r * c.r
     r: Rect -> r.w * r.h
@@ -816,7 +819,7 @@ Every operator is syntactic sugar for an ordinary standard-library function on t
 
 | Operator | Function | Notes |
 | --- | --- | --- |
-| `a + b`, `a - b`, `a * b`, `a / b` | `add`, `subtract`, `multiply`, `divide` | Trap on `Int` overflow; `Float \| NaN` on `Float` (§3.1.4) |
+| `a + b`, `a - b`, `a * b`, `a / b` | `add`, `subtract`, `multiply`, `divide` | Trap on overflow and on division by zero (§3.1.1, §3.1.4) |
 | `a +% b`, `a -% b`, `a *% b` | `addWrapping`, `subtractWrapping`, `multiplyWrapping` | Never trap |
 | `a == b`, `a != b` | `equals` | |
 | `a < b`, `a <= b`, `a > b`, `a >= b` | `lessThan`, `lessOrEqual`, `greaterThan`, `greaterOrEqual` | Return `Bool` |
@@ -837,7 +840,7 @@ fn lessThan[T: Ordered](a: T, b: T) -> Bool { compare(a, b) is Less }
 fn lessOrEqual[T: Ordered](a: T, b: T) -> Bool { not (compare(a, b) is Greater) }
 ```
 
-`Float` is `Ordered`, since it holds no NaN (§3.1.4); `-∞` is its least value and `∞` its greatest. A `Float | NaN` is not, so sorting values that may be NaN first narrows them or takes an explicit comparator.
+`Float` is `Ordered`, since it holds only finite values (§3.1.4). A `Float | NaN` is not, so sorting values that may be NaN first narrows them or takes an explicit comparator.
 
 `a % b` calls `remainder`, and unary `-a` calls `negate`.
 
@@ -1036,7 +1039,7 @@ let firstSquares = range(1..).map { n -> n * n }.take(10)
 `???` is a type hole: an expression standing in for code not yet written. It is a single token and may appear wherever an expression may.
 
 ```
-fn area(s: Shape) -> Float | NaN {
+fn area(s: Shape) -> Float {
   case s {
     Circle(r:) -> 3.14159 * r * r
     Rect(w:, h:) -> ???
@@ -2831,7 +2834,7 @@ The built-in editor is modeless. Basic navigation uses the arrow keys with modif
 ├ Files ─────────┤ 15 │     Rect(w:, h:) -> w * h  │               │
 │▾ hello         ├────────────────────────────────┤               │
 │  main.crag     │ scratch> area(Rect(w: 2, h: 3))│               │
-│ ▸ geo          │ 6.0 : Float | NaN              │               │
+│ ▸ geo          │ 6.0 : Float                    │               │
 │▸ dependencies  │ scratch> █                     │               │
 └ hello │ geo/shape.crag │ Editor │ Debug: 1 paused ──────────────┘
 ```

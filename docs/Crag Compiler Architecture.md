@@ -147,7 +147,7 @@ Every Crag type occupies zero, one or two machine words, so a parameter or resul
 
 - A collection is one pointer to a runtime root node; empty collections are shared static singletons. `List[UInt8]` and the other sized-integer lists use packed leaves (§3.1.3).
 - In-place updates check for a count of one at run time, as in Perceus, unless the compiler already proved the value unique.
-- The codec writes `Float` NaNs in canonical form and map keys in sorted order, so equal values encode and hash equally.
+- The codec writes `NaN` in its canonical bit pattern and map keys in sorted order, so equal values encode and hash equally.
 
 ## 12 Known risks
 
