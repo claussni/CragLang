@@ -677,7 +677,7 @@ let x = 2  // error: x is already declared in this scope
 
 ### 5.5 Module level
 
-Only `let` bindings and embed declarations with `Solid` values are allowed at module level. They are evaluated at compile time or once on first use. There are no top-level `var`, `ref` or `ext` bindings.
+Only `let` bindings and embed declarations with `Solid` values are allowed at module level. They are evaluated at compile time or once on first use. There are no top-level `var`, `ref` or `ext` bindings. They are private to their module: `pub` exports only types, forms and functions (§14.1).
 
 ### 5.6 Functions
 
@@ -2404,7 +2404,7 @@ A program carries the checker at runtime only if it uses `run` or `decode`. Writ
 A translator turns an `Expr` tree into another language, such as SQL. It is ordinary Crag code in a library, walking the tree as data. Its vocabulary is the set of `pub` functions it can express in its target.
 
 ```
-pub let sql = Vocabulary[SqlNode](
+let sql = Vocabulary[SqlNode](
   equals: binary("="),
   compare: comparison,
   and: binary("AND"),
