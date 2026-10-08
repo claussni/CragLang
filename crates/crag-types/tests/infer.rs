@@ -53,6 +53,7 @@ pub fn multiply(a: Int, b: Int) -> Int
 pub fn multiply(a: Float, b: Float) -> Float
 pub fn negate(a: Int) -> Int
 pub fn negate(a: Int8) -> Int8
+pub fn negate(a: Fixed[2]) -> Fixed[2]
 pub fn equals(a: Int, b: Int) -> Bool
 pub fn equals(a: Str, b: Str) -> Bool
 pub fn lessThan(a: Int, b: Int) -> Bool
@@ -440,7 +441,7 @@ fn ranges_are_increasing_sequences_of_discrete_values() {
     let text = "distinct type Grade(rank: Int)
 fn compare(a: Grade, b: Grade) -> Ordering { Less }
 fn next(g: Grade) -> Grade { Grade(rank: g.rank + 1) }
-fn f(xs: List[Int], n: Int8, lo: Grade, hi: Grade) {
+fn f(xs: List[Int], n: Int8, lo: Grade, hi: Grade, p: Fixed[2]) {
   let a = 1..3
   let b = 1..n
   let c: RangeFrom[Int8] = (-1..)
@@ -454,20 +455,29 @@ fn f(xs: List[Int], n: Int8, lo: Grade, hi: Grade) {
     1..5 -> 1
     _ -> 2
   }
+  let m = 0.00..2.00
+  let o = -0.50..p
+  let q: Range[Fixed[2]] = 0..1
+  for z in 0.0..0.5 { }
+  let t = case p {
+    0.00..9.99 -> 1
+    _ -> 2
+  }
 }";
     assert_eq!(
         ok(text),
         [
             "a: Grade, b: Grade, -> Equal | Greater | Less",
             "g: Grade, -> Grade",
-            "xs: List[Int], n: Int8, lo: Grade, hi: Grade, a: Range[Int], b: Range[Int8], \
+            "xs: List[Int], n: Int8, lo: Grade, hi: Grade, p: Fixed[2], a: Range[Int], b: Range[Int8], \
              c: RangeFrom[Int8], d: List[Int], e: Int, g: Int8, c: CodePoint, x: Int, \
-             y: Grade, k: Int, -> ()",
+             y: Grade, k: Int, m: Range[Fixed[2]], o: Range[Fixed[2]], q: Range[Fixed[2]], \
+             z: Fixed[1], t: Int, -> ()",
         ]
     );
     let text = "type Grade(rank: Int)
-fn f(x: Float, g: Grade) {
-  let a = 1.5..2.5
+fn f(x: Float, g: Grade, p: Fixed[2]) {
+  let a = x..2.5
   let b = g..g
   let c = 3..1
   let d = 1..\"z\"
@@ -479,16 +489,31 @@ fn f(x: Float, g: Grade) {
     5..1 -> 1
     _ -> 2
   }
+  let i = 0.0..2.00
+  let j = 0.00..2.0
+  let k = 0.5..p
+  let l = 2.50..-1.00
+  let m = case p {
+    0.0..1.00 -> 1
+    2.00..1.00 -> 2
+    _ -> 3
+  }
 }";
     assert_eq!(
         errors(text),
         [
-            "`1.5..2.5`: Float is not Discrete, so it forms no range",
+            "`x..2.5`: Float is not Discrete, so it forms no range",
             "`g..g`: Grade is not Discrete, so it forms no range",
             "`3..1`: the range decreases; its first end must not exceed its last",
             "`\"z\"`: expected Int, found Str",
             "`1.0..2.0`: Float is not Discrete, so it forms no range",
             "`5..1`: the range decreases; its first end must not exceed its last",
+            "`2.00`: expected Fixed[1], found Fixed[2]",
+            "`2.0`: expected Fixed[2], found Fixed[1]",
+            "`0.5`: expected Fixed[2], found Fixed[1]",
+            "`2.50..-1.00`: the range decreases; its first end must not exceed its last",
+            "`0.0..1.00`: expected Fixed[2], found Fixed[1]",
+            "`2.00..1.00`: the range decreases; its first end must not exceed its last",
         ]
     );
 }

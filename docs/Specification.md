@@ -127,7 +127,7 @@ The reserved words are listed in Appendix B. Boolean operators are keywords: `an
 | Grid | `[1, 2; 3, 4]` | Type `Grid[T]`; `;` separates rows |
 | Range | `1..10` | `Range[T]`, inclusive on both ends; `1..` is open, `RangeFrom[T]` (§7.4) |
 
-A `CodePoint` literal uses single quotes: `'a'`. Single quotes are reserved for code points. A byte literal is a string-like literal with a `b` prefix, typed `Bytes`: `b"\x00\xff"`. A decimal literal such as `19.99` is a `Fixed[S]` when the expected type is `Fixed`, and a `Float` otherwise; more decimals than the scale `S` allows is a compile error.
+A `CodePoint` literal uses single quotes: `'a'`. Single quotes are reserved for code points. A byte literal is a string-like literal with a `b` prefix, typed `Bytes`: `b"\x00\xff"`. A decimal literal such as `19.99` is a `Fixed[S]` when the expected type is `Fixed`, and a `Float` otherwise; more decimals than the scale `S` allows is a compile error. A decimal literal at an end of a range is a `Fixed[S]` whose scale is exactly the number of decimals written, so `0.00..2.00` is a `Range[Fixed[2]]` (§7.4).
 
 A multi-line string literal is enclosed in triple quotes. The line break after the opening `"""` and the one before the closing `"""` are not part of the value, and the indentation common to all content lines is stripped, so the literal can follow the surrounding code. Interpolation and escapes work as in ordinary string literals.
 
@@ -1167,9 +1167,10 @@ type RangeFrom[T: Discrete](first: T)
 - `next(t)` is the least value greater than `t`. A type whose `compare` and `next` disagree breaks iteration; the compiler cannot check this.
 - `a..b` requires `a <= b`, so a range is never empty and `a..a` holds one value. A range whose ends are both constants and decrease is a compile error; otherwise `a..b` traps when `a > b`, since a decreasing range is almost always a mistake.
 - Iterating `a..b` yields `a` and applies `next` until it reaches `b`; it never calls `next(b)`, so `0..UInt8.max` is safe. Iterating `a..` applies `next` without end: the loop runs until it is left, and `next` traps when the type runs out of values, as integer overflow does.
-- `Int`, the sized integers and `CodePoint` fit `Discrete` through the prelude, and the compiler handles their ranges directly. `Float` is not `Ordered` and `Fixed[S]` has no `next`, so neither forms ranges.
+- `Int`, the sized integers, `CodePoint` and `Fixed[S]` fit `Discrete` through the prelude, and the compiler handles their ranges directly. `Float` is not `Ordered`, so it forms no range.
+- A range over `Fixed[S]` steps by one unit of its scale, 10⁻ˢ: `0.00..2.00` holds 0.00, 0.01, …, 2.00. A decimal literal at an end has exactly the scale it is written with, so the step shows in the range itself. `0.0..2.00` is a compile error, since its ends are a `Fixed[1]` and a `Fixed[2]`, and so is `0.0..p` for a `p: Fixed[2]`.
 - Any type fits `Discrete` once it has `compare` and `next`, so ranges work over the program's own types.
-- A range pattern `lo..hi` in a `case` arm (§7.2) follows the same rules: its ends are literals of a discrete type, and `lo > hi` is a compile error.
+- A range pattern `lo..hi` in a `case` arm (§7.2) follows the same rules: its ends are literals of a discrete type, decimal ends are written with the scale of the subject's `Fixed[S]`, and `lo > hi` is a compile error.
 - An open range fits only where an unbounded sequence is accepted, as in `range(1..)` (§6.10.1).
 
 At the end of a line an open range must be parenthesized, since a line ending in `..` continues (§2.3). `..` also serves as the spread marker; the two uses never collide because a range always has an operand on its left, while a spread, an open-record marker and a rest pattern never do.
@@ -1177,6 +1178,7 @@ At the end of a line an open range must be parenthesized, since a line ending in
 ```
 for i in 1..3 { print("{i}") }  // prints 1, 2, 3
 for c in 'a'..'e' { print("{c}") }  // prints a to e
+for p in 0.0..0.5 { print("{p}") }  // prints 0.0, 0.1, …, 0.5
 
 distinct type Grade(rank: Int)
 fn compare(a: Grade, b: Grade) -> Ordering { compare(a.rank, b.rank) }

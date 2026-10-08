@@ -995,7 +995,10 @@ impl<'a, 'db> Infer<'a, 'db> {
                 .members(db)
                 .into_iter()
                 .filter_map(|m| self.range_element(m))
-                .any(|element| self.default_fits(*start, element)),
+                .any(|element| match self.written_scale(*start) {
+                    Some(scale) => fixed_scale(db, element) == Some(scale),
+                    None => self.default_fits(*start, element),
+                }),
             _ => true,
         }
     }
@@ -1926,9 +1929,9 @@ impl<'a, 'db> Infer<'a, 'db> {
             .find_map(|m| self.range_element(m));
         let element = match (element, end) {
             (Some(element), _) => {
-                self.check(start, element);
+                self.range_end(start, element);
                 if let Some(end) = end {
-                    self.check(end, element);
+                    self.range_end(end, element);
                 }
                 element
             }
@@ -1936,7 +1939,7 @@ impl<'a, 'db> Infer<'a, 'db> {
             (None, Some(end)) if self.is_pending(start) && !self.is_pending(end) => {
                 let end_ty = self.synth(end);
                 if self.is_discrete(end_ty) {
-                    self.check(start, end_ty);
+                    self.range_end(start, end_ty);
                     end_ty
                 } else {
                     let element = self.synth(start);
@@ -1945,9 +1948,16 @@ impl<'a, 'db> Infer<'a, 'db> {
                 }
             }
             (None, _) => {
-                let element = self.synth(start);
+                let element = match self.written_scale(start) {
+                    Some(scale) => {
+                        let element = self.builtin(Builtin::Fixed(scale));
+                        self.check(start, element);
+                        element
+                    }
+                    None => self.synth(start),
+                };
                 if let Some(end) = end {
-                    self.check(end, element);
+                    self.range_end(end, element);
                 }
                 element
             }
@@ -1956,8 +1966,12 @@ impl<'a, 'db> Infer<'a, 'db> {
             self.error(Site::Expr(id), ErrorKind::NotDiscrete { ty: element });
             return self.err_ty();
         }
+        let scale = fixed_scale(db, element);
         if let Some(end) = end
-            && let (Some(lo), Some(hi)) = (self.constant_expr(start), self.constant_expr(end))
+            && let (Some(lo), Some(hi)) = (
+                self.constant_expr(start, scale),
+                self.constant_expr(end, scale),
+            )
             && lo > hi
         {
             self.error(Site::Expr(id), ErrorKind::Decreasing);
@@ -1970,6 +1984,34 @@ impl<'a, 'db> Infer<'a, 'db> {
         match range {
             Some(range) => Ty::new(db, TyKind::Named(range, vec![element])),
             None => self.err_ty(),
+        }
+    }
+
+    /// Checks a range end against the element type. A decimal literal
+    /// end of a `Fixed` range has exactly the scale it is written with,
+    /// so `0.0..2.00` mixes `Fixed[1]` and `Fixed[2]` (§7.4).
+    fn range_end(&mut self, end: ExprId, element: Ty<'db>) {
+        match self.written_scale(end) {
+            Some(scale) if fixed_scale(self.db, element).is_some() => {
+                let written = self.builtin(Builtin::Fixed(scale));
+                self.check(end, written);
+                self.expect(Site::Expr(end), written, element);
+            }
+            _ => {
+                self.check(end, element);
+            }
+        }
+    }
+
+    /// The number of decimals of a decimal literal, possibly negated:
+    /// `2` for `0.50`.
+    fn written_scale(&self, id: ExprId) -> Option<u32> {
+        match self.body.expr(id) {
+            Expr::Literal(Literal::Float(text)) => decimals(text),
+            Expr::Call { callee, args, .. } if args.len() == 1 && self.is_negation(*callee) => {
+                self.written_scale(args[0])
+            }
+            _ => None,
         }
     }
 
@@ -1986,13 +2028,16 @@ impl<'a, 'db> Infer<'a, 'db> {
     }
 
     /// Whether `ty` fits `Discrete` (§7.4): the built-in integers and
-    /// `CodePoint`, and types with a `compare` and a `next` in scope.
+    /// `CodePoint`, `Fixed`, and types with a `compare` and a `next` in
+    /// scope.
     /// Type parameters pass; their bounds are checked with M2.
     fn is_discrete(&self, ty: Ty<'db>) -> bool {
         let db = self.db;
         match ty.kind(db) {
             TyKind::Error | TyKind::Param(..) => true,
-            TyKind::Builtin(b, _) => b.int_range().is_some() || *b == Builtin::CodePoint,
+            TyKind::Builtin(b, _) => {
+                b.int_range().is_some() || matches!(b, Builtin::CodePoint | Builtin::Fixed(_))
+            }
             TyKind::Named(..) => {
                 let ordering = prelude_type(db, self.program, "Ordering");
                 self.has_function("compare", &[ty, ty], ordering)
@@ -2024,12 +2069,13 @@ impl<'a, 'db> Infer<'a, 'db> {
         })
     }
 
-    /// The value of a range end written as a literal, possibly negated.
-    fn constant_expr(&self, id: ExprId) -> Option<i128> {
+    /// The value of a range end written as a literal, possibly negated,
+    /// counted in units of the scale of a `Fixed` range.
+    fn constant_expr(&self, id: ExprId, scale: Option<u32>) -> Option<i128> {
         match self.body.expr(id) {
-            Expr::Literal(literal) => constant(literal),
+            Expr::Literal(literal) => constant(literal, scale),
             Expr::Call { callee, args, .. } if args.len() == 1 && self.is_negation(*callee) => {
-                self.constant_expr(args[0]).map(|n| -n)
+                self.constant_expr(args[0], scale).map(|n| -n)
             }
             _ => None,
         }
@@ -2208,11 +2254,25 @@ impl<'a, 'db> Infer<'a, 'db> {
                     self.error(Site::Pat(id), ErrorKind::Literal { ty });
                 }
                 if let Pat::Range { start, end } = body.pat(id) {
+                    let scale = fixed_scale(self.db, ty);
                     if !self.literal_fits(end, ty) {
                         self.error(Site::Pat(id), ErrorKind::Literal { ty });
                     } else if !self.is_discrete(ty) {
                         self.error(Site::Pat(id), ErrorKind::NotDiscrete { ty });
-                    } else if let (Some(lo), Some(hi)) = (constant(start), constant(end))
+                    } else if let Some(scale) = scale
+                        && let Some(written) = [start, end].into_iter().find_map(|l| match l {
+                            Literal::Float(text) => decimals(text).filter(|&d| d != scale),
+                            _ => None,
+                        })
+                    {
+                        let found = self.builtin(Builtin::Fixed(written));
+                        let kind = ErrorKind::Mismatch {
+                            expected: ty,
+                            found,
+                        };
+                        self.error(Site::Pat(id), kind);
+                    } else if let (Some(lo), Some(hi)) =
+                        (constant(start, scale), constant(end, scale))
                         && lo > hi
                     {
                         self.error(Site::Pat(id), ErrorKind::Decreasing);
@@ -2286,13 +2346,35 @@ impl<'a, 'db> Infer<'a, 'db> {
     }
 }
 
-/// The value of an integer or code point literal, which a range compares.
-fn constant(literal: &Literal) -> Option<i128> {
-    match literal {
-        Literal::Int(n) => i128::try_from(*n).ok(),
-        Literal::CodePoint(c) => Some(i128::from(u32::from(*c))),
+/// The value of a literal a range compares, in units of `scale` for a
+/// `Fixed` range.
+fn constant(literal: &Literal, scale: Option<u32>) -> Option<i128> {
+    match (literal, scale) {
+        (Literal::Int(n), scale) => i128::try_from(*n)
+            .ok()?
+            .checked_mul(10i128.checked_pow(scale.unwrap_or(0))?),
+        (Literal::Float(text), Some(scale)) => fixed_value(text, scale),
+        (Literal::CodePoint(c), None) => Some(i128::from(u32::from(*c))),
         _ => None,
     }
+}
+
+/// The scale `S` of a `Fixed[S]`.
+fn fixed_scale(db: &dyn Db, ty: Ty<'_>) -> Option<u32> {
+    match ty.as_builtin(db) {
+        Some((Builtin::Fixed(scale), _)) => Some(scale),
+        _ => None,
+    }
+}
+
+/// The number of decimals a decimal literal is written with, trailing
+/// zeros included.
+fn decimals(text: &str) -> Option<u32> {
+    if text.contains(['e', 'E']) {
+        return None;
+    }
+    let (_, fraction) = text.split_once('.')?;
+    u32::try_from(fraction.len()).ok()
 }
 
 fn field_value(field: &FieldArg) -> ExprId {
@@ -2304,17 +2386,20 @@ fn field_value(field: &FieldArg) -> ExprId {
 /// Whether a decimal literal is exact at `scale` digits and fits the
 /// representation of `Fixed` (Compiler Architecture §11).
 fn fixed_fits(text: &str, scale: u32, sign: i128) -> bool {
+    fixed_value(text, scale).is_some_and(|n| i64::try_from(sign * n).is_ok())
+}
+
+/// A decimal literal in units of 10^-`scale`, if it is exact at `scale`
+/// digits.
+fn fixed_value(text: &str, scale: u32) -> Option<i128> {
     if text.contains(['e', 'E']) {
-        return false;
+        return None;
     }
     let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
     let fraction = fraction.trim_end_matches('0');
     if fraction.len() > scale as usize {
-        return false;
+        return None;
     }
     let digits = format!("{whole}{fraction:0<width$}", width = scale as usize);
-    digits
-        .parse::<i128>()
-        .ok()
-        .is_some_and(|n| i64::try_from(sign * n).is_ok())
+    digits.parse::<i128>().ok()
 }
