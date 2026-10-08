@@ -97,6 +97,11 @@ pub enum LowerError<'db> {
         name: String,
         range: Range<u32>,
     },
+    /// A spread that is not the first entry of a field list, or a second
+    /// one (§3.8).
+    MisplacedSpread {
+        range: Range<u32>,
+    },
     /// An expression where a type is expected.
     ExpectedType {
         range: Range<u32>,
@@ -265,10 +270,8 @@ impl<'a, 'db> Lowerer<'a, 'db> {
     // Functions.
 
     /// Type parameters, parameters, result type and block of a function.
-    pub fn function(
-        &mut self,
-        node: &SyntaxNode,
-    ) -> (Vec<Param>, Option<TypeRefId>, Option<ExprId>) {
+    /// Declares the type parameters of a function or type, if it has any.
+    fn type_params(&mut self, node: &SyntaxNode) {
         if let Some(params) = child(node, S::TypeParams) {
             for param in params.children() {
                 if let Some(token) = ident(&param) {
@@ -279,6 +282,56 @@ impl<'a, 'db> Lowerer<'a, 'db> {
                 }
             }
         }
+    }
+
+    pub fn type_decl(&mut self, node: &SyntaxNode) -> TypeDecl<'db> {
+        self.type_params(node);
+        let modifier = |kind| node.tokens().any(|t| t.kind() == LeafKind::Token(kind));
+        let mut decl = TypeDecl {
+            distinct: modifier(T::Distinct),
+            opaque: modifier(T::Opaque),
+            ..TypeDecl::default()
+        };
+        if let Some(list) = child(node, S::FieldList) {
+            decl.record = true;
+            for (i, entry) in list.children().enumerate() {
+                let mut nodes = entry.children();
+                match entry.kind() {
+                    S::Spread => {
+                        let ty = self.type_or_missing(nodes.next(), &entry);
+                        if i > 0 || decl.parent.is_some() {
+                            self.errors.push(LowerError::MisplacedSpread {
+                                range: entry.range(),
+                            });
+                        } else {
+                            decl.parent = Some(ty);
+                        }
+                    }
+                    S::Field => {
+                        let ty = self.type_or_missing(nodes.next(), &entry);
+                        let default = nodes.next().map(|n| self.boundary(&n));
+                        if let Some(token) = ident(&entry) {
+                            let name = self.name(token.text());
+                            decl.fields.push(FieldDecl { name, ty, default });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            decl.alias = node
+                .children()
+                .find(|n| !matches!(n.kind(), S::TypeParams) && !is_clause(n.kind()))
+                .map(|t| self.type_node(&t));
+        }
+        decl
+    }
+
+    pub fn function(
+        &mut self,
+        node: &SyntaxNode,
+    ) -> (Vec<Param>, Option<TypeRefId>, Option<ExprId>) {
+        self.type_params(node);
         let mut params = Vec::new();
         for param in child(node, S::ParamList)
             .into_iter()
@@ -1606,6 +1659,10 @@ fn is_statement(kind: S) -> bool {
 }
 
 /// Kinds bracket application parses only as types.
+fn is_clause(kind: S) -> bool {
+    matches!(kind, S::WhereClause | S::IsClause | S::OnClause)
+}
+
 fn is_type_only(kind: S) -> bool {
     matches!(kind, S::FnType | S::UnionType | S::IsClause)
 }

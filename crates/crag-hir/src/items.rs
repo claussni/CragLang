@@ -124,6 +124,14 @@ pub struct TestId<'db> {
     pub ordinal: u32,
 }
 
+/// The number of type parameters a function or type signature declares.
+pub fn type_param_count(signature: &GreenNode) -> usize {
+    SyntaxNode::new_root(signature.clone())
+        .children()
+        .find(|n| n.kind() == S::TypeParams)
+        .map_or(0, |params| params.children().count())
+}
+
 /// Reads a module's declarations from its syntax tree. Declarations whose
 /// name is missing are left out; the parser reported them.
 #[crag_db::tracked(returns(ref))]

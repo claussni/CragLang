@@ -483,13 +483,13 @@ Imports are not passed on, so a scope is made from item trees alone: the module'
 
 #### 11.4.6 HIR lowering
 
-The CST mirrors the text; later stages want something simpler. HIR lowering turns each body into a resolved, desugared tree: names become references to bindings or items, operators and prefixes become calls of their functions, named arguments form one field list on their call, `_` arguments become closures that evaluate their supplied arguments once, and `for`, `let … else` and patterns get explicit forms. Bodies belong to functions, module-level `let`s and tests.
+The CST mirrors the text; later stages want something simpler. HIR lowering turns each body into a resolved, desugared tree: names become references to bindings or items, operators and prefixes become calls of their functions, named arguments form one field list on their call, `_` arguments become closures that evaluate their supplied arguments once, and `for`, `let … else` and patterns get explicit forms. Bodies belong to functions, module-level `let`s, tests and type declarations, whose field types and defaults are lowered like a body.
 
 Lowering resolves local names itself, so it also checks the no-shadowing rule, that only a `var` is assigned, and that no closure writes a captured `var` (§5.2, §5.4, §6.4.1). Literals are decoded here: digits, escapes, doubled braces and the indentation of triple-quoted strings (§2.6).
 
 **Data structures**
 
-- `Owner` — what has a body: an `ItemId`, or a `TestId` made of the module, the test's label and its place among the tests with that label.
+- `Owner` — what has a body: an `ItemId` of a function, value or type, or a `TestId` made of the module, the test's label and its place among the tests with that label.
 - `Body` — arenas of `Expr`, `Pat`, `TypeRef` and `Binding` nodes indexed by small integers, plus the parameters, the result type and the root. It holds no positions.
 - `BodySourceMap` — the CST range of every node, beside the body.
 
@@ -501,18 +501,27 @@ Lowering resolves local names itself, so it also checks the no-shadowing rule, t
 
 #### 11.4.7 Core inference
 
-Inference gives every expression a type and reports type errors. Crag infers locally, within one function, using bidirectional checking ([survey](https://arxiv.org/abs/1908.05839)): the checker either checks an expression against an expected type that flows down from the context, or synthesizes a type from the expression itself. M1 covers primitives, records, functions and simple unions; M2 adds the rest.
+Inference gives every expression a type and reports type errors. Crag infers locally, within one function, using bidirectional checking ([survey](https://arxiv.org/abs/1908.05839)): the checker either checks an expression against an expected type that flows down from the context, or synthesizes a type from the expression itself. Literals, closures, collection and record literals and generic tags such as `Empty` take their types from the context.
+
+M1 covers primitives, records, functions and unions as written. Where branches meet, their types join into a union, absorbed as in §3.6.1. A call picks the one candidate that fits its arguments, filtered by the expected type and then by the default types of literals, so `1 + 2` is an `Int` addition. Bodies of generic functions are checked with their type parameters as opaque types. What needs M2 is reported as not supported yet: calls of generic functions, narrowing by `is`, `pass`, `?.`, conversions, refs, signals and handlers. Ranges are typed only in `for` and patterns.
+
+Builtin types are declarations of the prelude with a builtin's name and number of type parameters and no body, such as `type Int` and `type List[T]` (§19.1). A named type's identity is the declaration that stands for all declarations merging with it (§3.3). The crate is `crag-types`.
 
 **Data structures**
 
-- `Type` — interned type terms (primitives, records, functions, unions, named types).
-- `InferenceResult` — a type for every `ExprId` and `PatId`, the resolved target of every call, and diagnostics.
+- `Ty` — interned type terms: builtins, named types by their identity, anonymous records, functions, unions, type parameters, and an error type that fits everything, so that one error is reported once.
+- `TypeDef` and `Signature` — a type declaration's fields, parent or alias target, and a function's parameter and result types, lowered from the HIR.
+- `InferenceResult` — a type for every expression, pattern, binding and written type, the callee of every call, the success type, the holes with their types, and the errors, each at a node of the body. The body's source map gives their ranges.
 
 **Functions**
 
-- `fn body_types(db: &dyn Db, function: FunctionId) -> Arc<InferenceResult>` — the query.
-- `fn check(cx: &mut InferCtx, expr: ExprId, expected: TypeId)` and `fn synth(cx: &mut InferCtx, expr: ExprId) -> TypeId` — the two modes.
-- `fn unify_record(cx: &mut InferCtx, a: &[Field], b: &[Field]) -> Result<(), TypeError>` and `fn is_subtype(db: &dyn Db, a: TypeId, b: TypeId) -> bool` — compatibility checks.
+- `fn body_types(db: &dyn Db, program: Program, owner: Owner) -> &InferenceResult` — the query.
+- `fn success_type(db: &dyn Db, program: Program, function: ItemId) -> Option<Ty>` — written, or inferred from the body; none for a recursive function without a written one. `fn value_type` does the same for module-level values. Both infer apart from `body_types` and resolve a cycle as none, so the body that started a cycle still gets its types (§11.5.6 names the group).
+- `fn type_header`, `fn alias_target`, `fn type_parent` and `fn type_def` — a declaration as other types see it: its kind and parameters, an alias's target, its parent, and its lowered fields. References and subtyping read only the first three, so recursive types lower without a cycle.
+- `Infer::check(expr, expected)` and `Infer::synth(expr)` — the two modes.
+- `fn is_subtype(db: &dyn Db, program: Program, s: Ty, t: Ty) -> bool`, `fn join` and `fn normalize` — fitting (§3.13.3), and unions with absorption.
+- `fn fields_of(db: &dyn Db, program: Program, ty: Ty) -> Option<Vec<(Name, Ty)>>` — a record's fields, its parent's first.
+- `fn module_type_errors(db: &dyn Db, program: Program, module: ModuleId) -> Vec<(Owner, TypeError)>` — for the driver.
 
 #### 11.4.8 `case` checking
 
@@ -637,8 +646,7 @@ Crag types can be unions such as `Int | NotFound`. When two branches meet, their
 
 **Functions**
 
-- `fn join(db: &dyn Db, a: TypeId, b: TypeId) -> TypeId` — union plus absorption.
-- `fn normalize(db: &dyn Db, members: &[TypeId]) -> UnionType` — removes members covered by another member.
+- `fn join` and `fn normalize` — union plus absorption, already part of core inference (§11.4.7).
 - `fn narrow(env: &NarrowingEnv, var: LocalId, pat: PatId) -> (NarrowingEnv, NarrowingEnv)` — splits the environment at a test into the matching and the remaining case.
 
 #### 11.5.2 Error inference over recursive groups

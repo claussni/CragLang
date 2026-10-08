@@ -30,7 +30,7 @@ use crate::scope::Resolution;
 
 macro_rules! id {
     ($name:ident) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, crag_db::SalsaValue)]
         pub struct $name(pub u32);
 
         impl $name {
@@ -65,6 +65,29 @@ pub struct Body<'db> {
     /// The block of a function or test, the value of a `let`; none for a
     /// function without a body (§19.2).
     pub root: Option<ExprId>,
+    /// A type declaration's fields, parent and alias target.
+    pub type_decl: Option<TypeDecl<'db>>,
+}
+
+/// A type declaration (§3.2–3.9). Its clauses are not lowered yet.
+#[derive(Clone, Debug, Default, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct TypeDecl<'db> {
+    /// Whether it has a field list; a tag has none (§3.2).
+    pub record: bool,
+    /// The spread parent (§3.8).
+    pub parent: Option<TypeRefId>,
+    pub fields: Vec<FieldDecl<'db>>,
+    /// `type X = T` (§3.5).
+    pub alias: Option<TypeRefId>,
+    pub distinct: bool,
+    pub opaque: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct FieldDecl<'db> {
+    pub name: Name<'db>,
+    pub ty: TypeRefId,
+    pub default: Option<ExprId>,
 }
 
 impl<'db> Body<'db> {

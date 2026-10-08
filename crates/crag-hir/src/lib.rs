@@ -44,6 +44,7 @@ pub use hir::*;
 pub use input::{ModuleId, Parse, Program, SourceFile, parse};
 pub use items::{
     Import, ImportItem, Item, ItemId, ItemKind, ItemTree, Name, Test, TestId, item_tree,
+    type_param_count,
 };
 pub use literal::Literal;
 pub use lower::{BodySourceMap, LowerError};
@@ -51,6 +52,6 @@ pub use pretty::pretty;
 pub use scope::{
     Entries, Entry, ImportCycle, ImportGraph, ImportTarget, Imports, ModuleIndex, ModuleScope,
     NameError, Origin, PRELUDE, PathError, PathTarget, Resolution, Selection, import_graph,
-    imports, module_index, module_scope, resolve_path, scope_entries, type_names,
+    imports, module_index, module_scope, resolve_path, scope_entries, type_identity, type_names,
 };
 pub use shadow::{Previous, Redeclaration, check_shadowing};

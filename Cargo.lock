@@ -145,6 +145,14 @@ name = "crag-syntax"
 version = "0.0.0"
 
 [[package]]
+name = "crag-types"
+version = "0.0.0"
+dependencies = [
+ "crag-db",
+ "crag-hir",
+]
+
+[[package]]
 name = "cranelift-assembler-x64"
 version = "0.136.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

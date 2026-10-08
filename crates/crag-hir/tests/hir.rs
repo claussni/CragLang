@@ -82,6 +82,7 @@ fn lower(text: &str) -> (Vec<String>, Vec<String>) {
                 LowerError::VarWrittenInClosure { name, range } => {
                     (format!("{name} written in a closure"), range)
                 }
+                LowerError::MisplacedSpread { range } => ("misplaced spread".into(), range),
                 LowerError::ExpectedType { range } => ("expected a type".into(), range),
                 LowerError::ExpectedValue { range } => ("expected a value".into(), range),
             };
@@ -230,7 +231,8 @@ fn what_lowering_reports() {
   undefinedVar = 3
   let t = List[(Int) -> Int]
   let u = p[(Int) -> Int]
-}"#;
+}
+type Moved(x: Int, ..Point, ..Point)"#;
     let (_, errors) = lower(text);
     assert_eq!(
         errors,
@@ -248,6 +250,8 @@ fn what_lowering_reports() {
             "line 15: unknown prefix @@",
             "line 16: unresolved undefinedVar",
             "line 18: expected a value",
+            "line 20: misplaced spread",
+            "line 20: misplaced spread",
         ]
     );
 }

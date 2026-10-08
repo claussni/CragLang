@@ -589,6 +589,38 @@ fn meet<'a, 'db>(
     (resolution, collisions)
 }
 
+/// The declaration that stands for a type's identity, name plus shape
+/// (§3.3): of the declarations in the program that merge with it, the one
+/// in the first module by path. A `distinct` or `opaque` type stands for
+/// itself.
+#[crag_db::tracked(returns(copy))]
+pub fn type_identity<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> ItemId<'db> {
+    let tree = item_tree(db, *item.module(db));
+    let Some(shape) = tree
+        .items
+        .iter()
+        .find(|i| i.id == item)
+        .and_then(|i| type_shape(&i.signature))
+    else {
+        return item;
+    };
+    let key = |id: ItemId<'db>| (id.module(db).path(db).clone(), *id.ordinal(db));
+    let mut identity = item;
+    for module in module_index(db, program).modules.values() {
+        for other in &item_tree(db, *module).items {
+            let id = other.id;
+            if *id.kind(db) == ItemKind::Type
+                && id.name(db) == item.name(db)
+                && key(id) < key(identity)
+                && type_shape(&other.signature).as_ref() == Some(&shape)
+            {
+                identity = id;
+            }
+        }
+    }
+    identity
+}
+
 /// A type declaration as compared for merging: without `pub`, and none
 /// for `distinct` and `opaque` types, which never merge (§14.3).
 fn type_shape(signature: &GreenNode) -> Option<Vec<crag_syntax::GreenElement>> {
