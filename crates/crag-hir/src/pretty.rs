@@ -206,7 +206,6 @@ impl Printer<'_, '_> {
                     .collect();
                 format!("(type-args {}{args})", self.expr(*base))
             }
-            Expr::Compare { op, call } => format!("(compare {op:?} {})", self.expr(*call)),
             Expr::And(a, b) => format!("(and {} {})", self.expr(*a), self.expr(*b)),
             Expr::Or(a, b) => format!("(or {} {})", self.expr(*a), self.expr(*b)),
             Expr::Not(a) => format!("(not {})", self.expr(*a)),

@@ -598,7 +598,6 @@ impl<'a, 'db> Lowerer<'a, 'db> {
                     StrPart::Text(_) => None,
                 })
                 .collect(),
-            Expr::Compare { call, .. } => vec![*call],
             Expr::And(a, b) | Expr::Or(a, b) => vec![*a, *b],
             Expr::Not(a) => vec![*a],
             Expr::Range { start, end } => std::iter::once(*start).chain(*end).collect(),
@@ -945,31 +944,17 @@ impl<'a, 'db> Lowerer<'a, 'db> {
             T::MinusPercent => "subtractWrapping",
             T::StarPercent => "multiplyWrapping",
             T::EqEq | T::BangEq => "equals",
-            T::Lt | T::LtEq | T::Gt | T::GtEq => "compare",
+            T::Lt => "lessThan",
+            T::LtEq => "lessOrEqual",
+            T::Gt => "greaterThan",
+            T::GtEq => "greaterOrEqual",
             _ => return self.alloc_expr(Expr::Missing, range),
         };
         let call = self.operator(function, vec![lhs, rhs], range.clone());
-        let expr = match op {
-            T::BangEq => Expr::Not(call),
-            T::Lt => Expr::Compare {
-                op: CompareOp::Less,
-                call,
-            },
-            T::LtEq => Expr::Compare {
-                op: CompareOp::LessEqual,
-                call,
-            },
-            T::Gt => Expr::Compare {
-                op: CompareOp::Greater,
-                call,
-            },
-            T::GtEq => Expr::Compare {
-                op: CompareOp::GreaterEqual,
-                call,
-            },
-            _ => return call,
-        };
-        self.alloc_expr(expr, range)
+        if op == T::BangEq {
+            return self.alloc_expr(Expr::Not(call), range);
+        }
+        call
     }
 
     /// `not`, unary `-`, or a run of prefix symbols, each applied to what

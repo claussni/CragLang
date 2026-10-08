@@ -165,7 +165,7 @@ Crag is structurally typed: a type is identified by its shape, and a named type 
 | Type | Meaning | Key rules |
 | --- | --- | --- |
 | `Int` | Signed 64-bit integer on every platform | Overflow traps; `+%` style operators wrap |
-| `Float` | IEEE 754 binary float | `==` follows IEEE (so `NaN != NaN`); not usable as a map key |
+| `Float` | IEEE 754 binary float | `==` and `<` follow IEEE (so `NaN != NaN`); not `Ordered` (§6.2); not usable as a map key |
 | `Fixed[S]` | Decimal fixed point, `S` fractional digits | Multiplying or dividing two fixed values requires explicit rounding |
 | `Bool` | `type Bool = True \| False` | An ordinary union of two tag types |
 | `Str` | UTF-8 text | No integer indexing, no list interface (§12.5) |
@@ -610,7 +610,7 @@ A union of forms is satisfied by fitting **at least one** member; fitting severa
 
 ```
 form Hash[T] { hash(x: T) -> Int }
-form Ordered[T] { compare(a: T, b: T) -> Order }
+form Ordered[T] { compare(a: T, b: T) -> Ordering }
 form Keyable[T] = Hash[T] | Ordered[T]
 
 type Index[K: Keyable, V](entries: List[(key: K, value: V)])
@@ -799,10 +799,25 @@ Every operator is syntactic sugar for an ordinary standard-library function on t
 | `a + b`, `a - b`, `a * b`, `a / b` | `add`, `subtract`, `multiply`, `divide` | Trap on `Int` overflow |
 | `a +% b`, `a -% b`, `a *% b` | wrapping variants | Never trap |
 | `a == b`, `a != b` | `equals` | IEEE semantics on `Float` |
-| `a < b`, `a <= b`, `a > b`, `a >= b` | `compare` |  |
+| `a < b`, `a <= b`, `a > b`, `a >= b` | `lessThan`, `lessOrEqual`, `greaterThan`, `greaterOrEqual` | Return `Bool`; IEEE semantics on `Float` |
 | `and`, `or`, `not` | boolean keywords | Short-circuiting |
 
-The operator functions are `add`, `subtract`, `multiply`, `divide`, `remainder`, `negate`, `equals` and `compare`. Every comparison operator goes through `compare`.
+The operator functions are `add`, `subtract`, `multiply`, `divide`, `remainder`, `negate`, `equals`, `lessThan`, `lessOrEqual`, `greaterThan` and `greaterOrEqual`. Each comparison operator calls its own function, which returns a `Bool`.
+
+General-purpose ordering, as used by sorting and `SortedMap`, goes through `compare`, the function of the `Ordered` form (§4.7). It returns an `Ordering`, one of the prelude tags `Less`, `Equal` and `Greater`. For every `Ordered` type the prelude defines the comparison functions from `compare`, so `a < b` there means `compare(a, b) is Less`. A type defines a comparison function itself only when it orders values without `compare`, or more cheaply.
+
+```
+type Less
+type Equal
+type Greater
+type Ordering = Less | Equal | Greater
+form Ordered[T] { compare(a: T, b: T) -> Ordering }
+
+fn lessThan[T: Ordered](a: T, b: T) -> Bool { compare(a, b) is Less }
+fn lessOrEqual[T: Ordered](a: T, b: T) -> Bool { not (compare(a, b) is Greater) }
+```
+
+`Float` is not `Ordered`. Its `compare` returns `Ordering | Unordered`, and `Unordered` when either operand is NaN. Its comparison functions follow IEEE 754, so every comparison with NaN is `False`, as `==` is. Sorting floats takes an explicit comparator.
 
 `a % b` calls `remainder`, and unary `-a` calls `negate`.
 
@@ -2467,8 +2482,8 @@ The module `std.core` is the prelude. The runtime defines it and imports it into
 | Numbers | `Int`, `Int8`, `Int16`, `Int32`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, `Float`, `Fixed[S]` with `roundHalfEven`, `roundHalfUp`, `roundUp`, `roundDown`, `floor` and `ceil`; `Int.trunc`, `Int.round`, `Int.floor`, `Int.ceil` | Numeric literals; explicit rounding of fixed-point products and quotients (§3.1.2); float-to-integer conversion |
 | Text and bytes | `Str`, `CodePoint`, `Bytes` | String literals; the default type of `embed` (§18.4.1) |
 | Collections | `List`, `Map`, `Set`, `Grid` | List, map and grid literals; sets by context (§12.2) |
-| Tags and unions | `Bool`, `True`, `False`, `Option[T]`, `Empty`, `.then` | `if`, `case` guards, `and`/`or`/`not`; map indexing, `get`, `?.` |
-| Forms and operators | `Eq`, `Ordered`, `Show`, `Hash`, `Iterable`; `add`, `equals`, `compare` and the other operator functions | Operators (§6.2); `for` and collectors |
+| Tags and unions | `Bool`, `True`, `False`, `Option[T]`, `Empty`, `.then`; `Ordering`, `Less`, `Equal`, `Greater`, `Unordered` | `if`, `case` guards, `and`/`or`/`not`; map indexing, `get`, `?.`; the `Ordered` form |
+| Forms and operators | `Eq`, `Ordered`, `Show`, `Hash`, `Iterable`; `add`, `equals`, `lessThan`, `compare` and the other operator functions | Operators (§6.2); `for` and collectors |
 | Type mappings | `discard`, `check`, `expect` and their prefixes | Prefixes (§8.5) |
 | Shared state | `Ref[T]`, `update`, `use`, `swap`, `empty` | `ref` and `ext` bindings and their sugar (§9.3) |
 | Laziness | `Lazy[T]` | `lazy` (§6.10) |

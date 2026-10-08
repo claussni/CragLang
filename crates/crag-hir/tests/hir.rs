@@ -34,7 +34,8 @@ pub fn subtract(a: Int, b: Int) -> Int
 pub fn multiply(a: Int, b: Int) -> Int
 pub fn negate(a: Int) -> Int
 pub fn equals(a: Int, b: Int) -> Bool
-pub fn compare(a: Int, b: Int) -> Order
+pub fn lessThan(a: Int, b: Int) -> Bool
+pub fn greaterThan(a: Int, b: Int) -> Bool
 pub fn map[T, U](xs: List[T], f: (T) -> U) -> List[U]
 pub fn size(xs: List[Int]) -> Int
 pub fn parse(s: Str) -> Int
@@ -101,7 +102,7 @@ fn operators_become_calls() {
         ["(params a$0: Int b$1: Int = a$0) -> Int {\
           (let c$2 (call add/1 a$0 (call multiply/1 b$1 2))); \
           (or (and (call equals/1 (call negate/1 c$2) 1) \
-          (not (compare Less (call compare/1 a$0 b$1)))) \
+          (not (call lessThan/1 a$0 b$1))) \
           (not (call equals/1 a$0 b$1)))}"]
     );
 }
@@ -159,7 +160,7 @@ let (left, right) = (left: 1, right: 2)
         bodies,
         [
             "(params v$0: Int) -> Int {(case v$0 [0 -> 1] [1..9 -> 2] \
-             [n$1 @ Int where (compare Greater (call compare/1 n$1 10)) -> n$1] \
+             [n$1 @ Int where (call greaterThan/1 n$1 10) -> n$1] \
              [(Point(x: x$2, y: 0) | Point(x$2, y: 1)) -> x$2] \
              [[first$3, ..rest$4, last$5] -> first$3] [Done -> 3] [_ -> pass])}",
             "(pattern (left$0, right$1)) (record {left: 1, right: 2})",

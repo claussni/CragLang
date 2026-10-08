@@ -178,12 +178,6 @@ pub enum Expr<'db> {
         base: ExprId,
         args: Vec<TypeArg>,
     },
-    /// `a < b` and the other comparisons: the result of `compare` (§6.2),
-    /// tested against `op`.
-    Compare {
-        op: CompareOp,
-        call: ExprId,
-    },
     /// Short-circuiting `and`, `or` and `not` (§6.2).
     And(ExprId, ExprId),
     Or(ExprId, ExprId),
@@ -239,14 +233,6 @@ pub enum StrPart {
 pub enum FieldArg<'db> {
     Field { path: Vec<Name<'db>>, value: ExprId },
     Spread(ExprId),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
-pub enum CompareOp {
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
