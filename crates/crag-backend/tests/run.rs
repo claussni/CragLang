@@ -33,7 +33,7 @@ use crag_abi::{HEADER_SIZE, HEAP_OFFSET, RuntimeFn, TrapKind};
 use crag_backend::{code, type_index};
 use crag_codegen::{CodeObject, CodegenSettings, FuncId, OptLevel, compile_entry_stub, target_for};
 use crag_db::RootDatabase;
-use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, owners};
+use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, lower_body, owners};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{InstanceKey, Tier};
 use crag_runtime::{
@@ -195,6 +195,11 @@ impl Module {
         let program = Program::new(&db, vec![core, module]);
         let syntax = &crag_hir::parse(&db, *module.file(&db)).errors;
         assert!(syntax.is_empty(), "{syntax:?}");
+        let lowering: Vec<_> = owners(&db, module)
+            .into_iter()
+            .flat_map(|owner| lower_body(&db, program, owner).errors.clone())
+            .collect();
+        assert!(lowering.is_empty(), "{lowering:?}");
         let errors = crag_types::module_type_errors(&db, program, module);
         assert!(
             errors.is_empty(),

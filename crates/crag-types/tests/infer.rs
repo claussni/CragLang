@@ -58,6 +58,7 @@ pub fn negate(a: Fixed[2]) -> Fixed[2]
 pub fn equals(a: Int, b: Int) -> Bool
 pub fn equals(a: Str, b: Str) -> Bool
 pub fn lessThan(a: Int, b: Int) -> Bool
+pub fn greaterThan(a: Int, b: Int) -> Bool
 pub fn size(xs: List[Int]) -> Int
 pub fn size(s: Str) -> Int
 pub fn map[T, U](xs: List[T], f: (T) -> U) -> List[U]
@@ -112,7 +113,13 @@ fn check(text: &str) -> Checked {
             let snippet = &text[e.range.start as usize..e.range.end as usize];
             format!("`{snippet}`: {}", e.message)
         });
+    // Lowering errors show as their debug form: a test expects none.
+    let lowering = owners(&db, module)
+        .into_iter()
+        .flat_map(|owner| lower_body(&db, program, owner).errors.clone())
+        .map(|e| format!("{e:?}"));
     let errors = syntax
+        .chain(lowering)
         .chain(
             module_type_errors(&db, program, module)
                 .into_iter()
@@ -449,7 +456,7 @@ fn f(xs: List[Int], n: Int8, lo: Grade, hi: Grade, p: Fixed[2]) {
   let d = xs.slice(0..1)
   let e = draw(1..6)
   let g: Int8 = draw(1..6)
-  for c in 'a'..'e' { }
+  for ch in 'a'..'e' { }
   for x in a { }
   for y in lo..hi { }
   let k = case n {
@@ -472,7 +479,7 @@ fn f(xs: List[Int], n: Int8, lo: Grade, hi: Grade, p: Fixed[2]) {
             "a: Grade, b: Grade, -> Equal | Greater | Less",
             "g: Grade, -> Grade",
             "xs: List[Int], n: Int8, lo: Grade, hi: Grade, p: Fixed[2], a: Range[Int], b: Range[Int8], \
-             c: RangeFrom[Int8], d: List[Int], e: Int, g: Int8, c: CodePoint, x: Int, \
+             c: RangeFrom[Int8], d: List[Int], e: Int, g: Int8, ch: CodePoint, x: Int, \
              y: Grade, k: Int, m: Range[Fixed[2]], o: Range[Fixed[2]], q: Range[Fixed[2]], \
              z: Fixed[1], t: Int, -> ()",
         ]
