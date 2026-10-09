@@ -19,7 +19,9 @@
 
 use std::collections::HashMap;
 
-use crag_abi::{FRAME_BUDGET, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET};
+use crag_abi::{
+    FRAME_BUDGET, NO_POSITION, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET,
+};
 use cranelift_codegen::binemit::Reloc as ClifReloc;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -670,11 +672,13 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
                 side_pop(&mut b);
                 b.ins().return_call(callee, &values);
             }
-            Term::Trap(kind) => {
+            Term::Trap { kind, position } => {
                 let conv = isa.default_call_conv();
-                let trap = imports.runtime(&mut b, conv, RuntimeFn::Trap, 1, 0);
+                let trap = imports.runtime(&mut b, conv, RuntimeFn::Trap, 2, 0);
                 let kind = b.ins().iconst(I64, *kind as i64);
-                b.ins().call(trap, &[ctx, kind]);
+                let position = position.map_or(NO_POSITION, u64::from);
+                let position = b.ins().iconst(I64, position as i64);
+                b.ins().call(trap, &[ctx, kind, position]);
                 // `rt_trap` does not return.
                 b.ins().trap(TrapCode::unwrap_user(1));
             }

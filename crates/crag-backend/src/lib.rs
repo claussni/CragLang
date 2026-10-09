@@ -77,7 +77,7 @@ pub fn code<'db>(
     tier: Tier,
 ) -> Option<Result<Code<'db>, String>> {
     let body = mir(db, program, instance, tier).as_ref()?;
-    let lowered = lower_to_lir(db, program, body);
+    let lowered = lower_to_lir(db, program, *instance.owner(db), body);
     let settings = CodegenSettings {
         target: host().clone(),
         opt: match tier {

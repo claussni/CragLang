@@ -19,7 +19,7 @@
 //! M0 scope (Implementation Plan §11.3.1 to §11.3.4 and §11.3.9): fibers and
 //! the context switch, stack growth by copying, the side stack, the sentinel
 //! stop request and the stress harness. M1 adds the allocator, reference
-//! counting, and lists and maps (§11.4.11 to §11.4.13).
+//! counting, lists and maps, and traps (§11.4.11 to §11.4.14).
 //!
 //! Runtime discipline (Compiler Architecture §2.1): no thread-locals, no
 //! callbacks into Crag code from the runtime stack, panics abort in images
@@ -51,28 +51,29 @@ pub mod stack;
 pub mod stress;
 #[cfg(test)]
 mod testing;
+pub mod unwind;
 
 pub use fiber::{Fiber, FiberConfig, FiberState, TaskContext, Worker};
 pub use heap::{Heap, alloc_box};
 pub use rc::{Types, release_box};
 pub use sentinel::{StopHandle, StopReason, request_stop};
+pub use unwind::{CodeMap, Trap};
 
 use crag_abi::RuntimeFn;
 
-/// The address of a runtime function, for the loader's symbol table; none
-/// for traps, which the unwinder adds (Implementation Plan §11.4.14).
-pub fn runtime_fn_addr(func: RuntimeFn) -> Option<usize> {
+/// The address of a runtime function, for the loader's symbol table.
+pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
     match func {
-        RuntimeFn::Morestack => Some(stack::rt_morestack as *const () as usize),
-        RuntimeFn::SideGrow => Some(side_stack::rt_side_grow as *const () as usize),
-        RuntimeFn::Alloc => Some(heap::rt_alloc as *const () as usize),
-        RuntimeFn::Release => Some(rc::rt_release as *const () as usize),
-        RuntimeFn::ListPush => Some(list::rt_list_push as *const () as usize),
-        RuntimeFn::ListElem => Some(list::rt_list_elem as *const () as usize),
-        RuntimeFn::ListSlice => Some(list::rt_list_slice as *const () as usize),
-        RuntimeFn::MapInsert => Some(map::rt_map_insert as *const () as usize),
-        RuntimeFn::MapGet => Some(map::rt_map_get as *const () as usize),
-        RuntimeFn::Trap => None,
+        RuntimeFn::Morestack => stack::rt_morestack as *const () as usize,
+        RuntimeFn::SideGrow => side_stack::rt_side_grow as *const () as usize,
+        RuntimeFn::Alloc => heap::rt_alloc as *const () as usize,
+        RuntimeFn::Release => rc::rt_release as *const () as usize,
+        RuntimeFn::ListPush => list::rt_list_push as *const () as usize,
+        RuntimeFn::ListElem => list::rt_list_elem as *const () as usize,
+        RuntimeFn::ListSlice => list::rt_list_slice as *const () as usize,
+        RuntimeFn::MapInsert => map::rt_map_insert as *const () as usize,
+        RuntimeFn::MapGet => map::rt_map_get as *const () as usize,
+        RuntimeFn::Trap => unwind::rt_trap as *const () as usize,
     }
 }
 

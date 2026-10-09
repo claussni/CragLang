@@ -24,11 +24,13 @@ use crag_codegen::{
     target_for,
 };
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
-use crag_runtime::{Fiber, FiberConfig, FiberState, Worker};
+use crag_runtime::{CodeMap, Fiber, FiberConfig, FiberState, Worker};
 
 /// Loaded functions; `FuncId(i)` is the i-th.
 pub struct Image {
     pub functions: Vec<usize>,
+    /// The stack maps of the functions, for unwinding.
+    pub code: CodeMap,
     arena: CodeArena,
     symbols: SymbolTable,
     pub settings: CodegenSettings,
@@ -47,13 +49,16 @@ impl Image {
         let mut arena = CodeArena::new(1 << 20).unwrap();
         let mut symbols = SymbolTable::new();
         for func in RuntimeFn::ALL {
-            if let Some(addr) = crag_runtime::runtime_fn_addr(func) {
-                symbols.define_runtime(func, addr);
-            }
+            symbols.define_runtime(func, crag_runtime::runtime_fn_addr(func));
         }
         let group: Vec<_> = (0..).map(FuncId).zip(&objects).collect();
         let entries = load_group(&mut arena, &mut symbols, &group).unwrap();
+        let mut code = CodeMap::new();
+        for ((func, object), entry) in group.iter().zip(&entries) {
+            code.add(*func, entry.addr(), object);
+        }
         Image {
+            code,
             functions: entries.iter().map(|e| e.addr()).collect(),
             arena,
             symbols,

@@ -576,7 +576,7 @@ Boxes are allocated inline from the worker's heap (§11.4.11) and counted inline
 **Functions**
 
 - `fn layout(db: &dyn Db, program: Program, ty: Ty) -> Option<Layout>` and `fn record_layout(db: &dyn Db, program: Program, ty: Ty) -> Option<(Vec<FieldSlot>, u32)>` — the words of a type, and the fields of a box at their offsets.
-- `fn lower_to_lir(db: &dyn Db, program: Program, mir: &MirBody) -> Lowered` — one case per MIR statement and terminator; the LIR, what it could not lower, and the instances it calls.
+- `fn lower_to_lir(db: &dyn Db, program: Program, owner: Owner, mir: &MirBody) -> Lowered` — one case per MIR statement and terminator; the LIR, what it could not lower, and the instances it calls. The owner's source map gives the positions of traps.
 - `fn code(db: &dyn Db, program: Program, instance: InstanceKey, tier: Tier) -> &Option<Result<Code, String>>` — the query: the code object, the `FuncId` it is loaded as, its words of parameters and results, and the instances to load with it.
 
 #### 11.4.11 Allocator
@@ -649,15 +649,22 @@ Until generic instances exist (§11.5.10), the runtime hashes and compares keys 
 
 A trap (overflow, failed `where` condition, out-of-range index) stops the current computation and transfers control to the nearest handler (§8.3). The runtime finds that handler by walking frames through the frame-pointer chain and, for each frame, releasing the values the safepoint table marks as live.
 
+The frame that traps has already released what it holds: MIR traps in a block of its own that releases what is live (§11.4.9). Every frame below it is suspended at a call, and the stack map of that call lists the slots of the boxes the frame keeps across it. Each such box has a reference of its own, because a counted local owns one while it is live, and a part read out of a value is retained when it lives on. `rt_trap` switches to the system stack and walks the frame-pointer chain down to the fiber's first frame, whose saved frame pointer is zero. It finds each call's stack map by its return address and releases the boxes in its slots. Then it records the trap in the fiber and switches to the worker, and the fiber is `Trapped`. Code generation passes the byte offset of the expression that trapped in its module's source; the code map gives the function from the return address, and the driver turns both into a report (§11.4.15).
+
+Crag has no trap handlers before signals and handlers (M2), so a trap always ends its task, and the handler table comes with them. Stack maps list only registers holding boxes, so a box inside a union a frame holds is not released when it unwinds: a leak until stack maps carry unions, never a double release. `Immediate` handlers wait for dispose handlers (Specification §13.3).
+
 **Data structures**
 
-- `SafepointTable` — per code object: for each call site or check, the live owned values and their types.
-- `HandlerTable` — code ranges covered by trap handlers and their entry points.
+- `CodeMap` — the runtime's safepoint table for the loaded code: the return address of each call with the slots of its boxes, and the range of each function's code, from the code objects' stack maps.
+- `Trap` — why and where a fiber stopped: the kind, the source position, and the function.
+- Later: `HandlerTable` — code ranges covered by trap handlers and their entry points.
 
 **Functions**
 
-- `extern "C" fn rt_trap(kind: TrapKind, pos: SourcePos) -> !` — switches to the system stack and starts unwinding.
-- `unsafe fn unwind_to_handler(fiber: &mut Fiber, trap: Trap) -> !` — walks frames, releases live values (running `Immediate` handlers), stops at a handler or ends the task.
+- `unsafe extern "C" fn rt_trap(ctx: *const TaskContext, kind: u64, position: u64) -> !` — switches to the system stack, unwinds and ends the fiber.
+- `unsafe fn unwind(worker: *mut Worker, ret: *const usize, fp: usize)` — walks the frames from the trapping one and releases what each holds.
+- `fn CodeMap::add(&mut self, func: FuncId, entry: usize, object: &CodeObject)` and `fn CodeMap::function_at(&self, pc: usize) -> Option<FuncId>`; `fn Worker::set_code_map(&mut self, code: Arc<CodeMap>)`.
+- `fn Fiber::trap(&self) -> Option<Trap>` — the trap of a fiber whose state is `Trapped`.
 
 #### 11.4.15 Driver and diagnostics
 

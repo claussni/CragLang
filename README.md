@@ -10,7 +10,7 @@ Compiler, host and runtime for the Crag language, written in Rust.
 
 | Crate | Components |
 | --- | --- |
-| `crates/crag-runtime` | Fiber runtime, stack growth, side stack, sentinel, stress harness, allocator, reference counting, lists and maps |
+| `crates/crag-runtime` | Fiber runtime, stack growth, side stack, sentinel, stress harness, allocator, reference counting, lists and maps, traps |
 | `crates/crag-abi` | Constants shared by generated code and the runtime |
 | `crates/crag-codegen` | Cranelift facade |
 | `crates/crag-loader` | Code loader |

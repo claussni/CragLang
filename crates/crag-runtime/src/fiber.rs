@@ -34,6 +34,7 @@ use crate::heap::Heap;
 use crate::rc::Types;
 use crate::side_stack::SideStack;
 use crate::stack::StackMemory;
+use crate::unwind::{CodeMap, Trap};
 
 /// The per-task record generated code receives as its implicit first
 /// argument (Compiler Architecture §10). Generated code reads
@@ -59,7 +60,8 @@ pub struct TaskContext {
     pub(crate) worker: AtomicPtr<Worker>,
     /// The fiber's stack pointer while it is not running.
     pub(crate) saved_sp: AtomicUsize,
-    /// Set to `STATUS_FINISHED` when the fiber's function has returned.
+    /// Set to `STATUS_FINISHED` when the fiber's function has returned, or
+    /// to `STATUS_TRAPPED` when it trapped.
     pub(crate) status: AtomicUsize,
     /// Stop reasons that wait for the next stack check.
     pub(crate) pending: AtomicUsize,
@@ -73,6 +75,7 @@ const _: () = assert!(offset_of!(TaskContext, side_end) == SIDE_END_OFFSET as us
 const _: () = assert!(offset_of!(TaskContext, heap) == HEAP_OFFSET as usize);
 
 pub(crate) const STATUS_FINISHED: usize = 1;
+pub(crate) const STATUS_TRAPPED: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FiberState {
@@ -84,6 +87,8 @@ pub enum FiberState {
     Paused,
     /// Its function returned; the results are available.
     Finished,
+    /// Its function trapped; the trap says why and where.
+    Trapped,
 }
 
 /// How a fiber's stack starts and grows.
@@ -148,6 +153,8 @@ pub struct Fiber {
     /// the fiber stack, so the entry stub's pointers to them survive growth.
     _args: Box<[u64]>,
     results: Box<[u64; 2]>,
+    /// Why it trapped, once it has.
+    pub(crate) trap: Option<Trap>,
 }
 
 impl Fiber {
@@ -222,6 +229,7 @@ impl Fiber {
             side: SideStack::new(config.side_chunk),
             _args: args,
             results,
+            trap: None,
         }))
     }
 
@@ -233,6 +241,11 @@ impl Fiber {
     /// fewer than two results leaves the rest zero.
     pub fn results(&self) -> Option<[u64; 2]> {
         (self.state == FiberState::Finished).then_some(*self.results)
+    }
+
+    /// The trap that ended the fiber, if one did.
+    pub fn trap(&self) -> Option<Trap> {
+        self.trap
     }
 
     /// How often the stack has moved to a new mapping.
@@ -269,6 +282,8 @@ pub struct Worker {
     heap: Heap,
     /// The descriptors of the image's types, for freeing boxes.
     types: Arc<Types>,
+    /// The stack maps of the image's code, for unwinding.
+    code: Arc<CodeMap>,
 }
 
 const _: () = assert!(offset_of!(Worker, sp) == 0);
@@ -286,6 +301,7 @@ impl Worker {
             queue: VecDeque::new(),
             heap: Heap::new(),
             types: Arc::default(),
+            code: Arc::default(),
         }
     }
 
@@ -293,6 +309,22 @@ impl Worker {
     /// code it runs. A worker without them cannot free a box.
     pub fn set_types(&mut self, types: Arc<Types>) {
         self.types = types;
+    }
+
+    /// Gives the worker the map of the image's code. A worker without it
+    /// releases nothing a frame holds when a fiber traps.
+    pub fn set_code_map(&mut self, code: Arc<CodeMap>) {
+        self.code = code;
+    }
+
+    /// The code map.
+    ///
+    /// # Safety
+    ///
+    /// `worker` is live, and its code map is not replaced meanwhile.
+    pub(crate) unsafe fn code<'a>(worker: *mut Worker) -> &'a CodeMap {
+        // SAFETY: as the caller promises.
+        unsafe { &(*worker).code }
     }
 
     /// The heap the fibers this worker runs allocate from.
@@ -345,8 +377,10 @@ impl Worker {
             (*ctx).worker.store(std::ptr::null_mut(), Ordering::Relaxed);
             (*ctx).heap.store(std::ptr::null_mut(), Ordering::Relaxed);
             (*ctx).fiber.store(std::ptr::null_mut(), Ordering::Relaxed);
-            if (*ctx).status.load(Ordering::Relaxed) == STATUS_FINISHED {
-                (*fiber).state = FiberState::Finished;
+            match (*ctx).status.load(Ordering::Relaxed) {
+                STATUS_FINISHED => (*fiber).state = FiberState::Finished,
+                STATUS_TRAPPED => (*fiber).state = FiberState::Trapped,
+                _ => {}
             }
             (*fiber).state
         }
@@ -359,7 +393,7 @@ impl Worker {
 
     /// The run loop: resumes queued fibers in turn until none is runnable. A
     /// preempted fiber goes to the back of the queue. Returns the fibers that
-    /// finished or paused, in that order.
+    /// finished, trapped or paused, in that order.
     pub fn run(&mut self) -> Vec<Box<Fiber>> {
         let mut stopped = Vec::new();
         while let Some(mut fiber) = self.queue.pop_front() {

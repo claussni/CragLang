@@ -141,10 +141,13 @@ pub enum RuntimeFn {
     /// C argument registers, every register preserved, no result.
     SideGrow = 1,
 
-    /// `rt_trap(ctx: *mut TaskContext, kind: u64) -> !`, with `kind` a
-    /// [`TrapKind`].
+    /// `rt_trap(ctx: *mut TaskContext, kind: u64, position: u64) -> !`, with
+    /// `kind` a [`TrapKind`] and `position` the byte offset of the
+    /// expression that trapped in its module's source, or [`NO_POSITION`].
     ///
-    /// Called where a check fails; it never returns (Implementation Plan
+    /// Called where a check fails, after the frame has released what it
+    /// holds; it never returns. It releases what the frames below hold, as
+    /// their stack maps list it, and ends the fiber (Implementation Plan
     /// §11.4.14). The functions from here on have the C calling convention,
     /// take the task context first, and run on the system stack.
     Trap = 2,
@@ -252,6 +255,26 @@ pub enum TrapKind {
     /// The compiler does not support what was reached yet.
     Unsupported = 6,
 }
+
+impl TrapKind {
+    pub const ALL: [TrapKind; 7] = [
+        TrapKind::Overflow,
+        TrapKind::DivideByZero,
+        TrapKind::Index,
+        TrapKind::Hole,
+        TrapKind::NoMatch,
+        TrapKind::Error,
+        TrapKind::Unsupported,
+    ];
+
+    /// The kind with this discriminant, if any.
+    pub fn from_index(index: u64) -> Option<TrapKind> {
+        Self::ALL.get(usize::try_from(index).ok()?).copied()
+    }
+}
+
+/// The position `rt_trap` receives when the trap has no source expression.
+pub const NO_POSITION: u64 = u64::MAX;
 
 /// Bytes of a box's header: the count with its flag bits, then the type
 /// index (Compiler Architecture §11.1). Fields follow it.

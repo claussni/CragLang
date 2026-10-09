@@ -195,8 +195,12 @@ pub enum Term {
         func: FuncId,
         args: Vec<VReg>,
     },
-    /// Calls `rt_trap`, which does not return.
-    Trap(TrapKind),
+    /// Calls `rt_trap`, which does not return, with the source position
+    /// of what trapped, if known.
+    Trap {
+        kind: TrapKind,
+        position: Option<u32>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -326,7 +330,7 @@ impl LirFunction {
                     values.iter().try_for_each(reg)?;
                 }
                 Term::TailCall { args, .. } => args.iter().try_for_each(reg)?,
-                Term::Trap(_) => {}
+                Term::Trap { .. } => {}
             }
         }
         Ok(())

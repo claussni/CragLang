@@ -27,6 +27,8 @@
 //! What code generation does not handle yet, such as strings, ends its
 //! block with a trap and is listed.
 
+use std::ops::Range;
+
 use crag_abi::{
     COUNT_OFFSET, HEAP_OFFSET, LEN_OFFSET, LIST_SIZE, MAP_SIZE, PAGE_FREE_OFFSET, PAGE_USED_OFFSET,
     TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TypeDescriptor, size_class,
@@ -37,7 +39,7 @@ use crag_codegen::{
 };
 use crag_db::Db;
 use crag_db::plumbing::AsId;
-use crag_hir::{Owner, Program, hir_body};
+use crag_hir::{Owner, Program, hir_body, lower_body};
 use crag_mir::{
     BinOp, BlockId, CmpOp, Constant, InstanceKey, Local, MirBody, Operand, Place, Rvalue,
     Statement, Terminator, TrapKind,
@@ -67,7 +69,14 @@ pub fn func_id(instance: InstanceKey<'_>) -> FuncId {
 
 type Unsupported = &'static str;
 
-pub fn lower_to_lir<'db>(db: &'db dyn Db, program: Program, mir: &MirBody<'db>) -> Lowered<'db> {
+/// Lowers the MIR of a body of `owner`, whose source map gives the
+/// positions of traps.
+pub fn lower_to_lir<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    owner: Owner<'db>,
+    mir: &MirBody<'db>,
+) -> Lowered<'db> {
     let named = |name: &str| {
         prelude_item(db, program, name).map(|i| Ty::new(db, TyKind::Named(i, Vec::new())))
     };
@@ -75,6 +84,7 @@ pub fn lower_to_lir<'db>(db: &'db dyn Db, program: Program, mir: &MirBody<'db>) 
         db,
         program,
         mir,
+        positions: &lower_body(db, program, owner).source_map.exprs,
         vregs: 0,
         locals: Vec::new(),
         layouts: Vec::new(),
@@ -122,7 +132,10 @@ pub fn lower_to_lir<'db>(db: &'db dyn Db, program: Program, mir: &MirBody<'db>) 
         .map(|b| {
             b.unwrap_or(LirBlock {
                 insts: Vec::new(),
-                term: Term::Trap(AbiTrap::Unsupported),
+                term: Term::Trap {
+                    kind: AbiTrap::Unsupported,
+                    position: None,
+                },
             })
         })
         .collect();
@@ -144,6 +157,8 @@ struct Lower<'a, 'db> {
     db: &'db dyn Db,
     program: Program,
     mir: &'a MirBody<'db>,
+    /// Where each expression of the body is in its module's source.
+    positions: &'db [Range<u32>],
     vregs: u32,
     /// The registers of each local.
     locals: Vec<Vec<VReg>>,
@@ -188,7 +203,11 @@ impl<'a, 'db> Lower<'a, 'db> {
         if !self.unsupported.contains(&what) {
             self.unsupported.push(what);
         }
-        self.end(Term::Trap(AbiTrap::Unsupported), None);
+        let term = Term::Trap {
+            kind: AbiTrap::Unsupported,
+            position: None,
+        };
+        self.end(term, None);
     }
 
     fn constant(&mut self, value: i64) -> VReg {
@@ -1010,7 +1029,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 }
                 self.end(Term::Return(values), None);
             }
-            Terminator::Trap { kind, .. } => {
+            Terminator::Trap { kind, site } => {
                 let kind = match kind {
                     TrapKind::Overflow => AbiTrap::Overflow,
                     TrapKind::DivideByZero => AbiTrap::DivideByZero,
@@ -1020,7 +1039,9 @@ impl<'a, 'db> Lower<'a, 'db> {
                     TrapKind::Error => AbiTrap::Error,
                     TrapKind::Unsupported => AbiTrap::Unsupported,
                 };
-                self.end(Term::Trap(kind), None);
+                // The byte offset of the expression in the module's source.
+                let position = site.and_then(|e| self.positions.get(e.index()).map(|r| r.start));
+                self.end(Term::Trap { kind, position }, None);
             }
         }
         Ok(())

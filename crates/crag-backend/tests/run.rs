@@ -16,25 +16,30 @@
 
 //! Compiles Crag modules and runs their functions.
 //!
-//! The functions run on the test's own thread, entered through the entry
-//! stub with a task context whose stack limit is zero, so no stack check
-//! fails, and whose heap is the module's. The runtime's functions switch to
+//! `Module::call` runs a function on the test's own thread, entered through
+//! the entry stub with a task context whose stack limit is zero, so no stack
+//! check fails, and whose heap is the module's. The runtime's functions switch to
 //! a worker's stack, which this context has none of, so stubs here do what
 //! they do on the test's own stack: `rt_alloc` and `rt_release` count their
 //! calls, and the list and map functions call the runtime's Rust halves.
-//! `rt_trap` aborts.
+//! `rt_trap` aborts. `Module::run` runs a function on a fiber instead, with
+//! a second copy of the code that calls the runtime itself, so a trap ends
+//! the fiber.
 
 use std::cell::Cell;
 use std::collections::HashMap;
 
-use crag_abi::{HEADER_SIZE, HEAP_OFFSET, RuntimeFn};
+use crag_abi::{HEADER_SIZE, HEAP_OFFSET, RuntimeFn, TrapKind};
 use crag_backend::{code, type_index};
 use crag_codegen::{CodeObject, CodegenSettings, FuncId, OptLevel, compile_entry_stub, target_for};
 use crag_db::RootDatabase;
 use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, owners};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{InstanceKey, Tier};
-use crag_runtime::{Heap, Types, alloc_box, list, map, release_box};
+use crag_runtime::{
+    CodeMap, Fiber, FiberConfig, FiberState, Heap, Trap, Types, Worker, alloc_box, list, map,
+    release_box,
+};
 use crag_types::{Ty, TyKind, prelude_item};
 
 const PRELUDE: &str = r#"pub type Int
@@ -167,6 +172,10 @@ struct Module {
     settings: CodegenSettings,
     heap: Box<Heap>,
     types: Types,
+    /// The code loaded again with the runtime's own functions, and the
+    /// worker that runs it on fibers.
+    fibers: (CodeArena, SymbolTable, HashMap<String, usize>),
+    worker: Worker,
 }
 
 impl Module {
@@ -228,13 +237,31 @@ impl Module {
                 RuntimeFn::ListSlice => rt_list_slice as *const () as usize,
                 RuntimeFn::MapInsert => rt_map_insert as *const () as usize,
                 RuntimeFn::MapGet => rt_map_get as *const () as usize,
-                f => crag_runtime::runtime_fn_addr(f).expect("the runtime has it"),
+                f => crag_runtime::runtime_fn_addr(f),
             };
             symbols.define_runtime(func, addr);
         }
         let mut arena = CodeArena::new(1 << 20).unwrap();
         let group: Vec<(FuncId, &CodeObject)> = objects.iter().map(|(f, o)| (*f, o)).collect();
         let entries = load_group(&mut arena, &mut symbols, &group).unwrap();
+        let mut fiber_arena = CodeArena::new(1 << 20).unwrap();
+        let mut fiber_symbols = SymbolTable::new();
+        for func in RuntimeFn::ALL {
+            fiber_symbols.define_runtime(func, crag_runtime::runtime_fn_addr(func));
+        }
+        let fiber_entries = load_group(&mut fiber_arena, &mut fiber_symbols, &group).unwrap();
+        let mut code_map = CodeMap::new();
+        for ((func, object), entry) in group.iter().zip(&fiber_entries) {
+            code_map.add(*func, entry.addr(), object);
+        }
+        let fiber_functions = names
+            .iter()
+            .zip(&fiber_entries)
+            .map(|((name, ..), entry)| (name.clone(), entry.addr()))
+            .collect();
+        let mut worker = Worker::new();
+        worker.set_types(std::sync::Arc::new(Types::new(types.iter().cloned())));
+        worker.set_code_map(std::sync::Arc::new(code_map));
         let functions = names
             .into_iter()
             .zip(entries)
@@ -254,6 +281,8 @@ impl Module {
             settings,
             heap: Box::new(Heap::new()),
             types: Types::new(types),
+            fibers: (fiber_arena, fiber_symbols, fiber_functions),
+            worker,
         }
     }
 
@@ -281,6 +310,28 @@ impl Module {
             );
         }
         results[..returns as usize].to_vec()
+    }
+
+    /// Runs a function on a fiber with the runtime's own functions: its
+    /// result words, or the trap that ended it.
+    fn run(&mut self, name: &str, args: &[i64]) -> Result<Vec<u64>, Trap> {
+        let (_, params, returns) = self.functions[name];
+        assert_eq!(args.len(), params as usize, "arguments of {name}");
+        let (arena, symbols, functions) = &mut self.fibers;
+        let stub = compile_entry_stub(params, returns, &self.settings).unwrap();
+        let stub = load(arena, symbols, &stub).unwrap();
+        let args: Vec<u64> = args.iter().map(|&a| a as u64).collect();
+        // SAFETY: the stub was compiled for this function's words, and both
+        // stay loaded while the module exists, which the fiber does not
+        // outlive.
+        let mut fiber = unsafe {
+            Fiber::new(stub.addr(), functions[name], &args, FiberConfig::default()).unwrap()
+        };
+        match self.worker.resume(&mut fiber) {
+            FiberState::Finished => Ok(fiber.results().unwrap()[..returns as usize].to_vec()),
+            FiberState::Trapped => Err(fiber.trap().unwrap()),
+            state => panic!("{name} stopped {state:?}"),
+        }
     }
 
     fn int(&mut self, name: &str, args: &[i64]) -> i64 {
@@ -675,4 +726,57 @@ fn sets(n: Int) -> Int {{
     assert_eq!(m.heap.live_blocks(), 0);
     assert_eq!(m.int("sets", &[9]), 9);
     assert_eq!(m.heap.live_blocks(), 0);
+}
+
+#[test]
+fn traps_end_the_fiber_and_release_what_it_holds() {
+    let text = r#"type Point(x: Int, y: Int)
+
+fn inc(n: Int) -> Int {
+  n + 1
+}
+
+fn deep(n: Int, p: Point) -> Int {
+  if n == 0 {
+    p.x / (p.y - p.y)
+  } else {
+    let q = Point(x: n, y: 1)
+    deep(n - 1, p) + q.x
+  }
+}
+
+fn start(n: Int) -> Int {
+  deep(n, Point(x: 1, y: 2))
+}
+
+fn pick(i: Int) -> Int {
+  let points = [Point(x: 1, y: 2), Point(x: 3, y: 4)]
+  let p = points[i]
+  p.x + p.y
+}
+"#;
+    let mut m = Module::new(text);
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    let at = |what: &str| Some(text.find(what).unwrap() as u32);
+    assert_eq!(m.run("inc", &[41]), Ok(vec![42]));
+    let trap = m.run("inc", &[i64::MAX]).unwrap_err();
+    assert_eq!(
+        (trap.kind, trap.position),
+        (TrapKind::Overflow, at("n + 1"))
+    );
+    assert!(trap.func.is_some());
+    // Every frame holds a point across its call when the last one traps.
+    let trap = m.run("start", &[1000]).unwrap_err();
+    assert_eq!(
+        (trap.kind, trap.position),
+        (TrapKind::DivideByZero, at("p.x / (p.y - p.y)"))
+    );
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+    assert_eq!(m.run("pick", &[1]), Ok(vec![7]));
+    let trap = m.run("pick", &[2]).unwrap_err();
+    assert_eq!(
+        (trap.kind, trap.position),
+        (TrapKind::Index, at("points[i]"))
+    );
+    assert_eq!(m.worker.heap().live_blocks(), 0);
 }
