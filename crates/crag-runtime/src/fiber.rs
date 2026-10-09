@@ -244,8 +244,8 @@ impl Fiber {
     }
 
     /// The trap that ended the fiber, if one did.
-    pub fn trap(&self) -> Option<Trap> {
-        self.trap
+    pub fn trap(&self) -> Option<&Trap> {
+        self.trap.as_ref()
     }
 
     /// How often the stack has moved to a new mapping.

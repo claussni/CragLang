@@ -120,9 +120,9 @@ fn check(config: FiberConfig) {
     let trap = Trap {
         kind: TrapKind::Overflow,
         position: Some(42),
-        func: Some(FuncId(0)),
+        stack: vec![FuncId(0); 5001],
     };
-    assert_eq!(fiber.trap(), Some(trap));
+    assert_eq!(fiber.trap(), Some(&trap));
     assert_eq!(fiber.results(), None);
     // Every frame's box was released on the way out.
     assert_eq!(worker.heap().live_blocks(), 0);

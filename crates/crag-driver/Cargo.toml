@@ -1,0 +1,27 @@
+[package]
+name = "crag-driver"
+description = "The crag command: run and test a project, with diagnostics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "crag"
+path = "src/main.rs"
+
+[dependencies]
+crag-abi = { path = "../crag-abi" }
+crag-backend = { path = "../crag-backend" }
+crag-codegen = { path = "../crag-codegen" }
+crag-db = { path = "../crag-db" }
+crag-hir = { path = "../crag-hir" }
+crag-loader = { path = "../crag-loader" }
+crag-mir = { path = "../crag-mir" }
+crag-runtime = { path = "../crag-runtime" }
+crag-syntax = { path = "../crag-syntax" }
+crag-types = { path = "../crag-types" }

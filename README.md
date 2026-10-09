@@ -21,6 +21,8 @@ Compiler, host and runtime for the Crag language, written in Rust.
 | `crates/crag-types` | Types and core inference (M1) |
 | `crates/crag-mir` | MIR builder (M1) |
 | `crates/crag-backend` | Code generation from MIR (M1) |
+| `crates/crag-driver` | The `crag` command: `run` and `test`, diagnostics (M1) |
+| `std` | The standard library: the prelude `std.core` (M1) |
 
 ## Build
 
@@ -32,6 +34,14 @@ so only Docker is needed on the host.
     ./cargo test
     ./cargo clippy --all-targets
     ./cargo fmt
+
+The `crag` command works on the project in the current directory, a
+directory with a `package.crag` naming the package and its `main` module:
+
+    ./cargo build -p crag-driver
+    cd my-project
+    /path/to/target/debug/crag run
+    /path/to/target/debug/crag test [filter]
 
 ## Use of Claude Code
 

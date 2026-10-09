@@ -1,0 +1,215 @@
+// This file is part of Crag.
+//
+// Copyright (C) 2026 Ralf Claussnitzer
+//
+// Crag is free software: you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the Free Software
+// Foundation, either version 3 of the License, or (at your option) any later
+// version.
+//
+// Crag is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+// A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// Crag. If not, see <https://www.gnu.org/licenses/>.
+
+// The prelude (Specification §19.3), as far as M1 reaches. The types without
+// a body are the compiler's built-in types, and the functions without a
+// body are operations it generates inline. The operators of `Fixed` wait for
+// generic functions.
+
+pub type Int
+pub type Int8
+pub type Int16
+pub type Int32
+pub type UInt8
+pub type UInt16
+pub type UInt32
+pub type UInt64
+pub type Float
+pub type Fixed[S]
+pub type CodePoint
+pub type Str
+pub type Bytes
+pub type List[T]
+pub type Map[K, V]
+pub type Set[T]
+pub type Grid[T]
+pub type Lazy[T]
+
+pub type True
+pub type False
+pub type Bool = True | False
+pub type Empty[T]
+pub type Option[T] = T | Empty[T]
+pub type Less
+pub type Equal
+pub type Greater
+pub type Ordering = Less | Equal | Greater
+
+pub type Range[T](first: T, last: T)
+pub type RangeFrom[T](first: T)
+
+// What `main` may return for the exit status (§19.7.1).
+pub type ExitCode(code: Int) where code >= 0 and code <= 255
+
+// Int
+
+pub fn add(a: Int, b: Int) -> Int
+pub fn subtract(a: Int, b: Int) -> Int
+pub fn multiply(a: Int, b: Int) -> Int
+pub fn divide(a: Int, b: Int) -> Int
+pub fn remainder(a: Int, b: Int) -> Int
+pub fn addWrapping(a: Int, b: Int) -> Int
+pub fn subtractWrapping(a: Int, b: Int) -> Int
+pub fn multiplyWrapping(a: Int, b: Int) -> Int
+pub fn negate(a: Int) -> Int
+pub fn equals(a: Int, b: Int) -> Bool
+pub fn lessThan(a: Int, b: Int) -> Bool
+pub fn lessOrEqual(a: Int, b: Int) -> Bool
+pub fn greaterThan(a: Int, b: Int) -> Bool
+pub fn greaterOrEqual(a: Int, b: Int) -> Bool
+
+// Int8
+
+pub fn add(a: Int8, b: Int8) -> Int8
+pub fn subtract(a: Int8, b: Int8) -> Int8
+pub fn multiply(a: Int8, b: Int8) -> Int8
+pub fn divide(a: Int8, b: Int8) -> Int8
+pub fn remainder(a: Int8, b: Int8) -> Int8
+pub fn addWrapping(a: Int8, b: Int8) -> Int8
+pub fn subtractWrapping(a: Int8, b: Int8) -> Int8
+pub fn multiplyWrapping(a: Int8, b: Int8) -> Int8
+pub fn negate(a: Int8) -> Int8
+pub fn equals(a: Int8, b: Int8) -> Bool
+pub fn lessThan(a: Int8, b: Int8) -> Bool
+pub fn lessOrEqual(a: Int8, b: Int8) -> Bool
+pub fn greaterThan(a: Int8, b: Int8) -> Bool
+pub fn greaterOrEqual(a: Int8, b: Int8) -> Bool
+
+// Int16
+
+pub fn add(a: Int16, b: Int16) -> Int16
+pub fn subtract(a: Int16, b: Int16) -> Int16
+pub fn multiply(a: Int16, b: Int16) -> Int16
+pub fn divide(a: Int16, b: Int16) -> Int16
+pub fn remainder(a: Int16, b: Int16) -> Int16
+pub fn addWrapping(a: Int16, b: Int16) -> Int16
+pub fn subtractWrapping(a: Int16, b: Int16) -> Int16
+pub fn multiplyWrapping(a: Int16, b: Int16) -> Int16
+pub fn negate(a: Int16) -> Int16
+pub fn equals(a: Int16, b: Int16) -> Bool
+pub fn lessThan(a: Int16, b: Int16) -> Bool
+pub fn lessOrEqual(a: Int16, b: Int16) -> Bool
+pub fn greaterThan(a: Int16, b: Int16) -> Bool
+pub fn greaterOrEqual(a: Int16, b: Int16) -> Bool
+
+// Int32
+
+pub fn add(a: Int32, b: Int32) -> Int32
+pub fn subtract(a: Int32, b: Int32) -> Int32
+pub fn multiply(a: Int32, b: Int32) -> Int32
+pub fn divide(a: Int32, b: Int32) -> Int32
+pub fn remainder(a: Int32, b: Int32) -> Int32
+pub fn addWrapping(a: Int32, b: Int32) -> Int32
+pub fn subtractWrapping(a: Int32, b: Int32) -> Int32
+pub fn multiplyWrapping(a: Int32, b: Int32) -> Int32
+pub fn negate(a: Int32) -> Int32
+pub fn equals(a: Int32, b: Int32) -> Bool
+pub fn lessThan(a: Int32, b: Int32) -> Bool
+pub fn lessOrEqual(a: Int32, b: Int32) -> Bool
+pub fn greaterThan(a: Int32, b: Int32) -> Bool
+pub fn greaterOrEqual(a: Int32, b: Int32) -> Bool
+
+// UInt8
+
+pub fn add(a: UInt8, b: UInt8) -> UInt8
+pub fn subtract(a: UInt8, b: UInt8) -> UInt8
+pub fn multiply(a: UInt8, b: UInt8) -> UInt8
+pub fn divide(a: UInt8, b: UInt8) -> UInt8
+pub fn remainder(a: UInt8, b: UInt8) -> UInt8
+pub fn addWrapping(a: UInt8, b: UInt8) -> UInt8
+pub fn subtractWrapping(a: UInt8, b: UInt8) -> UInt8
+pub fn multiplyWrapping(a: UInt8, b: UInt8) -> UInt8
+pub fn negate(a: UInt8) -> UInt8
+pub fn equals(a: UInt8, b: UInt8) -> Bool
+pub fn lessThan(a: UInt8, b: UInt8) -> Bool
+pub fn lessOrEqual(a: UInt8, b: UInt8) -> Bool
+pub fn greaterThan(a: UInt8, b: UInt8) -> Bool
+pub fn greaterOrEqual(a: UInt8, b: UInt8) -> Bool
+
+// UInt16
+
+pub fn add(a: UInt16, b: UInt16) -> UInt16
+pub fn subtract(a: UInt16, b: UInt16) -> UInt16
+pub fn multiply(a: UInt16, b: UInt16) -> UInt16
+pub fn divide(a: UInt16, b: UInt16) -> UInt16
+pub fn remainder(a: UInt16, b: UInt16) -> UInt16
+pub fn addWrapping(a: UInt16, b: UInt16) -> UInt16
+pub fn subtractWrapping(a: UInt16, b: UInt16) -> UInt16
+pub fn multiplyWrapping(a: UInt16, b: UInt16) -> UInt16
+pub fn negate(a: UInt16) -> UInt16
+pub fn equals(a: UInt16, b: UInt16) -> Bool
+pub fn lessThan(a: UInt16, b: UInt16) -> Bool
+pub fn lessOrEqual(a: UInt16, b: UInt16) -> Bool
+pub fn greaterThan(a: UInt16, b: UInt16) -> Bool
+pub fn greaterOrEqual(a: UInt16, b: UInt16) -> Bool
+
+// UInt32
+
+pub fn add(a: UInt32, b: UInt32) -> UInt32
+pub fn subtract(a: UInt32, b: UInt32) -> UInt32
+pub fn multiply(a: UInt32, b: UInt32) -> UInt32
+pub fn divide(a: UInt32, b: UInt32) -> UInt32
+pub fn remainder(a: UInt32, b: UInt32) -> UInt32
+pub fn addWrapping(a: UInt32, b: UInt32) -> UInt32
+pub fn subtractWrapping(a: UInt32, b: UInt32) -> UInt32
+pub fn multiplyWrapping(a: UInt32, b: UInt32) -> UInt32
+pub fn negate(a: UInt32) -> UInt32
+pub fn equals(a: UInt32, b: UInt32) -> Bool
+pub fn lessThan(a: UInt32, b: UInt32) -> Bool
+pub fn lessOrEqual(a: UInt32, b: UInt32) -> Bool
+pub fn greaterThan(a: UInt32, b: UInt32) -> Bool
+pub fn greaterOrEqual(a: UInt32, b: UInt32) -> Bool
+
+// UInt64
+
+pub fn add(a: UInt64, b: UInt64) -> UInt64
+pub fn subtract(a: UInt64, b: UInt64) -> UInt64
+pub fn multiply(a: UInt64, b: UInt64) -> UInt64
+pub fn divide(a: UInt64, b: UInt64) -> UInt64
+pub fn remainder(a: UInt64, b: UInt64) -> UInt64
+pub fn addWrapping(a: UInt64, b: UInt64) -> UInt64
+pub fn subtractWrapping(a: UInt64, b: UInt64) -> UInt64
+pub fn multiplyWrapping(a: UInt64, b: UInt64) -> UInt64
+pub fn negate(a: UInt64) -> UInt64
+pub fn equals(a: UInt64, b: UInt64) -> Bool
+pub fn lessThan(a: UInt64, b: UInt64) -> Bool
+pub fn lessOrEqual(a: UInt64, b: UInt64) -> Bool
+pub fn greaterThan(a: UInt64, b: UInt64) -> Bool
+pub fn greaterOrEqual(a: UInt64, b: UInt64) -> Bool
+
+// Float
+
+pub fn add(a: Float, b: Float) -> Float
+pub fn subtract(a: Float, b: Float) -> Float
+pub fn multiply(a: Float, b: Float) -> Float
+pub fn divide(a: Float, b: Float) -> Float
+pub fn negate(a: Float) -> Float
+pub fn equals(a: Float, b: Float) -> Bool
+pub fn lessThan(a: Float, b: Float) -> Bool
+pub fn lessOrEqual(a: Float, b: Float) -> Bool
+pub fn greaterThan(a: Float, b: Float) -> Bool
+pub fn greaterOrEqual(a: Float, b: Float) -> Bool
+
+// CodePoint
+pub fn equals(a: CodePoint, b: CodePoint) -> Bool
+pub fn lessThan(a: CodePoint, b: CodePoint) -> Bool
+pub fn lessOrEqual(a: CodePoint, b: CodePoint) -> Bool
+pub fn greaterThan(a: CodePoint, b: CodePoint) -> Bool
+pub fn greaterOrEqual(a: CodePoint, b: CodePoint) -> Bool
+
+// Str
+
+pub fn equals(a: Str, b: Str) -> Bool

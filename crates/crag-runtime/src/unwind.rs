@@ -80,14 +80,15 @@ impl CodeMap {
 }
 
 /// Why and where a fiber stopped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Trap {
     pub kind: TrapKind,
     /// The byte offset of the expression that trapped in its module's
     /// source, if code generation knew it.
     pub position: Option<u32>,
-    /// The function that trapped, if the code map holds it.
-    pub func: Option<FuncId>,
+    /// The function that trapped, then the functions of the frames below it
+    /// in turn, as far as the code map holds them.
+    pub stack: Vec<FuncId>,
 }
 
 /// `rt_trap(ctx, kind, position)`: see `crag_abi::RuntimeFn::Trap`.
@@ -132,14 +133,13 @@ unsafe extern "C" fn trap_entry(
     // context, and the fiber's frames are suspended at calls.
     unsafe {
         let worker: *mut Worker = (*ctx).worker.load(Ordering::Relaxed);
-        let code = Worker::code(worker);
-        let pc = ret.read();
         let trap = Trap {
             kind: TrapKind::from_index(kind).unwrap_or_else(|| die("a trap of no kind")),
             position: (position != NO_POSITION).then_some(position as u32),
-            func: code.function_at(pc),
+            stack: unwind(worker, ret, fp),
         };
-        unwind(worker, ret, fp);
+        // The fiber takes the trap, so nothing on this stack owns anything
+        // when `leave` abandons it.
         (*(*ctx).fiber.load(Ordering::Relaxed)).trap = Some(trap);
         (*ctx).status.store(STATUS_TRAPPED, Ordering::Relaxed);
         leave(worker)
@@ -148,12 +148,14 @@ unsafe extern "C" fn trap_entry(
 
 /// Releases the boxes every frame below the trapping one holds, from the
 /// return address at `ret` and the frame pointer `fp` down the chain to the
-/// fiber's first frame, whose saved frame pointer is zero.
+/// fiber's first frame, whose saved frame pointer is zero. Returns the
+/// functions of the frames the code map knows, the trapping one first.
 ///
 /// # Safety
 ///
 /// As for `trap_entry`.
-unsafe fn unwind(worker: *mut Worker, mut ret: *const usize, mut fp: usize) {
+unsafe fn unwind(worker: *mut Worker, mut ret: *const usize, mut fp: usize) -> Vec<FuncId> {
+    let mut stack = Vec::new();
     // SAFETY: as the caller promises. Each frame's stack pointer at its call
     // lies just above the return address; the frame pointer of the frame
     // below holds the next link of the chain, and the return address
@@ -163,12 +165,13 @@ unsafe fn unwind(worker: *mut Worker, mut ret: *const usize, mut fp: usize) {
         let (heap, types) = Worker::heap_and_types(worker);
         loop {
             let sp = ret as usize + 8;
+            stack.extend(code.function_at(ret.read()));
             for &offset in code.slots(ret.read()) {
                 let ptr = ((sp + offset as usize) as *const *mut u8).read();
                 drop_box(heap, types, ptr);
             }
             if fp == 0 {
-                return;
+                return stack;
             }
             ret = (fp + 8) as *const usize;
             fp = (fp as *const usize).read();

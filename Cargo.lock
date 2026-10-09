@@ -122,6 +122,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "crag-driver"
+version = "0.0.0"
+dependencies = [
+ "crag-abi",
+ "crag-backend",
+ "crag-codegen",
+ "crag-db",
+ "crag-hir",
+ "crag-loader",
+ "crag-mir",
+ "crag-runtime",
+ "crag-syntax",
+ "crag-types",
+]
+
+[[package]]
 name = "crag-hir"
 version = "0.0.0"
 dependencies = [

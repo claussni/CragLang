@@ -649,14 +649,14 @@ Until generic instances exist (§11.5.10), the runtime hashes and compares keys 
 
 A trap (overflow, failed `where` condition, out-of-range index) stops the current computation and transfers control to the nearest handler (§8.3). The runtime finds that handler by walking frames through the frame-pointer chain and, for each frame, releasing the values the safepoint table marks as live.
 
-The frame that traps has already released what it holds: MIR traps in a block of its own that releases what is live (§11.4.9). Every frame below it is suspended at a call, and the stack map of that call lists the slots of the boxes the frame keeps across it. Each such box has a reference of its own, because a counted local owns one while it is live, and a part read out of a value is retained when it lives on. `rt_trap` switches to the system stack and walks the frame-pointer chain down to the fiber's first frame, whose saved frame pointer is zero. It finds each call's stack map by its return address and releases the boxes in its slots. Then it records the trap in the fiber and switches to the worker, and the fiber is `Trapped`. Code generation passes the byte offset of the expression that trapped in its module's source; the code map gives the function from the return address, and the driver turns both into a report (§11.4.15).
+The frame that traps has already released what it holds: MIR traps in a block of its own that releases what is live (§11.4.9). Every frame below it is suspended at a call, and the stack map of that call lists the slots of the boxes the frame keeps across it. Each such box has a reference of its own, because a counted local owns one while it is live, and a part read out of a value is retained when it lives on. `rt_trap` switches to the system stack and walks the frame-pointer chain down to the fiber's first frame, whose saved frame pointer is zero. It finds each call's stack map by its return address and releases the boxes in its slots. Then it records the trap in the fiber and switches to the worker, and the fiber is `Trapped`. Code generation passes the byte offset of the expression that trapped in its module's source; the code map gives the function of each frame from its return address, and the driver turns both into a report (§11.4.15).
 
 Crag has no trap handlers before signals and handlers (M2), so a trap always ends its task, and the handler table comes with them. Stack maps list only registers holding boxes, so a box inside a union a frame holds is not released when it unwinds: a leak until stack maps carry unions, never a double release. `Immediate` handlers wait for dispose handlers (Specification §13.3).
 
 **Data structures**
 
 - `CodeMap` — the runtime's safepoint table for the loaded code: the return address of each call with the slots of its boxes, and the range of each function's code, from the code objects' stack maps.
-- `Trap` — why and where a fiber stopped: the kind, the source position, and the function.
+- `Trap` — why and where a fiber stopped: the kind, the source position, and the functions of the frames it unwound, the trapping one first.
 - Later: `HandlerTable` — code ranges covered by trap handlers and their entry points.
 
 **Functions**
@@ -670,11 +670,18 @@ Crag has no trap handlers before signals and handlers (M2), so a trap always end
 
 The driver is the command-line entry: it sets up the database, feeds files in as inputs, asks for the queries it needs and runs the result. Diagnostics are printed against source ranges with the offending text underlined.
 
+A project is a directory with a `package.crag`. M1 reads only its `package` and `main` lines; the full manifest comes with the resolver (§11.9.1). Every other `.crag` file below the root is a module named by the package and its path, so `geo/shape.crag` in package `demo` is `demo.geo.shape`. The prelude `std.core` lives in `std/core.crag` and is bundled with the tool (Specification §19.4). It declares the built-in types, `Option`, the orderings, the ranges, `ExitCode`, and the operator functions of the number types, which the MIR builder turns into operations.
+
+Before anything runs, the driver collects the errors of every module: syntax errors, import and name errors, redeclarations, lowering errors and type errors. Each is printed with its file, line and column, the line, and the range underlined; any error stops the command with status 1. `crag run` compiles the instances `main` reaches by following each code object's calls, loads them with the runtime's functions, and runs `main` on a fiber. Its status is 0 for `()` or the code of an `ExitCode`. A trap is reported against the source with the functions of the frames it unwound, a run of one function told once, and the status is 70 (Specification §19.7.1). `crag test [filter]` runs every test whose label contains the filter in a fiber of its own; a test passes when its block completes and fails when it traps, until error values arrive (M2). The command works on the project in the current directory; usage errors exit with 2 (§20.6).
+
+Until `std.test` exists, a test fails itself with `???`. With no I/O yet, a program shows what it computed only through its exit status. The trap report has no positions of the calls below the trapping frame until line tables (§11.4.10).
+
 **Functions**
 
-- `fn crag_run(project: &Path) -> ExitCode` — compile the instances reachable from `main`, load them, start a fiber.
-- `fn crag_test(project: &Path, filter: Option<&str>) -> TestReport` — discover tests, compile them, run each in its own task, report results.
-- `fn render_diagnostic(d: &Diagnostic, source: &str) -> String`.
+- `fn crag_run(project: &Path, out: &mut dyn Write) -> u8` — compiles the instances reachable from `main`, loads them, runs a fiber and returns the exit status.
+- `fn crag_test(project: &Path, filter: Option<&str>, out: &mut dyn Write) -> TestReport` — discovers tests, compiles them, runs each in its own task and reports the results.
+- `fn check(project: &Project) -> Vec<Diagnostic>` — every error of the project's modules.
+- `fn render_diagnostic(d: &Diagnostic, file: &str, source: &str) -> String`, and `Image::report` for a trap.
 
 ### 11.5 M2 components
 

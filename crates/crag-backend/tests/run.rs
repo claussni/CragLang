@@ -329,7 +329,7 @@ impl Module {
         };
         match self.worker.resume(&mut fiber) {
             FiberState::Finished => Ok(fiber.results().unwrap()[..returns as usize].to_vec()),
-            FiberState::Trapped => Err(fiber.trap().unwrap()),
+            FiberState::Trapped => Err(fiber.trap().unwrap().clone()),
             state => panic!("{name} stopped {state:?}"),
         }
     }
@@ -764,13 +764,16 @@ fn pick(i: Int) -> Int {
         (trap.kind, trap.position),
         (TrapKind::Overflow, at("n + 1"))
     );
-    assert!(trap.func.is_some());
+    assert_eq!(trap.stack.len(), 1);
     // Every frame holds a point across its call when the last one traps.
     let trap = m.run("start", &[1000]).unwrap_err();
     assert_eq!(
         (trap.kind, trap.position),
         (TrapKind::DivideByZero, at("p.x / (p.y - p.y)"))
     );
+    // `deep` 1001 times; `start` tail-called the first, so its frame is
+    // gone.
+    assert_eq!(trap.stack.len(), 1001);
     assert_eq!(m.worker.heap().live_blocks(), 0);
     assert_eq!(m.run("pick", &[1]), Ok(vec![7]));
     let trap = m.run("pick", &[2]).unwrap_err();
