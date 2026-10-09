@@ -21,7 +21,7 @@
 //! index alone when every member is a tag, as for `Bool`. Strings, bytes
 //! and closures take two words.
 
-use crag_abi::HEADER_SIZE;
+use crag_abi::{CountedField, HEADER_SIZE, TypeDescriptor};
 use crag_db::Db;
 use crag_db::plumbing::AsId;
 use crag_hir::{ItemKind, Name, Program, item_tree, module_index};
@@ -183,4 +183,48 @@ pub fn subtypes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Vec<i64>
     }
     out.sort_unstable();
     out
+}
+
+/// The type indices a value of the union `ty` may carry with a box as its
+/// payload: those of its members that are boxes, and of their subtypes.
+/// None when a member has no layout yet.
+pub fn boxed_indices<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Vec<u32>> {
+    let mut out = Vec::new();
+    for m in ty.members(db) {
+        if layout(db, program, m)? == Layout::Box {
+            out.extend(subtypes(db, program, m).into_iter().map(|i| i as u32));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Some(out)
+}
+
+/// The descriptor of a record type: the fields that hold references, which
+/// the runtime releases when it frees a box of the type. None when a field
+/// is a string, bytes or a closure, whose references are not counted yet.
+pub fn type_descriptor<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    ty: Ty<'db>,
+) -> Option<TypeDescriptor> {
+    let (slots, _) = record_layout(db, program, ty)?;
+    let mut counted = Vec::new();
+    for slot in slots {
+        match slot.layout {
+            Layout::Box => counted.push(CountedField::Box(slot.offset)),
+            Layout::Union => {
+                let boxed = boxed_indices(db, program, slot.ty)?;
+                if !boxed.is_empty() {
+                    counted.push(CountedField::Union {
+                        offset: slot.offset,
+                        boxed,
+                    });
+                }
+            }
+            Layout::Pair => return None,
+            Layout::Zero | Layout::Imm(_) | Layout::Tag => {}
+        }
+    }
+    Some(TypeDescriptor { counted })
 }

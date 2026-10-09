@@ -18,10 +18,9 @@
 //!
 //! The functions run on the test's own thread, entered through the entry
 //! stub with a task context whose stack limit is zero, so no stack check
-//! fails, and whose heap is the module's. The runtime functions later
-//! components provide are stubs here that count what they are asked to do,
-//! and `rt_alloc` is one too, because the runtime's switches to a worker's
-//! stack.
+//! fails, and whose heap is the module's. `rt_alloc` and `rt_release` are
+//! stubs here that count their calls and do what the runtime's do, because
+//! the runtime's switch to a worker's stack. `rt_trap` aborts.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -33,7 +32,7 @@ use crag_db::RootDatabase;
 use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, owners};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{InstanceKey, Tier};
-use crag_runtime::{Heap, alloc_box};
+use crag_runtime::{Heap, Types, alloc_box, release_box};
 use crag_types::{Ty, TyKind, prelude_item};
 
 const PRELUDE: &str = r#"pub type Int
@@ -67,7 +66,11 @@ pub fn lessThan(a: Float, b: Float) -> Bool
 thread_local! {
     /// Calls of `rt_alloc`: boxes the inline path did not allocate.
     static SLOW_ALLOCS: Cell<usize> = const { Cell::new(0) };
+    /// Calls of `rt_release`: boxes whose count generated code took to
+    /// zero, not counting the fields freed with them.
     static RELEASED: Cell<usize> = const { Cell::new(0) };
+    /// The descriptors of the module running on this thread.
+    static TYPES: Cell<*const Types> = const { Cell::new(std::ptr::null()) };
 }
 
 /// The heap in a task context.
@@ -87,23 +90,13 @@ extern "C" fn rt_alloc(ctx: *mut u64, size: u64, index: u64) -> *mut u8 {
     alloc_box(unsafe { heap_of(ctx) }, size as usize, index)
 }
 
-extern "C" fn rt_retain(_ctx: *mut u64, ptr: *mut u64) {
-    // SAFETY: generated code passes boxes it allocated.
-    unsafe { *ptr += 1 }
-}
-
-/// Frees a box with the last reference. The tests' boxes hold no boxes, so
-/// there are no fields to release.
-extern "C" fn rt_release(ctx: *mut u64, ptr: *mut u64) {
-    // SAFETY: as for `rt_retain` and `rt_alloc`.
-    unsafe {
-        assert!(*ptr > 0, "released a dead box");
-        *ptr -= 1;
-        if *ptr == 0 {
-            RELEASED.set(RELEASED.get() + 1);
-            heap_of(ctx).free(ptr.cast());
-        }
-    }
+/// Frees a box whose count generated code took to zero, with the fields
+/// it releases in turn.
+extern "C" fn rt_release(ctx: *mut u64, ptr: *mut u8) {
+    RELEASED.set(RELEASED.get() + 1);
+    // SAFETY: generated code passes the context it received and a box it
+    // allocated, of a type the module describes.
+    unsafe { release_box(heap_of(ctx), &*TYPES.get(), ptr) }
 }
 
 extern "C" fn rt_trap(_ctx: *mut u64, kind: u64) {
@@ -123,6 +116,7 @@ struct Module {
     symbols: SymbolTable,
     settings: CodegenSettings,
     heap: Box<Heap>,
+    types: Types,
 }
 
 impl Module {
@@ -151,6 +145,7 @@ impl Module {
         let mut objects: Vec<(FuncId, CodeObject)> = Vec::new();
         let mut names = Vec::new();
         let mut unsupported = Vec::new();
+        let mut types = Vec::new();
         for owner in owners(&db, module) {
             let Owner::Item(item) = owner else { continue };
             if *item.kind(&db) != ItemKind::Function {
@@ -167,13 +162,13 @@ impl Module {
                 unsupported.push(format!("{name}: {what}"));
             }
             names.push((name, compiled.params, compiled.returns));
+            types.extend(compiled.types.iter().cloned());
             objects.push((compiled.func, compiled.object.clone()));
         }
         let mut symbols = SymbolTable::new();
         for func in RuntimeFn::ALL {
             let addr = match func {
                 RuntimeFn::Alloc => rt_alloc as *const () as usize,
-                RuntimeFn::Retain => rt_retain as *const () as usize,
                 RuntimeFn::Release => rt_release as *const () as usize,
                 RuntimeFn::Trap => rt_trap as *const () as usize,
                 f => crag_runtime::runtime_fn_addr(f).expect("the runtime has it"),
@@ -201,6 +196,7 @@ impl Module {
             symbols,
             settings,
             heap: Box::new(Heap::new()),
+            types: Types::new(types),
         }
     }
 
@@ -214,6 +210,7 @@ impl Module {
         let mut ctx = [0u64; 8];
         ctx[HEAP_OFFSET as usize / 8] = &raw mut *self.heap as u64;
         let mut results = [0u64; 2];
+        TYPES.set(&self.types);
         // SAFETY: the stub was compiled for this function's words, and the
         // context's zero limit lets every stack check pass on this thread.
         // Generated code and the stubs use the heap only during the call.
@@ -394,6 +391,72 @@ fn run(x: Int) -> Int {
     assert_eq!(m.int("run", &[5]), 7 + 7 + 5 + 30);
     // Both boxes were freed, each exactly once.
     assert_eq!(RELEASED.get(), 2);
+    assert_eq!(m.heap.live_blocks(), 0);
+}
+
+#[test]
+fn fields_are_released_with_their_box() {
+    let mut m = Module::new(
+        r#"type Nil
+type Cons(head: Int, tail: Cons | Nil)
+type Point(x: Int, y: Int)
+type Line(from: Point, to: Point)
+
+fn build(n: Int, acc: Cons | Nil) -> Cons | Nil {
+  if n == 0 { acc } else { build(n - 1, Cons(head: n, tail: acc)) }
+}
+
+fn sum(list: Cons | Nil, acc: Int) -> Int {
+  case list {
+    Nil -> acc
+    c: Cons -> sum(c.tail, acc + c.head)
+  }
+}
+
+fn twice(n: Int) -> Int {
+  let list = build(n, Nil)
+  sum(list, 0) + sum(list, 0)
+}
+
+fn dropped(n: Int) -> Int {
+  let list = build(n, Nil)
+  n
+}
+
+fn second(n: Int) -> Int {
+  let list = build(n, Nil)
+  case list {
+    Nil -> 0
+    c: Cons -> sum(c.tail, 0)
+  }
+}
+
+fn shared(x: Int) -> Int {
+  let p = Point(x: x, y: 1)
+  let line = Line(from: p, to: p)
+  line.from.x + line.to.y + p.x
+}
+"#,
+    );
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    let n = 100_000;
+    RELEASED.set(0);
+    assert_eq!(m.int("twice", &[n]), n * (n + 1));
+    // The second walk owns the list and frees each cell as it passes it.
+    assert_eq!(RELEASED.get(), n as usize);
+    assert_eq!(m.heap.live_blocks(), 0);
+    // A list nothing reads goes with its first cell, in one call of the
+    // runtime.
+    RELEASED.set(0);
+    assert_eq!(m.int("dropped", &[n]), n);
+    assert_eq!(RELEASED.get(), 1);
+    assert_eq!(m.heap.live_blocks(), 0);
+    // The rest of the list is held by its first cell and by the local read
+    // out of it, so it outlives the first cell when that is released first.
+    assert_eq!(m.int("second", &[n]), n * (n + 1) / 2 - 1);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("shared", &[5]), 11);
+    assert_eq!(m.heap.live_blocks(), 0);
 }
 
 #[test]
@@ -419,6 +482,7 @@ fn total(n: Int) -> Int {
     // the heap's page for its class empty.
     assert_eq!((SLOW_ALLOCS.get(), RELEASED.get()), (1, 10_001));
     assert_eq!(m.heap.pages_in_use(), 1);
+    assert_eq!(m.heap.live_blocks(), 0);
 }
 
 #[test]

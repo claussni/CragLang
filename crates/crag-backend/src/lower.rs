@@ -20,14 +20,14 @@
 //! are words; narrow integers are kept sign- or zero-extended to 64 bits,
 //! and a `Float` is a word holding its bits. A `Bool` is the type index of
 //! `True` or `False`, so a branch compares it with `True`'s. Boxes are
-//! allocated, retained and released through the runtime.
+//! allocated and counted inline, and the runtime frees them.
 //!
 //! What code generation does not handle yet, such as strings and
 //! collections, ends its block with a trap and is listed.
 
 use crag_abi::{
     COUNT_OFFSET, HEAP_OFFSET, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, TYPE_INDEX_OFFSET,
-    TrapKind as AbiTrap, size_class,
+    TrapKind as AbiTrap, TypeDescriptor, size_class,
 };
 use crag_codegen::{
     BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, Cond, FuncId, Inst, LirFunction,
@@ -42,7 +42,9 @@ use crag_mir::{
 };
 use crag_types::{Builtin, Step, Ty, TyKind, prelude_item, signature};
 
-use crate::layout::{Layout, layout, record_layout, subtypes, type_index};
+use crate::layout::{
+    Layout, boxed_indices, layout, record_layout, subtypes, type_descriptor, type_index,
+};
 
 /// The LIR of a body, with what it could not lower.
 pub struct Lowered<'db> {
@@ -50,6 +52,9 @@ pub struct Lowered<'db> {
     pub unsupported: Vec<&'static str>,
     /// The functions it calls.
     pub calls: Vec<InstanceKey<'db>>,
+    /// The types of the boxes it allocates, by type index, with their
+    /// descriptors.
+    pub types: Vec<(u32, TypeDescriptor)>,
 }
 
 /// The function an instance is loaded as.
@@ -74,6 +79,7 @@ pub fn lower_to_lir<'db>(db: &'db dyn Db, program: Program, mir: &MirBody<'db>) 
         current: (0, Vec::new()),
         unsupported: Vec::new(),
         calls: Vec::new(),
+        types: Vec::new(),
         tracked: Vec::new(),
         true_index: named("True").map_or(-1, type_index),
         false_index: named("False").map_or(-1, type_index),
@@ -127,6 +133,7 @@ pub fn lower_to_lir<'db>(db: &'db dyn Db, program: Program, mir: &MirBody<'db>) 
         },
         unsupported: l.unsupported,
         calls: l.calls,
+        types: l.types,
     }
 }
 
@@ -143,6 +150,8 @@ struct Lower<'a, 'db> {
     current: (usize, Vec<Inst>),
     unsupported: Vec<Unsupported>,
     calls: Vec<InstanceKey<'db>>,
+    /// The types it allocates, with their descriptors.
+    types: Vec<(u32, TypeDescriptor)>,
     tracked: Vec<VReg>,
     true_index: i64,
     false_index: i64,
@@ -276,8 +285,8 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let values = self.rvalue(*local, rvalue)?;
                 self.assign(*local, values)
             }
-            Statement::Retain(local) => self.count(*local, RuntimeFn::Retain),
-            Statement::Release(local) => self.count(*local, RuntimeFn::Release),
+            Statement::Retain(local) => self.count(*local, Self::retain),
+            Statement::Release(local) => self.count(*local, Self::release),
             Statement::Poll => {
                 self.push(Inst::Poll);
                 Ok(())
@@ -286,39 +295,97 @@ impl<'a, 'db> Lower<'a, 'db> {
     }
 
     /// Retains or releases the box a local holds, if it holds one.
-    fn count(&mut self, local: Local, func: RuntimeFn) -> Result<(), Unsupported> {
+    fn count(&mut self, local: Local, op: fn(&mut Self, VReg)) -> Result<(), Unsupported> {
         let regs = self.locals[local.index()].clone();
         match self.layouts[local.index()] {
             Some(Layout::Box) => {
-                self.push(Inst::CallRuntime {
-                    func,
-                    args: regs,
-                    dsts: Vec::new(),
-                });
+                op(self, regs[0]);
                 Ok(())
             }
             Some(Layout::Union) => {
-                let members = self.local_ty(local).members(self.db);
-                let mut boxed = Vec::new();
-                for m in members {
-                    if self.layout_of(m)? == Layout::Box {
-                        boxed.extend(subtypes(self.db, self.program, m));
-                    }
-                }
+                let boxed = boxed_indices(self.db, self.program, self.local_ty(local))
+                    .ok_or("values of this type")?;
+                let boxed: Vec<i64> = boxed.into_iter().map(i64::from).collect();
                 let (call, done) = (self.new_block(), self.new_block());
                 self.test_index(regs[0], &boxed, call, done);
                 self.current = (call.0 as usize, Vec::new());
-                self.push(Inst::CallRuntime {
-                    func,
-                    args: vec![regs[1]],
-                    dsts: Vec::new(),
-                });
+                op(self, regs[1]);
                 self.end(Term::Jump(done), Some(done));
                 Ok(())
             }
             Some(Layout::Pair) => Err("strings, bytes and closures"),
             _ => Ok(()),
         }
+    }
+
+    /// Adds a reference to a box, unless it is static (see `crag_abi`).
+    fn retain(&mut self, ptr: VReg) {
+        let (add, done) = (self.new_block(), self.new_block());
+        let counted = self.counted(ptr);
+        self.end(
+            Term::Branch {
+                cond: counted,
+                then: add,
+                otherwise: done,
+            },
+            Some(add),
+        );
+        let one = self.constant(1);
+        self.atomic_add(ptr, one);
+        self.end(Term::Jump(done), Some(done));
+    }
+
+    /// Gives up a reference to a box, unless it is static, and has the
+    /// runtime free it with the last.
+    fn release(&mut self, ptr: VReg) {
+        let (sub, free, done) = (self.new_block(), self.new_block(), self.new_block());
+        let counted = self.counted(ptr);
+        self.end(
+            Term::Branch {
+                cond: counted,
+                then: sub,
+                otherwise: done,
+            },
+            Some(sub),
+        );
+        let minus_one = self.constant(-1);
+        let before = self.atomic_add(ptr, minus_one);
+        let one = self.constant(1);
+        let last = self.cmp(Cond::Eq, before, one);
+        self.end(
+            Term::Branch {
+                cond: last,
+                then: free,
+                otherwise: done,
+            },
+            Some(free),
+        );
+        self.push(Inst::CallRuntime {
+            func: RuntimeFn::Release,
+            args: vec![ptr],
+            dsts: Vec::new(),
+        });
+        self.end(Term::Jump(done), Some(done));
+    }
+
+    /// Whether a box is counted: its count is not negative, which a static
+    /// box's is.
+    fn counted(&mut self, ptr: VReg) -> VReg {
+        let count = self.load(ptr, COUNT_OFFSET);
+        let zero = self.constant(0);
+        self.cmp(Cond::Ge, count, zero)
+    }
+
+    /// Adds `value` to a box's count atomically; the count before.
+    fn atomic_add(&mut self, ptr: VReg, value: VReg) -> VReg {
+        let dst = self.reg();
+        self.push(Inst::AtomicAdd {
+            dst,
+            addr: ptr,
+            offset: COUNT_OFFSET,
+            value,
+        });
+        dst
     }
 
     /// A new box of `size` bytes with a count of one and the type index in
@@ -465,6 +532,12 @@ impl<'a, 'db> Lower<'a, 'db> {
             Rvalue::Record { ty: record, fields } => {
                 let (slots, size) =
                     record_layout(self.db, self.program, *record).ok_or("records of this type")?;
+                let index = type_index(*record);
+                if !self.types.iter().any(|(i, _)| i64::from(*i) == index) {
+                    let descriptor = type_descriptor(self.db, self.program, *record)
+                        .ok_or("records holding strings, bytes or closures")?;
+                    self.types.push((index as u32, descriptor));
+                }
                 let mut values = Vec::new();
                 for (name, op) in fields {
                     let slot = slots
@@ -473,7 +546,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                         .ok_or("records of this type")?;
                     values.push((slot.offset, self.operand(op, slot.ty)?));
                 }
-                let ptr = self.alloc(size, type_index(*record));
+                let ptr = self.alloc(size, index);
                 for (offset, words) in values {
                     for (k, src) in words.into_iter().enumerate() {
                         self.push(Inst::Store {

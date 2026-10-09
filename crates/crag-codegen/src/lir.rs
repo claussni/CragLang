@@ -157,6 +157,14 @@ pub enum Inst {
         addr: VReg,
         offset: i32,
     },
+    /// Adds `value` to the word at `addr + offset` atomically, with
+    /// sequentially consistent ordering; `dst` becomes the word before.
+    AtomicAdd {
+        dst: VReg,
+        addr: VReg,
+        offset: i32,
+        value: VReg,
+    },
     /// Allocates `size` bytes on the side stack and puts their address in
     /// `dst`. The address stays valid when the machine stack moves. The
     /// function frees everything it pushed when it returns or tail-calls, so
@@ -281,6 +289,11 @@ impl LirFunction {
                     Inst::Store { src, addr, .. } => {
                         reg(src)?;
                         reg(addr)?;
+                    }
+                    Inst::AtomicAdd {
+                        dst, addr, value, ..
+                    } => {
+                        [dst, addr, value].into_iter().try_for_each(reg)?;
                     }
                     Inst::SidePush { dst, align, .. } => {
                         reg(dst)?;

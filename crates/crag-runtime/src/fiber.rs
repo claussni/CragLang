@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use crag_abi::{HEAP_OFFSET, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET, STACK_MARGIN};
 
 use crate::heap::Heap;
+use crate::rc::Types;
 use crate::side_stack::SideStack;
 use crate::stack::StackMemory;
 
@@ -266,6 +267,8 @@ pub struct Worker {
     queue: VecDeque<Box<Fiber>>,
     /// What the fibers this worker runs allocate from.
     heap: Heap,
+    /// The descriptors of the image's types, for freeing boxes.
+    types: Arc<Types>,
 }
 
 const _: () = assert!(offset_of!(Worker, sp) == 0);
@@ -282,7 +285,29 @@ impl Worker {
             sp: 0,
             queue: VecDeque::new(),
             heap: Heap::new(),
+            types: Arc::default(),
         }
+    }
+
+    /// Gives the worker the descriptors of the types of the image whose
+    /// code it runs. A worker without them cannot free a box.
+    pub fn set_types(&mut self, types: Arc<Types>) {
+        self.types = types;
+    }
+
+    /// The heap the fibers this worker runs allocate from.
+    pub fn heap(&mut self) -> &mut Heap {
+        &mut self.heap
+    }
+
+    /// The heap and the type descriptors.
+    ///
+    /// # Safety
+    ///
+    /// `worker` is live, and nothing else uses its heap meanwhile.
+    pub(crate) unsafe fn heap_and_types<'a>(worker: *mut Worker) -> (&'a mut Heap, &'a Types) {
+        // SAFETY: as the caller promises; the fields are disjoint.
+        unsafe { (&mut (*worker).heap, &*(*worker).types) }
     }
 
     /// Runs the fiber until it finishes or stops, and returns its new state:

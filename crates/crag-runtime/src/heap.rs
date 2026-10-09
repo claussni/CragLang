@@ -415,6 +415,18 @@ impl Heap {
     pub fn pages_in_use(&self) -> usize {
         self.classes.iter().map(Vec::len).sum()
     }
+
+    /// Blocks of the size classes allocated and not yet freed, counting
+    /// those other threads have freed as free.
+    pub fn live_blocks(&mut self) -> usize {
+        let mut live = 0;
+        for &page in self.classes.iter().flatten() {
+            collect(page);
+            // SAFETY: the page is in use by this heap.
+            live += unsafe { (*page).used };
+        }
+        live
+    }
 }
 
 impl Drop for Heap {

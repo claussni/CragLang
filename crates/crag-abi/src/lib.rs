@@ -155,23 +155,22 @@ pub enum RuntimeFn {
     /// type index in its header (Implementation Plan §11.4.11).
     Alloc = 3,
 
-    /// `rt_retain(ctx: *mut TaskContext, ptr: *mut u8)`: adds a reference to
-    /// a box (Implementation Plan §11.4.12).
-    Retain = 4,
-
-    /// `rt_release(ctx: *mut TaskContext, ptr: *mut u8)`: gives up a
-    /// reference to a box, releasing its fields and freeing it with the last.
-    Release = 5,
+    /// `rt_release(ctx: *mut TaskContext, ptr: *mut u8)`.
+    ///
+    /// Called when the inline decrement has taken a box's count from one to
+    /// zero: releases the box's fields, using its type's descriptor, and
+    /// frees it, and so on for every field whose count reaches zero
+    /// (Implementation Plan §11.4.12). Retaining is inline code only.
+    Release = 4,
 }
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 6] = [
+    pub const ALL: [RuntimeFn; 5] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
         RuntimeFn::Alloc,
-        RuntimeFn::Retain,
         RuntimeFn::Release,
     ];
 
@@ -182,7 +181,6 @@ impl RuntimeFn {
             RuntimeFn::SideGrow => "rt_side_grow",
             RuntimeFn::Trap => "rt_trap",
             RuntimeFn::Alloc => "rt_alloc",
-            RuntimeFn::Retain => "rt_retain",
             RuntimeFn::Release => "rt_release",
         }
     }
@@ -220,6 +218,39 @@ pub const COUNT_OFFSET: i32 = 0;
 
 /// Offset of the type index in a box, a word whose upper half is zero.
 pub const TYPE_INDEX_OFFSET: i32 = 8;
+
+// Reference counts are atomic, because boxes are shared across threads. A
+// count with its top bit set, [`STATIC_COUNT`], belongs to a value that is
+// never freed, such as a literal in the image, and is never changed.
+// Generated code counts inline:
+//
+// ```text
+// retain(p):  if p.count >= 0 { atomic p.count += 1 }
+// release(p): if p.count >= 0 and (atomic p.count -= 1) == 1 { rt_release(ctx, p) }
+// ```
+//
+// Comparisons are signed, and the decrement yields the count before it.
+
+/// The count of a static box, or any count with this bit set.
+pub const STATIC_COUNT: u64 = 1 << 63;
+
+/// What the runtime needs to know of a box's type to free it: the fields
+/// that hold counted references. Code generation describes each type it
+/// allocates, and the image indexes the descriptors by type index.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TypeDescriptor {
+    pub counted: Vec<CountedField>,
+}
+
+/// A field of a box that may hold a reference.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CountedField {
+    /// A box pointer at this offset.
+    Box(u32),
+    /// A union at this offset: its type index, then its payload, which is a
+    /// box pointer when the index is one of `boxed`, sorted.
+    Union { offset: u32, boxed: Vec<u32> },
+}
 
 /// Bytes of the largest block the heap allocates from pages of a size class.
 /// A larger box is a mapping of its own, allocated by `rt_alloc` alone.

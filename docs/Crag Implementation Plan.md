@@ -571,7 +571,7 @@ Code generation translates MIR into the facade's `LirFunction` and has Cranelift
 
 Each local becomes as many registers as its layout has words (Compiler Architecture §11). Numbers are words: narrow integers stay sign- or zero-extended to 64 bits, and a `Float` is a word holding its bits. A box is a pointer to a 16-byte header, the count and then the type index, followed by the fields: the parent's at their own offsets, then the type's own by name. A union is a type index and a payload word, or the index alone when every member is a tag, so a `Bool` is the index of `True` or `False`. A type index is the interned type's own index for now. A type test compares the index; a test for a record type finer than the static one reads the box's header and compares it with the indices of the program's record types that fit. Overflow tests use Cranelift's overflow flags for 64-bit types and a range check of the exact result for narrower ones.
 
-Boxes are allocated inline from the worker's heap (§11.4.11). They are retained and released, and checks trap, through calls of runtime functions that reference counting and the unwinder provide (§11.4.12, §11.4.14); the inline fast paths for counts arrive with them. The LIR gained what MIR needs: division, bit operations, shifts, unsigned and `Float` comparisons, `Float` arithmetic on the bits, overflow tests, selects, runtime calls and a trap terminator. What code generation does not handle yet, strings, bytes, collections, closures, module-level values and calls of the prelude's builtins, ends its block with a trap and is listed with the code. Stack maps cover the registers holding boxes; line tables wait for MIR to carry positions, and code objects go to the artifact store with the persisted store (§11.9.5). The crate is `crag-backend`.
+Boxes are allocated inline from the worker's heap (§11.4.11) and counted inline (§11.4.12); checks trap through a call of a runtime function the unwinder provides (§11.4.14). The LIR gained what MIR needs: division, bit operations, shifts, unsigned and `Float` comparisons, `Float` arithmetic on the bits, overflow tests, selects, runtime calls and a trap terminator. What code generation does not handle yet, strings, bytes, collections, closures, module-level values and calls of the prelude's builtins, ends its block with a trap and is listed with the code. Stack maps cover the registers holding boxes; line tables wait for MIR to carry positions, and code objects go to the artifact store with the persisted store (§11.9.5). The crate is `crag-backend`.
 
 **Functions**
 
@@ -602,17 +602,22 @@ Generated code allocates a box inline: it pops the free list of the heap's curre
 
 #### 11.4.12 Reference counting
 
-Crag frees memory by reference counting: every heap value has a count of references, and the value is released when it reaches zero. Values can be shared across threads, so counts change with atomic instructions. Static values, such as string literals, carry a flag and are never counted.
+Crag frees memory by reference counting: every box has a count of references, and the box is freed when it reaches zero. Values can be shared across threads, so counts change with atomic instructions. A static value, such as a literal in the image, has a count with its top bit set and is never counted.
+
+Generated code counts inline. A retain tests the count's sign and adds one atomically; a release tests the sign, subtracts one atomically, and calls `rt_release` when the count was one. For a union, both first test whether the index names a box. `rt_release` switches to the system stack and frees the box there, releasing its fields as the descriptor of its type lists them. A field whose count reaches zero goes on a list of boxes to free, linked through their dead count words, so freeing a long chain is a loop, needs no memory and cannot overflow a stack. The descriptors are data rather than generated drop glue: the runtime never calls back into Crag code (Compiler Architecture §2.1), and glue that runs Crag code at a drop comes with drop handlers and deferred teardown (Specification §13.5).
+
+Code generation describes each record type it allocates: the code of an instance lists the descriptors of the types it allocates, and the image indexes them by type index. A worker holds the image's descriptors. A record with a string, bytes or closure field is not allocated yet, because their references are not counted.
 
 **Data structures**
 
-- `Header` — the count (atomic integer) and a pointer to the value's type descriptor.
+- `TypeDescriptor` — in `crag-abi`: the fields of a box that hold references, each a box pointer or a union with the indices that carry a box.
+- `Types` — the image's descriptors, indexed by type index.
 
 **Functions**
 
-- `unsafe fn rc_inc(obj: *const Header)` and `unsafe fn rc_dec(obj: *const Header)` — inlined atomic add and subtract; `rc_dec` calls `rt_release` when the count reaches zero.
-- `unsafe extern "C" fn rt_release(obj: *mut Header, ty: &TypeDescriptor)` — runs the drop glue: releases the fields, then frees the memory.
-- `fn drop_glue(db: &dyn Db, ty: TypeId) -> InstanceKey` — generated per type: the code that releases each field.
+- `fn type_descriptor(db: &dyn Db, program: Program, ty: Ty) -> Option<TypeDescriptor>` — the counted fields of a record type.
+- `unsafe extern "C" fn rt_release(ctx: *const TaskContext, ptr: *mut u8)` — the inline release's miss: frees the box and what only it held.
+- `unsafe fn release_box(heap: &mut Heap, types: &Types, ptr: *mut u8)` — the loop `rt_release` runs.
 
 #### 11.4.13 Collection primitives
 

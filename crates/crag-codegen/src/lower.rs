@@ -25,8 +25,8 @@ use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::types::{F64, I64};
 use cranelift_codegen::ir::{
-    AbiParam, ExtFuncData, ExternalName, FuncRef, Function, InstBuilder, MemFlagsData, Signature,
-    TrapCode, UserExternalName, UserFuncName, Value,
+    AbiParam, AtomicRmwOp, ExtFuncData, ExternalName, FuncRef, Function, InstBuilder, MemFlagsData,
+    Signature, TrapCode, UserExternalName, UserFuncName, Value,
 };
 use cranelift_codegen::isa::{self, CallConv, OwnedTargetIsa, TargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
@@ -613,6 +613,22 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
                     let p = b.use_var(vars[addr.0 as usize]);
                     let v = b.use_var(vars[src.0 as usize]);
                     b.ins().store(MemFlagsData::trusted(), v, p, *offset);
+                }
+                Inst::AtomicAdd {
+                    dst,
+                    addr,
+                    offset,
+                    value,
+                } => {
+                    let mut p = b.use_var(vars[addr.0 as usize]);
+                    if *offset != 0 {
+                        p = b.ins().iadd_imm_s(p, i64::from(*offset));
+                    }
+                    let x = b.use_var(vars[value.0 as usize]);
+                    let old =
+                        b.ins()
+                            .atomic_rmw(I64, MemFlagsData::trusted(), AtomicRmwOp::Add, p, x);
+                    b.def_var(vars[dst.0 as usize], old);
                 }
                 Inst::SidePush { dst, size, align } => {
                     let p = emit_side_push(&mut b, &mut imports, ctx, *size, *align);
