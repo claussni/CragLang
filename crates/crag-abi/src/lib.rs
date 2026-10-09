@@ -92,6 +92,10 @@ pub const SIDE_PTR_OFFSET: i32 = 8;
 /// Offset of the end of the side stack's current chunk in the task context.
 pub const SIDE_END_OFFSET: i32 = 16;
 
+/// Offset of the worker's heap in the task context, which generated code
+/// allocates from inline (Implementation Plan §11.4.11).
+pub const HEAP_OFFSET: i32 = 24;
+
 /// The value the runtime stores in `stack_limit` to force the next check into
 /// the runtime (Plan §11.3.4). The check compares unsigned, so no stack
 /// pointer passes it.
@@ -217,6 +221,58 @@ pub const COUNT_OFFSET: i32 = 0;
 /// Offset of the type index in a box, a word whose upper half is zero.
 pub const TYPE_INDEX_OFFSET: i32 = 8;
 
+/// Bytes of the largest block the heap allocates from pages of a size class.
+/// A larger box is a mapping of its own, allocated by `rt_alloc` alone.
+pub const SMALL_SIZE_MAX: u32 = 8192;
+
+/// Number of size classes.
+pub const SIZE_CLASSES: usize = 36;
+
+/// The size class of a block of `size` bytes, if the heap has one: a class
+/// per word up to 64 bytes, then four per doubling up to
+/// [`SMALL_SIZE_MAX`]. Code generation and the heap must agree on it, so it
+/// is here.
+pub const fn size_class(size: u32) -> Option<u32> {
+    if size == 0 || size > SMALL_SIZE_MAX {
+        None
+    } else if size <= 64 {
+        Some(size.div_ceil(8) - 1)
+    } else {
+        let w = size - 1;
+        let top = 31 - w.leading_zeros();
+        Some(8 + (top - 6) * 4 + ((w >> (top - 2)) & 3))
+    }
+}
+
+/// The bytes of a block of `class`, the largest size in it.
+pub const fn class_size(class: u32) -> u32 {
+    if class < 8 {
+        (class + 1) * 8
+    } else {
+        let top = 6 + (class - 8) / 4;
+        (1 << top) + ((class - 8) % 4 + 1) * (1 << (top - 2))
+    }
+}
+
+// The heap: the page each size class currently allocates from, one word per
+// class from the heap's first byte. A class without free blocks has a page
+// whose free list is empty, never a null page, so the inline path needs one
+// test only:
+//
+// ```text
+// page = ctx.heap.pages[class]
+// block = page.free
+// if block == 0 { block = rt_alloc(ctx, size, type_index) }
+// else { page.free = block.next; page.used += 1; initialize the header }
+// ```
+
+/// Offset of the free list in a page: the first free block, whose first
+/// word links the next.
+pub const PAGE_FREE_OFFSET: i32 = 0;
+
+/// Offset of the count of a page's blocks in use.
+pub const PAGE_USED_OFFSET: i32 = 8;
+
 /// Another Crag function, as generated code refers to it. The loader resolves
 /// it to an address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -296,4 +352,26 @@ pub enum RelocTarget {
     Runtime(RuntimeFn),
     /// An offset into this code object's own `code`.
     Local(u32),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn size_classes_cover_each_size_with_the_smallest_class() {
+        assert_eq!(size_class(SMALL_SIZE_MAX), Some(SIZE_CLASSES as u32 - 1));
+        assert_eq!(class_size(SIZE_CLASSES as u32 - 1), SMALL_SIZE_MAX);
+        assert_eq!(size_class(0), None);
+        assert_eq!(size_class(SMALL_SIZE_MAX + 1), None);
+        for size in 1..=SMALL_SIZE_MAX {
+            let class = size_class(size).unwrap();
+            assert!(class_size(class) >= size, "{size}");
+            assert!(class == 0 || class_size(class - 1) < size, "{size}");
+        }
+        for class in 0..SIZE_CLASSES as u32 {
+            assert!(class_size(class).is_multiple_of(8));
+            assert_eq!(size_class(class_size(class)), Some(class));
+        }
+    }
 }

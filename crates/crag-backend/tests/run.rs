@@ -18,19 +18,22 @@
 //!
 //! The functions run on the test's own thread, entered through the entry
 //! stub with a task context whose stack limit is zero, so no stack check
-//! fails. The runtime functions later components provide are stubs here
-//! that count what they are asked to do.
+//! fails, and whose heap is the module's. The runtime functions later
+//! components provide are stubs here that count what they are asked to do,
+//! and `rt_alloc` is one too, because the runtime's switches to a worker's
+//! stack.
 
 use std::cell::Cell;
 use std::collections::HashMap;
 
-use crag_abi::{HEADER_SIZE, RuntimeFn};
+use crag_abi::{HEADER_SIZE, HEAP_OFFSET, RuntimeFn};
 use crag_backend::{code, type_index};
 use crag_codegen::{CodeObject, CodegenSettings, FuncId, OptLevel, compile_entry_stub, target_for};
 use crag_db::RootDatabase;
 use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, owners};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{InstanceKey, Tier};
+use crag_runtime::{Heap, alloc_box};
 use crag_types::{Ty, TyKind, prelude_item};
 
 const PRELUDE: &str = r#"pub type Int
@@ -62,37 +65,48 @@ pub fn lessThan(a: Float, b: Float) -> Bool
 "#;
 
 thread_local! {
-    static ALLOCATED: Cell<usize> = const { Cell::new(0) };
+    /// Calls of `rt_alloc`: boxes the inline path did not allocate.
+    static SLOW_ALLOCS: Cell<usize> = const { Cell::new(0) };
     static RELEASED: Cell<usize> = const { Cell::new(0) };
 }
 
-extern "C" fn rt_alloc(_ctx: *mut u8, size: u64, index: u64) -> *mut u64 {
-    ALLOCATED.set(ALLOCATED.get() + 1);
-    assert!(size >= u64::from(HEADER_SIZE) && size.is_multiple_of(8));
-    // Never freed: the tests only count.
-    let words = vec![0u64; size as usize / 8].leak();
-    words[0] = 1;
-    words[1] = index;
-    words.as_mut_ptr()
+/// The heap in a task context.
+///
+/// # Safety
+///
+/// `ctx` is a context `Module::call` made.
+unsafe fn heap_of<'a>(ctx: *mut u64) -> &'a mut Heap {
+    // SAFETY: as the caller promises.
+    unsafe { &mut *(*ctx.byte_offset(HEAP_OFFSET as isize) as *mut Heap) }
 }
 
-extern "C" fn rt_retain(_ctx: *mut u8, ptr: *mut u64) {
-    // SAFETY: generated code passes boxes from `rt_alloc`.
+extern "C" fn rt_alloc(ctx: *mut u64, size: u64, index: u64) -> *mut u8 {
+    SLOW_ALLOCS.set(SLOW_ALLOCS.get() + 1);
+    assert!(size >= u64::from(HEADER_SIZE) && size.is_multiple_of(8));
+    // SAFETY: generated code passes the context it received.
+    alloc_box(unsafe { heap_of(ctx) }, size as usize, index)
+}
+
+extern "C" fn rt_retain(_ctx: *mut u64, ptr: *mut u64) {
+    // SAFETY: generated code passes boxes it allocated.
     unsafe { *ptr += 1 }
 }
 
-extern "C" fn rt_release(_ctx: *mut u8, ptr: *mut u64) {
-    // SAFETY: as for `rt_retain`.
+/// Frees a box with the last reference. The tests' boxes hold no boxes, so
+/// there are no fields to release.
+extern "C" fn rt_release(ctx: *mut u64, ptr: *mut u64) {
+    // SAFETY: as for `rt_retain` and `rt_alloc`.
     unsafe {
         assert!(*ptr > 0, "released a dead box");
         *ptr -= 1;
         if *ptr == 0 {
             RELEASED.set(RELEASED.get() + 1);
+            heap_of(ctx).free(ptr.cast());
         }
     }
 }
 
-extern "C" fn rt_trap(_ctx: *mut u8, kind: u64) {
+extern "C" fn rt_trap(_ctx: *mut u64, kind: u64) {
     eprintln!("trap {kind}");
     std::process::abort();
 }
@@ -108,6 +122,7 @@ struct Module {
     arena: CodeArena,
     symbols: SymbolTable,
     settings: CodegenSettings,
+    heap: Box<Heap>,
 }
 
 impl Module {
@@ -185,6 +200,7 @@ impl Module {
             arena,
             symbols,
             settings,
+            heap: Box::new(Heap::new()),
         }
     }
 
@@ -194,11 +210,13 @@ impl Module {
         assert_eq!(args.len(), params as usize, "arguments of {name}");
         let stub = compile_entry_stub(params, returns, &self.settings).unwrap();
         let stub = load(&mut self.arena, &self.symbols, &stub).unwrap();
-        // The stack limit, then the side stack's pointer and end.
+        // The stack limit, the side stack's pointer and end, then the heap.
         let mut ctx = [0u64; 8];
+        ctx[HEAP_OFFSET as usize / 8] = &raw mut *self.heap as u64;
         let mut results = [0u64; 2];
         // SAFETY: the stub was compiled for this function's words, and the
         // context's zero limit lets every stack check pass on this thread.
+        // Generated code and the stubs use the heap only during the call.
         unsafe {
             let stub: Stub = std::mem::transmute(stub.as_ptr());
             stub(
@@ -372,11 +390,35 @@ fn run(x: Int) -> Int {
 }
 "#,
     );
-    ALLOCATED.set(0);
     RELEASED.set(0);
     assert_eq!(m.int("run", &[5]), 7 + 7 + 5 + 30);
     // Both boxes were freed, each exactly once.
-    assert_eq!((ALLOCATED.get(), RELEASED.get()), (2, 2));
+    assert_eq!(RELEASED.get(), 2);
+}
+
+#[test]
+fn boxes_come_from_the_free_list() {
+    let mut m = Module::new(
+        r#"type Point(x: Int, y: Int)
+
+fn total(n: Int) -> Int {
+  var sum = 0
+  for i in 1..n {
+    let p = Point(x: i, y: 1)
+    sum = sum + p.x + p.y
+  }
+  sum
+}
+"#,
+    );
+    SLOW_ALLOCS.set(0);
+    RELEASED.set(0);
+    assert_eq!(m.int("total", &[10_000]), 10_000 * 10_001 / 2 + 10_000);
+    // Each point is freed before the next is made, and the next takes its
+    // block from the free list inline. Only the first box, the range, finds
+    // the heap's page for its class empty.
+    assert_eq!((SLOW_ALLOCS.get(), RELEASED.get()), (1, 10_001));
+    assert_eq!(m.heap.pages_in_use(), 1);
 }
 
 #[test]

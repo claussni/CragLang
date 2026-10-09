@@ -571,7 +571,7 @@ Code generation translates MIR into the facade's `LirFunction` and has Cranelift
 
 Each local becomes as many registers as its layout has words (Compiler Architecture §11). Numbers are words: narrow integers stay sign- or zero-extended to 64 bits, and a `Float` is a word holding its bits. A box is a pointer to a 16-byte header, the count and then the type index, followed by the fields: the parent's at their own offsets, then the type's own by name. A union is a type index and a payload word, or the index alone when every member is a tag, so a `Bool` is the index of `True` or `False`. A type index is the interned type's own index for now. A type test compares the index; a test for a record type finer than the static one reads the box's header and compares it with the indices of the program's record types that fit. Overflow tests use Cranelift's overflow flags for 64-bit types and a range check of the exact result for narrower ones.
 
-Boxes are allocated, retained and released, and checks trap, through calls of runtime functions that the allocator, reference counting and the unwinder provide (§11.4.11, §11.4.12, §11.4.14); the inline fast paths arrive with them. The LIR gained what MIR needs: division, bit operations, shifts, unsigned and `Float` comparisons, `Float` arithmetic on the bits, overflow tests, selects, runtime calls and a trap terminator. What code generation does not handle yet, strings, bytes, collections, closures, module-level values and calls of the prelude's builtins, ends its block with a trap and is listed with the code. Stack maps cover the registers holding boxes; line tables wait for MIR to carry positions, and code objects go to the artifact store with the persisted store (§11.9.5). The crate is `crag-backend`.
+Boxes are allocated inline from the worker's heap (§11.4.11). They are retained and released, and checks trap, through calls of runtime functions that reference counting and the unwinder provide (§11.4.12, §11.4.14); the inline fast paths for counts arrive with them. The LIR gained what MIR needs: division, bit operations, shifts, unsigned and `Float` comparisons, `Float` arithmetic on the bits, overflow tests, selects, runtime calls and a trap terminator. What code generation does not handle yet, strings, bytes, collections, closures, module-level values and calls of the prelude's builtins, ends its block with a trap and is listed with the code. Stack maps cover the registers holding boxes; line tables wait for MIR to carry positions, and code objects go to the artifact store with the persisted store (§11.9.5). The crate is `crag-backend`.
 
 **Functions**
 
@@ -583,17 +583,22 @@ Boxes are allocated, retained and released, and checks trap, through calls of ru
 
 Crag allocates many small, short-lived objects, often freed by a different thread than the one that allocated them. The allocator follows [mimalloc](https://github.com/microsoft/mimalloc): memory is split into pages of one size class each, every page has its own free lists, and frees from other threads go to a separate list that the owner collects later, so the common paths need no locks.
 
+Segments are 4 MiB, aligned to their size, and split into pages of 64 KiB; the segment's first bytes describe its pages. There is a size class per word up to 64 bytes and four per doubling up to 8 KiB; `crag-abi` defines them, because generated code picks the class of a box at compile time. A box above 8 KiB gets a segment of its own, which its free unmaps. A page carves its free blocks from its unused end a few at a time, a page whose blocks are all freed goes back to its segment, and a segment without pages in use is unmapped unless it is the heap's last. Each worker owns a heap, and the task context points to it.
+
+Generated code allocates a box inline: it pops the free list of the heap's current page for the class, counts the block as used and writes the header. The class of a heap without a free block has a shared empty page, so the inline path tests only the block it popped, and calls `rt_alloc` when it is null. `rt_alloc` switches to the system stack and runs the slow path there. A heap that is dropped unmaps the segments without live blocks and abandons the others; adopting abandoned segments comes with the scheduler (§11.7.1), and so does a cheaper search for a page with room than the walk over the class's pages done now.
+
 **Data structures**
 
-- `Heap` — per worker: for each size class, the page currently allocated from.
-- `Page` — one size class; a local free list, a thread-free list (atomic) and a count of used blocks.
+- `Heap` — per worker: for each size class, the page currently allocated from, and the pages in use.
+- `Page` — one size class; a local free list, a thread-free list (atomic), a count of used blocks and the owning heap's id.
 - `Segment` — a large aligned region holding pages, so a block's page is found by masking its address.
 
 **Functions**
 
-- `fn alloc(heap: &mut Heap, size: usize) -> *mut u8` — inlined fast path: pop from the current page's free list.
-- `fn alloc_slow(heap: &mut Heap, class: SizeClass) -> *mut u8` — collect the thread-free list, find or create a page.
-- `unsafe fn free(ptr: *mut u8)` — push to the local free list, or to the thread-free list if another thread owns the page.
+- `fn Heap::alloc(&mut self, size: usize) -> *mut u8` — the fast path that generated code also inlines: pop from the current page's free list.
+- `fn Heap::alloc_slow(&mut self, class: usize) -> *mut u8` — collect the thread-free list, find or create a page.
+- `unsafe fn Heap::free(&mut self, ptr: *mut u8)` — push to the local free list if this heap owns the page, else to the thread-free list.
+- `unsafe extern "C" fn rt_alloc(ctx: *const TaskContext, size: u64, type_index: u64) -> *mut u8` — the inline path's miss: a box with its header.
 
 #### 11.4.12 Reference counting
 

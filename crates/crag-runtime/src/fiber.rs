@@ -28,15 +28,16 @@ use std::mem::offset_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-use crag_abi::{SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET, STACK_MARGIN};
+use crag_abi::{HEAP_OFFSET, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET, STACK_MARGIN};
 
+use crate::heap::Heap;
 use crate::side_stack::SideStack;
 use crate::stack::StackMemory;
 
 /// The per-task record generated code receives as its implicit first
-/// argument (Compiler Architecture §10). Generated code reads only
-/// `stack_limit`; the assembly routines of this crate use the other fields
-/// by offset.
+/// argument (Compiler Architecture §10). Generated code reads
+/// `stack_limit`, the side-stack fields and `heap`; the assembly routines
+/// of this crate use the other fields by offset.
 ///
 /// The fields are atomics because another thread may request a stop, and
 /// because the record is shared between the fiber and its stop handles.
@@ -49,6 +50,9 @@ pub struct TaskContext {
     pub(crate) side_ptr: AtomicUsize,
     /// The end of the side stack's current chunk.
     pub(crate) side_end: AtomicUsize,
+    /// The heap of the worker running the fiber, which generated code
+    /// allocates from.
+    pub(crate) heap: AtomicPtr<Heap>,
     /// The worker running the fiber. The assembly routines find the system
     /// stack through it.
     pub(crate) worker: AtomicPtr<Worker>,
@@ -65,6 +69,7 @@ pub struct TaskContext {
 const _: () = assert!(offset_of!(TaskContext, stack_limit) == STACK_LIMIT_OFFSET as usize);
 const _: () = assert!(offset_of!(TaskContext, side_ptr) == SIDE_PTR_OFFSET as usize);
 const _: () = assert!(offset_of!(TaskContext, side_end) == SIDE_END_OFFSET as usize);
+const _: () = assert!(offset_of!(TaskContext, heap) == HEAP_OFFSET as usize);
 
 pub(crate) const STATUS_FINISHED: usize = 1;
 
@@ -169,6 +174,7 @@ impl Fiber {
             // so a fiber that never pushes allocates nothing.
             side_ptr: AtomicUsize::new(0),
             side_end: AtomicUsize::new(0),
+            heap: AtomicPtr::new(std::ptr::null_mut()),
             worker: AtomicPtr::new(std::ptr::null_mut()),
             saved_sp: AtomicUsize::new(0),
             status: AtomicUsize::new(0),
@@ -258,6 +264,8 @@ pub struct Worker {
     /// load it to switch back, so it must stay the first field.
     sp: usize,
     queue: VecDeque<Box<Fiber>>,
+    /// What the fibers this worker runs allocate from.
+    heap: Heap,
 }
 
 const _: () = assert!(offset_of!(Worker, sp) == 0);
@@ -273,6 +281,7 @@ impl Worker {
         Worker {
             sp: 0,
             queue: VecDeque::new(),
+            heap: Heap::new(),
         }
     }
 
@@ -298,6 +307,9 @@ impl Worker {
             let ctx = Arc::as_ptr(&(*fiber).ctx);
             (*ctx).fiber.store(fiber, Ordering::Relaxed);
             (*ctx).worker.store(worker, Ordering::Relaxed);
+            (*ctx)
+                .heap
+                .store(&raw mut (*worker).heap, Ordering::Relaxed);
             (*fiber).state = FiberState::Running;
 
             switch(
@@ -306,6 +318,7 @@ impl Worker {
             );
 
             (*ctx).worker.store(std::ptr::null_mut(), Ordering::Relaxed);
+            (*ctx).heap.store(std::ptr::null_mut(), Ordering::Relaxed);
             (*ctx).fiber.store(std::ptr::null_mut(), Ordering::Relaxed);
             if (*ctx).status.load(Ordering::Relaxed) == STATUS_FINISHED {
                 (*fiber).state = FiberState::Finished;

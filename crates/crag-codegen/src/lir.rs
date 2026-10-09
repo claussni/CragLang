@@ -141,6 +141,10 @@ pub enum Inst {
         args: Vec<VReg>,
         dsts: Vec<VReg>,
     },
+    /// `dst` becomes the address of the task context.
+    Context {
+        dst: VReg,
+    },
     /// Reads the word at `addr + offset`.
     Load {
         dst: VReg,
@@ -243,7 +247,7 @@ impl LirFunction {
         for b in &self.blocks {
             for inst in &b.insts {
                 match inst {
-                    Inst::Const { dst, .. } => reg(dst)?,
+                    Inst::Const { dst, .. } | Inst::Context { dst } => reg(dst)?,
                     Inst::Move { dst, src } => {
                         reg(dst)?;
                         reg(src)?;

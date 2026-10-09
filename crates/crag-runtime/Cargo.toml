@@ -1,6 +1,6 @@
 [package]
 name = "crag-runtime"
-description = "Crag runtime: fibers, growable stacks, side stack"
+description = "Crag runtime: fibers, growable stacks, side stack, allocator"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -18,7 +18,7 @@
 //!
 //! M0 scope (Implementation Plan §11.3.1 to §11.3.4 and §11.3.9): fibers and
 //! the context switch, stack growth by copying, the side stack, the sentinel
-//! stop request and the stress harness.
+//! stop request and the stress harness. M1 adds the allocator (§11.4.11).
 //!
 //! Runtime discipline (Compiler Architecture §2.1): no thread-locals, no
 //! callbacks into Crag code from the runtime stack, panics abort in images
@@ -37,24 +37,27 @@
 compile_error!("the runtime's context switch is written for x86-64 Unix only");
 
 pub mod fiber;
+pub mod heap;
 pub mod sentinel;
 pub mod side_stack;
 pub mod stack;
 pub mod stress;
 
 pub use fiber::{Fiber, FiberConfig, FiberState, TaskContext, Worker};
+pub use heap::{Heap, alloc_box};
 pub use sentinel::{StopHandle, StopReason, request_stop};
 
 use crag_abi::RuntimeFn;
 
 /// The address of a runtime function, for the loader's symbol table; none
-/// for the functions later components add: traps, allocation and reference
-/// counts (Implementation Plan §11.4.11, §11.4.12, §11.4.14).
+/// for the functions later components add: traps and reference counts
+/// (Implementation Plan §11.4.12, §11.4.14).
 pub fn runtime_fn_addr(func: RuntimeFn) -> Option<usize> {
     match func {
         RuntimeFn::Morestack => Some(stack::rt_morestack as *const () as usize),
         RuntimeFn::SideGrow => Some(side_stack::rt_side_grow as *const () as usize),
-        RuntimeFn::Trap | RuntimeFn::Alloc | RuntimeFn::Retain | RuntimeFn::Release => None,
+        RuntimeFn::Alloc => Some(heap::rt_alloc as *const () as usize),
+        RuntimeFn::Trap | RuntimeFn::Retain | RuntimeFn::Release => None,
     }
 }
 

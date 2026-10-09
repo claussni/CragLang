@@ -25,7 +25,10 @@
 //! What code generation does not handle yet, such as strings and
 //! collections, ends its block with a trap and is listed.
 
-use crag_abi::{TYPE_INDEX_OFFSET, TrapKind as AbiTrap};
+use crag_abi::{
+    COUNT_OFFSET, HEAP_OFFSET, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, TYPE_INDEX_OFFSET,
+    TrapKind as AbiTrap, size_class,
+};
 use crag_codegen::{
     BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, Cond, FuncId, Inst, LirFunction,
     OverflowOp, RuntimeFn, Term, VReg,
@@ -318,6 +321,79 @@ impl<'a, 'db> Lower<'a, 'db> {
         }
     }
 
+    /// A new box of `size` bytes with a count of one and the type index in
+    /// its header: popped inline from the free list of the heap's current
+    /// page of its size class, or from `rt_alloc` when that list is empty
+    /// or the box is too large for a class (see `crag_abi`).
+    fn alloc(&mut self, size: u32, index: i64) -> VReg {
+        let ptr = self.reg();
+        let size_reg = self.constant(i64::from(size));
+        let index = self.constant(index);
+        let call = |this: &mut Self| {
+            this.push(Inst::CallRuntime {
+                func: RuntimeFn::Alloc,
+                args: vec![size_reg, index],
+                dsts: vec![ptr],
+            })
+        };
+        let Some(class) = size_class(size) else {
+            call(self);
+            return ptr;
+        };
+        let ctx = self.reg();
+        self.push(Inst::Context { dst: ctx });
+        let heap = self.load(ctx, HEAP_OFFSET);
+        let page = self.load(heap, 8 * class as i32);
+        let block = self.load(page, PAGE_FREE_OFFSET);
+        let (fast, slow, done) = (self.new_block(), self.new_block(), self.new_block());
+        self.end(
+            Term::Branch {
+                cond: block,
+                then: fast,
+                otherwise: slow,
+            },
+            Some(fast),
+        );
+        let next = self.load(block, 0);
+        self.push(Inst::Store {
+            src: next,
+            addr: page,
+            offset: PAGE_FREE_OFFSET,
+        });
+        let used = self.load(page, PAGE_USED_OFFSET);
+        let one = self.constant(1);
+        let used = self.bin(LirBin::Add, used, one);
+        self.push(Inst::Store {
+            src: used,
+            addr: page,
+            offset: PAGE_USED_OFFSET,
+        });
+        self.push(Inst::Store {
+            src: one,
+            addr: block,
+            offset: COUNT_OFFSET,
+        });
+        self.push(Inst::Store {
+            src: index,
+            addr: block,
+            offset: TYPE_INDEX_OFFSET,
+        });
+        self.push(Inst::Move {
+            dst: ptr,
+            src: block,
+        });
+        self.end(Term::Jump(done), Some(slow));
+        call(self);
+        self.end(Term::Jump(done), Some(done));
+        ptr
+    }
+
+    fn load(&mut self, addr: VReg, offset: i32) -> VReg {
+        let dst = self.reg();
+        self.push(Inst::Load { dst, addr, offset });
+        dst
+    }
+
     /// Ends the block with a test whether an index is one of `indices`.
     fn test_index(&mut self, index: VReg, indices: &[i64], hit: LirBlockId, miss: LirBlockId) {
         for (k, &i) in indices.iter().enumerate() {
@@ -397,14 +473,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                         .ok_or("records of this type")?;
                     values.push((slot.offset, self.operand(op, slot.ty)?));
                 }
-                let size = self.constant(i64::from(size));
-                let index = self.constant(type_index(*record));
-                let ptr = self.reg();
-                self.push(Inst::CallRuntime {
-                    func: RuntimeFn::Alloc,
-                    args: vec![size, index],
-                    dsts: vec![ptr],
-                });
+                let ptr = self.alloc(size, type_index(*record));
                 for (offset, words) in values {
                     for (k, src) in words.into_iter().enumerate() {
                         self.push(Inst::Store {
@@ -454,15 +523,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                         .ok_or("records of this type")?;
                     let ptr = word(&values)?;
                     values = (0..slot.layout.words())
-                        .map(|k| {
-                            let dst = self.reg();
-                            self.push(Inst::Load {
-                                dst,
-                                addr: ptr,
-                                offset: (slot.offset + 8 * k as u32) as i32,
-                            });
-                            dst
-                        })
+                        .map(|k| self.load(ptr, (slot.offset + 8 * k as u32) as i32))
                         .collect();
                     ty = slot.ty;
                 }
@@ -763,12 +824,7 @@ impl<'a, 'db> Lower<'a, 'db> {
     /// Ends the block with a test whether the box is of a type that fits
     /// `ty`; the following code goes to `miss`.
     fn test_header(&mut self, ptr: VReg, ty: Ty<'db>, hit: LirBlockId, miss: LirBlockId) {
-        let index = self.reg();
-        self.push(Inst::Load {
-            dst: index,
-            addr: ptr,
-            offset: TYPE_INDEX_OFFSET,
-        });
+        let index = self.load(ptr, TYPE_INDEX_OFFSET);
         let indices = subtypes(self.db, self.program, ty);
         self.test_index(index, &indices, hit, miss);
         self.current = (miss.0 as usize, Vec::new());

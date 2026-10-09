@@ -603,6 +603,7 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
                         b.def_var(vars[dst.0 as usize], v);
                     }
                 }
+                Inst::Context { dst } => b.def_var(vars[dst.0 as usize], ctx),
                 Inst::Load { dst, addr, offset } => {
                     let p = b.use_var(vars[addr.0 as usize]);
                     let v = b.ins().load(I64, MemFlagsData::trusted(), p, *offset);
