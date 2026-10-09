@@ -710,17 +710,25 @@ A narrowed type is never a union of types finer than the members of the binding'
 
 A function's error union is inferred from the errors its body produces and the errors of the functions it calls. Mutually recursive functions depend on each other, so the compiler finds groups of them as strongly connected components with [Tarjan's algorithm](https://en.wikipedia.org/wiki/Tarjan%27s_strongly_connected_components_algorithm), and solves each group by starting from empty unions and repeating until nothing grows. Because unions only grow and the set of declared error types is finite, this always ends.
 
+An error type is one that fits the prelude's `distinct type Error`. A function's own frame is open when its written type names no error: the values its body gives, by its last expression, `return` and `pass`, are split into their error members, which are collected, and the rest, which must fit the written type. Its result is the written type joined with the collected errors. A written type that names an error is the whole result, checked as written. Closures and local functions check their values as written. A function without a written type has the type its body gives, errors included.
+
+The graph is that of the functions each body names, in calls, as values and as the candidates of method calls and fields, every overload included, because inference compares them all (§3.13.1); it needs no inference, so finding a group never depends on the group's types. While a group is solved, each member's body is inferred with the errors found so far, and a call of a member gives its written success type and those errors. A member of a recursive group without a written success type gives none, which the call reports. Calls outside the group read `result_type`, which takes a group's errors from its solution.
+
+`pass` as the body of a `case` arm gives the values no earlier arm handled, those the arm matches, to the caller as `return` does (§8.2); MIR converts the subject to them and returns it. `pass` anywhere else is an error. The `check` prefix `?` does not propagate: it replaces the error members with `Empty` (§8.4), and comes with generic functions (§11.5.3).
+
 **Data structures**
 
-- `CallGraph` — for each function, the functions its resolved calls reach (`callees(fn)`).
-- `SccSummary` — per group: each member's error union, effects and parameter escape levels.
+- `callees(fn)` — for each function, the functions its body names.
+- `Group` — the members of a function's component, in a fixed order, and whether they depend on themselves.
 
 **Functions**
 
-- `fn callees(db: &dyn Db, function: FunctionId) -> Arc<[FunctionId]>` — a query over `body_types`.
-- `fn scc_of(db: &dyn Db, function: FunctionId) -> SccId` — Tarjan's algorithm over `callees`.
-- `fn scc_summary(db: &dyn Db, scc: SccId) -> Arc<SccSummary>` — the fixpoint loop for errors, effects and escape together.
-- `fn propagate_pass(cx: &mut InferCtx, case: ExprId, unhandled: TypeId)` — a `pass` arm adds the alternatives its `case` has not handled so far to the enclosing function's inferred return type (§8.2). The `check` prefix `?` does not propagate: it replaces the error members with `Empty` (§8.4).
+- `fn callees(db: &dyn Db, program: Program, function: ItemId) -> &Vec<ItemId>` — a query over the HIR body.
+- `fn group_of(db: &dyn Db, program: Program, function: ItemId) -> &Group` — Tarjan's algorithm over `callees`, from the function to its component.
+- `fn group_errors(db: &dyn Db, program: Program, root: ItemId) -> &Vec<(ItemId, Ty)>` — the fixpoint loop for the group whose first member is `root`; effects (§11.5.7) and escape levels (§11.5.8) will join it.
+- `fn result_type(db: &dyn Db, program: Program, function: ItemId) -> Option<Ty>` — what a call gives: the written success type and the group's errors, or the inferred type.
+- `fn infer_in_group(db, program, owner, group: &[(ItemId, Ty)]) -> InferenceResult` — inference with the errors of the group so far.
+- `fn error_members` and `fn success_members` — the two parts of a union.
 
 #### 11.5.3 Generics and forms
 

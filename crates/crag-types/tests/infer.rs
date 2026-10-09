@@ -44,6 +44,7 @@ pub type Greater
 pub type Ordering = Less | Equal | Greater
 pub type Range[T](first: T, last: T)
 pub type RangeFrom[T](first: T)
+pub distinct type Error
 pub fn add(a: Int, b: Int) -> Int
 pub fn add(a: Int8, b: Int8) -> Int8
 pub fn add(a: Float, b: Float) -> Float
@@ -899,6 +900,83 @@ fn f(x: Int | NotFound) {
         [
             "`x is Str`: a Str pattern never matches a Int | NotFound",
             "`Str`: a Str pattern never matches a Int | NotFound",
+        ]
+    );
+}
+
+#[test]
+fn errors_are_inferred_over_recursive_groups() {
+    let text = "type NotFound(..Error)
+type Expired(..Error)
+type Session(user: Str)
+fn session(id: Int) -> Session {
+  if id == 0 { return NotFound() }
+  if id == 1 { Expired() } else { Session(user: \"ada\") }
+}
+fn greet(id: Int) -> Str {
+  case session(id) {
+    Session -> \"hello\"
+    Expired -> \"log in again\"
+    pass
+  }
+}
+fn count(n: Int) -> Int {
+  if n == 0 { return NotFound() }
+  down(n)
+}
+fn down(n: Int) -> Int {
+  if n == 1 { return Expired() }
+  count(n - 1)
+}
+fn deep(n: Int) -> Int {
+  if n == 0 { return Expired() }
+  case deep(n - 1) {
+    k: Int -> k + 1
+    pass
+  }
+}
+fn plain(id: Int) {
+  let s = session(id)
+  let c = count(id)
+  let d = deep(id)
+  session(id)
+}";
+    assert_eq!(
+        ok(text),
+        [
+            "id: Int, -> Expired | NotFound | Session",
+            "id: Int, -> NotFound | Str",
+            "n: Int, -> Expired | Int | NotFound",
+            "n: Int, -> Expired | Int | NotFound",
+            "n: Int, k: Int, -> Expired | Int",
+            "id: Int, s: Expired | NotFound | Session, c: Expired | Int | NotFound, \
+             d: Expired | Int, -> Expired | NotFound | Session",
+        ]
+    );
+    let text = "type NotFound(..Error)
+type Expired(..Error)
+type Bad
+fn session(id: Int) -> Int {
+  if id == 0 { return NotFound() }
+  if id == 1 { return Bad }
+  Expired()
+}
+fn closed(id: Int) -> Int | NotFound {
+  session(id)
+}
+fn stray(id: Int) -> Int {
+  let x = case id {
+    0 -> 1
+    _ -> { pass }
+  }
+  x
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`Bad`: expected Int, found Bad",
+            "`{\n  session(id)\n}`: expected Int | NotFound, found Expired | Int | NotFound",
+            "`pass`: `pass` stands only as the body of a `case` arm",
         ]
     );
 }

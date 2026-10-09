@@ -1465,11 +1465,23 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         self.trap(TrapKind::NoMatch, Some(expr));
         let join = self.new_block();
         for (arm, block) in arms.iter().zip(m.arms) {
-            if let Some(block) = block {
-                self.switch_to(block);
-                self.eval(arm.body, dest);
-                self.join(dest, join);
+            let Some(block) = block else {
+                continue;
+            };
+            self.switch_to(block);
+            if let Expr::Pass = self.body.expr(arm.body) {
+                // The values no earlier arm handled go to the caller
+                // (§8.2).
+                let passed = self.ty(arm.body);
+                let op = match self.converts(ty, passed) {
+                    true => self.assign(passed, Rvalue::Convert(Operand::Local(local))),
+                    false => Operand::Local(local),
+                };
+                self.finish_dest(op, passed, Dest::Return);
+                continue;
             }
+            self.eval(arm.body, dest);
+            self.join(dest, join);
         }
         self.switch_to(join);
     }

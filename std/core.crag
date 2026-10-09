@@ -48,6 +48,9 @@ pub type Equal
 pub type Greater
 pub type Ordering = Less | Equal | Greater
 
+// The parent of every error type (§8.1).
+pub distinct type Error
+
 pub type Range[T](first: T, last: T)
 pub type RangeFrom[T](first: T)
 

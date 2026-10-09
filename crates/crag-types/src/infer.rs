@@ -36,9 +36,9 @@ use crag_hir::{
 
 use crate::case::{Checker, PatternMatrix};
 use crate::def::{
-    HeaderKind, TypeLowerer, alias_target, prelude_item, signature, success_type, type_header,
-    value_type,
+    HeaderKind, TypeLowerer, alias_target, prelude_item, signature, type_header, value_type,
 };
+use crate::group::{error_type, result_type};
 use crate::relate::{declared_fields, fields_of, is_subtype, join, normalize};
 use crate::result::{Callee, ErrorKind, InferenceResult, Site, TypeError};
 use crate::ty::{Builtin, Ty, TyKind};
@@ -46,6 +46,18 @@ use crate::ty::{Builtin, Ty, TyKind};
 /// The types of one body. Runs apart from `body_types` for the queries
 /// that ask for a success type or a value's type.
 pub fn infer<'db>(db: &'db dyn Db, program: Program, owner: Owner<'db>) -> InferenceResult<'db> {
+    infer_in_group(db, program, owner, &[])
+}
+
+/// The types of one body while the errors of its group are solved: a call
+/// of a member of `group` gives its written success type and the errors
+/// found so far (§11.5.2).
+pub fn infer_in_group<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    owner: Owner<'db>,
+    group: &[(ItemId<'db>, Ty<'db>)],
+) -> InferenceResult<'db> {
     let body = hir_body(db, program, owner);
     let generic_owner = match owner {
         Owner::Item(item) => Some(item),
@@ -69,6 +81,8 @@ pub fn infer<'db>(db: &'db dyn Db, program: Program, owner: Owner<'db>) -> Infer
         range: prelude_item(db, program, "Range").map(|e| type_identity(db, program, e)),
         range_from: prelude_item(db, program, "RangeFrom").map(|e| type_identity(db, program, e)),
         module: owner.module(db),
+        group,
+        error: error_type(db, program),
     };
     let result = match owner {
         Owner::Item(item) => match *item.kind(db) {
@@ -139,6 +153,11 @@ struct Infer<'a, 'db> {
     range_from: Option<ItemId<'db>>,
     /// The module of the body, whose scope says which types are discrete.
     module: ModuleId,
+    /// While a group's errors are solved, the errors of its members so
+    /// far.
+    group: &'a [(ItemId<'db>, Ty<'db>)],
+    /// The prelude's `Error` (§8.1).
+    error: Option<Ty<'db>>,
 }
 
 /// The narrowed type of each binding at a point of the body, by binding.
@@ -149,6 +168,11 @@ struct Frame<'db> {
     expected: Option<Ty<'db>>,
     /// Without one, the types the `return`s give.
     returned: Vec<Ty<'db>>,
+    /// Whether the errors are left to inference: a function's own frame
+    /// whose written type names no error (§8.1).
+    open: bool,
+    /// In an open frame, the errors the body gives.
+    errors: Vec<Ty<'db>>,
 }
 
 /// An argument of a call being resolved: typed, or waiting for the
@@ -233,28 +257,105 @@ impl<'a, 'db> Infer<'a, 'db> {
         let Some(root) = body.root else {
             return expected;
         };
-        Some(self.frame(expected, root))
+        let open = expected.is_some_and(|e| self.errors_of(e).is_never(self.db));
+        Some(self.frame(expected, root, open))
     }
 
     /// Checks a function or closure body against its written result type,
-    /// or infers it from the body and its `return`s.
-    fn frame(&mut self, expected: Option<Ty<'db>>, root: ExprId) -> Ty<'db> {
+    /// or infers it from the body and its `return`s. An open frame adds
+    /// the errors the body gives to its written type.
+    fn frame(&mut self, expected: Option<Ty<'db>>, root: ExprId, open: bool) -> Ty<'db> {
         self.frames.push(Frame {
             expected,
             returned: Vec::new(),
+            open,
+            errors: Vec::new(),
         });
-        let ty = match expected {
-            Some(expected) => self.check(root, expected),
-            None => self.synth(root),
-        };
+        let ty = self.infer(root, expected);
+        self.result_value(Site::Expr(root), ty);
         let frame = self.frames.pop().expect("pushed above");
         match expected {
-            Some(expected) => expected,
-            None => {
-                let mut types = frame.returned;
-                types.push(ty);
+            Some(expected) => {
+                let mut types = frame.errors;
+                types.push(expected);
                 self.join_all(types)
             }
+            None => self.join_all(frame.returned),
+        }
+    }
+
+    /// A value the innermost frame gives, by its last expression, a
+    /// `return` or a `pass`: checked against the written type, where an
+    /// open frame takes the errors apart.
+    fn result_value(&mut self, site: Site, ty: Ty<'db>) {
+        let Some(frame) = self.frames.last() else {
+            return;
+        };
+        let Some(expected) = frame.expected else {
+            self.frames.last_mut().expect("checked").returned.push(ty);
+            return;
+        };
+        if !frame.open || self.fits(ty, expected) {
+            self.expect(site, ty, expected);
+            return;
+        }
+        let errors = self.errors_of(ty);
+        let rest = self.successes_of(ty);
+        if self.fits(rest, expected) {
+            self.frames.last_mut().expect("checked").errors.push(errors);
+        } else {
+            self.error(
+                site,
+                ErrorKind::Mismatch {
+                    expected,
+                    found: ty,
+                },
+            );
+        }
+    }
+
+    /// The members of `ty` that are errors.
+    fn errors_of(&self, ty: Ty<'db>) -> Ty<'db> {
+        let Some(error) = self.error else {
+            return Ty::never(self.db);
+        };
+        let members = ty
+            .members(self.db)
+            .into_iter()
+            .filter(|&m| !m.is_error(self.db) && self.fits(m, error))
+            .collect();
+        self.join_all(members)
+    }
+
+    /// The members of `ty` that are not errors.
+    fn successes_of(&self, ty: Ty<'db>) -> Ty<'db> {
+        let Some(error) = self.error else {
+            return ty;
+        };
+        let members = ty
+            .members(self.db)
+            .into_iter()
+            .filter(|&m| m.is_error(self.db) || !self.fits(m, error))
+            .collect();
+        self.join_all(members)
+    }
+
+    /// What a call of `function` gives, or none for a recursive function
+    /// without a written success type.
+    fn result_of(&self, function: ItemId<'db>) -> Option<Ty<'db>> {
+        if let Some(&(_, errors)) = self.group.iter().find(|(m, _)| *m == function) {
+            let success = signature(self.db, self.program, function).result?;
+            return Some(self.join(success, errors));
+        }
+        result_type(self.db, self.program, function)
+    }
+
+    /// The success type of `function`, which a type-qualified call and
+    /// the return-type filter compare (§5.6.1).
+    fn success_of(&self, function: ItemId<'db>) -> Option<Ty<'db>> {
+        match signature(self.db, self.program, function).result {
+            Some(success) => Some(success),
+            None => self.result_of(function).map(|r| self.successes_of(r)),
         }
     }
 
@@ -505,7 +606,7 @@ impl<'a, 'db> Infer<'a, 'db> {
             }
             Expr::Case { subject, arms } => self.case(*subject, arms, expected),
             Expr::Pass => {
-                self.error(Site::Expr(id), ErrorKind::Unsupported("`pass` arms"));
+                self.error(Site::Expr(id), ErrorKind::PassOutsideCase);
                 self.err_ty()
             }
             Expr::Atomic(inner) => {
@@ -645,7 +746,7 @@ impl<'a, 'db> Infer<'a, 'db> {
     }
 
     fn success(&mut self, id: ExprId, function: ItemId<'db>) -> Ty<'db> {
-        match success_type(self.db, self.program, function) {
+        match self.result_of(function) {
             Some(ty) => ty,
             None => {
                 self.error(Site::Expr(id), ErrorKind::RecursiveSuccess { function });
@@ -674,7 +775,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                 .filter(|&f| {
                     let sig = signature(db, self.program, f);
                     let params = sig.params.iter().map(|p| p.ty).collect();
-                    let result = success_type(db, self.program, f).unwrap_or_else(|| Ty::error(db));
+                    let result = self.result_of(f).unwrap_or_else(|| Ty::error(db));
                     self.fits(Ty::new(db, TyKind::Fn { params, result }), expected)
                 })
                 .collect(),
@@ -1056,9 +1157,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                 .map(|(f, _)| *f)
                 .collect();
             if let Some(success) = success {
-                viable.retain(|&f| {
-                    success_type(db, program, f).is_some_and(|r| self.fits(success, r))
-                });
+                viable.retain(|&f| self.success_of(f).is_some_and(|r| self.fits(success, r)));
             }
             if viable.len() > 1
                 && let Some(expected) = expected
@@ -1066,9 +1165,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                 let fitting: Vec<_> = viable
                     .iter()
                     .copied()
-                    .filter(|&f| {
-                        success_type(db, program, f).is_some_and(|r| self.fits(r, expected))
-                    })
+                    .filter(|&f| self.success_of(f).is_some_and(|r| self.fits(r, expected)))
                     .collect();
                 if !fitting.is_empty() {
                     viable = fitting;
@@ -1775,7 +1872,7 @@ impl<'a, 'db> Infer<'a, 'db> {
         let result = wanted.map(|(_, r)| r).filter(|r| !r.is_error(db));
         let inside = self.without_vars();
         let outside = std::mem::replace(&mut self.narrowed, inside);
-        let result = self.frame(result, root);
+        let result = self.frame(result, root, false);
         self.narrowed = outside;
         Ty::new(
             db,
@@ -1974,7 +2071,8 @@ impl<'a, 'db> Infer<'a, 'db> {
     }
 
     /// `case` (§7.2): a subject that is a binding is narrowed in each arm
-    /// to what its pattern matches of the values no earlier arm took.
+    /// to what its pattern matches of the values no earlier arm took. A
+    /// `pass` arm gives those values to the caller (§8.2).
     fn case(&mut self, subject: ExprId, arms: &[Arm], expected: Option<Ty<'db>>) -> Ty<'db> {
         let db = self.db;
         let subject_ty = self.synth(subject);
@@ -1988,24 +2086,31 @@ impl<'a, 'db> Infer<'a, 'db> {
         for arm in arms {
             self.narrowed = start.clone();
             typed &= self.pattern_checks(arm.pat, subject_ty);
-            if let Some(binding) = binding
-                && let Some(matched) = self.pats[arm.pat.index()]
-                && !matched.is_error(db)
-            {
-                // An arm that never matches, which is reported, narrows
-                // nothing.
-                if let Some(narrowed) = self.refine(remaining.unwrap_or(subject_ty), matched) {
-                    self.narrowed[binding.index()] = Some(narrowed);
-                }
+            // What the arm matches of what is left; an arm that never
+            // matches, which is reported, narrows nothing.
+            let matched = self.pats[arm.pat.index()]
+                .filter(|m| !m.is_error(db))
+                .and_then(|m| self.refine(remaining.unwrap_or(subject_ty), m));
+            if let (Some(binding), Some(matched)) = (binding, matched) {
+                self.narrowed[binding.index()] = Some(matched);
             }
             if let Some(guard) = arm.guard {
                 let (holds, _) = self.condition(guard);
                 self.narrowed = holds;
             }
-            let ty = self.infer(arm.body, expected);
+            let ty = match self.body.expr(arm.body) {
+                Expr::Pass => {
+                    let passed = matched.unwrap_or(subject_ty);
+                    self.result_value(Site::Expr(arm.body), passed);
+                    let never = Ty::never(db);
+                    self.exprs[arm.body.index()] = Some(passed);
+                    never
+                }
+                _ => self.infer(arm.body, expected),
+            };
             types.push(ty);
             ends.push((ty, std::mem::take(&mut self.narrowed)));
-            if binding.is_some() && arm.guard.is_none() {
+            if arm.guard.is_none() {
                 remaining = match (remaining, self.lowered(arm.pat)) {
                     (Some(r), Some(patterns)) => {
                         for pattern in patterns {
@@ -2161,27 +2266,12 @@ impl<'a, 'db> Infer<'a, 'db> {
             }
             Stmt::Return(value) => {
                 let expected = self.frames.last().and_then(|f| f.expected);
-                let ty = match (value, expected) {
-                    (Some(value), Some(expected)) => self.check(*value, expected),
-                    (Some(value), None) => self.synth(*value),
-                    (None, expected) => {
-                        if let Some(expected) = expected
-                            && !self.fits(unit, expected)
-                        {
-                            // A bare `return` gives `()`.
-                            let kind = ErrorKind::Mismatch {
-                                expected,
-                                found: unit,
-                            };
-                            let site = self.frame_site();
-                            self.error(site, kind);
-                        }
-                        unit
-                    }
+                let (ty, site) = match value {
+                    Some(value) => (self.infer(*value, expected), Site::Expr(*value)),
+                    // A bare `return` gives `()`.
+                    None => (unit, self.frame_site()),
                 };
-                if let Some(frame) = self.frames.last_mut() {
-                    frame.returned.push(ty);
-                }
+                self.result_value(site, ty);
                 Ty::never(db)
             }
             Stmt::On { handler, .. } => {
@@ -2355,7 +2445,9 @@ impl<'a, 'db> Infer<'a, 'db> {
                     .iter()
                     .zip(&sig.params)
                     .all(|(&p, s)| self.fits(p, s.ty))
-                && success_type(db, self.program, function).is_some_and(|r| self.fits(r, result))
+                && self
+                    .result_of(function)
+                    .is_some_and(|r| self.fits(r, result))
         })
     }
 
@@ -2423,7 +2515,7 @@ impl<'a, 'db> Infer<'a, 'db> {
         let inside = self.without_vars();
         let outside = std::mem::replace(&mut self.narrowed, inside);
         let result = match function.body {
-            Some(root) => self.frame(expected, root),
+            Some(root) => self.frame(expected, root, false),
             None => expected.unwrap_or_else(|| Ty::error(db)),
         };
         self.narrowed = outside;

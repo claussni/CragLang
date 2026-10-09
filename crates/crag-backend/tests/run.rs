@@ -53,6 +53,7 @@ pub type False
 pub type Bool = True | False
 pub type Empty[T]
 pub type Option[T] = T | Empty[T]
+pub distinct type Error
 pub type Range[T](first: T, last: T)
 pub type List[T]
 pub type Map[K, V]
@@ -550,6 +551,62 @@ fn vars(n: Int) -> Int {
     assert_eq!(m.heap.live_blocks(), 0);
     assert_eq!(m.int("unwraps", &[21]), 42);
     assert_eq!(m.int("vars", &[5]), 6);
+}
+
+#[test]
+fn errors_pass_to_the_caller() {
+    let mut m = Module::new(
+        r#"type NotFound(..Error)
+type Expired(..Error, after: Int)
+type Session(user: Int)
+
+fn session(id: Int) -> Session {
+  if id == 0 { return NotFound() }
+  if id < 0 { Expired(after: 0 - id) } else { Session(user: id * 2) }
+}
+
+fn user(id: Int) -> Int {
+  case session(id) {
+    s: Session -> s.user
+    e: Expired -> e.after * 100
+    pass
+  }
+}
+
+fn count(n: Int) -> Int {
+  if n == 0 { return NotFound() }
+  down(n)
+}
+
+fn down(n: Int) -> Int {
+  if n == 1 { return Expired(after: 7) }
+  count(n - 1)
+}
+
+fn outcome(id: Int) -> Int {
+  case user(id) {
+    n: Int -> n
+    NotFound -> -1
+  }
+}
+
+fn counted(n: Int) -> Int {
+  case count(n) {
+    k: Int -> k
+    NotFound -> -1
+    e: Expired -> e.after
+  }
+}
+"#,
+    );
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    assert_eq!(m.int("outcome", &[21]), 42);
+    assert_eq!(m.int("outcome", &[-3]), 300);
+    assert_eq!(m.int("outcome", &[0]), -1);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("counted", &[0]), -1);
+    assert_eq!(m.int("counted", &[6]), 7);
+    assert_eq!(m.heap.live_blocks(), 0);
 }
 
 #[test]

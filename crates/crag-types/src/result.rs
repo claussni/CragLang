@@ -202,6 +202,8 @@ pub enum ErrorKind<'db> {
     Refutable {
         missing: String,
     },
+    /// `pass` anywhere but as the body of a `case` arm (§8.2).
+    PassOutsideCase,
     /// Something core inference does not handle yet; later milestones of
     /// the Implementation Plan add it.
     Unsupported(&'static str),
@@ -288,6 +290,7 @@ impl<'db> ErrorKind<'db> {
             ErrorKind::Refutable { missing } => {
                 format!("the pattern does not cover `{missing}`")
             }
+            ErrorKind::PassOutsideCase => "`pass` stands only as the body of a `case` arm".into(),
             ErrorKind::Unsupported(what) => format!("{what} are not supported yet"),
         }
     }

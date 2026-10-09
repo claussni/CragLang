@@ -17,8 +17,9 @@
 //! Crag's types and type inference (Implementation Plan §11.4.7).
 //!
 //! Written types are lowered to interned `Ty` terms: `type_def` and
-//! `signature` lower declarations, `success_type` and `value_type` give
-//! the types other bodies use. `body_types` infers one body: a type for
+//! `signature` lower declarations, `result_type` and `value_type` give
+//! the types other bodies use: a call gives the callee's success type and
+//! the errors inferred for its recursive group (§11.5.2). `body_types` infers one body: a type for
 //! every expression, pattern and binding, the target of every call, and
 //! the type errors.
 
@@ -27,6 +28,7 @@ extern crate crag_db as salsa;
 mod case;
 mod decision;
 mod def;
+mod group;
 mod infer;
 mod relate;
 mod result;
@@ -40,6 +42,9 @@ pub use decision::{Bindings, DecisionTree, Position, Step, decision_tree};
 pub use def::{
     FieldDef, HeaderKind, SigParam, Signature, TypeDef, TypeDefKind, TypeHeader, alias_target,
     prelude_item, signature, success_type, type_def, type_header, type_parent, value_type,
+};
+pub use group::{
+    Group, callees, error_members, error_type, group_errors, group_of, result_type, success_members,
 };
 pub use infer::constant as literal_value;
 pub use relate::{declared_fields, fields_of, is_subtype, join, normalize, parent, subst};
