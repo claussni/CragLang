@@ -106,6 +106,120 @@ impl<'db> Body<'db> {
     pub fn binding(&self, id: BindingId) -> &Binding<'db> {
         &self.bindings[id.index()]
     }
+
+    /// The expressions directly inside `expr`, those of its statements,
+    /// closures and local functions included.
+    pub fn children(&self, expr: ExprId) -> Vec<ExprId> {
+        let fields = |fields: Option<&[FieldArg<'db>]>| -> Vec<ExprId> {
+            fields
+                .unwrap_or_default()
+                .iter()
+                .map(|f| match f {
+                    FieldArg::Field { value, .. } | FieldArg::Spread(value) => *value,
+                })
+                .collect()
+        };
+        match self.expr(expr) {
+            Expr::Missing | Expr::Hole | Expr::Literal(_) | Expr::Name { .. } | Expr::Pass => {
+                Vec::new()
+            }
+            Expr::Str(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    StrPart::Expr(e) => Some(*e),
+                    StrPart::Text(_) => None,
+                })
+                .collect(),
+            Expr::Call {
+                callee,
+                args,
+                fields: f,
+            } => [*callee]
+                .into_iter()
+                .chain(args.iter().copied())
+                .chain(fields(f.as_deref()))
+                .collect(),
+            Expr::MethodCall {
+                receiver,
+                args,
+                fields: f,
+                ..
+            } => [*receiver]
+                .into_iter()
+                .chain(args.iter().copied())
+                .chain(fields(f.as_deref()))
+                .collect(),
+            Expr::TypedCall {
+                args, fields: f, ..
+            } => args.iter().copied().chain(fields(f.as_deref())).collect(),
+            Expr::Field { receiver, .. } => vec![*receiver],
+            Expr::Index { base, args } => [*base].into_iter().chain(args.iter().copied()).collect(),
+            Expr::TypeArgs { base, .. } => vec![*base],
+            Expr::And(a, b) | Expr::Or(a, b) => vec![*a, *b],
+            Expr::Not(a) | Expr::Atomic(a) | Expr::Lazy(a) => vec![*a],
+            Expr::Range { start, end } => [*start].into_iter().chain(*end).collect(),
+            Expr::Is { expr, .. } => vec![*expr],
+            Expr::Record(f) => fields(Some(f)),
+            Expr::List(items) => items.clone(),
+            Expr::Map(entries) => entries.iter().flat_map(|&(k, v)| [k, v]).collect(),
+            Expr::Grid(rows) => rows.iter().flatten().copied().collect(),
+            Expr::Block { stmts, tail } => stmts
+                .iter()
+                .flat_map(|s| match s {
+                    Stmt::Expr(e)
+                    | Stmt::Let { value: e, .. }
+                    | Stmt::Bind { value: e, .. }
+                    | Stmt::Assign { value: e, .. }
+                    | Stmt::Emit { value: e, .. }
+                    | Stmt::On { handler: e, .. } => vec![*e],
+                    Stmt::LetElse {
+                        value, otherwise, ..
+                    } => vec![*value, *otherwise],
+                    Stmt::For { iterable, body, .. } => vec![*iterable, *body],
+                    Stmt::Return(e) => e.iter().copied().collect(),
+                    Stmt::Fn { function, .. } => function
+                        .params
+                        .iter()
+                        .filter_map(|p| p.default)
+                        .chain(function.body)
+                        .collect(),
+                })
+                .chain(*tail)
+                .collect(),
+            Expr::Closure { body, .. } => vec![*body],
+            Expr::If {
+                condition,
+                then,
+                otherwise,
+            } => [*condition, *then].into_iter().chain(*otherwise).collect(),
+            Expr::Case { subject, arms } => [*subject]
+                .into_iter()
+                .chain(
+                    arms.iter()
+                        .flat_map(|a| a.guard.into_iter().chain([a.body])),
+                )
+                .collect(),
+        }
+    }
+
+    /// The `var`s assigned anywhere inside `expr`.
+    pub fn assigned_in(&self, expr: ExprId) -> Vec<BindingId> {
+        let mut assigned = Vec::new();
+        let mut pending = vec![expr];
+        while let Some(e) = pending.pop() {
+            if let Expr::Block { stmts, .. } = self.expr(e) {
+                for stmt in stmts {
+                    if let Stmt::Assign { binding, .. } = stmt
+                        && !assigned.contains(binding)
+                    {
+                        assigned.push(*binding);
+                    }
+                }
+            }
+            pending.extend(self.children(e));
+        }
+        assigned
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]

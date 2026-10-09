@@ -468,6 +468,91 @@ fn both(n: Int) -> Int {
 }
 
 #[test]
+fn narrowed_bindings_run() {
+    let mut m = Module::new(
+        r#"type Nil
+type Cons(head: Int, tail: Cons | Nil)
+type LookupError(code: Int)
+type Missing(..LookupError)
+
+fn early(o: Option[Int]) -> Int {
+  if o is Empty { return -1 }
+  o + 1
+}
+
+fn options(n: Int) -> Int {
+  early(n) * 10 + early(Empty)
+}
+
+fn build(n: Int, acc: Cons | Nil) -> Cons | Nil {
+  if n == 0 { acc } else { build(n - 1, Cons(head: n, tail: acc)) }
+}
+
+fn sum(list: Cons | Nil, acc: Int) -> Int {
+  if list is Nil { return acc }
+  sum(list.tail, acc + list.head)
+}
+
+fn length(list: Cons | Nil) -> Int {
+  case list {
+    Nil -> 0
+    _ -> 1 + length(list.tail)
+  }
+}
+
+fn total(n: Int) -> Int {
+  let list = build(n, Nil)
+  sum(list, 0) * 1000 + length(list)
+}
+
+fn kind(r: Int | LookupError) -> Int {
+  if r is Missing { return r.code * 10 }
+  case r {
+    n: Int -> n
+    _ -> r.code
+  }
+}
+
+fn kinds(n: Int) -> Int {
+  kind(Missing(code: n)) + kind(LookupError(code: 1)) * 100 + kind(n) * 1000
+}
+
+fn widened(n: Int) -> Int {
+  let w: Missing | Int = Missing(code: n)
+  kind(w)
+}
+
+fn unwrap(o: Option[Int]) -> Int {
+  let n: Int = o else { return 0 }
+  n * 2
+}
+
+fn unwraps(n: Int) -> Int {
+  unwrap(n) + unwrap(Empty)
+}
+
+fn vars(n: Int) -> Int {
+  var v: Int | Nil = n
+  if v is Nil { return 0 }
+  let a = v + 1
+  v = Nil
+  if v is Int { return 100 }
+  a
+}
+"#,
+    );
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    assert_eq!(m.int("options", &[4]), 50 - 1);
+    assert_eq!(m.int("total", &[100]), 5050 * 1000 + 100);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("kinds", &[7]), 70 + 100 + 7000);
+    assert_eq!(m.int("widened", &[3]), 30);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("unwraps", &[21]), 42);
+    assert_eq!(m.int("vars", &[5]), 6);
+}
+
+#[test]
 fn records_are_counted() {
     let mut m = Module::new(
         r#"type Point(x: Int, y: Int)

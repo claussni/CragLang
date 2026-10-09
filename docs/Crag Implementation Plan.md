@@ -503,7 +503,7 @@ Lowering resolves local names itself, so it also checks the no-shadowing rule, t
 
 Inference gives every expression a type and reports type errors. Crag infers locally, within one function, using bidirectional checking ([survey](https://arxiv.org/abs/1908.05839)): the checker either checks an expression against an expected type that flows down from the context, or synthesizes a type from the expression itself. Literals, closures, collection and record literals and generic tags such as `Empty` take their types from the context.
 
-M1 covers primitives, records, functions and unions as written. Where branches meet, their types join into a union, absorbed as in §3.6.1. A call picks the one candidate that fits its arguments, filtered by the expected type and then by the default types of literals, so `1 + 2` is an `Int` addition. Bodies of generic functions are checked with their type parameters as opaque types. What needs M2 is reported as not supported yet: calls of generic functions, narrowing by `is`, `pass`, `?.`, conversions, refs, signals and handlers. A range is a `Range[T]` or `RangeFrom[T]` of the prelude; `T` fits `Discrete` when it is a built-in integer, `CodePoint`, `Fixed[S]`, or a type with a concrete `compare` and `next` in scope. A decimal literal end has the scale it is written with, and constant ends that decrease are an error.
+M1 covers primitives, records, functions and unions as written. Where branches meet, their types join into a union, absorbed as in §3.6.1. A call picks the one candidate that fits its arguments, filtered by the expected type and then by the default types of literals, so `1 + 2` is an `Int` addition. Bodies of generic functions are checked with their type parameters as opaque types. What needs M2 is reported as not supported yet: calls of generic functions, `pass`, `?.`, conversions, refs, signals and handlers. A range is a `Range[T]` or `RangeFrom[T]` of the prelude; `T` fits `Discrete` when it is a built-in integer, `CodePoint`, `Fixed[S]`, or a type with a concrete `compare` and `next` in scope. A decimal literal end has the scale it is written with, and constant ends that decrease are an error.
 
 Builtin types are declarations of the prelude with a builtin's name and number of type parameters and no body, such as `type Int` and `type List[T]` (§19.1). A named type's identity is the declaration that stands for all declarations merging with it (§3.3). The crate is `crag-types`.
 
@@ -569,7 +569,7 @@ A counted local, one of a type whose values live on the heap, owns one reference
 
 Code generation translates MIR into the facade's `LirFunction` and has Cranelift compile it. Besides machine code, every code object carries the tables the runtime needs: safepoints with live values, frame layout and source lines.
 
-Each local becomes as many registers as its layout has words (Compiler Architecture §11). Numbers are words: narrow integers stay sign- or zero-extended to 64 bits, and a `Float` is a word holding its bits. A box is a pointer to a 16-byte header, the count and then the type index, followed by the fields: the parent's at their own offsets, then the type's own by name. A union is a type index and a payload word, or the index alone when every member is a tag, so a `Bool` is the index of `True` or `False`. A type index is the interned type's own index for now. A type test compares the index; a test for a record type finer than the static one reads the box's header and compares it with the indices of the program's record types that fit. Overflow tests use Cranelift's overflow flags for 64-bit types and a range check of the exact result for narrower ones.
+Each local becomes as many registers as its layout has words (Compiler Architecture §11). Numbers are words: narrow integers stay sign- or zero-extended to 64 bits, and a `Float` is a word holding its bits. A box is a pointer to a 16-byte header, the count and then the type index, followed by the fields: the parent's at their own offsets, then the type's own by name. A union is a type index and a payload word, or the index alone when every member is a tag, so a `Bool` is the index of `True` or `False`. The index is that of the member the value belongs to, which may be a parent of the value's own type; a conversion to a wider union retags the members it absorbs. A type index is the interned type's own index for now. A type test compares the index; a test for a record type finer than the static one reads the box's header and compares it with the indices of the program's record types that fit. Overflow tests use Cranelift's overflow flags for 64-bit types and a range check of the exact result for narrower ones.
 
 Boxes are allocated inline from the worker's heap (§11.4.11) and counted inline (§11.4.12); an empty list or map is allocated inline too, and the runtime grows it and finds its elements (§11.4.13). Checks trap through a call of a runtime function the unwinder provides (§11.4.14). The LIR gained what MIR needs: division, bit operations, shifts, unsigned and `Float` comparisons, `Float` arithmetic on the bits, overflow tests, selects, runtime calls and a trap terminator. What code generation does not handle yet, strings, bytes, closures, module-level values and calls of the prelude's builtins, ends its block with a trap and is listed with the code. Stack maps cover the registers holding boxes; line tables wait for MIR to carry positions, and code objects go to the artifact store with the persisted store (§11.9.5). The crate is `crag-backend`.
 
@@ -689,15 +689,22 @@ Until `std.test` exists, a test fails itself with `???`. With no I/O yet, a prog
 
 Crag types can be unions such as `Int | NotFound`. When two branches meet, their types are joined into a union, and a union that contains both a type and its parent keeps only the parent (absorption, §3.13.2). Inside a `case` arm, `if` or `let … else`, the type of a variable narrows to the members that branch allows; this is flow-sensitive typing, where a variable's type depends on where in the code it is read.
 
+Inference keeps, where control is, the narrowed type of each binding a test narrowed. `x is T` splits it into what holds where the test does and where it does not: `x` narrows to `T` when `T` is one type that fits it, else to the members `T` overlaps, and to the members that do not fit `T` on the other side; a test that never holds is an error. The right operand of `and` sees what the left one established, that of `or` what it ruled out, and `not` swaps the two sides. A `case` on a binding narrows it in each arm to what the arm's pattern matches of the members no earlier unguarded arm covers, which the case checker decides member by member. The `else` part of `let … else` sees the binding narrowed to what the pattern misses, and the code after it to what it matches. Where paths meet, a binding stays narrowed to the union of what each path that gets there narrowed it to; a path of type `Never` does not get there, so after `if x is E { return … }` the rest of the block sees `x` without `E`. Only `let` bindings, `var`s and parameters read by name narrow. Assigning a `var` ends its narrowing, a loop body starts without the narrowings of the `var`s it assigns, and closures and local functions do not see those of `var`s at all.
+
+A narrowed type is never a union of types finer than the members of the binding's type, because a union value is tagged with the member it belongs to. MIR reads a narrowed binding by converting it to the narrowed type.
+
 **Data structures**
 
-- `UnionType` — an interned, sorted set of member types, always normalized by absorption.
-- `NarrowingEnv` — per program point, the narrowed type of each variable that differs from its declared type.
+- `Ty::Union` — an interned, sorted set of member types, always normalized by absorption (§11.4.7).
+- `Flow` — the narrowed type of each binding at the current point of inference, if a test narrowed it.
 
 **Functions**
 
 - `fn join` and `fn normalize` — union plus absorption, already part of core inference (§11.4.7).
-- `fn narrow(env: &NarrowingEnv, var: LocalId, pat: PatId) -> (NarrowingEnv, NarrowingEnv)` — splits the environment at a test into the matching and the remaining case.
+- `Infer::condition(expr) -> (Flow, Flow)` — checks a condition and returns the narrowings where it holds and where it does not.
+- `Infer::refine(subject, target) -> Option<Ty>` and `Infer::rest(subject, target) -> Ty` — the two sides of a type test.
+- `Infer::merge(flows) -> Flow` — the narrowings where paths meet.
+- `Body::assigned_in(expr) -> Vec<BindingId>` — the `var`s a loop body assigns.
 
 #### 11.5.2 Error inference over recursive groups
 

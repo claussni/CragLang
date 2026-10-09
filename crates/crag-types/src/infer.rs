@@ -20,15 +20,18 @@
 //! record literals and generic tags take their types from the context.
 //!
 //! Core inference covers primitives, records, functions and unions as
-//! written. Narrowing by `is`, error propagation, generic calls and forms,
-//! overload ranking and union lifting come with M2 (§11.5); what needs
-//! them is reported as not supported yet rather than guessed.
+//! written. Narrowing (§11.5.1) follows control flow: the inference keeps
+//! the narrowed type of each binding where control is, splits it at a
+//! test and joins it where paths meet. Error propagation, generic calls
+//! and forms, overload ranking and union lifting come with the rest of M2
+//! (§11.5); what needs them is reported as not supported yet rather than
+//! guessed.
 
 use crag_db::Db;
 use crag_hir::{
-    Arm, BindingId, Body, Expr, ExprId, FieldArg, ItemId, ItemKind, Literal, LocalFn, ModuleId,
-    Name, Owner, Pat, PatId, PatLiteral, Program, Resolution, Stmt, TypeArg, TypeRef, TypeRefId,
-    TypeTarget, hir_body, module_scope, type_identity,
+    Arm, BindingId, BindingKind, Body, Expr, ExprId, FieldArg, ItemId, ItemKind, Literal, LocalFn,
+    ModuleId, Name, Owner, Pat, PatId, PatLiteral, Program, Resolution, Stmt, TypeArg, TypeRef,
+    TypeRefId, TypeTarget, hir_body, module_scope, type_identity,
 };
 
 use crate::case::{Checker, PatternMatrix};
@@ -56,6 +59,7 @@ pub fn infer<'db>(db: &'db dyn Db, program: Program, owner: Owner<'db>) -> Infer
         exprs: vec![None; body.exprs.len()],
         pats: vec![None; body.pats.len()],
         bindings: vec![None; body.bindings.len()],
+        narrowed: vec![None; body.bindings.len()],
         callees: Vec::new(),
         holes: Vec::new(),
         frames: Vec::new(),
@@ -117,6 +121,9 @@ struct Infer<'a, 'db> {
     exprs: Vec<Option<Ty<'db>>>,
     pats: Vec<Option<Ty<'db>>>,
     bindings: Vec<Option<Ty<'db>>>,
+    /// Where control is: the type each binding is narrowed to there, if a
+    /// test narrowed it (§3.13.4).
+    narrowed: Flow<'db>,
     callees: Vec<(ExprId, Callee<'db>)>,
     holes: Vec<(ExprId, Ty<'db>)>,
     /// The function and closures being checked, innermost last, for
@@ -133,6 +140,9 @@ struct Infer<'a, 'db> {
     /// The module of the body, whose scope says which types are discrete.
     module: ModuleId,
 }
+
+/// The narrowed type of each binding at a point of the body, by binding.
+type Flow<'db> = Vec<Option<Ty<'db>>>;
 
 struct Frame<'db> {
     /// The written result type; the `return`s are checked against it.
@@ -443,23 +453,12 @@ impl<'a, 'db> Infer<'a, 'db> {
                     self.err_ty()
                 }
             },
-            Expr::And(a, b) | Expr::Or(a, b) => {
-                let bool_ty = self.bool_ty;
-                self.check(*a, bool_ty);
-                self.check(*b, bool_ty);
-                bool_ty
-            }
-            Expr::Not(a) => {
-                let bool_ty = self.bool_ty;
-                self.check(*a, bool_ty);
-                bool_ty
-            }
-            Expr::Range { start, end } => self.range(id, *start, *end, expected),
-            Expr::Is { expr, ty } => {
-                self.synth(*expr);
-                self.lower_type(*ty);
+            Expr::And(..) | Expr::Or(..) | Expr::Not(_) | Expr::Is { .. } => {
+                let (holds, fails) = self.test(id);
+                self.narrowed = self.merge(vec![holds, fails]);
                 self.bool_ty
             }
+            Expr::Range { start, end } => self.range(id, *start, *end, expected),
             Expr::Record(fields) => self.record_literal(fields, expected),
             Expr::List(items) => {
                 self.collection(id, items, expected, &[Builtin::List, Builtin::Set])
@@ -486,37 +485,25 @@ impl<'a, 'db> Infer<'a, 'db> {
                 then,
                 otherwise,
             } => {
-                let bool_ty = self.bool_ty;
-                self.check(*condition, bool_ty);
+                let (holds, fails) = self.condition(*condition);
+                self.narrowed = holds;
+                let a = match otherwise {
+                    Some(_) => self.infer(*then, expected),
+                    None => self.synth(*then),
+                };
+                let after_then = std::mem::replace(&mut self.narrowed, fails);
+                let b = match otherwise {
+                    Some(otherwise) => self.infer(*otherwise, expected),
+                    None => Ty::unit(db),
+                };
+                let after_else = std::mem::take(&mut self.narrowed);
+                self.meet(vec![(a, after_then), (b, after_else)]);
                 match otherwise {
-                    Some(otherwise) => {
-                        let a = self.infer(*then, expected);
-                        let b = self.infer(*otherwise, expected);
-                        self.join(a, b)
-                    }
-                    None => {
-                        self.synth(*then);
-                        Ty::unit(db)
-                    }
+                    Some(_) => self.join(a, b),
+                    None => Ty::unit(db),
                 }
             }
-            Expr::Case { subject, arms } => {
-                let subject_ty = self.synth(*subject);
-                let mut types = Vec::new();
-                let mut typed = true;
-                for arm in arms {
-                    typed &= self.pattern_checks(arm.pat, subject_ty);
-                    if let Some(guard) = arm.guard {
-                        let bool_ty = self.bool_ty;
-                        self.check(guard, bool_ty);
-                    }
-                    types.push(self.infer(arm.body, expected));
-                }
-                if typed {
-                    self.coverage(*subject, subject_ty, arms);
-                }
-                self.join_all(types)
-            }
+            Expr::Case { subject, arms } => self.case(*subject, arms, expected),
             Expr::Pass => {
                 self.error(Site::Expr(id), ErrorKind::Unsupported("`pass` arms"));
                 self.err_ty()
@@ -607,6 +594,9 @@ impl<'a, 'db> Infer<'a, 'db> {
         expected: Option<Ty<'db>>,
     ) -> Ty<'db> {
         if let Some(binding) = local {
+            if let Some(ty) = self.narrowed[binding.index()] {
+                return ty;
+            }
             return match self.bindings[binding.index()] {
                 Some(ty) => ty,
                 None => {
@@ -1783,7 +1773,10 @@ impl<'a, 'db> Infer<'a, 'db> {
             param_tys.push(ty);
         }
         let result = wanted.map(|(_, r)| r).filter(|r| !r.is_error(db));
+        let inside = self.without_vars();
+        let outside = std::mem::replace(&mut self.narrowed, inside);
         let result = self.frame(result, root);
+        self.narrowed = outside;
         Ty::new(
             db,
             TyKind::Fn {
@@ -1791,6 +1784,248 @@ impl<'a, 'db> Infer<'a, 'db> {
                 result,
             },
         )
+    }
+
+    // Narrowing.
+
+    /// Checks a condition and returns the narrowings where it holds and
+    /// where it does not.
+    fn condition(&mut self, id: ExprId) -> (Flow<'db>, Flow<'db>) {
+        match self.body.expr(id) {
+            Expr::And(..) | Expr::Or(..) | Expr::Not(_) | Expr::Is { .. } => {
+                let outcomes = self.test(id);
+                self.exprs[id.index()] = Some(self.bool_ty);
+                outcomes
+            }
+            _ => {
+                let bool_ty = self.bool_ty;
+                self.check(id, bool_ty);
+                (self.narrowed.clone(), self.narrowed.clone())
+            }
+        }
+    }
+
+    /// `and`, `or`, `not` and `is`, which narrow (§3.13.4): the right
+    /// operand of `and` sees what the left one established, and that of
+    /// `or` what the left one ruled out.
+    fn test(&mut self, id: ExprId) -> (Flow<'db>, Flow<'db>) {
+        match self.body.expr(id) {
+            Expr::And(a, b) => {
+                let (a_holds, a_fails) = self.condition(*a);
+                self.narrowed = a_holds;
+                let (b_holds, b_fails) = self.condition(*b);
+                (b_holds, self.merge(vec![a_fails, b_fails]))
+            }
+            Expr::Or(a, b) => {
+                let (a_holds, a_fails) = self.condition(*a);
+                self.narrowed = a_fails;
+                let (b_holds, b_fails) = self.condition(*b);
+                (self.merge(vec![a_holds, b_holds]), b_fails)
+            }
+            Expr::Not(a) => {
+                let (holds, fails) = self.condition(*a);
+                (fails, holds)
+            }
+            Expr::Is { expr, ty } => {
+                let subject = self.synth(*expr);
+                let target = self.pattern_type(*ty, subject);
+                let start = self.narrowed.clone();
+                if subject.is_error(self.db) || target.is_error(self.db) {
+                    return (start.clone(), start);
+                }
+                let Some(matched) = self.refine(subject, target) else {
+                    let kind = ErrorKind::NeverMatches {
+                        pattern: target,
+                        subject,
+                    };
+                    self.error(Site::Expr(id), kind);
+                    return (start.clone(), start);
+                };
+                let Some(binding) = self.narrowable(*expr) else {
+                    return (start.clone(), start);
+                };
+                let (mut holds, mut fails) = (start.clone(), start);
+                holds[binding.index()] = Some(matched);
+                fails[binding.index()] = Some(self.rest(subject, target));
+                (holds, fails)
+            }
+            _ => unreachable!("only tests are tested"),
+        }
+    }
+
+    /// The binding a test of `expr` narrows: a `let`, a `var` or a
+    /// parameter read by its name. Refs and fields are never narrowed.
+    fn narrowable(&self, expr: ExprId) -> Option<BindingId> {
+        let Expr::Name {
+            local: Some(binding),
+            ..
+        } = self.body.expr(expr)
+        else {
+            return None;
+        };
+        let kind = self.body.binding(*binding).kind;
+        matches!(
+            kind,
+            BindingKind::Let | BindingKind::Var | BindingKind::Param
+        )
+        .then_some(*binding)
+    }
+
+    /// The type a value of `subject` has when it is also one of `target`:
+    /// `target` itself when it is one type that fits the subject, else
+    /// the members of the subject that `target` overlaps; none when no
+    /// value is of both.
+    ///
+    /// A union of finer types than the subject's members is never made,
+    /// because a union value is tagged with the member it was made as.
+    fn refine(&self, subject: Ty<'db>, target: Ty<'db>) -> Option<Ty<'db>> {
+        let db = self.db;
+        let targets = target.members(db);
+        if targets.len() == 1 && self.fits(target, subject) {
+            return Some(target);
+        }
+        let members: Vec<Ty<'db>> = subject
+            .members(db)
+            .into_iter()
+            .filter(|&m| self.fits(m, target) || targets.iter().any(|&t| self.fits(t, m)))
+            .collect();
+        (!members.is_empty()).then(|| self.join_all(members))
+    }
+
+    /// The members of `subject` whose values are never of `target`.
+    fn rest(&self, subject: Ty<'db>, target: Ty<'db>) -> Ty<'db> {
+        let members = subject
+            .members(self.db)
+            .into_iter()
+            .filter(|&m| !self.fits(m, target))
+            .collect();
+        self.join_all(members)
+    }
+
+    /// The members of `subject` some value of which no pattern of the
+    /// matrix matches.
+    fn unmatched(&self, matrix: &PatternMatrix<'db>, subject: Ty<'db>) -> Ty<'db> {
+        let checker = Checker::new(self.db, self.program);
+        let members = subject
+            .members(self.db)
+            .into_iter()
+            .filter(|&m| checker.missing_example(matrix, m).is_some())
+            .collect();
+        self.join_all(members)
+    }
+
+    /// The pattern `id` as the case checker sees it, its alternatives
+    /// apart; none if it did not type.
+    fn lowered(&self, id: PatId) -> Option<Vec<crate::case::Pattern<'db>>> {
+        let checker = Checker::new(self.db, self.program);
+        let alternatives = match self.body.pat(id) {
+            Pat::Or(alternatives) => alternatives.clone(),
+            _ => vec![id],
+        };
+        alternatives
+            .into_iter()
+            .map(|alt| checker.lower(self.body, &self.pats, alt))
+            .collect()
+    }
+
+    /// Where control paths meet: a binding stays narrowed if every path
+    /// that gets here narrowed it, to the union of what they narrowed it
+    /// to.
+    fn merge(&self, flows: Vec<Flow<'db>>) -> Flow<'db> {
+        let mut flows = flows.into_iter();
+        let Some(mut merged) = flows.next() else {
+            return self.narrowed.clone();
+        };
+        for flow in flows {
+            for (m, f) in merged.iter_mut().zip(flow) {
+                *m = match (*m, f) {
+                    (Some(a), Some(b)) => Some(self.join(a, b)),
+                    _ => None,
+                };
+            }
+        }
+        merged
+    }
+
+    /// Continues after branches, each with its type and the narrowings at
+    /// its end; a branch of type `Never` does not get here.
+    fn meet(&mut self, ends: Vec<(Ty<'db>, Flow<'db>)>) {
+        let db = self.db;
+        let (reached, left): (Vec<_>, Vec<_>) =
+            ends.into_iter().partition(|(ty, _)| !ty.is_never(db));
+        self.narrowed = match reached.is_empty() {
+            true => left.into_iter().next().map(|(_, f)| f).unwrap_or_default(),
+            false => self.merge(reached.into_iter().map(|(_, f)| f).collect()),
+        };
+    }
+
+    /// Narrowings that do not hold in code that may run later, such as a
+    /// closure: those of `var`s.
+    fn without_vars(&self) -> Flow<'db> {
+        let body = self.body;
+        self.narrowed
+            .iter()
+            .enumerate()
+            .map(|(i, &ty)| match body.bindings[i].kind {
+                BindingKind::Var => None,
+                _ => ty,
+            })
+            .collect()
+    }
+
+    /// `case` (§7.2): a subject that is a binding is narrowed in each arm
+    /// to what its pattern matches of the values no earlier arm took.
+    fn case(&mut self, subject: ExprId, arms: &[Arm], expected: Option<Ty<'db>>) -> Ty<'db> {
+        let db = self.db;
+        let subject_ty = self.synth(subject);
+        let binding = self.narrowable(subject);
+        let start = self.narrowed.clone();
+        let mut remaining = Some(subject_ty);
+        let mut matrix = PatternMatrix::default();
+        let mut types = Vec::new();
+        let mut ends = Vec::new();
+        let mut typed = true;
+        for arm in arms {
+            self.narrowed = start.clone();
+            typed &= self.pattern_checks(arm.pat, subject_ty);
+            if let Some(binding) = binding
+                && let Some(matched) = self.pats[arm.pat.index()]
+                && !matched.is_error(db)
+            {
+                // An arm that never matches, which is reported, narrows
+                // nothing.
+                if let Some(narrowed) = self.refine(remaining.unwrap_or(subject_ty), matched) {
+                    self.narrowed[binding.index()] = Some(narrowed);
+                }
+            }
+            if let Some(guard) = arm.guard {
+                let (holds, _) = self.condition(guard);
+                self.narrowed = holds;
+            }
+            let ty = self.infer(arm.body, expected);
+            types.push(ty);
+            ends.push((ty, std::mem::take(&mut self.narrowed)));
+            if binding.is_some() && arm.guard.is_none() {
+                remaining = match (remaining, self.lowered(arm.pat)) {
+                    (Some(r), Some(patterns)) => {
+                        for pattern in patterns {
+                            matrix.push(pattern);
+                        }
+                        Some(self.unmatched(&matrix, r))
+                    }
+                    // Past an arm that did not type, nothing is known.
+                    _ => None,
+                };
+            }
+        }
+        if typed {
+            self.coverage(subject, subject_ty, arms);
+        }
+        match ends.is_empty() {
+            true => self.narrowed = start,
+            false => self.meet(ends),
+        }
+        self.join_all(types)
     }
 
     // Statements.
@@ -1824,8 +2059,38 @@ impl<'a, 'db> Infer<'a, 'db> {
                 otherwise,
             } => {
                 let value_ty = self.synth(*value);
-                let target = self.written(*ty).unwrap_or(value_ty);
-                self.pattern(*pat, target);
+                let written = self.written(*ty);
+                let target = written.unwrap_or(value_ty);
+                if let Some(written) = written
+                    && !value_ty.is_error(db)
+                    && !written.is_error(db)
+                    && self.refine(value_ty, written).is_none()
+                {
+                    let kind = ErrorKind::NeverMatches {
+                        pattern: written,
+                        subject: value_ty,
+                    };
+                    self.error(Site::Type(ty.expect("written")), kind);
+                }
+                let typed = self.pattern_checks(*pat, target);
+                let binding = self.narrowable(*value).filter(|_| typed);
+                let start = self.narrowed.clone();
+                if let Some(binding) = binding {
+                    // The `else` part sees the values the pattern misses.
+                    let mut matrix = PatternMatrix::default();
+                    let rest = match self.lowered(*pat) {
+                        Some(patterns) => {
+                            for pattern in patterns {
+                                matrix.push(pattern);
+                            }
+                            let tested = self.rest(value_ty, target);
+                            let missed = self.unmatched(&matrix, target);
+                            self.join(tested, missed)
+                        }
+                        None => value_ty,
+                    };
+                    self.narrowed[binding.index()] = Some(rest);
+                }
                 if let Expr::Closure { .. } = self.body.expr(*otherwise) {
                     let kind = ErrorKind::Unsupported("`else` closures");
                     self.error(Site::Expr(*otherwise), kind);
@@ -1835,6 +2100,13 @@ impl<'a, 'db> Infer<'a, 'db> {
                     if !leaves.is_never(db) && !leaves.is_error(db) {
                         self.error(Site::Expr(*otherwise), ErrorKind::MustLeave);
                     }
+                }
+                self.narrowed = start;
+                if let Some(binding) = binding
+                    && let Some(matched) = self.pats[pat.index()]
+                    && let Some(matched) = self.refine(value_ty, matched)
+                {
+                    self.narrowed[binding.index()] = Some(matched);
                 }
                 unit
             }
@@ -1859,6 +2131,8 @@ impl<'a, 'db> Infer<'a, 'db> {
             Stmt::Assign { binding, value } => {
                 let ty = self.bindings[binding.index()].unwrap_or_else(|| Ty::error(db));
                 self.check(*value, ty);
+                // A `var` is narrowed until it is reassigned (§7.1).
+                self.narrowed[binding.index()] = None;
                 unit
             }
             Stmt::For {
@@ -1870,7 +2144,14 @@ impl<'a, 'db> Infer<'a, 'db> {
                 if self.pattern_checks(*pat, element) {
                     self.irrefutable(*pat, element);
                 }
-                self.synth(*body);
+                // The body may run again after what it assigns.
+                for binding in self.body.assigned_in(*body) {
+                    self.narrowed[binding.index()] = None;
+                }
+                let before = self.narrowed.clone();
+                let ty = self.synth(*body);
+                let after = std::mem::take(&mut self.narrowed);
+                self.meet(vec![(unit, before), (ty, after)]);
                 unit
             }
             Stmt::Emit { value, .. } => {
@@ -2139,10 +2420,13 @@ impl<'a, 'db> Infer<'a, 'db> {
             );
             self.bindings[binding.index()] = Some(ty);
         }
+        let inside = self.without_vars();
+        let outside = std::mem::replace(&mut self.narrowed, inside);
         let result = match function.body {
             Some(root) => self.frame(expected, root),
             None => expected.unwrap_or_else(|| Ty::error(db)),
         };
+        self.narrowed = outside;
         self.bindings[binding.index()] = Some(Ty::new(db, TyKind::Fn { params, result }));
     }
 

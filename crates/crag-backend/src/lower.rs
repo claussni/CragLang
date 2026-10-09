@@ -862,23 +862,61 @@ impl<'a, 'db> Lower<'a, 'db> {
         to: Ty<'db>,
     ) -> Result<Vec<VReg>, Unsupported> {
         let (f, t) = (self.layout_of(from)?, self.layout_of(to)?);
+        let tag = type_index(self.member_of(from, to));
         Ok(match (f, t) {
             (Layout::Zero, Layout::Zero) => Vec::new(),
-            (Layout::Zero, Layout::Tag) => vec![self.constant(type_index(from))],
-            (Layout::Zero, Layout::Union) => {
-                vec![self.constant(type_index(from)), self.constant(0)]
-            }
-            (Layout::Imm(_) | Layout::Box, Layout::Union) => {
-                vec![self.constant(type_index(from)), values[0]]
-            }
-            (Layout::Tag, Layout::Union) => vec![values[0], self.constant(0)],
-            (Layout::Union, Layout::Union) | (Layout::Tag, Layout::Tag) => values,
+            (Layout::Zero, Layout::Tag) => vec![self.constant(tag)],
+            (Layout::Zero, Layout::Union) => vec![self.constant(tag), self.constant(0)],
+            (Layout::Imm(_) | Layout::Box, Layout::Union) => vec![self.constant(tag), values[0]],
+            (Layout::Tag, Layout::Union) => vec![self.retag(values[0], from, to), self.constant(0)],
+            (Layout::Union, Layout::Union) => vec![self.retag(values[0], from, to), values[1]],
+            (Layout::Tag, Layout::Tag) => vec![self.retag(values[0], from, to)],
             (Layout::Box, Layout::Box) => values,
             (Layout::Union, Layout::Imm(_) | Layout::Box) => vec![values[1]],
             (Layout::Union, Layout::Tag) => vec![values[0]],
             (Layout::Union | Layout::Tag, Layout::Zero) => Vec::new(),
             _ => return Err("this conversion"),
         })
+    }
+
+    /// The member of the union `to` that a value of `from` is tagged
+    /// with: the member it is a value of, which may be a parent of its
+    /// type. A type test of a finer type reads the box's header.
+    fn member_of(&self, from: Ty<'db>, to: Ty<'db>) -> Ty<'db> {
+        let members = to.members(self.db);
+        if members.contains(&from) {
+            return from;
+        }
+        members
+            .into_iter()
+            .find(|&m| crag_types::is_subtype(self.db, self.program, from, m))
+            .unwrap_or(from)
+    }
+
+    /// The tag of a union value of `from` as one of `to`, where a member of
+    /// `from` may be part of a member of `to`.
+    fn retag(&mut self, tag: VReg, from: Ty<'db>, to: Ty<'db>) -> VReg {
+        let mut tag = tag;
+        for member in from.members(self.db) {
+            let target = self.member_of(member, to);
+            if target == member {
+                continue;
+            }
+            let (old, new) = (
+                self.constant(type_index(member)),
+                self.constant(type_index(target)),
+            );
+            let cond = self.cmp(Cond::Eq, tag, old);
+            let dst = self.reg();
+            self.push(Inst::Select {
+                dst,
+                cond,
+                a: new,
+                b: tag,
+            });
+            tag = dst;
+        }
+        tag
     }
 
     /// The machine operation of a number type.

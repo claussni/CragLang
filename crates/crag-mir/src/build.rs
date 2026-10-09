@@ -630,7 +630,14 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             if self.body.binding(binding).kind == BindingKind::Fn {
                 return self.unsupported(expr, "local functions");
             }
-            return Operand::Local(self.binding(binding));
+            // A narrowed binding is read as the member a test found
+            // (§3.13.4).
+            let local = self.binding(binding);
+            let (from, to) = (self.locals[local.index()].ty, self.ty(expr));
+            return match self.converts(from, to) {
+                true => self.assign(to, Rvalue::Convert(Operand::Local(local))),
+                false => Operand::Local(local),
+            };
         }
         if self.is_call(expr) {
             return self.unsupported(expr, "functions as values");

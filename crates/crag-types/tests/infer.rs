@@ -799,3 +799,106 @@ test "t" { s([], Point(x: 1, y: 2), ["a": 1]) }
         }
     }
 }
+
+#[test]
+fn tests_narrow_bindings_where_they_hold() {
+    let text = "type NotFound
+type Timeout
+type Error
+type LookupError(..Error)
+type Missing(..LookupError)
+fn early(v: Int | NotFound) -> Int {
+  if v is NotFound { return 0 }
+  let a = v
+  a + 1
+}
+fn both(v: Int | NotFound, w: Int | Str) {
+  if v is Int and w is Int {
+    let a = v
+    let b = w
+  } else {
+    let c = v
+  }
+  if not (v is Int) or w is Str {
+    let d = v
+  } else {
+    let e = v
+    let g = w
+  }
+}
+fn arms(r: Int | LookupError | Timeout) {
+  case r {
+    Missing -> { let a = r }
+    Int where r < 5 -> { let b = r }
+    Int -> { let c = r }
+    _ -> { let d = r }
+  }
+}
+fn after(r: Int | NotFound | Timeout) -> Int {
+  case r {
+    NotFound -> { return 0 }
+    _ -> {}
+  }
+  let a = r
+  if a is Timeout { return 1 }
+  a
+}
+fn unwrap(o: Option[Int], r: Int | NotFound | Timeout) -> Int {
+  let n: Int = o else {
+    let e = o
+    return 0
+  }
+  let m = o
+  let k: Int = r else {
+    let rest = r
+    return 1
+  }
+  n + k
+}
+fn vars(x: Int | NotFound) {
+  if x is NotFound { return }
+  var v: Int | NotFound = x
+  if v is NotFound { return }
+  let a = v
+  let f = { n: Int ->
+    let q = v
+    let y = x
+    n
+  }
+  for i in [1, 2] {
+    let b = v
+    v = i
+  }
+  let c = v
+  v = NotFound
+  let d = v
+}";
+    assert_eq!(
+        ok(text),
+        [
+            "v: Int | NotFound, a: Int, -> Int",
+            "v: Int | NotFound, w: Int | Str, a: Int, b: Int, c: Int | NotFound, \
+             d: Int | NotFound, e: Int, g: Int, -> ()",
+            "r: Int | LookupError | Timeout, a: Missing, b: Int, c: Int, \
+             d: LookupError | Timeout, -> ()",
+            "r: Int | NotFound | Timeout, a: Int | Timeout, -> Int",
+            "o: Empty[Int] | Int, r: Int | NotFound | Timeout, e: Empty[Int], n: Int, m: Int, \
+             rest: NotFound | Timeout, k: Int, -> Int",
+            "x: Int | NotFound, v: Int | NotFound, a: Int, n: Int, q: Int | NotFound, y: Int, \
+             f: (Int) -> Int, i: Int, b: Int | NotFound, c: Int | NotFound, \
+             d: Int | NotFound, -> ()",
+        ]
+    );
+    let text = "type NotFound
+fn f(x: Int | NotFound) {
+  let a = x is Str
+  let n: Str = x else { return }
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`x is Str`: a Str pattern never matches a Int | NotFound",
+            "`Str`: a Str pattern never matches a Int | NotFound",
+        ]
+    );
+}
