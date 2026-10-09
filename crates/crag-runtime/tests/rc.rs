@@ -146,7 +146,7 @@ fn check(config: FiberConfig) {
     let mut worker = Worker::new();
     worker.set_types(Arc::new(Types::new([(
         NODE as u32,
-        TypeDescriptor {
+        TypeDescriptor::Record {
             counted: vec![CountedField::Union {
                 offset: 16,
                 boxed: vec![NODE as u32],

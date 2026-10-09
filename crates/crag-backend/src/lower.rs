@@ -20,14 +20,16 @@
 //! are words; narrow integers are kept sign- or zero-extended to 64 bits,
 //! and a `Float` is a word holding its bits. A `Bool` is the type index of
 //! `True` or `False`, so a branch compares it with `True`'s. Boxes are
-//! allocated and counted inline, and the runtime frees them.
+//! allocated and counted inline, and the runtime frees them. An empty list
+//! or map is allocated inline too; the runtime grows it and finds its
+//! elements.
 //!
-//! What code generation does not handle yet, such as strings and
-//! collections, ends its block with a trap and is listed.
+//! What code generation does not handle yet, such as strings, ends its
+//! block with a trap and is listed.
 
 use crag_abi::{
-    COUNT_OFFSET, HEAP_OFFSET, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, TYPE_INDEX_OFFSET,
-    TrapKind as AbiTrap, TypeDescriptor, size_class,
+    COUNT_OFFSET, HEAP_OFFSET, LEN_OFFSET, LIST_SIZE, MAP_SIZE, PAGE_FREE_OFFSET, PAGE_USED_OFFSET,
+    TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TypeDescriptor, size_class,
 };
 use crag_codegen::{
     BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, Cond, FuncId, Inst, LirFunction,
@@ -43,7 +45,8 @@ use crag_mir::{
 use crag_types::{Builtin, Step, Ty, TyKind, prelude_item, signature};
 
 use crate::layout::{
-    Layout, boxed_indices, layout, record_layout, subtypes, type_descriptor, type_index,
+    Layout, boxed_indices, equal_by_words, layout, record_layout, subtypes, type_descriptor,
+    type_index,
 };
 
 /// The LIR of a body, with what it could not lower.
@@ -533,11 +536,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let (slots, size) =
                     record_layout(self.db, self.program, *record).ok_or("records of this type")?;
                 let index = type_index(*record);
-                if !self.types.iter().any(|(i, _)| i64::from(*i) == index) {
-                    let descriptor = type_descriptor(self.db, self.program, *record)
-                        .ok_or("records holding strings, bytes or closures")?;
-                    self.types.push((index as u32, descriptor));
-                }
+                self.describe(*record)?;
                 let mut values = Vec::new();
                 for (name, op) in fields {
                     let slot = slots
@@ -558,12 +557,71 @@ impl<'a, 'db> Lower<'a, 'db> {
                 }
                 Ok(vec![ptr])
             }
-            Rvalue::List(_)
-            | Rvalue::Map(_)
-            | Rvalue::Len(_)
-            | Rvalue::Index { .. }
-            | Rvalue::MapGet { .. }
-            | Rvalue::Slice { .. } => Err("collections"),
+            Rvalue::List(items) => match ty.as_builtin(self.db) {
+                Some((Builtin::List, [element])) => {
+                    let element = *element;
+                    let values = items
+                        .iter()
+                        .map(|op| self.operand(op, element))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut list = self.empty(ty, LIST_SIZE)?;
+                    for words in values {
+                        let [w0, w1] = self.pad(words);
+                        list = self.runtime(RuntimeFn::ListPush, vec![list, w0, w1]);
+                    }
+                    Ok(vec![list])
+                }
+                Some((Builtin::Set, [element])) => {
+                    let element = *element;
+                    let entries: Vec<_> = items.iter().map(|op| (op.clone(), None)).collect();
+                    Ok(vec![self.map(ty, element, None, &entries)?])
+                }
+                _ => Err("collections of this type"),
+            },
+            Rvalue::Map(entries) => match ty.as_builtin(self.db) {
+                Some((Builtin::Map, [k, v])) => {
+                    let (k, v) = (*k, *v);
+                    let entries: Vec<_> = entries
+                        .iter()
+                        .map(|(key, value)| (key.clone(), Some(value.clone())))
+                        .collect();
+                    Ok(vec![self.map(ty, k, Some(v), &entries)?])
+                }
+                _ => Err("collections of this type"),
+            },
+            Rvalue::Len(place) => {
+                let list = word(&self.read(place)?)?;
+                Ok(vec![self.load(list, LEN_OFFSET)])
+            }
+            Rvalue::Index { list, index } => {
+                let list_ty = self.place_ty(list)?;
+                let ptr = word(&self.read(list)?)?;
+                let int = Ty::builtin(self.db, Builtin::Int);
+                let index = word(&self.operand(index, int)?)?;
+                self.element(ptr, list_ty, index)
+            }
+            Rvalue::MapGet { map, key } => {
+                let map_ty = self.place_ty(map)?;
+                let Some((Builtin::Map, &[k, v])) = map_ty.as_builtin(self.db) else {
+                    return Err("collections of this type");
+                };
+                self.describe(map_ty)?;
+                let ptr = word(&self.read(map)?)?;
+                let key = self.operand(key, k)?;
+                let [k0, k1] = self.pad(key);
+                let at = self.runtime(RuntimeFn::MapGet, vec![ptr, k0, k1]);
+                self.option(at, v, ty)
+            }
+            Rvalue::Slice { list, front, back } => {
+                let list_ty = self.place_ty(list)?;
+                self.describe(list_ty)?;
+                let ptr = word(&self.read(list)?)?;
+                let front = self.constant(i64::from(*front));
+                let back = self.constant(i64::from(*back));
+                Ok(vec![
+                    self.runtime(RuntimeFn::ListSlice, vec![ptr, front, back]),
+                ])
+            }
             Rvalue::Concat(_) => Err("strings and bytes"),
             Rvalue::Global(_) => Err("module-level values"),
         }
@@ -600,12 +658,180 @@ impl<'a, 'db> Lower<'a, 'db> {
                         .collect();
                     ty = slot.ty;
                 }
-                Step::Elem(_) | Step::ElemBack(_) | Step::Slice { .. } => {
-                    return Err("collections");
+                Step::Elem(i) => {
+                    let index = self.constant(i64::from(*i));
+                    values = self.element(word(&values)?, ty, index)?;
+                    ty = element_of(db, ty)?;
                 }
+                Step::ElemBack(i) => {
+                    let list = word(&values)?;
+                    let len = self.load(list, LEN_OFFSET);
+                    let from_end = self.constant(i64::from(*i) + 1);
+                    let index = self.bin(LirBin::Sub, len, from_end);
+                    values = self.element(list, ty, index)?;
+                    ty = element_of(db, ty)?;
+                }
+                Step::Slice { .. } => return Err("this place"),
             }
         }
         Ok(values)
+    }
+
+    /// The type of the value at a place.
+    fn place_ty(&self, place: &Place<'db>) -> Result<Ty<'db>, Unsupported> {
+        let db = self.db;
+        let mut ty = self.local_ty(place.local);
+        for step in &place.path {
+            ty = match step {
+                Step::As(t) => *t,
+                Step::Field(name) => crag_types::fields_of(db, self.program, ty)
+                    .and_then(|fs| fs.into_iter().find(|(n, _)| n == name))
+                    .map(|(_, t)| t)
+                    .ok_or("records of this type")?,
+                Step::Elem(_) | Step::ElemBack(_) => element_of(db, ty)?,
+                Step::Slice { .. } => ty,
+            };
+        }
+        Ok(ty)
+    }
+
+    /// Registers the descriptor of a record or collection type, which the
+    /// runtime needs to free its boxes and to store its elements.
+    fn describe(&mut self, ty: Ty<'db>) -> Result<(), Unsupported> {
+        let index = type_index(ty) as u32;
+        if self.types.iter().any(|(i, _)| *i == index) {
+            return Ok(());
+        }
+        let Some(descriptor) = type_descriptor(self.db, self.program, ty) else {
+            return Err(match ty.as_builtin(self.db) {
+                Some((Builtin::Map | Builtin::Set, [key, ..]))
+                    if !equal_by_words(self.db, self.program, *key) =>
+                {
+                    "maps with keys of this type"
+                }
+                Some(_) => "collections holding strings, bytes or closures",
+                None => "records holding strings, bytes or closures",
+            });
+        };
+        self.types.push((index, descriptor));
+        Ok(())
+    }
+
+    /// Calls a runtime function with one result.
+    fn runtime(&mut self, func: RuntimeFn, args: Vec<VReg>) -> VReg {
+        let dst = self.reg();
+        self.push(Inst::CallRuntime {
+            func,
+            args,
+            dsts: vec![dst],
+        });
+        dst
+    }
+
+    /// A value's words as the two arguments of a runtime function, zero
+    /// where it has fewer.
+    fn pad(&mut self, words: Vec<VReg>) -> [VReg; 2] {
+        let mut out = [VReg(0); 2];
+        for (k, slot) in out.iter_mut().enumerate() {
+            *slot = match words.get(k) {
+                Some(&w) => w,
+                None => self.constant(0),
+            };
+        }
+        out
+    }
+
+    /// A new empty list or map of `size` bytes: its header, and zero for
+    /// the rest (see `crag_abi`).
+    fn empty(&mut self, ty: Ty<'db>, size: u32) -> Result<VReg, Unsupported> {
+        self.describe(ty)?;
+        let ptr = self.alloc(size, type_index(ty));
+        let zero = self.constant(0);
+        for offset in (LEN_OFFSET..size as i32).step_by(8) {
+            self.push(Inst::Store {
+                src: zero,
+                addr: ptr,
+                offset,
+            });
+        }
+        Ok(ptr)
+    }
+
+    /// A map or set with the entries, each a key and, for a map, a value.
+    fn map(
+        &mut self,
+        ty: Ty<'db>,
+        key: Ty<'db>,
+        value: Option<Ty<'db>>,
+        entries: &[(Operand<'db>, Option<Operand<'db>>)],
+    ) -> Result<VReg, Unsupported> {
+        let mut words = Vec::new();
+        for (k, v) in entries {
+            let k = self.operand(k, key)?;
+            let v = match (v, value) {
+                (Some(v), Some(value)) => self.operand(v, value)?,
+                _ => Vec::new(),
+            };
+            words.push((k, v));
+        }
+        let mut map = self.empty(ty, MAP_SIZE)?;
+        for (k, v) in words {
+            let [k0, k1] = self.pad(k);
+            let [v0, v1] = self.pad(v);
+            map = self.runtime(RuntimeFn::MapInsert, vec![map, k0, k1, v0, v1]);
+        }
+        Ok(map)
+    }
+
+    /// The words of element `index` of a list of type `ty`, borrowed.
+    fn element(&mut self, list: VReg, ty: Ty<'db>, index: VReg) -> Result<Vec<VReg>, Unsupported> {
+        let element = element_of(self.db, ty)?;
+        self.describe(ty)?;
+        let words = self.layout_of(element)?.words();
+        let at = self.runtime(RuntimeFn::ListElem, vec![list, index]);
+        Ok((0..words).map(|k| self.load(at, 8 * k as i32)).collect())
+    }
+
+    /// The `Option` of a map's value: the value at `at`, or `Empty` when
+    /// `at` is null.
+    fn option(&mut self, at: VReg, value: Ty<'db>, ty: Ty<'db>) -> Result<Vec<VReg>, Unsupported> {
+        let db = self.db;
+        let present = value.members(db);
+        let empty = ty
+            .members(db)
+            .into_iter()
+            .find(|m| !present.contains(m))
+            .ok_or("this conversion")?;
+        let out: Vec<VReg> = (0..self.layout_of(ty)?.words())
+            .map(|_| self.reg())
+            .collect();
+        let (hit, miss, done) = (self.new_block(), self.new_block(), self.new_block());
+        let term = Term::Branch {
+            cond: at,
+            then: hit,
+            otherwise: miss,
+        };
+        self.end(term, Some(hit));
+        let words = self.layout_of(value)?.words();
+        let found = (0..words).map(|k| self.load(at, 8 * k as i32)).collect();
+        let found = self.convert(found, value, ty)?;
+        self.moves(&out, found)?;
+        self.end(Term::Jump(done), Some(miss));
+        let nothing = self.convert(Vec::new(), empty, ty)?;
+        self.moves(&out, nothing)?;
+        self.end(Term::Jump(done), Some(done));
+        Ok(out)
+    }
+
+    /// Copies values into registers.
+    fn moves(&mut self, dsts: &[VReg], values: Vec<VReg>) -> Result<(), Unsupported> {
+        if dsts.len() != values.len() {
+            return Err("this conversion");
+        }
+        for (&dst, src) in dsts.iter().zip(values) {
+            self.push(Inst::Move { dst, src });
+        }
+        Ok(())
     }
 
     /// A value of `from` as a value of `to`: a member put into a union or
@@ -834,17 +1060,7 @@ impl<'a, 'db> Lower<'a, 'db> {
     ) -> Result<(), Unsupported> {
         let db = self.db;
         let values = self.read(place)?;
-        let mut ty = self.local_ty(place.local);
-        for step in &place.path {
-            ty = match step {
-                Step::As(t) => *t,
-                Step::Field(name) => crag_types::fields_of(db, self.program, ty)
-                    .and_then(|fs| fs.into_iter().find(|(n, _)| n == name))
-                    .map(|(_, t)| t)
-                    .ok_or("records of this type")?,
-                _ => return Err("collections"),
-            };
-        }
+        let ty = self.place_ty(place)?;
         let members = ty.members(db);
         let shape = self.layout_of(ty)?;
         for &(case, target) in cases {
@@ -906,6 +1122,14 @@ impl<'a, 'db> Lower<'a, 'db> {
 
 fn block(b: BlockId) -> LirBlockId {
     LirBlockId(b.0)
+}
+
+/// The element type of a list type.
+fn element_of<'db>(db: &'db dyn Db, ty: Ty<'db>) -> Result<Ty<'db>, Unsupported> {
+    match ty.as_builtin(db) {
+        Some((Builtin::List, [element])) => Ok(*element),
+        _ => Err("collections of this type"),
+    }
 }
 
 fn word(values: &[VReg]) -> Result<VReg, Unsupported> {

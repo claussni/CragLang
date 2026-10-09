@@ -21,7 +21,7 @@
 //! index alone when every member is a tag, as for `Bool`. Strings, bytes
 //! and closures take two words.
 
-use crag_abi::{CountedField, HEADER_SIZE, TypeDescriptor};
+use crag_abi::{CountedField, ElementLayout, HEADER_SIZE, TypeDescriptor};
 use crag_db::Db;
 use crag_db::plumbing::AsId;
 use crag_hir::{ItemKind, Name, Program, item_tree, module_index};
@@ -200,14 +200,74 @@ pub fn boxed_indices<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Opt
     Some(out)
 }
 
-/// The descriptor of a record type: the fields that hold references, which
-/// the runtime releases when it frees a box of the type. None when a field
-/// is a string, bytes or a closure, whose references are not counted yet.
+/// The words of a value of `ty` in a collection. None for what has no
+/// layout yet, and for strings, bytes and closures, whose references are
+/// not counted yet.
+pub fn element_layout<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    ty: Ty<'db>,
+) -> Option<ElementLayout> {
+    let (words, counted) = match layout(db, program, ty)? {
+        Layout::Zero => (0, Vec::new()),
+        Layout::Imm(_) | Layout::Tag => (1, Vec::new()),
+        Layout::Box => (1, vec![CountedField::Box(0)]),
+        Layout::Union => {
+            let boxed = boxed_indices(db, program, ty)?;
+            let counted = match boxed.is_empty() {
+                true => Vec::new(),
+                false => vec![CountedField::Union { offset: 0, boxed }],
+            };
+            (2, counted)
+        }
+        Layout::Pair => return None,
+    };
+    Some(ElementLayout { words, counted })
+}
+
+/// Whether two values of `ty` are equal exactly when their words are, as
+/// the runtime compares map keys: numbers but `Float`, code points, tags,
+/// and unions of these.
+pub fn equal_by_words<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
+    ty.members(db)
+        .into_iter()
+        .all(|m| match layout(db, program, m) {
+            Some(Layout::Zero | Layout::Tag) => true,
+            Some(Layout::Imm(b)) => b != Builtin::Float,
+            _ => false,
+        })
+}
+
+/// The descriptor of a record or collection type: for a record the fields
+/// that hold references, which the runtime releases when it frees a box of
+/// the type, and for a collection the layouts of what it holds. None when
+/// a field or an element is a string, bytes or a closure, whose references
+/// are not counted yet, or a map's key is not equal by its words.
 pub fn type_descriptor<'db>(
     db: &'db dyn Db,
     program: Program,
     ty: Ty<'db>,
 ) -> Option<TypeDescriptor> {
+    let map = |key: Ty<'db>, value: Option<Ty<'db>>| {
+        if !equal_by_words(db, program, key) {
+            return None;
+        }
+        let value = match value {
+            Some(v) => element_layout(db, program, v)?,
+            None => ElementLayout::default(),
+        };
+        let key = element_layout(db, program, key)?;
+        Some(TypeDescriptor::Map { key, value })
+    };
+    match ty.as_builtin(db) {
+        Some((Builtin::List, [element])) => {
+            let element = element_layout(db, program, *element)?;
+            return Some(TypeDescriptor::List { element });
+        }
+        Some((Builtin::Map, [key, value])) => return map(*key, Some(*value)),
+        Some((Builtin::Set, [key])) => return map(*key, None),
+        _ => {}
+    }
     let (slots, _) = record_layout(db, program, ty)?;
     let mut counted = Vec::new();
     for slot in slots {
@@ -226,5 +286,5 @@ pub fn type_descriptor<'db>(
             Layout::Zero | Layout::Imm(_) | Layout::Tag => {}
         }
     }
-    Some(TypeDescriptor { counted })
+    Some(TypeDescriptor::Record { counted })
 }

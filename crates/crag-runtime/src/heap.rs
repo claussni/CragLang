@@ -504,35 +504,11 @@ pub fn alloc_box(heap: &mut Heap, size: usize, type_index: u64) -> *mut u8 {
     ptr
 }
 
-/// `rt_alloc(ctx, size, type_index)`: see `crag_abi::RuntimeFn::Alloc`.
-///
-/// Called with the C convention when the inline path finds no free block.
-/// It switches to the system stack, keeping the fiber's stack pointer in a
-/// callee-saved register, and allocates there.
-///
-/// # Safety
-///
-/// Only generated code may call this, on a fiber stack, with the fiber's
-/// task context.
-#[unsafe(naked)]
-pub(crate) unsafe extern "C" fn rt_alloc(
-    ctx: *const TaskContext,
-    size: u64,
-    type_index: u64,
-) -> *mut u8 {
-    std::arch::naked_asm!(
-        "push rbx",
-        "mov rbx, rsp",
-        "mov rax, [rdi + {worker}]",
-        "mov rsp, [rax]",
-        "and rsp, -16",
-        "call {slow}",
-        "mov rsp, rbx",
-        "pop rbx",
-        "ret",
-        worker = const offset_of!(TaskContext, worker),
-        slow = sym alloc_slow_entry,
-    )
+system_stack_fn! {
+    /// `rt_alloc(ctx, size, type_index)`: see `crag_abi::RuntimeFn::Alloc`.
+    ///
+    /// Called when the inline path finds no free block.
+    fn rt_alloc(ctx: *const TaskContext, size: u64, type_index: u64) -> *mut u8 => alloc_slow_entry
 }
 
 /// The Rust half of `rt_alloc`, on the system stack.

@@ -87,7 +87,7 @@ A small language subset runs through every layer, so each later milestone widens
 - **Code generation.** MIR to CLIF through the facade, with safepoint, frame and line tables per code object.
 - **Allocator.** Size classes with per-worker, page-local free lists in the style of mimalloc.
 - **Reference counting.** Atomic increments and decrements, skipped for static values; release at zero.
-- **Collection primitives.** Persistent lists as RRB trees, maps and sets as hash array mapped tries, sorted maps as persistent B-trees, and arenas with generational handles (§12, §13.2), with in-place variants for unique values (§13.4).
+- **Collection primitives.** Persistent lists as RRB trees, and maps and sets as hash array mapped tries (§12), updated in place when unique (§13.4). Sorted maps as persistent B-trees and arenas with generational handles (§13.2) follow with the standard library types that use them.
 - **Traps and unwinder.** `rt_trap`, a frame walk over frame pointers and tables that releases live owned values, and trap reports with source positions.
 - **Driver.** `crag run`, and `crag test` with test discovery and a runner; diagnostics rendered against source spans.
 
@@ -571,7 +571,7 @@ Code generation translates MIR into the facade's `LirFunction` and has Cranelift
 
 Each local becomes as many registers as its layout has words (Compiler Architecture §11). Numbers are words: narrow integers stay sign- or zero-extended to 64 bits, and a `Float` is a word holding its bits. A box is a pointer to a 16-byte header, the count and then the type index, followed by the fields: the parent's at their own offsets, then the type's own by name. A union is a type index and a payload word, or the index alone when every member is a tag, so a `Bool` is the index of `True` or `False`. A type index is the interned type's own index for now. A type test compares the index; a test for a record type finer than the static one reads the box's header and compares it with the indices of the program's record types that fit. Overflow tests use Cranelift's overflow flags for 64-bit types and a range check of the exact result for narrower ones.
 
-Boxes are allocated inline from the worker's heap (§11.4.11) and counted inline (§11.4.12); checks trap through a call of a runtime function the unwinder provides (§11.4.14). The LIR gained what MIR needs: division, bit operations, shifts, unsigned and `Float` comparisons, `Float` arithmetic on the bits, overflow tests, selects, runtime calls and a trap terminator. What code generation does not handle yet, strings, bytes, collections, closures, module-level values and calls of the prelude's builtins, ends its block with a trap and is listed with the code. Stack maps cover the registers holding boxes; line tables wait for MIR to carry positions, and code objects go to the artifact store with the persisted store (§11.9.5). The crate is `crag-backend`.
+Boxes are allocated inline from the worker's heap (§11.4.11) and counted inline (§11.4.12); an empty list or map is allocated inline too, and the runtime grows it and finds its elements (§11.4.13). Checks trap through a call of a runtime function the unwinder provides (§11.4.14). The LIR gained what MIR needs: division, bit operations, shifts, unsigned and `Float` comparisons, `Float` arithmetic on the bits, overflow tests, selects, runtime calls and a trap terminator. What code generation does not handle yet, strings, bytes, closures, module-level values and calls of the prelude's builtins, ends its block with a trap and is listed with the code. Stack maps cover the registers holding boxes; line tables wait for MIR to carry positions, and code objects go to the artifact store with the persisted store (§11.9.5). The crate is `crag-backend`.
 
 **Functions**
 
@@ -606,16 +606,16 @@ Crag frees memory by reference counting: every box has a count of references, an
 
 Generated code counts inline. A retain tests the count's sign and adds one atomically; a release tests the sign, subtracts one atomically, and calls `rt_release` when the count was one. For a union, both first test whether the index names a box. `rt_release` switches to the system stack and frees the box there, releasing its fields as the descriptor of its type lists them. A field whose count reaches zero goes on a list of boxes to free, linked through their dead count words, so freeing a long chain is a loop, needs no memory and cannot overflow a stack. The descriptors are data rather than generated drop glue: the runtime never calls back into Crag code (Compiler Architecture §2.1), and glue that runs Crag code at a drop comes with drop handlers and deferred teardown (Specification §13.5).
 
-Code generation describes each record type it allocates: the code of an instance lists the descriptors of the types it allocates, and the image indexes them by type index. A worker holds the image's descriptors. A record with a string, bytes or closure field is not allocated yet, because their references are not counted.
+Code generation describes each record and collection type it allocates or reads: the code of an instance lists the descriptors of those types, and the image indexes them by type index. A worker holds the image's descriptors. A record or collection holding strings, bytes or closures is not compiled yet, because their references are not counted.
 
 **Data structures**
 
-- `TypeDescriptor` — in `crag-abi`: the fields of a box that hold references, each a box pointer or a union with the indices that carry a box.
+- `TypeDescriptor` — in `crag-abi`: for a record the fields of a box that hold references, each a box pointer or a union with the indices that carry a box; for a list or map the layouts of what it holds (§11.4.13).
 - `Types` — the image's descriptors, indexed by type index.
 
 **Functions**
 
-- `fn type_descriptor(db: &dyn Db, program: Program, ty: Ty) -> Option<TypeDescriptor>` — the counted fields of a record type.
+- `fn type_descriptor(db: &dyn Db, program: Program, ty: Ty) -> Option<TypeDescriptor>` — the counted fields of a record type, or the layouts of a collection type's elements.
 - `unsafe extern "C" fn rt_release(ctx: *const TaskContext, ptr: *mut u8)` — the inline release's miss: frees the box and what only it held.
 - `unsafe fn release_box(heap: &mut Heap, types: &Types, ptr: *mut u8)` — the loop `rt_release` runs.
 
@@ -623,17 +623,27 @@ Code generation describes each record type it allocates: the code of an instance
 
 Crag's lists, maps and grids are immutable and persistent: an "update" builds a new version that shares unchanged parts with the old one (§12, §13.4). The runtime provides the underlying structures, which grow with the standard library from M1 on: lists as [RRB trees](https://infoscience.epfl.ch/record/169879) (wide trees supporting fast indexing, appending, splitting and concatenation), maps and sets as [hash array mapped tries](https://en.wikipedia.org/wiki/Hash_array_mapped_trie), sorted maps as persistent B-trees, and arenas with [generational handles](https://github.com/fitzgen/generational-arena) for cyclic data (§13.2). When the compiler proves a version has no other user, updates happen in place.
 
+A list is a box with its length, the height of its tree and the tree. Leaves hold up to 32 elements and inner nodes up to 32 children. A balanced node is indexed by the bits of the index; a relaxed one, made by slicing or joining, keeps the cumulative sizes of its children and is searched. Joining rebalances the nodes along the seam until they number at most two more than the fewest that hold their slots, the search step invariant of the paper, so relaxed trees stay shallow. A map is a box with its length and the root of a trie in the compressed form of [CHAMP](https://doi.org/10.1145/2814270.2814312): a node has one bitmap of the entries it holds inline and one of its children, and every child holds two entries or more, so a map's shape does not depend on the order of its updates. Below the depth where the 64-bit hash runs out, collision nodes list entries with equal hashes. A set is a map whose values have no words. Nodes are boxes with the collection's type index and their kind in the upper half of the index word. The descriptor of the type gives the layout of the elements, or of the keys and values, so the runtime counts what they hold and frees nodes like any other box.
+
+An update takes the collection by value. It changes in place every node only the caller's reference reaches, and copies a shared one with references to what it holds (Compiler Architecture §11.3); a caller that keeps the old version retains it first. One function per update thus covers both cases, without `*_unique` variants, and the compiler's proof of uniqueness (§13.4) will later skip the check of the count.
+
+Until generic instances exist (§11.5.10), the runtime hashes and compares keys by their words, so code generation accepts map and set keys that are equal exactly when their words are: integers, code points, `Fixed`, tags and unions of these. Generated code allocates an empty list or map inline and calls the runtime to append, find an element, slice, insert and look up; those functions run on the system stack, like `rt_alloc`. List, map and set literals, indexing, `for` over a list, list patterns with a rest, and map lookups as an `Option` compile; the MIR builder now also lowers a list literal that is a set. Setting an element, joining, removing a key and iterating a map are in the runtime and tested there, waiting for the standard library to call them. Empty collections are allocated, not static singletons, until images hold static data. Sorted maps and arenas come with the standard library types that use them.
+
 **Data structures**
 
-- `RrbNode`, `HamtNode`, `BTreeNode` — reference-counted nodes with branching factor 32 (RRB, HAMT) or a fixed node size (B-tree).
-- `Arena` — a flat store of slots, each with a generation number; a `Handle` is index plus generation.
+- `List` — the list's box: the header, the length, the height and the tree. `RrbNode` — a leaf of up to 32 elements, or an inner node of up to 32 children with, when relaxed, their cumulative sizes.
+- `Map` — the map's box: the header, the length and the root. `HamtNode` — a bitmap node of entries and children, or a collision node of entries with equal hashes.
+- `ElementLayout` — in `crag-abi`: the words of an element, key or value and the fields among them that hold references; `TypeDescriptor::List` and `TypeDescriptor::Map` carry them.
+- Later: `BTreeNode`, with a fixed node size, and `Arena` — a flat store of slots, each with a generation number; a `Handle` is index plus generation.
 
 **Functions**
 
-- `fn list_get(list: &List, i: usize) -> Option<Value>`, `fn list_set(list: &List, i: usize, v: Value) -> List`, `fn list_push(list: &List, v: Value) -> List`, `fn list_concat(a: &List, b: &List) -> List`, `fn list_slice(list: &List, range: Range<usize>) -> List`.
-- `fn map_get(map: &Map, key: &Value) -> Option<Value>`, `fn map_insert(map: &Map, key: Value, v: Value) -> Map`, `fn map_remove(map: &Map, key: &Value) -> Map`, `fn map_iter(map: &Map) -> MapIter`.
-- `fn arena_insert(arena: &mut Arena, v: Value) -> Handle`, `fn arena_get(arena: &Arena, h: Handle) -> Option<&Value>`, `fn arena_remove(arena: &mut Arena, h: Handle)` — a stale generation traps or returns `Empty`.
-- `fn list_set_unique(list: List, i: usize, v: Value) -> List` and the other `*_unique` variants — in-place versions the compiler calls when the value is unique; they take ownership instead of a borrow.
+- `unsafe fn list::push(heap: &mut Heap, types: &Types, list: *mut u8, value: &[u64]) -> *mut u8` and `list::set(…, i: usize, value: &[u64])` — take the list and the value.
+- `unsafe fn list::get(types: &Types, list: *mut u8, i: usize) -> *mut u64` — the address of the element's words, borrowed; `list::slice(heap, types, list, front: usize, back: usize)` and `list::concat(heap, types, a, b)` — new lists, borrowing their arguments.
+- `unsafe fn map::insert(heap: &mut Heap, types: &Types, map: *mut u8, key: &[u64], value: &[u64]) -> *mut u8` and `map::remove(heap, types, map, key)` — take the map.
+- `unsafe fn map::get(types: &Types, map: *mut u8, key: &[u64]) -> *mut u64` — the value's words, or null; `map::iter(types, map) -> MapIter` — the entries in an unspecified order.
+- `rt_list_push`, `rt_list_elem`, `rt_list_slice`, `rt_map_insert`, `rt_map_get` — what generated code calls (`crag_abi::RuntimeFn`).
+- Later: `fn arena_insert(arena: &mut Arena, v: Value) -> Handle`, `fn arena_get(arena: &Arena, h: Handle) -> Option<&Value>`, `fn arena_remove(arena: &mut Arena, h: Handle)` — a stale generation traps or returns `Empty`.
 
 #### 11.4.14 Traps and unwinder
 

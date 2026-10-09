@@ -352,8 +352,21 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     /// The operand as a value of `to`, which its type `from` fits.
     fn coerce(&mut self, op: Operand<'db>, from: Ty<'db>, to: Ty<'db>) -> Operand<'db> {
         match self.converts(from, to) {
-            true => self.assign(to, Rvalue::Convert(op)),
+            true => {
+                let op = self.typed(op, from);
+                self.assign(to, Rvalue::Convert(op))
+            }
             false => op,
+        }
+    }
+
+    /// The operand as one whose type is known: a constant typed only by
+    /// where it goes, such as a number, goes into a local of `ty` first,
+    /// so that a conversion knows what it converts from.
+    fn typed(&mut self, op: Operand<'db>, ty: Ty<'db>) -> Operand<'db> {
+        match op {
+            Operand::Const(Constant::Tag(_) | Constant::Unit) | Operand::Local(_) => op,
+            Operand::Const(_) => self.assign(ty, Rvalue::Use(op)),
         }
     }
 
@@ -361,6 +374,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     fn assign_to(&mut self, local: Local, op: Operand<'db>, from: Ty<'db>) {
         let to = self.locals[local.index()].ty;
         if self.converts(from, to) {
+            let op = self.typed(op, from);
             self.push(Statement::Assign(local, Rvalue::Convert(op)));
         } else if op != Operand::Local(local) {
             self.push(Statement::Assign(local, Rvalue::Use(op)));
@@ -544,7 +558,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Expr::Record(fields) => self.record(expr, ty, &[], fields),
             Expr::List(items) => {
                 let element = match ty.as_builtin(db) {
-                    Some((Builtin::List, [element])) => *element,
+                    Some((Builtin::List | Builtin::Set, [element])) => *element,
                     _ => return self.trap(TrapKind::Error, Some(expr)),
                 };
                 let mut ops = Vec::new();

@@ -162,16 +162,55 @@ pub enum RuntimeFn {
     /// frees it, and so on for every field whose count reaches zero
     /// (Implementation Plan §11.4.12). Retaining is inline code only.
     Release = 4,
+
+    /// `rt_list_push(ctx, list, w0, w1) -> list`.
+    ///
+    /// The list with the element appended, whose words are `w0` and `w1`
+    /// as far as its layout has words. It takes the list's reference and the
+    /// element's, and updates in place what only that reference holds
+    /// (Implementation Plan §11.4.13).
+    ListPush = 5,
+
+    /// `rt_list_elem(ctx, list, index) -> *const u64`.
+    ///
+    /// The address of the element's words, for an index inside the list. It
+    /// borrows the list, and the address is valid while the list is.
+    ListElem = 6,
+
+    /// `rt_list_slice(ctx, list, front, back) -> list`.
+    ///
+    /// A new list of the elements without the first `front` and the last
+    /// `back`, which together are at most the length. It borrows the list.
+    ListSlice = 7,
+
+    /// `rt_map_insert(ctx, map, k0, k1, v0, v1) -> map`.
+    ///
+    /// The map with the key bound to the value, words as for
+    /// `rt_list_push`; a set is a map whose values have no words. It takes
+    /// the references of the map, the key and the value.
+    MapInsert = 8,
+
+    /// `rt_map_get(ctx, map, k0, k1) -> *const u64`.
+    ///
+    /// The address of the words of the key's value, or null when the map
+    /// has none. It borrows the map, and the address is valid while the map
+    /// is.
+    MapGet = 9,
 }
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 5] = [
+    pub const ALL: [RuntimeFn; 10] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
         RuntimeFn::Alloc,
         RuntimeFn::Release,
+        RuntimeFn::ListPush,
+        RuntimeFn::ListElem,
+        RuntimeFn::ListSlice,
+        RuntimeFn::MapInsert,
+        RuntimeFn::MapGet,
     ];
 
     /// The symbol the loader looks up.
@@ -182,6 +221,11 @@ impl RuntimeFn {
             RuntimeFn::Trap => "rt_trap",
             RuntimeFn::Alloc => "rt_alloc",
             RuntimeFn::Release => "rt_release",
+            RuntimeFn::ListPush => "rt_list_push",
+            RuntimeFn::ListElem => "rt_list_elem",
+            RuntimeFn::ListSlice => "rt_list_slice",
+            RuntimeFn::MapInsert => "rt_map_insert",
+            RuntimeFn::MapGet => "rt_map_get",
         }
     }
 
@@ -216,7 +260,9 @@ pub const HEADER_SIZE: u32 = 16;
 /// Offset of the reference count in a box.
 pub const COUNT_OFFSET: i32 = 0;
 
-/// Offset of the type index in a box, a word whose upper half is zero.
+/// Offset of the type index in a box. The word's upper half is zero in
+/// every box generated code sees; the nodes of a collection, which only the
+/// runtime sees, carry their kind there.
 pub const TYPE_INDEX_OFFSET: i32 = 8;
 
 // Reference counts are atomic, because boxes are shared across threads. A
@@ -234,12 +280,21 @@ pub const TYPE_INDEX_OFFSET: i32 = 8;
 /// The count of a static box, or any count with this bit set.
 pub const STATIC_COUNT: u64 = 1 << 63;
 
-/// What the runtime needs to know of a box's type to free it: the fields
-/// that hold counted references. Code generation describes each type it
-/// allocates, and the image indexes the descriptors by type index.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct TypeDescriptor {
-    pub counted: Vec<CountedField>,
+/// What the runtime needs to know of a box's type to free it, and of a
+/// collection's elements to store them. Code generation describes each type
+/// it allocates, and the image indexes the descriptors by type index.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TypeDescriptor {
+    /// A record: the fields that hold counted references.
+    Record { counted: Vec<CountedField> },
+    /// A list, whose elements each take `element.words` words.
+    List { element: ElementLayout },
+    /// A map, or a set when the value has no words. Keys are equal when
+    /// their words are, so a key holds no reference and no `Float`.
+    Map {
+        key: ElementLayout,
+        value: ElementLayout,
+    },
 }
 
 /// A field of a box that may hold a reference.
@@ -251,6 +306,29 @@ pub enum CountedField {
     /// box pointer when the index is one of `boxed`, sorted.
     Union { offset: u32, boxed: Vec<u32> },
 }
+
+/// The words of a value inside a collection: at most two, with the fields
+/// that hold references at their offsets from the value's first word.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ElementLayout {
+    pub words: u32,
+    pub counted: Vec<CountedField>,
+}
+
+// A list or a map is a box that generated code allocates inline when it is
+// empty, and the runtime then grows: the header, the number of elements,
+// and then what only the runtime reads, zero in an empty one. Its nodes
+// are boxes too, with the type index of the collection.
+
+/// Offset of the number of elements, an `Int`, in a list or a map.
+pub const LEN_OFFSET: i32 = 16;
+
+/// Bytes of a list's box: the header, the length, the height of its tree
+/// and the tree.
+pub const LIST_SIZE: u32 = 40;
+
+/// Bytes of a map's box: the header, the length and the root node.
+pub const MAP_SIZE: u32 = 32;
 
 /// Bytes of the largest block the heap allocates from pages of a size class.
 /// A larger box is a mapping of its own, allocated by `rt_alloc` alone.

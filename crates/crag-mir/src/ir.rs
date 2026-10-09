@@ -175,6 +175,7 @@ pub enum Rvalue<'db> {
         ty: Ty<'db>,
         fields: Vec<(Name<'db>, Operand<'db>)>,
     },
+    /// A list, or a set when the local is one.
     List(Vec<Operand<'db>>),
     Map(Vec<(Operand<'db>, Operand<'db>)>),
     /// Strings joined.

@@ -18,8 +18,8 @@
 //!
 //! M0 scope (Implementation Plan §11.3.1 to §11.3.4 and §11.3.9): fibers and
 //! the context switch, stack growth by copying, the side stack, the sentinel
-//! stop request and the stress harness. M1 adds the allocator and reference
-//! counting (§11.4.11, §11.4.12).
+//! stop request and the stress harness. M1 adds the allocator, reference
+//! counting, and lists and maps (§11.4.11 to §11.4.13).
 //!
 //! Runtime discipline (Compiler Architecture §2.1): no thread-locals, no
 //! callbacks into Crag code from the runtime stack, panics abort in images
@@ -37,13 +37,20 @@
 #[cfg(not(all(target_arch = "x86_64", unix)))]
 compile_error!("the runtime's context switch is written for x86-64 Unix only");
 
+#[macro_use]
+mod system;
+
 pub mod fiber;
 pub mod heap;
+pub mod list;
+pub mod map;
 pub mod rc;
 pub mod sentinel;
 pub mod side_stack;
 pub mod stack;
 pub mod stress;
+#[cfg(test)]
+mod testing;
 
 pub use fiber::{Fiber, FiberConfig, FiberState, TaskContext, Worker};
 pub use heap::{Heap, alloc_box};
@@ -60,6 +67,11 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> Option<usize> {
         RuntimeFn::SideGrow => Some(side_stack::rt_side_grow as *const () as usize),
         RuntimeFn::Alloc => Some(heap::rt_alloc as *const () as usize),
         RuntimeFn::Release => Some(rc::rt_release as *const () as usize),
+        RuntimeFn::ListPush => Some(list::rt_list_push as *const () as usize),
+        RuntimeFn::ListElem => Some(list::rt_list_elem as *const () as usize),
+        RuntimeFn::ListSlice => Some(list::rt_list_slice as *const () as usize),
+        RuntimeFn::MapInsert => Some(map::rt_map_insert as *const () as usize),
+        RuntimeFn::MapGet => Some(map::rt_map_get as *const () as usize),
         RuntimeFn::Trap => None,
     }
 }

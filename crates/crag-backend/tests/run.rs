@@ -18,9 +18,11 @@
 //!
 //! The functions run on the test's own thread, entered through the entry
 //! stub with a task context whose stack limit is zero, so no stack check
-//! fails, and whose heap is the module's. `rt_alloc` and `rt_release` are
-//! stubs here that count their calls and do what the runtime's do, because
-//! the runtime's switch to a worker's stack. `rt_trap` aborts.
+//! fails, and whose heap is the module's. The runtime's functions switch to
+//! a worker's stack, which this context has none of, so stubs here do what
+//! they do on the test's own stack: `rt_alloc` and `rt_release` count their
+//! calls, and the list and map functions call the runtime's Rust halves.
+//! `rt_trap` aborts.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -32,7 +34,7 @@ use crag_db::RootDatabase;
 use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, owners};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{InstanceKey, Tier};
-use crag_runtime::{Heap, Types, alloc_box, release_box};
+use crag_runtime::{Heap, Types, alloc_box, list, map, release_box};
 use crag_types::{Ty, TyKind, prelude_item};
 
 const PRELUDE: &str = r#"pub type Int
@@ -47,6 +49,9 @@ pub type Bool = True | False
 pub type Empty[T]
 pub type Option[T] = T | Empty[T]
 pub type Range[T](first: T, last: T)
+pub type List[T]
+pub type Map[K, V]
+pub type Set[T]
 pub fn add(a: Int, b: Int) -> Int
 pub fn add(a: UInt8, b: UInt8) -> UInt8
 pub fn add(a: Float, b: Float) -> Float
@@ -99,6 +104,51 @@ extern "C" fn rt_release(ctx: *mut u64, ptr: *mut u8) {
     unsafe { release_box(heap_of(ctx), &*TYPES.get(), ptr) }
 }
 
+/// The descriptors of the running module.
+///
+/// # Safety
+///
+/// Called during `Module::call`.
+unsafe fn types<'a>() -> &'a Types {
+    // SAFETY: as the caller promises.
+    unsafe { &*TYPES.get() }
+}
+
+// The list and map functions. Generated code passes the context it received
+// and collections of the module's types.
+
+extern "C" fn rt_list_push(ctx: *mut u64, list: *mut u8, w0: u64, w1: u64) -> *mut u8 {
+    // SAFETY: see above.
+    unsafe { list::push(heap_of(ctx), types(), list, &[w0, w1]) }
+}
+
+extern "C" fn rt_list_elem(_ctx: *mut u64, list: *mut u8, index: u64) -> *mut u64 {
+    // SAFETY: see above.
+    unsafe { list::get(types(), list, index as usize) }
+}
+
+extern "C" fn rt_list_slice(ctx: *mut u64, list: *mut u8, front: u64, back: u64) -> *mut u8 {
+    // SAFETY: see above.
+    unsafe { list::slice(heap_of(ctx), types(), list, front as usize, back as usize) }
+}
+
+extern "C" fn rt_map_insert(
+    ctx: *mut u64,
+    map: *mut u8,
+    k0: u64,
+    k1: u64,
+    v0: u64,
+    v1: u64,
+) -> *mut u8 {
+    // SAFETY: see above.
+    unsafe { map::insert(heap_of(ctx), types(), map, &[k0, k1], &[v0, v1]) }
+}
+
+extern "C" fn rt_map_get(_ctx: *mut u64, map: *mut u8, k0: u64, k1: u64) -> *mut u64 {
+    // SAFETY: see above.
+    unsafe { map::get(types(), map, &[k0, k1]) }
+}
+
 extern "C" fn rt_trap(_ctx: *mut u64, kind: u64) {
     eprintln!("trap {kind}");
     std::process::abort();
@@ -133,6 +183,8 @@ impl Module {
             SourceFile::new(&db, text.to_string()),
         );
         let program = Program::new(&db, vec![core, module]);
+        let syntax = &crag_hir::parse(&db, *module.file(&db)).errors;
+        assert!(syntax.is_empty(), "{syntax:?}");
         let errors = crag_types::module_type_errors(&db, program, module);
         assert!(
             errors.is_empty(),
@@ -171,6 +223,11 @@ impl Module {
                 RuntimeFn::Alloc => rt_alloc as *const () as usize,
                 RuntimeFn::Release => rt_release as *const () as usize,
                 RuntimeFn::Trap => rt_trap as *const () as usize,
+                RuntimeFn::ListPush => rt_list_push as *const () as usize,
+                RuntimeFn::ListElem => rt_list_elem as *const () as usize,
+                RuntimeFn::ListSlice => rt_list_slice as *const () as usize,
+                RuntimeFn::MapInsert => rt_map_insert as *const () as usize,
+                RuntimeFn::MapGet => rt_map_get as *const () as usize,
                 f => crag_runtime::runtime_fn_addr(f).expect("the runtime has it"),
             };
             symbols.define_runtime(func, addr);
@@ -500,4 +557,122 @@ fn plain(n: Int) -> Int {
     );
     assert_eq!(m.unsupported, ["label: strings and bytes"]);
     assert_eq!(m.int("plain", &[21]), 42);
+}
+
+#[test]
+fn collections_run() {
+    // A literal long enough to need a tree of several leaves.
+    let long: Vec<String> = (1..=100).map(|i| i.to_string()).collect();
+    let long = long.join(", ");
+    let mut m = Module::new(&format!(
+        r#"type Point(x: Int, y: Int)
+
+fn total(xs: List[Int]) -> Int {{
+  var sum = 0
+  for x in xs {{
+    sum = sum + x
+  }}
+  sum
+}}
+
+fn literal(i: Int) -> Int {{
+  let xs = [1, 2, 3, 4, 5]
+  total(xs) * 100 + xs[i]
+}}
+
+fn long() -> List[Int] {{
+  [{long}]
+}}
+
+fn walk(xs: List[Int], acc: Int) -> Int {{
+  case xs {{
+    [] -> acc
+    [x, ..rest] -> walk(rest, acc + x)
+  }}
+}}
+
+fn ends(xs: List[Int]) -> Int {{
+  case xs {{
+    [] -> 0
+    [x] -> x
+    [a, .., b] -> a * 1000 + b
+  }}
+}}
+
+fn walked(n: Int) -> Int {{
+  let xs = long()
+  walk(xs, 0) + ends(xs) + ends([n]) + ends([])
+}}
+
+fn points(n: Int) -> Int {{
+  let ps = [Point(x: n, y: 2), Point(x: 3, y: 4)]
+  var sum = 0
+  for p in ps {{
+    sum = sum + p.x * p.y
+  }}
+  case ps {{
+    [first, ..] -> sum + first.x
+    [] -> 0
+  }}
+}}
+
+fn options(n: Int) -> Int {{
+  let xs: List[Option[Int]] = [n, Empty, 5]
+  var sum = 0
+  for x in xs {{
+    case x {{
+      Empty -> {{ sum = sum + 1000 }}
+      v: Int -> {{ sum = sum + v }}
+    }}
+  }}
+  sum
+}}
+
+fn lookup(k: Int) -> Int {{
+  let ages = [1: 10, 2: 20, 3: Point(x: 30, y: 0).x]
+  case ages[k] {{
+    Empty -> -1
+    v: Int -> v
+  }}
+}}
+
+fn nested(k: Int) -> Int {{
+  let places = [1: Point(x: 7, y: 8), 2: Point(x: 9, y: 10)]
+  case places[k] {{
+    Empty -> -1
+    p: Point -> p.x + p.y
+  }}
+}}
+
+fn grid(i: Int) -> Int {{
+  let rows = [[1, 2], [3], [i, 5, 6]]
+  rows[0][1] + rows[1][0] + rows[2][0] * 10
+}}
+
+fn sets(n: Int) -> Int {{
+  let s: Set[Int] = [1, 2, 2, n]
+  n
+}}
+"#
+    ));
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    assert_eq!(m.int("literal", &[0]), 1501);
+    assert_eq!(m.int("literal", &[4]), 1505);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("walked", &[7]), 5050 + 1100 + 7);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("points", &[5]), 10 + 12 + 5);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("options", &[3]), 1008);
+    assert_eq!(m.heap.live_blocks(), 0);
+    let found: Vec<i64> = (0..5).map(|k| m.int("lookup", &[k])).collect();
+    assert_eq!(found, [-1, 10, 20, 30, -1]);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("nested", &[2]), 19);
+    assert_eq!(m.int("nested", &[3]), -1);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("grid", &[4]), 45);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("sets", &[9]), 9);
+    assert_eq!(m.heap.live_blocks(), 0);
 }

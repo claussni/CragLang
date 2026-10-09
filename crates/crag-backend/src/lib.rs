@@ -19,8 +19,9 @@
 //!
 //! Values are laid out in words as Compiler Architecture §11 describes;
 //! `layout` decides how. Boxes are allocated and counted inline, the runtime
-//! frees them using the descriptors of their types, and checks trap through
-//! a call of the runtime. Every call is a safepoint whose stack map lists
+//! frees them using the descriptors of their types, lists and maps grow and
+//! are read through calls of the runtime, and checks trap through a call of
+//! the runtime. Every call is a safepoint whose stack map lists
 //! the boxes the frame holds.
 
 extern crate crag_db as salsa;
@@ -37,7 +38,9 @@ use crag_db::Db;
 use crag_hir::Program;
 use crag_mir::{InstanceKey, Tier, mir};
 
-pub use layout::{FieldSlot, Layout, layout, record_layout, type_descriptor, type_index};
+pub use layout::{
+    FieldSlot, Layout, element_layout, layout, record_layout, type_descriptor, type_index,
+};
 pub use lower::{Lowered, func_id, lower_to_lir};
 
 /// The code of an instance, ready for the loader.
@@ -51,8 +54,8 @@ pub struct Code<'db> {
     pub returns: u32,
     /// The instances it calls, which must be loaded with it.
     pub calls: Vec<InstanceKey<'db>>,
-    /// The types of the boxes it allocates, by type index, whose
-    /// descriptors the image must hold.
+    /// The types of the boxes it allocates or whose elements it reads, by
+    /// type index, whose descriptors the image must hold.
     pub types: Vec<(u32, TypeDescriptor)>,
     /// What it could not compile; each traps where it is reached.
     pub unsupported: Vec<&'static str>,

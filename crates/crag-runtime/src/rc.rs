@@ -26,15 +26,18 @@
 //! is therefore freed in a loop, with no stack to overflow and no memory to
 //! allocate.
 
-use std::mem::offset_of;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 
-use crag_abi::{COUNT_OFFSET, CountedField, STATIC_COUNT, TYPE_INDEX_OFFSET, TypeDescriptor};
+use crag_abi::{
+    COUNT_OFFSET, CountedField, ElementLayout, STATIC_COUNT, TYPE_INDEX_OFFSET, TypeDescriptor,
+};
 
 use crate::die;
-use crate::fiber::{TaskContext, Worker};
+use crate::fiber::TaskContext;
 use crate::heap::Heap;
+use crate::system::worker_of;
+use crate::{list, map};
 
 /// The descriptors of an image's types, indexed by type index.
 #[derive(Debug, Default)]
@@ -58,6 +61,31 @@ impl Types {
     pub fn get(&self, index: u32) -> Option<&TypeDescriptor> {
         self.descriptors.get(index as usize)?.as_ref()
     }
+
+    /// The descriptor of the box at `ptr`, which must have one.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` points at a live box.
+    pub(crate) unsafe fn of(&self, ptr: *mut u8) -> &TypeDescriptor {
+        // SAFETY: as the caller promises.
+        let index = unsafe { header(ptr) } as u32;
+        match self.get(index) {
+            Some(descriptor) => descriptor,
+            None => die(&format!("a box of type {index}, which has no descriptor")),
+        }
+    }
+}
+
+/// The type index word of the box at `ptr`: the index, and in its upper
+/// half the kind of a collection's node.
+///
+/// # Safety
+///
+/// `ptr` points at a live box.
+pub(crate) unsafe fn header(ptr: *mut u8) -> u64 {
+    // SAFETY: as the caller promises.
+    unsafe { ptr.offset(TYPE_INDEX_OFFSET as isize).cast::<u64>().read() }
 }
 
 /// The count of the box at `ptr`.
@@ -68,6 +96,19 @@ impl Types {
 unsafe fn count<'a>(ptr: *mut u8) -> &'a AtomicU64 {
     // SAFETY: as the caller promises; the count is an aligned word.
     unsafe { &*ptr.offset(COUNT_OFFSET as isize).cast::<AtomicU64>() }
+}
+
+/// Adds a reference to a box, unless it is static.
+///
+/// # Safety
+///
+/// The caller holds a reference to the box at `ptr`.
+pub(crate) unsafe fn retain(ptr: *mut u8) {
+    // SAFETY: as the caller promises.
+    let count = unsafe { count(ptr) };
+    if count.load(Ordering::Relaxed) & STATIC_COUNT == 0 {
+        count.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Gives up a reference to a box; whether it was the last. A static box is
@@ -91,6 +132,79 @@ unsafe fn release(ptr: *mut u8) -> bool {
     true
 }
 
+/// Gives up a reference to a box, and frees it with the last.
+///
+/// # Safety
+///
+/// As for [`release_box`], once the reference given up was the last.
+pub(crate) unsafe fn drop_box(heap: &mut Heap, types: &Types, ptr: *mut u8) {
+    // SAFETY: as the caller promises.
+    unsafe {
+        if release(ptr) {
+            release_box(heap, types, ptr);
+        }
+    }
+}
+
+/// Whether the caller's reference to a box is its only one, so the box may
+/// change in place. A static box is never unique.
+///
+/// # Safety
+///
+/// The caller owns a reference to the box at `ptr`.
+pub(crate) unsafe fn is_unique(ptr: *mut u8) -> bool {
+    // SAFETY: as the caller promises. Acquire, so that what other threads
+    // did with the box before they released it happens before the change.
+    unsafe { count(ptr).load(Ordering::Acquire) == 1 }
+}
+
+/// Calls `f` with each box the counted fields at `base` hold.
+///
+/// # Safety
+///
+/// `base` points at words that hold what `fields` says.
+pub(crate) unsafe fn boxes_in(base: *mut u8, fields: &[CountedField], mut f: impl FnMut(*mut u8)) {
+    for field in fields {
+        // SAFETY: as the caller promises.
+        unsafe {
+            match field {
+                CountedField::Box(offset) => f(base.add(*offset as usize).cast::<*mut u8>().read()),
+                CountedField::Union { offset, boxed } => {
+                    let at = base.add(*offset as usize).cast::<u64>();
+                    if boxed.binary_search(&(at.read() as u32)).is_ok() {
+                        f(at.add(1).cast::<*mut u8>().read());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Adds a reference to each box a value of `layout` at `base` holds.
+///
+/// # Safety
+///
+/// The caller holds the value at `base`.
+pub(crate) unsafe fn retain_value(base: *mut u8, layout: &ElementLayout) {
+    // SAFETY: as the caller promises.
+    unsafe { boxes_in(base, &layout.counted, |b| retain(b)) }
+}
+
+/// Gives up the references a value of `layout` at `base` holds.
+///
+/// # Safety
+///
+/// The caller owns the value at `base`, which it does not use again.
+pub(crate) unsafe fn release_value(
+    heap: &mut Heap,
+    types: &Types,
+    base: *mut u8,
+    layout: &ElementLayout,
+) {
+    // SAFETY: as the caller promises.
+    unsafe { boxes_in(base, &layout.counted, |b| drop_box(heap, types, b)) }
+}
+
 /// Frees a box whose count has reached zero, and releases its fields,
 /// freeing those whose counts reach zero in turn.
 ///
@@ -109,26 +223,18 @@ pub unsafe fn release_box(heap: &mut Heap, types: &Types, ptr: *mut u8) {
         while !pending.is_null() {
             let ptr = pending;
             pending = link(ptr).read();
-            let index = ptr.offset(TYPE_INDEX_OFFSET as isize).cast::<u64>().read() as u32;
-            let Some(descriptor) = types.get(index) else {
-                die(&format!(
-                    "freed a box of type {index}, which has no descriptor"
-                ));
-            };
-            for field in &descriptor.counted {
-                let child = match field {
-                    CountedField::Box(offset) => ptr.add(*offset as usize).cast::<*mut u8>().read(),
-                    CountedField::Union { offset, boxed } => {
-                        let at = ptr.add(*offset as usize).cast::<u64>();
-                        if boxed.binary_search(&(at.read() as u32)).is_err() {
-                            continue;
-                        }
-                        at.add(1).cast::<*mut u8>().read()
-                    }
-                };
+            let kind = (header(ptr) >> 32) as u32;
+            let mut dead = |child: *mut u8| {
                 if release(child) {
                     link(child).write(pending);
                     pending = child;
+                }
+            };
+            match types.of(ptr) {
+                TypeDescriptor::Record { counted } => boxes_in(ptr, counted, &mut dead),
+                TypeDescriptor::List { element } => list::boxes_of(ptr, kind, element, &mut dead),
+                TypeDescriptor::Map { key, value } => {
+                    map::boxes_of(ptr, kind, key, value, &mut dead)
                 }
             }
             heap.free(ptr);
@@ -136,43 +242,21 @@ pub unsafe fn release_box(heap: &mut Heap, types: &Types, ptr: *mut u8) {
     }
 }
 
-/// `rt_release(ctx, ptr)`: see `crag_abi::RuntimeFn::Release`.
-///
-/// Switches to the system stack, keeping the fiber's stack pointer in a
-/// callee-saved register, and frees there.
-///
-/// # Safety
-///
-/// Only generated code may call this, on a fiber stack, with the fiber's
-/// task context, for a box whose count it has just taken to zero.
-#[unsafe(naked)]
-pub(crate) unsafe extern "C" fn rt_release(ctx: *const TaskContext, ptr: *mut u8) {
-    std::arch::naked_asm!(
-        "push rbx",
-        "mov rbx, rsp",
-        "mov rax, [rdi + {worker}]",
-        "mov rsp, [rax]",
-        "and rsp, -16",
-        "call {entry}",
-        "mov rsp, rbx",
-        "pop rbx",
-        "ret",
-        worker = const offset_of!(TaskContext, worker),
-        entry = sym release_entry,
-    )
+system_stack_fn! {
+    /// `rt_release(ctx, ptr)`: see `crag_abi::RuntimeFn::Release`.
+    fn rt_release(ctx: *const TaskContext, ptr: *mut u8) => release_entry
 }
 
 /// The Rust half of `rt_release`, on the system stack.
 ///
 /// # Safety
 ///
-/// Called only by `rt_release`, while a worker runs the fiber of `ctx`.
+/// Called only by `rt_release`, for a box whose count generated code has
+/// just taken to zero.
 unsafe extern "C" fn release_entry(ctx: *const TaskContext, ptr: *mut u8) {
-    // SAFETY: `Worker::resume` stored the worker in the context, and nothing
-    // else uses its heap while the fiber runs.
+    // SAFETY: as the caller promises.
     unsafe {
-        let worker: *mut Worker = (*ctx).worker.load(Ordering::Relaxed);
-        let (heap, types) = Worker::heap_and_types(worker);
+        let (heap, types) = worker_of(ctx);
         release_box(heap, types, ptr);
     }
 }
@@ -182,25 +266,22 @@ mod tests {
     use super::*;
     use crate::heap::alloc_box;
 
+    fn record(counted: Vec<CountedField>) -> TypeDescriptor {
+        TypeDescriptor::Record { counted }
+    }
+
     const NODE: u32 = 7;
     const PAIR: u32 = 9;
 
     fn types() -> Types {
         Types::new([
-            (
-                NODE,
-                TypeDescriptor {
-                    counted: vec![CountedField::Box(16)],
-                },
-            ),
+            (NODE, record(vec![CountedField::Box(16)])),
             (
                 PAIR,
-                TypeDescriptor {
-                    counted: vec![CountedField::Union {
-                        offset: 16,
-                        boxed: vec![NODE],
-                    }],
-                },
+                record(vec![CountedField::Union {
+                    offset: 16,
+                    boxed: vec![NODE],
+                }]),
             ),
         ])
     }
