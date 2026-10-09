@@ -20,6 +20,7 @@ Compiler, host and runtime for the Crag language, written in Rust.
 | `crates/crag-hir` | Item trees, names and imports, and HIR lowering (M1) |
 | `crates/crag-types` | Types and core inference (M1) |
 | `crates/crag-mir` | MIR builder (M1) |
+| `crates/crag-backend` | Code generation from MIR (M1) |
 
 ## Build
 

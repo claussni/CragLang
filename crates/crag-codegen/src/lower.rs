@@ -22,18 +22,18 @@ use std::collections::HashMap;
 use crag_abi::{FRAME_BUDGET, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET};
 use cranelift_codegen::binemit::Reloc as ClifReloc;
 use cranelift_codegen::control::ControlPlane;
-use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::types::I64;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::types::{F64, I64};
 use cranelift_codegen::ir::{
     AbiParam, ExtFuncData, ExternalName, FuncRef, Function, InstBuilder, MemFlagsData, Signature,
-    UserExternalName, UserFuncName, Value,
+    TrapCode, UserExternalName, UserFuncName, Value,
 };
 use cranelift_codegen::isa::{self, CallConv, OwnedTargetIsa, TargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::{Context, FinalizedRelocTarget};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
-use crate::lir::{BinOp, Cond, Inst, LirFunction, Term};
+use crate::lir::{BinOp, Cond, Inst, LirFunction, OverflowOp, Term};
 use crate::{
     CodeObject, CodegenError, CodegenSettings, FuncId, OptLevel, Reloc, RelocKind, RelocTarget,
     StackCheck, StackMap,
@@ -316,6 +316,22 @@ impl Imports {
         self.get(b, (NS_RUNTIME, RuntimeFn::Morestack as u32), sig)
     }
 
+    /// The runtime functions with the C convention: the task context, then
+    /// the arguments.
+    fn runtime(
+        &mut self,
+        b: &mut FunctionBuilder,
+        call_conv: CallConv,
+        func: RuntimeFn,
+        params: u32,
+        returns: u32,
+    ) -> FuncRef {
+        let mut sig = Signature::new(call_conv);
+        sig.params.extend((0..=params).map(|_| AbiParam::new(I64)));
+        sig.returns.extend((0..returns).map(|_| AbiParam::new(I64)));
+        self.get(b, (NS_RUNTIME, func as u32), sig)
+    }
+
     /// `rt_side_grow` has the same convention, for the same reason.
     fn side_grow(&mut self, b: &mut FunctionBuilder) -> FuncRef {
         let mut sig = Signature::new(CallConv::PreserveAll);
@@ -466,15 +482,78 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
                     let v = b.ins().iconst(I64, *value);
                     b.def_var(vars[dst.0 as usize], v);
                 }
+                Inst::Move { dst, src } => {
+                    let v = b.use_var(vars[src.0 as usize]);
+                    b.def_var(vars[dst.0 as usize], v);
+                }
                 Inst::Bin { op, dst, a, b: rhs } => {
                     let x = b.use_var(vars[a.0 as usize]);
                     let y = b.use_var(vars[rhs.0 as usize]);
+                    let float =
+                        |b: &mut FunctionBuilder, x| b.ins().bitcast(F64, MemFlagsData::new(), x);
                     let v = match op {
                         BinOp::Add => b.ins().iadd(x, y),
                         BinOp::Sub => b.ins().isub(x, y),
                         BinOp::Mul => b.ins().imul(x, y),
+                        BinOp::SDiv => b.ins().sdiv(x, y),
+                        BinOp::UDiv => b.ins().udiv(x, y),
+                        BinOp::SRem => b.ins().srem(x, y),
+                        BinOp::URem => b.ins().urem(x, y),
+                        BinOp::And => b.ins().band(x, y),
+                        BinOp::Or => b.ins().bor(x, y),
+                        BinOp::Shl => b.ins().ishl(x, y),
+                        BinOp::SShr => b.ins().sshr(x, y),
+                        BinOp::UShr => b.ins().ushr(x, y),
+                        BinOp::FAdd | BinOp::FSub | BinOp::FMul | BinOp::FDiv => {
+                            let (fx, fy) = (float(&mut b, x), float(&mut b, y));
+                            let r = match op {
+                                BinOp::FAdd => b.ins().fadd(fx, fy),
+                                BinOp::FSub => b.ins().fsub(fx, fy),
+                                BinOp::FMul => b.ins().fmul(fx, fy),
+                                _ => b.ins().fdiv(fx, fy),
+                            };
+                            b.ins().bitcast(I64, MemFlagsData::new(), r)
+                        }
                     };
                     b.def_var(vars[dst.0 as usize], v);
+                }
+                Inst::Overflow { op, dst, a, b: rhs } => {
+                    let x = b.use_var(vars[a.0 as usize]);
+                    let y = b.use_var(vars[rhs.0 as usize]);
+                    let (_, flag) = match op {
+                        OverflowOp::SAdd => b.ins().sadd_overflow(x, y),
+                        OverflowOp::UAdd => b.ins().uadd_overflow(x, y),
+                        OverflowOp::SSub => b.ins().ssub_overflow(x, y),
+                        OverflowOp::USub => b.ins().usub_overflow(x, y),
+                        OverflowOp::SMul => b.ins().smul_overflow(x, y),
+                        OverflowOp::UMul => b.ins().umul_overflow(x, y),
+                    };
+                    let v = b.ins().uextend(I64, flag);
+                    b.def_var(vars[dst.0 as usize], v);
+                }
+                Inst::Select {
+                    dst,
+                    cond,
+                    a,
+                    b: rhs,
+                } => {
+                    let c = b.use_var(vars[cond.0 as usize]);
+                    let x = b.use_var(vars[a.0 as usize]);
+                    let y = b.use_var(vars[rhs.0 as usize]);
+                    let v = b.ins().select(c, x, y);
+                    b.def_var(vars[dst.0 as usize], v);
+                }
+                Inst::CallRuntime { func, args, dsts } => {
+                    let conv = isa.default_call_conv();
+                    let (params, returns) = (args.len() as u32, dsts.len() as u32);
+                    let callee = imports.runtime(&mut b, conv, *func, params, returns);
+                    let mut values = vec![ctx];
+                    values.extend(args.iter().map(|r| b.use_var(vars[r.0 as usize])));
+                    let call = b.ins().call(callee, &values);
+                    let results = b.inst_results(call).to_vec();
+                    for (dst, v) in dsts.iter().zip(results) {
+                        b.def_var(vars[dst.0 as usize], v);
+                    }
                 }
                 Inst::Cmp {
                     cond,
@@ -484,15 +563,33 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
                 } => {
                     let x = b.use_var(vars[a.0 as usize]);
                     let y = b.use_var(vars[rhs.0 as usize]);
+                    let int = |cc| Ok::<IntCC, FloatCC>(cc);
                     let cc = match cond {
-                        Cond::Eq => IntCC::Equal,
-                        Cond::Ne => IntCC::NotEqual,
-                        Cond::Lt => IntCC::SignedLessThan,
-                        Cond::Le => IntCC::SignedLessThanOrEqual,
-                        Cond::Gt => IntCC::SignedGreaterThan,
-                        Cond::Ge => IntCC::SignedGreaterThanOrEqual,
+                        Cond::Eq => int(IntCC::Equal),
+                        Cond::Ne => int(IntCC::NotEqual),
+                        Cond::Lt => int(IntCC::SignedLessThan),
+                        Cond::Le => int(IntCC::SignedLessThanOrEqual),
+                        Cond::Gt => int(IntCC::SignedGreaterThan),
+                        Cond::Ge => int(IntCC::SignedGreaterThanOrEqual),
+                        Cond::ULt => int(IntCC::UnsignedLessThan),
+                        Cond::ULe => int(IntCC::UnsignedLessThanOrEqual),
+                        Cond::UGt => int(IntCC::UnsignedGreaterThan),
+                        Cond::UGe => int(IntCC::UnsignedGreaterThanOrEqual),
+                        Cond::FEq => Err(FloatCC::Equal),
+                        Cond::FNe => Err(FloatCC::NotEqual),
+                        Cond::FLt => Err(FloatCC::LessThan),
+                        Cond::FLe => Err(FloatCC::LessThanOrEqual),
+                        Cond::FGt => Err(FloatCC::GreaterThan),
+                        Cond::FGe => Err(FloatCC::GreaterThanOrEqual),
                     };
-                    let flag = b.ins().icmp(cc, x, y);
+                    let flag = match cc {
+                        Ok(cc) => b.ins().icmp(cc, x, y),
+                        Err(cc) => {
+                            let fx = b.ins().bitcast(F64, MemFlagsData::new(), x);
+                            let fy = b.ins().bitcast(F64, MemFlagsData::new(), y);
+                            b.ins().fcmp(cc, fx, fy)
+                        }
+                    };
                     let v = b.ins().uextend(I64, flag);
                     b.def_var(vars[dst.0 as usize], v);
                 }
@@ -555,6 +652,14 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
                 values.extend(args.iter().map(|r| b.use_var(vars[r.0 as usize])));
                 side_pop(&mut b);
                 b.ins().return_call(callee, &values);
+            }
+            Term::Trap(kind) => {
+                let conv = isa.default_call_conv();
+                let trap = imports.runtime(&mut b, conv, RuntimeFn::Trap, 1, 0);
+                let kind = b.ins().iconst(I64, *kind as i64);
+                b.ins().call(trap, &[ctx, kind]);
+                // `rt_trap` does not return.
+                b.ins().trap(TrapCode::unwrap_user(1));
             }
         }
     }

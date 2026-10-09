@@ -90,6 +90,20 @@ name = "crag-abi"
 version = "0.0.0"
 
 [[package]]
+name = "crag-backend"
+version = "0.0.0"
+dependencies = [
+ "crag-abi",
+ "crag-codegen",
+ "crag-db",
+ "crag-hir",
+ "crag-loader",
+ "crag-mir",
+ "crag-runtime",
+ "crag-types",
+]
+
+[[package]]
 name = "crag-codegen"
 version = "0.0.0"
 dependencies = [

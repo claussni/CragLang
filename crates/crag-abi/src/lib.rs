@@ -136,17 +136,50 @@ pub enum RuntimeFn {
     /// then repeats the push. It has the same convention as `rt_morestack`:
     /// C argument registers, every register preserved, no result.
     SideGrow = 1,
+
+    /// `rt_trap(ctx: *mut TaskContext, kind: u64) -> !`, with `kind` a
+    /// [`TrapKind`].
+    ///
+    /// Called where a check fails; it never returns (Implementation Plan
+    /// §11.4.14). The functions from here on have the C calling convention,
+    /// take the task context first, and run on the system stack.
+    Trap = 2,
+
+    /// `rt_alloc(ctx: *mut TaskContext, size: u64, type_index: u64) -> *mut u8`.
+    ///
+    /// A box of `size` bytes, header included, with a count of one and the
+    /// type index in its header (Implementation Plan §11.4.11).
+    Alloc = 3,
+
+    /// `rt_retain(ctx: *mut TaskContext, ptr: *mut u8)`: adds a reference to
+    /// a box (Implementation Plan §11.4.12).
+    Retain = 4,
+
+    /// `rt_release(ctx: *mut TaskContext, ptr: *mut u8)`: gives up a
+    /// reference to a box, releasing its fields and freeing it with the last.
+    Release = 5,
 }
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 2] = [RuntimeFn::Morestack, RuntimeFn::SideGrow];
+    pub const ALL: [RuntimeFn; 6] = [
+        RuntimeFn::Morestack,
+        RuntimeFn::SideGrow,
+        RuntimeFn::Trap,
+        RuntimeFn::Alloc,
+        RuntimeFn::Retain,
+        RuntimeFn::Release,
+    ];
 
     /// The symbol the loader looks up.
     pub fn symbol(self) -> &'static str {
         match self {
             RuntimeFn::Morestack => "rt_morestack",
             RuntimeFn::SideGrow => "rt_side_grow",
+            RuntimeFn::Trap => "rt_trap",
+            RuntimeFn::Alloc => "rt_alloc",
+            RuntimeFn::Retain => "rt_retain",
+            RuntimeFn::Release => "rt_release",
         }
     }
 
@@ -156,13 +189,41 @@ impl RuntimeFn {
     }
 }
 
+/// Why generated code stopped a computation (Specification §8.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum TrapKind {
+    Overflow = 0,
+    DivideByZero = 1,
+    /// An index outside the list.
+    Index = 2,
+    /// `???` was reached.
+    Hole = 3,
+    /// No arm of a `case` matched.
+    NoMatch = 4,
+    /// The function had compile errors.
+    Error = 5,
+    /// The compiler does not support what was reached yet.
+    Unsupported = 6,
+}
+
+/// Bytes of a box's header: the count with its flag bits, then the type
+/// index (Compiler Architecture §11.1). Fields follow it.
+pub const HEADER_SIZE: u32 = 16;
+
+/// Offset of the reference count in a box.
+pub const COUNT_OFFSET: i32 = 0;
+
+/// Offset of the type index in a box, a word whose upper half is zero.
+pub const TYPE_INDEX_OFFSET: i32 = 8;
+
 /// Another Crag function, as generated code refers to it. The loader resolves
 /// it to an address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FuncId(pub u32);
 
 /// The machine code of one function plus what the loader needs to place it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeObject {
     /// Machine code. It may hold more than one routine; execution starts at
     /// `entry`.

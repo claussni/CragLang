@@ -47,11 +47,14 @@ pub use sentinel::{StopHandle, StopReason, request_stop};
 
 use crag_abi::RuntimeFn;
 
-/// The address of a runtime function, for the loader's symbol table.
-pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
+/// The address of a runtime function, for the loader's symbol table; none
+/// for the functions later components add: traps, allocation and reference
+/// counts (Implementation Plan §11.4.11, §11.4.12, §11.4.14).
+pub fn runtime_fn_addr(func: RuntimeFn) -> Option<usize> {
     match func {
-        RuntimeFn::Morestack => stack::rt_morestack as *const () as usize,
-        RuntimeFn::SideGrow => side_stack::rt_side_grow as *const () as usize,
+        RuntimeFn::Morestack => Some(stack::rt_morestack as *const () as usize),
+        RuntimeFn::SideGrow => Some(side_stack::rt_side_grow as *const () as usize),
+        RuntimeFn::Trap | RuntimeFn::Alloc | RuntimeFn::Retain | RuntimeFn::Release => None,
     }
 }
 

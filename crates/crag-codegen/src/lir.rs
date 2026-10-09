@@ -20,7 +20,7 @@
 //! in SSA form: any block may assign any register, and the facade builds SSA.
 //! Every register holds one machine word.
 
-use crag_abi::FuncId;
+use crag_abi::{FuncId, RuntimeFn, TrapKind};
 
 /// A virtual register. Registers `0..params` hold the parameters on entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -30,16 +30,34 @@ pub struct VReg(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BlockId(pub u32);
 
-/// Wrapping 64-bit arithmetic. Overflow checks are explicit operations in
-/// MIR and arrive here as compares and branches.
+/// Wrapping 64-bit arithmetic and bit operations. Overflow checks are
+/// explicit operations in MIR and arrive here as [`Inst::Overflow`],
+/// compares and branches. The `F` operations treat the words as the bits
+/// of `f64`s and follow IEEE 754.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinOp {
     Add,
     Sub,
     Mul,
+    /// Division and remainder, which must not see a zero divisor or, signed,
+    /// the least value divided by -1.
+    SDiv,
+    UDiv,
+    SRem,
+    URem,
+    And,
+    Or,
+    Shl,
+    /// Shifts right, copying the sign bit or shifting in zeros.
+    SShr,
+    UShr,
+    FAdd,
+    FSub,
+    FMul,
+    FDiv,
 }
 
-/// Signed 64-bit comparisons.
+/// 64-bit comparisons: signed, unsigned, and of `f64` bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cond {
     Eq,
@@ -48,6 +66,27 @@ pub enum Cond {
     Le,
     Gt,
     Ge,
+    ULt,
+    ULe,
+    UGt,
+    UGe,
+    FEq,
+    FNe,
+    FLt,
+    FLe,
+    FGt,
+    FGe,
+}
+
+/// The operations whose 64-bit overflow [`Inst::Overflow`] tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverflowOp {
+    SAdd,
+    UAdd,
+    SSub,
+    USub,
+    SMul,
+    UMul,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +94,11 @@ pub enum Inst {
     Const {
         dst: VReg,
         value: i64,
+    },
+    /// `dst` becomes `src`.
+    Move {
+        dst: VReg,
+        src: VReg,
     },
     Bin {
         op: BinOp,
@@ -69,9 +113,31 @@ pub enum Inst {
         a: VReg,
         b: VReg,
     },
+    /// `dst` becomes 1 if the operation overflows 64 bits, else 0.
+    Overflow {
+        op: OverflowOp,
+        dst: VReg,
+        a: VReg,
+        b: VReg,
+    },
+    /// `dst` becomes `a` if `cond` is not zero, else `b`.
+    Select {
+        dst: VReg,
+        cond: VReg,
+        a: VReg,
+        b: VReg,
+    },
     /// A normal call. `dsts` receive the results, at most two.
     Call {
         func: FuncId,
+        args: Vec<VReg>,
+        dsts: Vec<VReg>,
+    },
+    /// A call of a runtime function with the C calling convention. The task
+    /// context goes first, before `args`; `dsts` receive the results, at
+    /// most one.
+    CallRuntime {
+        func: RuntimeFn,
         args: Vec<VReg>,
         dsts: Vec<VReg>,
     },
@@ -117,6 +183,8 @@ pub enum Term {
         func: FuncId,
         args: Vec<VReg>,
     },
+    /// Calls `rt_trap`, which does not return.
+    Trap(TrapKind),
 }
 
 #[derive(Clone, Debug)]
@@ -176,10 +244,25 @@ impl LirFunction {
             for inst in &b.insts {
                 match inst {
                     Inst::Const { dst, .. } => reg(dst)?,
-                    Inst::Bin { dst, a, b, .. } | Inst::Cmp { dst, a, b, .. } => {
+                    Inst::Move { dst, src } => {
+                        reg(dst)?;
+                        reg(src)?;
+                    }
+                    Inst::Bin { dst, a, b, .. }
+                    | Inst::Cmp { dst, a, b, .. }
+                    | Inst::Overflow { dst, a, b, .. } => {
                         reg(dst)?;
                         reg(a)?;
                         reg(b)?;
+                    }
+                    Inst::Select { dst, cond, a, b } => {
+                        [dst, cond, a, b].into_iter().try_for_each(reg)?;
+                    }
+                    Inst::CallRuntime { args, dsts, .. } => {
+                        if dsts.len() > 1 {
+                            return Err("a runtime call with more than 1 result".into());
+                        }
+                        args.iter().chain(dsts).try_for_each(reg)?;
                     }
                     Inst::Call { args, dsts, .. } => {
                         if dsts.len() > 2 {
@@ -226,6 +309,7 @@ impl LirFunction {
                     values.iter().try_for_each(reg)?;
                 }
                 Term::TailCall { args, .. } => args.iter().try_for_each(reg)?,
+                Term::Trap(_) => {}
             }
         }
         Ok(())

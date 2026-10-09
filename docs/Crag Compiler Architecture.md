@@ -125,9 +125,9 @@ The artifact store keeps item trees, inferred signatures, MIR and code objects k
 Every Crag type occupies zero, one or two machine words, so a parameter or result is never more than two registers and the Cranelift lowering stays simple. Every value still has its complete runtime type (§3.6.2).
 
 - **Zero words.** Unit `()` and tag types such as `True`, `Empty[Int]` or `NotFound`; a tag's identity is its type.
-- **One word, immediate.** `Int`, the sized integers, `Float`, `CodePoint`, `Fixed[S]` as an `i64` scaled by 10^S (about ±9.2·10^14 at S = 4), and arena handles (32-bit index, 32-bit generation).
+- **One word, immediate.** `Int`, the sized integers, `Float`, `CodePoint`, `Fixed[S]` as an `i64` scaled by 10^S (about ±9.2·10^14 at S = 4), arena handles (32-bit index, 32-bit generation), and unions of tags such as `Bool`, which need only the type index.
 - **One word, box pointer.** Records, collections, grids, lazy cells and runtime objects (refs, `ext`, stream ends, hubs, groups).
-- **Two words.** Unions: a type index plus a payload (an immediate, a box pointer, or nothing for tags). `Str` and `Bytes`: up to 15 bytes inline, otherwise a buffer pointer with offset and length, which is how slices share storage (§12.4). Closures: a code pointer plus an environment pointer, null for plain functions.
+- **Two words.** Other unions: a type index plus a payload (an immediate, a box pointer, or nothing for tags). `Str` and `Bytes`: up to 15 bytes inline, otherwise a buffer pointer with offset and length, which is how slices share storage (§12.4). Closures: a code pointer plus an environment pointer, null for plain functions.
 
 ### 11.1 Records
 

@@ -47,7 +47,9 @@ impl Image {
         let mut arena = CodeArena::new(1 << 20).unwrap();
         let mut symbols = SymbolTable::new();
         for func in RuntimeFn::ALL {
-            symbols.define_runtime(func, crag_runtime::runtime_fn_addr(func));
+            if let Some(addr) = crag_runtime::runtime_fn_addr(func) {
+                symbols.define_runtime(func, addr);
+            }
         }
         let group: Vec<_> = (0..).map(FuncId).zip(&objects).collect();
         let entries = load_group(&mut arena, &mut symbols, &group).unwrap();

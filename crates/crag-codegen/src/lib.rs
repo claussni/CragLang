@@ -30,8 +30,10 @@
 mod lir;
 mod lower;
 
-pub use crag_abi::{CodeObject, FuncId, Reloc, RelocKind, RelocTarget, StackCheck, StackMap};
-pub use lir::{BinOp, Block, BlockId, Cond, Inst, LirFunction, Term, VReg};
+pub use crag_abi::{
+    CodeObject, FuncId, Reloc, RelocKind, RelocTarget, RuntimeFn, StackCheck, StackMap, TrapKind,
+};
+pub use lir::{BinOp, Block, BlockId, Cond, Inst, LirFunction, OverflowOp, Term, VReg};
 pub use lower::{Target, UnknownTarget, compile, compile_entry_stub, target_for};
 
 /// How much the backend optimizes (Compiler Architecture §5).

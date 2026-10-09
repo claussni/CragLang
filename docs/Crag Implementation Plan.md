@@ -335,7 +335,7 @@ The runtime sometimes needs a running fiber to stop at its next safe point: to p
 
 **Data structures**
 
-- `LirFunction` — our lowered form: virtual registers, blocks, calls marked as normal or tail, loads and stores, side-stack pushes, a poll for loop back-edges, and the list of tracked registers that hold owned values.
+- `LirFunction` — our lowered form: virtual registers, blocks, calls marked as normal or tail, loads and stores, side-stack pushes, a poll for loop back-edges, and the list of tracked registers that hold owned values. Code generation adds the operations MIR needs (§11.4.10).
 - `CodeObject` — machine code bytes, relocations (places to patch with addresses at load time), stack maps and frame information. Every call is a safepoint, the stack check's call included; a stack map gives, for the return address of one call, the stack slots that hold the live tracked values.
 
 **Functions**
@@ -569,11 +569,15 @@ A counted local, one of a type whose values live on the heap, owns one reference
 
 Code generation translates MIR into the facade's `LirFunction` and has Cranelift compile it. Besides machine code, every code object carries the tables the runtime needs: safepoints with live values, frame layout and source lines.
 
+Each local becomes as many registers as its layout has words (Compiler Architecture §11). Numbers are words: narrow integers stay sign- or zero-extended to 64 bits, and a `Float` is a word holding its bits. A box is a pointer to a 16-byte header, the count and then the type index, followed by the fields: the parent's at their own offsets, then the type's own by name. A union is a type index and a payload word, or the index alone when every member is a tag, so a `Bool` is the index of `True` or `False`. A type index is the interned type's own index for now. A type test compares the index; a test for a record type finer than the static one reads the box's header and compares it with the indices of the program's record types that fit. Overflow tests use Cranelift's overflow flags for 64-bit types and a range check of the exact result for narrower ones.
+
+Boxes are allocated, retained and released, and checks trap, through calls of runtime functions that the allocator, reference counting and the unwinder provide (§11.4.11, §11.4.12, §11.4.14); the inline fast paths arrive with them. The LIR gained what MIR needs: division, bit operations, shifts, unsigned and `Float` comparisons, `Float` arithmetic on the bits, overflow tests, selects, runtime calls and a trap terminator. What code generation does not handle yet, strings, bytes, collections, closures, module-level values and calls of the prelude's builtins, ends its block with a trap and is listed with the code. Stack maps cover the registers holding boxes; line tables wait for MIR to carry positions, and code objects go to the artifact store with the persisted store (§11.9.5). The crate is `crag-backend`.
+
 **Functions**
 
-- `fn lower_to_lir(mir: &MirBody) -> LirFunction` — one case per MIR statement and terminator; runtime calls for allocation and traps.
-- `fn code(db: &dyn Db, instance: InstanceKey, tier: Tier) -> Arc<CodeObject>` — the query; results go to the artifact store.
-- `fn emit_tables(mir: &MirBody, compiled: &CompiledCode) -> (SafepointTable, LineTable)`.
+- `fn layout(db: &dyn Db, program: Program, ty: Ty) -> Option<Layout>` and `fn record_layout(db: &dyn Db, program: Program, ty: Ty) -> Option<(Vec<FieldSlot>, u32)>` — the words of a type, and the fields of a box at their offsets.
+- `fn lower_to_lir(db: &dyn Db, program: Program, mir: &MirBody) -> Lowered` — one case per MIR statement and terminator; the LIR, what it could not lower, and the instances it calls.
+- `fn code(db: &dyn Db, program: Program, instance: InstanceKey, tier: Tier) -> &Option<Result<Code, String>>` — the query: the code object, the `FuncId` it is loaded as, its words of parameters and results, and the instances to load with it.
 
 #### 11.4.11 Allocator
 

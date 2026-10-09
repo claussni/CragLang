@@ -1,0 +1,23 @@
+[package]
+name = "crag-backend"
+description = "Crag code generation: MIR to code objects"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crag-abi = { path = "../crag-abi" }
+crag-codegen = { path = "../crag-codegen" }
+crag-db = { path = "../crag-db" }
+crag-hir = { path = "../crag-hir" }
+crag-mir = { path = "../crag-mir" }
+crag-types = { path = "../crag-types" }
+
+[dev-dependencies]
+crag-loader = { path = "../crag-loader" }
+crag-runtime = { path = "../crag-runtime" }
