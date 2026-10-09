@@ -27,17 +27,19 @@
 //! the rest. List patterns split a list by length.
 
 use crag_db::Db;
-use crag_hir::{Body, Literal, Name, Pat, PatId, PatLiteral, Program};
+use crag_hir::{BindingId, Body, Literal, Name, Pat, PatId, PatLiteral, Program};
 
 use crate::infer::{fixed_scale, signed};
 use crate::relate::{declared_fields, fields_of, is_subtype};
 use crate::ty::{Builtin, Ty, TyKind};
 
-/// A pattern as the test sees it, with bindings dropped and fields by
-/// name.
+/// A pattern as the test sees it, with fields by name. The test looks
+/// through bindings, which only decision trees need (§11.4.9).
 #[derive(Clone, Debug)]
 pub(crate) enum Pattern<'db> {
     Wild,
+    /// `name` or `name: pattern`.
+    Bind(BindingId, Box<Pattern<'db>>),
     /// A type pattern, or with fields a record pattern. An anonymous
     /// record pattern has no type and matches the record it is checked
     /// against.
@@ -57,16 +59,18 @@ pub(crate) enum Pattern<'db> {
         ty: Ty<'db>,
         value: Value,
     },
+    /// With a rest, which may bind the elements it stands for.
     List {
         before: Vec<Pattern<'db>>,
-        rest: bool,
+        rest: Option<Option<BindingId>>,
         after: Vec<Pattern<'db>>,
     },
     Or(Vec<Pattern<'db>>),
 }
 
+/// A literal of a type whose values are not counted.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Value {
+pub enum Value {
     Str(String),
     Bytes(Vec<u8>),
     /// By its bits; Float has no NaN, and -0.0 is kept as 0.0, which it
@@ -74,9 +78,17 @@ pub(crate) enum Value {
     Float(u64),
 }
 
-impl Pattern<'_> {
-    fn is_wild(&self) -> bool {
+impl<'db> Pattern<'db> {
+    pub(crate) fn is_wild(&self) -> bool {
         matches!(self, Pattern::Wild)
+    }
+
+    /// The pattern a binding binds by.
+    pub(crate) fn peeled(&self) -> &Pattern<'db> {
+        match self {
+            Pattern::Bind(_, sub) => sub.peeled(),
+            p => p,
+        }
     }
 }
 
@@ -124,14 +136,15 @@ pub(crate) enum Ctor<'db> {
     },
 }
 
+/// The lengths of lists a list constructor stands for.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum ListLen {
+pub enum ListLen {
     Fixed(usize),
     AtLeast { prefix: usize, suffix: usize },
 }
 
 impl<'db> Ctor<'db> {
-    fn ty(&self) -> Ty<'db> {
+    pub(crate) fn ty(&self) -> Ty<'db> {
         match self {
             Ctor::Type { ty, .. }
             | Ctor::Range { ty, .. }
@@ -142,7 +155,7 @@ impl<'db> Ctor<'db> {
     }
 
     /// The types of the positions inside it.
-    fn arity(&self) -> Vec<Ty<'db>> {
+    pub(crate) fn arity(&self) -> Vec<Ty<'db>> {
         match self {
             Ctor::Type { fields, .. } => fields.iter().map(|(_, t)| *t).collect(),
             Ctor::List { element, len, .. } => {
@@ -265,7 +278,7 @@ fn escape(c: char, quote: char) -> String {
 }
 
 /// The values of a discrete type, as intervals.
-fn domain(db: &dyn Db, ty: Ty<'_>) -> Option<Vec<(i128, i128)>> {
+pub(crate) fn domain(db: &dyn Db, ty: Ty<'_>) -> Option<Vec<(i128, i128)>> {
     let (builtin, _) = ty.as_builtin(db)?;
     match builtin {
         Builtin::CodePoint => Some(vec![(0, 0xD7FF), (0xE000, 0x10FFFF)]),
@@ -275,8 +288,8 @@ fn domain(db: &dyn Db, ty: Ty<'_>) -> Option<Vec<(i128, i128)>> {
 }
 
 pub(crate) struct Checker<'db> {
-    db: &'db dyn Db,
-    program: Program,
+    pub(crate) db: &'db dyn Db,
+    pub(crate) program: Program,
 }
 
 impl<'db> Checker<'db> {
@@ -284,7 +297,7 @@ impl<'db> Checker<'db> {
         Checker { db, program }
     }
 
-    fn fits(&self, s: Ty<'db>, t: Ty<'db>) -> bool {
+    pub(crate) fn fits(&self, s: Ty<'db>, t: Ty<'db>) -> bool {
         is_subtype(self.db, self.program, s, t)
     }
 
@@ -304,8 +317,14 @@ impl<'db> Checker<'db> {
         }
         Some(match body.pat(id) {
             Pat::Missing => return None,
-            Pat::Wildcard | Pat::Bind { sub: None, .. } => Pattern::Wild,
-            Pat::Bind { sub: Some(sub), .. } => self.lower(body, pats, *sub)?,
+            Pat::Wildcard => Pattern::Wild,
+            Pat::Bind { binding, sub } => {
+                let sub = match sub {
+                    Some(sub) => self.lower(body, pats, *sub)?,
+                    None => Pattern::Wild,
+                };
+                Pattern::Bind(*binding, Box::new(sub))
+            }
             Pat::Type(_) => Pattern::Type {
                 ty: Some(ty),
                 fields: None,
@@ -346,7 +365,7 @@ impl<'db> Checker<'db> {
                 };
                 Pattern::List {
                     before: lower(before)?,
-                    rest: rest.is_some(),
+                    rest: *rest,
                     after: lower(after)?,
                 }
             }
@@ -417,7 +436,7 @@ impl<'db> Checker<'db> {
         q: Vec<Pattern<'db>>,
         tys: &[Ty<'db>],
     ) -> Option<Vec<Witness<'db>>> {
-        let Some(head) = q.first() else {
+        let Some(head) = q.first().map(Pattern::peeled) else {
             return rows.is_empty().then(Vec::new);
         };
         if let Pattern::Or(alternatives) = head {
@@ -464,21 +483,9 @@ impl<'db> Checker<'db> {
 
     /// The constructors of a column of type `ty` whose rows begin with
     /// `heads`.
-    fn split(&self, ty: Ty<'db>, heads: &[&Pattern<'db>]) -> Vec<Ctor<'db>> {
+    pub(crate) fn split(&self, ty: Ty<'db>, heads: &[&Pattern<'db>]) -> Vec<Ctor<'db>> {
         let db = self.db;
-        let members = ty.members(db);
-        let mut atoms = members.clone();
-        for head in heads {
-            let Pattern::Type { ty: Some(p), .. } = head else {
-                continue;
-            };
-            for p in p.members(db) {
-                let finer = members.iter().any(|&m| self.fits(p, m) && !self.fits(m, p));
-                if finer && !atoms.contains(&p) {
-                    atoms.push(p);
-                }
-            }
-        }
+        let atoms = self.atoms(ty, heads);
         let records = heads.iter().any(|h| {
             matches!(
                 h,
@@ -540,9 +547,33 @@ impl<'db> Checker<'db> {
         ctors
     }
 
+    /// The members of a column's type, and the finer types its type
+    /// patterns name.
+    pub(crate) fn atoms(&self, ty: Ty<'db>, heads: &[&Pattern<'db>]) -> Vec<Ty<'db>> {
+        let db = self.db;
+        let members = ty.members(db);
+        let mut atoms = members.clone();
+        for head in heads {
+            let Pattern::Type { ty: Some(p), .. } = head else {
+                continue;
+            };
+            for p in p.members(db) {
+                let finer = members.iter().any(|&m| self.fits(p, m) && !self.fits(m, p));
+                if finer && !atoms.contains(&p) {
+                    atoms.push(p);
+                }
+            }
+        }
+        atoms
+    }
+
     /// The patterns inside `pattern` for the values of `ctor`, or none
     /// when it matches none of them.
-    fn specialize(&self, pattern: &Pattern<'db>, ctor: &Ctor<'db>) -> Option<Vec<Pattern<'db>>> {
+    pub(crate) fn specialize(
+        &self,
+        pattern: &Pattern<'db>,
+        ctor: &Ctor<'db>,
+    ) -> Option<Vec<Pattern<'db>>> {
         let wild = || vec![Pattern::Wild; ctor.arity().len()];
         match (pattern, ctor) {
             (Pattern::Wild, _) => Some(wild()),
@@ -585,7 +616,7 @@ impl<'db> Checker<'db> {
                 Ctor::List { len, .. },
             ) => {
                 let fixed = before.len() + after.len();
-                let gap = match (len, rest) {
+                let gap = match (len, rest.is_some()) {
                     (ListLen::Fixed(n), false) if *n == fixed => 0,
                     (ListLen::Fixed(n), true) if *n >= fixed => n - fixed,
                     (ListLen::AtLeast { prefix, suffix }, true) => prefix + suffix - fixed,
@@ -604,7 +635,8 @@ impl<'db> Checker<'db> {
 /// Rows with an or-pattern at their head, one row per alternative.
 fn expand<'db>(rows: Vec<Vec<Pattern<'db>>>) -> Vec<Vec<Pattern<'db>>> {
     let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
+    for mut row in rows {
+        row[0] = row[0].peeled().clone();
         match &row[0] {
             Pattern::Or(alternatives) => {
                 let alternatives: Vec<Vec<Pattern<'db>>> = alternatives
@@ -657,7 +689,7 @@ fn list_lengths(heads: &[&Pattern<'_>]) -> Vec<ListLen> {
             after,
         } = head
         {
-            if *rest {
+            if rest.is_some() {
                 prefix = prefix.max(before.len());
                 suffix = suffix.max(after.len());
             } else {

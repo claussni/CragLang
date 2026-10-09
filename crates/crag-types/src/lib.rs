@@ -25,6 +25,7 @@
 extern crate crag_db as salsa;
 
 mod case;
+mod decision;
 mod def;
 mod infer;
 mod relate;
@@ -34,10 +35,13 @@ mod ty;
 use crag_db::Db;
 use crag_hir::{ItemKind, ModuleId, Owner, Program, owners};
 
+pub use case::{ListLen, Value};
+pub use decision::{Bindings, DecisionTree, Position, Step, decision_tree};
 pub use def::{
     FieldDef, HeaderKind, SigParam, Signature, TypeDef, TypeDefKind, TypeHeader, alias_target,
-    signature, success_type, type_def, type_header, type_parent, value_type,
+    prelude_item, signature, success_type, type_def, type_header, type_parent, value_type,
 };
+pub use infer::constant as literal_value;
 pub use relate::{declared_fields, fields_of, is_subtype, join, normalize, parent, subst};
 pub use result::{Callee, ErrorKind, InferenceResult, Site, TypeError};
 pub use ty::{Builtin, Ty, TyKind};

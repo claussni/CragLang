@@ -531,7 +531,7 @@ The test splits the values of a column into constructors that each pattern cover
 
 **Data structures**
 
-- `Pattern` — a pattern as the test sees it: bindings dropped, fields by name, literals as intervals or values.
+- `Pattern` — a pattern as the test sees it: fields by name, literals as intervals or values, and bindings, which the test looks through and decision trees keep (§11.4.9).
 - `PatternMatrix` — rows of patterns, one per unguarded arm or alternative.
 
 **Functions**
@@ -543,18 +543,27 @@ The test splits the values of a column into constructors that each pattern cover
 
 MIR is the form code generation consumes: a control-flow graph per instance, with every operation explicit. `case` becomes a decision tree that tests each position at most once ([Compiling pattern matching to good decision trees](https://doi.org/10.1145/1411304.1411311)). Reference-count increments and decrements are inserted from a [liveness analysis](https://en.wikipedia.org/wiki/Live-variable_analysis): a value is released right after its last use. Overflow checks and drops become explicit operations. For `Float` a run of operations shares one check of the sticky overflow flag, and division checks for a zero divisor first (Specification §3.1.4).
 
+The builder evaluates each expression into an operand of the current block; `if`, `case`, `and`, `or` and `for` add blocks, and a `for` polls on its back-edge. A call in tail position whose result needs no conversion is a tail call. The operators of the prelude on numbers are operations rather than calls, and a negated literal is a constant, so `Int8.min` can be written. Where a value meets a type it fits but is not, such as a member passed for a union, an explicit conversion changes its representation. A body with type errors traps where it starts. What the builder does not lower yet, such as closures, local functions, default arguments and calls of generic functions, traps where it is reached and is listed in the body.
+
+Decision trees are built in `crag-types` from the pattern matrix of `case` checking, sharing its constructors. A node tests the first position the first row looks into. A position of several types is first switched on its runtime type, a finer type before the types it is part of; one of a single type is then tested against intervals, literals or list lengths, or, as a record, opened into its fields. A guarded leaf goes on to the rest of the tree when its guard fails. A `let` destructures with the tree of its one pattern, and a typed `let … else` tests the type first.
+
+A counted local, one of a type whose values live on the heap, owns one reference while it is live. An operand gives that reference away, and a place only borrows it, so the reference is retained before every consuming use but the last and released after a last use that only borrows. Drops release what dies unused: a definition nothing reads, an unused parameter, and on each edge what the block holds that its successor does not need; an edge into a block with other predecessors is split. Every check traps in a block of its own, which releases what is live before the trap. The crate is `crag-mir`.
+
 **Data structures**
 
-- `MirBody` — basic blocks, each with statements and one terminator (jump, branch, switch on tag, call, tail call, return, trap).
-- `Local` — a typed temporary; `Place` — a local or a field path within it.
-- `DecisionTree` — test nodes on a position and tag, leaves naming the arm.
+- `MirBody` — the parameters, the typed locals, and basic blocks, each with statements and one terminator: jump, branch on a `Bool`, switch on the runtime type, call, tail call, return, or trap.
+- `Local` — a typed local, not in SSA form; `Place` — a local or a path of steps into it: a field, an element, or the value as a member of its union.
+- `Rvalue` — a use, a read of a place, a conversion, arithmetic with or without its check, the flags checks compute, comparisons, record, list and map construction, and the list and map operations patterns and loops need.
+- `DecisionTree` — tests of a position's type, interval, literal or length, guards, and leaves naming the arm with the positions of its bindings.
+- `InstanceKey` — the owner of a body and its type arguments, empty until monomorphization (§11.5.10); `Tier` — the baseline tier only, for now.
 
 **Functions**
 
-- `fn mir(db: &dyn Db, instance: InstanceKey, tier: Tier) -> Arc<MirBody>` — the query.
-- `fn build_decision_tree(matrix: &PatternMatrix) -> DecisionTree` and `fn lower_decision_tree(b: &mut MirBuilder, tree: &DecisionTree)`.
-- `fn compute_liveness(body: &MirBody) -> Liveness` and `fn insert_rc_ops(body: &mut MirBody, live: &Liveness)`.
-- `fn insert_overflow_checks(body: &mut MirBody)` and `fn insert_drops(body: &mut MirBody)`.
+- `fn mir(db: &dyn Db, program: Program, instance: InstanceKey, tier: Tier) -> &Option<MirBody>` — the query: building, then the checks, then the reference counts. None for what has no body, such as a builtin of the prelude.
+- `fn decision_tree(db: &dyn Db, program: Program, owner: Owner, subject: Ty, arms: &[(PatId, bool)]) -> Option<DecisionTree>` — the tree for patterns of a body, each with whether its arm is guarded; and `MirBuilder::lower_decision_tree`, which turns it into blocks.
+- `fn compute_liveness(body: &MirBody) -> Liveness` — the counted locals live at the edges of each block, by backward dataflow.
+- `fn insert_rc_ops(body: &mut MirBody, live: &Liveness)` and `fn insert_drops(body: &mut MirBody, live: &Liveness)`.
+- `fn insert_overflow_checks(body: &mut MirBody)`.
 
 #### 11.4.10 Code generation
 

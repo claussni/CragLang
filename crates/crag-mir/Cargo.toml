@@ -1,0 +1,16 @@
+[package]
+name = "crag-mir"
+description = "Crag MIR: control-flow graphs with explicit checks and reference counts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crag-db = { path = "../crag-db" }
+crag-hir = { path = "../crag-hir" }
+crag-types = { path = "../crag-types" }

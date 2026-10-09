@@ -124,6 +124,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crag-mir"
+version = "0.0.0"
+dependencies = [
+ "crag-db",
+ "crag-hir",
+ "crag-types",
+]
+
+[[package]]
 name = "crag-runtime"
 version = "0.0.0"
 dependencies = [

@@ -2435,9 +2435,9 @@ impl<'a, 'db> Infer<'a, 'db> {
     }
 }
 
-/// The value of a literal a range compares, in units of `scale` for a
-/// `Fixed` range.
-pub(crate) fn constant(literal: &Literal, scale: Option<u32>) -> Option<i128> {
+/// The value of an integer, decimal or code point literal, in units of
+/// `scale` for a `Fixed`.
+pub fn constant(literal: &Literal, scale: Option<u32>) -> Option<i128> {
     match (literal, scale) {
         (Literal::Int(n), scale) => i128::try_from(*n)
             .ok()?
