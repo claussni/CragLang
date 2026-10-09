@@ -88,6 +88,9 @@ pub fn lower_body<'db>(db: &'db dyn Db, program: Program, owner: Owner<'db>) -> 
     let scope = module_scope(db, program, module);
     let prefixes = prefixes(db, program, module);
     let mut lower = Lowerer::new(db, program, scope, prefixes);
+    if let Some(name) = crate::lower::ident(&node) {
+        lower.map.name = name.range();
+    }
     match node.kind() {
         S::FnDecl => {
             let (params, result, root) = lower.function(&node);

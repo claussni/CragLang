@@ -1231,3 +1231,87 @@ fn f(p: Point, l: Label, i: Int) {
         ]
     );
 }
+
+#[test]
+fn the_most_specific_overload_wins() {
+    // §5.6.1: a concrete type beats a type parameter, a subtype its parent,
+    // and a larger requirement set a smaller one. The result types tell
+    // the candidates apart.
+    let text = "form Show[T] {
+  show(x: T) -> Str
+}
+form Hash[T] {
+  hash(x: T) -> Int
+}
+type Shape(pos: Int)
+type Circle(..Shape, r: Int)
+type Point(x: Int)
+fn show(n: Int) -> Str { \"i\" }
+fn show(s: Str) -> Str { s }
+fn show(p: Point) -> Str { \"p\" }
+fn hash(p: Point) -> Int { 1 }
+fn describe[T: Show](x: T) -> Str { \"A\" }
+fn describe[T: Show](xs: List[T]) -> Int { 1 }
+fn describe(xs: List[Int]) -> Float { 1.0 }
+fn area(s: Shape) -> Int { 1 }
+fn area(c: Circle) -> Float { 1.0 }
+fn key[K: Show](k: K) -> Int { 1 }
+fn key[K](k: K) -> Float where Show[K], Hash[K] { 1.0 }
+fn f(c: Circle, s: Shape, n: Int, p: Point) {
+  let a = describe(3)
+  let b = describe([\"a\", \"b\"])
+  let d = describe([1, 2])
+  let e = area(c)
+  let g = area(s)
+  let h = key(n)
+  let i = key(p)
+  let j = c.area()
+}";
+    let bindings = ok(text);
+    assert_eq!(
+        bindings.last().unwrap(),
+        "c: Circle, s: Shape, n: Int, p: Point, a: Str, b: Int, d: Float, e: Float, g: Int, \
+         h: Int, i: Float, j: Float, -> ()"
+    );
+}
+
+#[test]
+fn incomparable_overloads_need_their_combination() {
+    let text = "form Show[T] {
+  show(x: T) -> Str
+}
+form Hash[T] {
+  hash(x: T) -> Int
+}
+fn describe[T: Show](xs: List[T]) -> Str { \"B\" }
+fn describe[T: Hash](xs: List[T]) -> Str { \"D\" }
+fn lookup[K: Show](k: K) -> Int { 1 }
+fn lookup[K: Hash](k: K) -> Int { 2 }
+fn lookup[K](k: K) -> Int where Show[K], Hash[K] { 3 }";
+    assert_eq!(
+        errors(text),
+        [
+            "`describe`: this overload and an earlier `describe` take the same parameters with \
+          incomparable bounds; add `fn describe[T](xs: List[T]) -> Str where Show[T], Hash[T]`"
+        ]
+    );
+}
+
+#[test]
+fn candidates_of_several_modules_are_not_ranked() {
+    // The prelude's `size(s: Str)` and this module's both fit.
+    let text = "type Text(s: Str)
+fn size(s: Str) -> Int { 1 }
+fn size(t: Text) -> Int { 2 }
+fn f(t: Text) {
+  let a = size(\"a\")
+  let b = size(t)
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`size(\"a\")`: `size` has viable candidates from several modules (app, std.core); \
+          import one of them selectively"
+        ]
+    );
+}

@@ -82,6 +82,8 @@ pub enum Site {
     Pat(PatId),
     Type(TypeRefId),
     Binding(BindingId),
+    /// The name of the declaration.
+    Name,
 }
 
 impl Site {
@@ -91,6 +93,7 @@ impl Site {
             Site::Pat(id) => map.pats.get(id.index()),
             Site::Type(id) => map.types.get(id.index()),
             Site::Binding(id) => map.bindings.get(id.index()),
+            Site::Name => Some(&map.name),
         }
         .cloned()
     }
@@ -228,6 +231,18 @@ pub enum ErrorKind<'db> {
     NoErrors {
         function: ItemId<'db>,
     },
+    /// Two overloads of one module with the same parameter shape and
+    /// incomparable bounds, without their combined overload (§5.6.1).
+    MissingCombined {
+        other: ItemId<'db>,
+        signature: String,
+    },
+    /// A call with viable candidates from several modules, which are
+    /// never ranked (§5.6.1).
+    SeveralModules {
+        name: Name<'db>,
+        modules: Vec<String>,
+    },
     /// `check` of a value whose successes contain `Empty`, which its
     /// failure would merge with (§8.4).
     EmptyMerges,
@@ -329,6 +344,15 @@ impl<'db> ErrorKind<'db> {
             ErrorKind::NoErrors { function } => {
                 format!("`{}` of a value that has no errors", item(function))
             }
+            ErrorKind::MissingCombined { other, signature } => format!(
+                "this overload and an earlier `{}` take the same parameters with incomparable bounds; add `{signature}`",
+                item(other)
+            ),
+            ErrorKind::SeveralModules { name: n, modules } => format!(
+                "`{}` has viable candidates from several modules ({}); import one of them selectively",
+                name(n),
+                modules.join(", ")
+            ),
             ErrorKind::EmptyMerges => {
                 "`check` of a value that can be `Empty` would merge success and failure".into()
             }

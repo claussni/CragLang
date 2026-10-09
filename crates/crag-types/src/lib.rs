@@ -33,6 +33,7 @@ mod def;
 mod generic;
 mod group;
 mod infer;
+mod overload;
 mod relate;
 mod result;
 mod ty;
@@ -54,6 +55,7 @@ pub use group::{
     Group, callees, error_members, error_type, group_errors, group_of, result_type, success_members,
 };
 pub use infer::constant as literal_value;
+pub use overload::{Ranked, Specificity, compare_param, most_specific, overload_errors};
 pub use relate::{declared_fields, fields_of, is_subtype, join, normalize, parent, subst};
 pub use result::{Callee, ErrorKind, InferenceResult, Site, TypeError};
 pub use ty::{Builtin, Ty, TyKind};
@@ -76,7 +78,10 @@ pub fn module_type_errors<'db>(
     program: Program,
     module: ModuleId,
 ) -> Vec<(Owner<'db>, TypeError<'db>)> {
-    let mut errors = Vec::new();
+    let mut errors: Vec<(Owner<'db>, TypeError<'db>)> = overload_errors(db, program, module)
+        .iter()
+        .map(|(item, e)| (Owner::Item(*item), e.clone()))
+        .collect();
     for owner in owners(db, module) {
         if let Owner::Item(item) = owner
             && *item.kind(db) == ItemKind::Type

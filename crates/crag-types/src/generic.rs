@@ -38,6 +38,7 @@ use crag_hir::{
 
 use crate::def::{SigParam, TypeLowerer, own_type_params, signature, type_header};
 use crate::group::result_type;
+use crate::overload::{Ranked, most_specific};
 use crate::relate::{is_subtype, join, normalize, parent, subst};
 use crate::result::{ErrorKind, Site, TypeError};
 use crate::ty::{Ty, TyKind};
@@ -596,9 +597,9 @@ fn fit_slots<'db>(
 }
 
 /// The function that fills a slot with these parameter and result types:
-/// a visible function that accepts the parameters and gives the result,
-/// or a slot of the caller. A function that is not generic, and a slot,
-/// beat a generic function. Without one, the functions that tie.
+/// the most specific of the visible functions that accept the parameters
+/// and give the result, and the slots of the caller (§5.6.1). Without
+/// one, the functions that tie.
 fn fill<'db>(
     db: &'db dyn Db,
     program: Program,
@@ -609,8 +610,12 @@ fn fill<'db>(
     depth: u32,
 ) -> Result<Filling<'db>, Vec<ItemId<'db>>> {
     let fits = |s: Ty<'db>, t: Ty<'db>| is_subtype(db, program, s, t);
-    let mut plain: Vec<(Filling<'db>, ItemId<'db>)> = Vec::new();
-    let mut generic: Vec<(Filling<'db>, ItemId<'db>)> = Vec::new();
+    let mut found: Vec<(Filling<'db>, Ranked<'db>)> = Vec::new();
+    let ranked = |function: ItemId<'db>, module: ModuleId, params: &[SigParam<'db>]| Ranked {
+        function,
+        module,
+        params: params.iter().map(|p| Some(p.ty)).collect(),
+    };
     let functions = match module_scope(db, program, at.module).resolve(name) {
         Some(Resolution::Value { functions, .. }) => functions.clone(),
         _ => Vec::new(),
@@ -633,7 +638,10 @@ fn fill<'db>(
                     args: Vec::new(),
                     fillings: Vec::new(),
                 };
-                plain.push((Filling::Function(instance), f));
+                found.push((
+                    Filling::Function(instance),
+                    ranked(f, *f.module(db), &sig.params),
+                ));
             }
             continue;
         }
@@ -656,7 +664,10 @@ fn fill<'db>(
             && fits(at_args(given), result)
             && let Ok(instance) = instantiate_at(db, program, f, &args, at, depth + 1)
         {
-            generic.push((Filling::Function(instance), f));
+            found.push((
+                Filling::Function(instance),
+                ranked(f, *f.module(db), &sig.params),
+            ));
         }
     }
     if let Some(caller) = at.caller {
@@ -666,14 +677,15 @@ fn fill<'db>(
                 && params.iter().zip(&slot.params).all(|(&p, q)| fits(p, q.ty))
                 && fits(slot.result, result)
             {
-                plain.push((Filling::Slot(k as u32), slot.function));
+                let rank = ranked(slot.function, at.module, &slot.params);
+                found.push((Filling::Slot(k as u32), rank));
             }
         }
     }
-    let best = if plain.is_empty() { generic } else { plain };
-    match best.len() {
-        1 => Ok(best.into_iter().next().expect("one").0),
-        _ => Err(best.into_iter().map(|(_, f)| f).collect()),
+    let ranks: Vec<Ranked<'db>> = found.iter().map(|(_, r)| r.clone()).collect();
+    match most_specific(db, program, &ranks).as_deref() {
+        Ok([one]) => Ok(found.swap_remove(*one).0),
+        _ => Err(ranks.into_iter().map(|r| r.function).collect()),
     }
 }
 

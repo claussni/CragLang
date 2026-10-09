@@ -49,6 +49,8 @@ pub struct BodySourceMap {
     pub pats: Vec<Range<u32>>,
     pub types: Vec<Range<u32>>,
     pub bindings: Vec<Range<u32>>,
+    /// The name of the declaration the body belongs to.
+    pub name: Range<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -1835,7 +1837,7 @@ fn child(node: &SyntaxNode, kind: S) -> Option<SyntaxNode> {
     node.children().find(|n| n.kind() == kind)
 }
 
-fn ident(node: &SyntaxNode) -> Option<SyntaxToken> {
+pub(crate) fn ident(node: &SyntaxNode) -> Option<SyntaxToken> {
     node.tokens()
         .find(|t| t.kind() == LeafKind::Token(T::Ident))
 }

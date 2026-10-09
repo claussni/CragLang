@@ -26,9 +26,10 @@
 //! apart from its written success type (§11.5.2). A call of a generic
 //! function infers its type arguments and is instantiated where it is
 //! written; in a generic body the type parameters are opaque and the
-//! slots of its bounds are candidates of calls (§11.5.3). Overload
-//! ranking and union lifting come with the rest of M2 (§11.5); what needs
-//! them is reported as not supported yet rather than guessed.
+//! slots of its bounds are candidates of calls (§11.5.3). Viable
+//! candidates are ranked by specificity (§11.5.4). Union lifting and the
+//! rest of M2 come later (§11.5); what needs them is reported as not
+//! supported yet rather than guessed.
 
 use crag_db::Db;
 use crag_hir::{
@@ -44,6 +45,7 @@ use crate::def::{
 };
 use crate::generic::{CallSite, Slot, bind, instantiate, mentions, slots, type_param_names};
 use crate::group::{error_type, result_type};
+use crate::overload::{Ranked, most_specific};
 use crate::relate::{declared_fields, fields_of, is_subtype, join, normalize};
 use crate::result::{Callee, ErrorKind, InferenceResult, Site, TypeError};
 use crate::ty::{Builtin, Ty, TyKind};
@@ -1174,7 +1176,17 @@ impl<'a, 'db> Infer<'a, 'db> {
             Expr::Closure { params, .. } => {
                 any(&|k| matches!(k, TyKind::Fn { params: p, .. } if p.len() == params.len()))
             }
-            Expr::List(_) => builtin(&[Builtin::List, Builtin::Set]),
+            Expr::Str(_) | Expr::Literal(Literal::Str(_)) => builtin(&[Builtin::Str]),
+            Expr::Literal(Literal::Bytes(_)) => builtin(&[Builtin::Bytes]),
+            Expr::Literal(Literal::CodePoint(_)) => builtin(&[Builtin::CodePoint]),
+            // A list literal fits when its items could fit the element
+            // type.
+            Expr::List(items) => any(&|k| match k {
+                TyKind::Builtin(Builtin::List | Builtin::Set, args) => {
+                    items.iter().all(|&item| self.could_fit(item, args[0]))
+                }
+                _ => false,
+            }),
             Expr::Map(_) => builtin(&[Builtin::Map]),
             Expr::Grid(_) => builtin(&[Builtin::Grid]),
             Expr::Lazy(_) => builtin(&[Builtin::Lazy]),
@@ -1225,9 +1237,9 @@ impl<'a, 'db> Infer<'a, 'db> {
     }
 
     /// Resolves a call of one of `functions` (§5.6.1) and checks its
-    /// arguments. M1 picks the only candidate that fits, filtered by the
-    /// expected type and then by the default types of literals; ranking
-    /// by specificity comes with §11.5.4. A generic function takes its
+    /// arguments: the candidates that fit, filtered by the success and the
+    /// expected type, the most specific of one module (§11.5.4), and of
+    /// those the ones the literals' default types fit. A generic function takes its
     /// type arguments from `targs` or infers them (§11.5.3); a slot of the
     /// generic function being checked is a candidate like a function.
     #[allow(clippy::too_many_arguments)]
@@ -1287,6 +1299,13 @@ impl<'a, 'db> Infer<'a, 'db> {
                     let params = &provisional[i];
                     self.plan(params, &positional, &named, builds_record)
                         .is_some_and(|p| self.plan_fits(params, &p, &positional, &named))
+                        && self.bounds_hold(
+                            &candidates[i],
+                            &positional,
+                            &named,
+                            builds_record,
+                            targs.as_deref(),
+                        )
                 })
                 .collect();
             let gives = |this: &Self, i: usize| {
@@ -1309,7 +1328,20 @@ impl<'a, 'db> Infer<'a, 'db> {
                     viable = fitting;
                 }
             }
+            // The most specific of one module's candidates (§5.6.1); of
+            // those left, the ones the literals fit with their default types.
+            let mut modules = Vec::new();
             if viable.len() > 1 {
+                let ranked: Vec<Ranked<'db>> = viable
+                    .iter()
+                    .map(|&i| self.ranked(&candidates[i], &positional, &named, builds_record))
+                    .collect();
+                match most_specific(db, self.program, &ranked) {
+                    Ok(best) => viable = best.into_iter().map(|k| viable[k]).collect(),
+                    Err(several) => modules = several,
+                }
+            }
+            if viable.len() > 1 && modules.is_empty() {
                 let defaults: Vec<_> = viable
                     .iter()
                     .copied()
@@ -1320,6 +1352,11 @@ impl<'a, 'db> Infer<'a, 'db> {
                 }
             }
             match viable.as_slice() {
+                _ if !modules.is_empty() => {
+                    let modules = modules.iter().map(|m| m.path(db).clone()).collect();
+                    self.error(Site::Expr(id), ErrorKind::SeveralModules { name, modules });
+                    None
+                }
                 [one] => Some(*one),
                 [] => {
                     let args = positional
@@ -1405,6 +1442,72 @@ impl<'a, 'db> Infer<'a, 'db> {
             self.exprs[callee.index()] = Some(Ty::new(db, TyKind::Fn { params, result }));
         }
         result
+    }
+
+    /// Whether a generic candidate's bounds hold for the type arguments
+    /// the typed arguments fix, if they fix all; a candidate whose bounds
+    /// fail is not viable.
+    fn bounds_hold(
+        &self,
+        candidate: &Candidate<'db>,
+        positional: &[Arg<'db>],
+        named: &[(Name<'db>, Arg<'db>)],
+        builds_record: bool,
+        targs: Option<&[Ty<'db>]>,
+    ) -> bool {
+        if candidate.kind != CandidateKind::Generic {
+            return true;
+        }
+        let plan = self.plan(&candidate.params, positional, named, builds_record);
+        let args = self.provisional_args(candidate, plan.as_ref(), targs, positional);
+        let Some(args) = args.into_iter().collect::<Option<Vec<_>>>() else {
+            return true;
+        };
+        args.iter().any(|a| a.is_error(self.db))
+            || instantiate(
+                self.db,
+                self.program,
+                candidate.function,
+                &args,
+                self.call_site(),
+            )
+            .is_ok()
+    }
+
+    /// A candidate as ranking sees it: the declared type of the parameter
+    /// each argument goes to.
+    fn ranked(
+        &self,
+        candidate: &Candidate<'db>,
+        positional: &[Arg<'db>],
+        named: &[(Name<'db>, Arg<'db>)],
+        builds_record: bool,
+    ) -> Ranked<'db> {
+        let mut params = vec![None; positional.len() + named.len()];
+        match self.plan(&candidate.params, positional, named, builds_record) {
+            Some(Plan::Params(given)) => {
+                for (i, g) in given.iter().enumerate() {
+                    if let Some(g) = *g {
+                        params[g] = Some(candidate.params[i].ty);
+                    }
+                }
+            }
+            Some(Plan::Record) => {
+                for (k, p) in candidate.params.iter().take(positional.len()).enumerate() {
+                    params[k] = Some(p.ty);
+                }
+            }
+            None => {}
+        }
+        let module = match candidate.kind {
+            CandidateKind::Slot(_) => self.module,
+            _ => *candidate.function.module(self.db),
+        };
+        Ranked {
+            function: candidate.function,
+            module,
+            params,
+        }
     }
 
     /// The functions a name may call: declared functions, and the slots
