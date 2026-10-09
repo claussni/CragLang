@@ -22,22 +22,27 @@
 //! Core inference covers primitives, records, functions and unions as
 //! written. Narrowing (§11.5.1) follows control flow: the inference keeps
 //! the narrowed type of each binding where control is, splits it at a
-//! test and joins it where paths meet. Error propagation, generic calls
-//! and forms, overload ranking and union lifting come with the rest of M2
-//! (§11.5); what needs them is reported as not supported yet rather than
-//! guessed.
+//! test and joins it where paths meet. A function's errors are inferred
+//! apart from its written success type (§11.5.2). A call of a generic
+//! function infers its type arguments and is instantiated where it is
+//! written; in a generic body the type parameters are opaque and the
+//! slots of its bounds are candidates of calls (§11.5.3). Overload
+//! ranking and union lifting come with the rest of M2 (§11.5); what needs
+//! them is reported as not supported yet rather than guessed.
 
 use crag_db::Db;
 use crag_hir::{
     Arm, BindingId, BindingKind, Body, Expr, ExprId, FieldArg, ItemId, ItemKind, Literal, LocalFn,
-    ModuleId, Name, Owner, Pat, PatId, PatLiteral, Program, Resolution, Stmt, TypeArg, TypeRef,
-    TypeRefId, TypeTarget, hir_body, module_scope, type_identity,
+    ModuleId, Name, Owner, PRELUDE, Pat, PatId, PatLiteral, Program, Resolution, Stmt, TypeArg,
+    TypeRef, TypeRefId, TypeTarget, hir_body, module_scope, type_identity,
 };
 
 use crate::case::{Checker, PatternMatrix};
+use crate::def::SigParam;
 use crate::def::{
     HeaderKind, TypeLowerer, alias_target, prelude_item, signature, type_header, value_type,
 };
+use crate::generic::{CallSite, Slot, bind, instantiate, mentions, slots, type_param_names};
 use crate::group::{error_type, result_type};
 use crate::relate::{declared_fields, fields_of, is_subtype, join, normalize};
 use crate::result::{Callee, ErrorKind, InferenceResult, Site, TypeError};
@@ -83,6 +88,7 @@ pub fn infer_in_group<'db>(
         module: owner.module(db),
         group,
         error: error_type(db, program),
+        generic: generic_owner.filter(|&item| *item.kind(db) == ItemKind::Function),
     };
     let result = match owner {
         Owner::Item(item) => match *item.kind(db) {
@@ -158,6 +164,9 @@ struct Infer<'a, 'db> {
     group: &'a [(ItemId<'db>, Ty<'db>)],
     /// The prelude's `Error` (§8.1).
     error: Option<Ty<'db>>,
+    /// The function being checked, whose type parameters are opaque here
+    /// and whose slots its body calls (§11.5.3).
+    generic: Option<ItemId<'db>>,
 }
 
 /// The narrowed type of each binding at a point of the body, by binding.
@@ -183,6 +192,23 @@ enum Arg<'db> {
     Pending(ExprId),
     /// The receiver of a method call, typed before the call.
     Receiver(ExprId, Ty<'db>),
+}
+
+/// A function a call may resolve to, with its parameters as the call
+/// sees them.
+struct Candidate<'db> {
+    function: ItemId<'db>,
+    params: Vec<SigParam<'db>>,
+    kind: CandidateKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CandidateKind {
+    Plain,
+    /// Its parameters name its type parameters.
+    Generic,
+    /// A slot of the generic function being checked, by index.
+    Slot(u32),
 }
 
 /// How the arguments of a call meet one candidate's parameters.
@@ -472,6 +498,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                     None,
                     *name,
                     functions,
+                    None,
                     receiver,
                     args,
                     fields.as_deref(),
@@ -492,6 +519,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                     None,
                     *name,
                     functions,
+                    None,
                     None,
                     args,
                     fields.as_deref(),
@@ -529,6 +557,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                     None,
                     *name,
                     functions,
+                    None,
                     receiver,
                     &[],
                     None,
@@ -548,8 +577,22 @@ impl<'a, 'db> Infer<'a, 'db> {
                     self.exprs[base.index()] = Some(ty);
                     ty
                 }
+                Expr::Name {
+                    name,
+                    local: None,
+                    item:
+                        Some(Resolution::Value {
+                            value: None,
+                            functions,
+                        }),
+                } => {
+                    let args = self.type_args(args);
+                    let ty = self.function_value(id, *name, functions, Some(args), expected);
+                    self.exprs[base.index()] = Some(ty);
+                    ty
+                }
                 _ => {
-                    let kind = ErrorKind::Unsupported("type arguments of functions");
+                    let kind = ErrorKind::Unsupported("type arguments of values");
                     self.error(Site::Expr(id), kind);
                     self.err_ty()
                 }
@@ -723,7 +766,7 @@ impl<'a, 'db> Infer<'a, 'db> {
             Some(Resolution::Value {
                 value: None,
                 functions,
-            }) => self.function_value(id, name, functions, expected),
+            }) => self.function_value(id, name, functions, None, expected),
             Some(Resolution::Type(item)) => self.type_value(id, name, *item, Vec::new(), expected),
             Some(Resolution::Form(_)) => {
                 self.error(Site::Expr(id), ErrorKind::NotAValue { name });
@@ -756,53 +799,109 @@ impl<'a, 'db> Infer<'a, 'db> {
     }
 
     /// An overloaded name used as a value: the function whose type fits
-    /// the expected one, or the only one (§5.6.1).
+    /// the expected one, or the only one (§5.6.1). A generic function
+    /// takes its type arguments from `targs` or from the expected type.
     fn function_value(
         &mut self,
         id: ExprId,
         name: Name<'db>,
         functions: &[ItemId<'db>],
+        targs: Option<Vec<Ty<'db>>>,
         expected: Option<Ty<'db>>,
     ) -> Ty<'db> {
         let db = self.db;
-        let (generic, concrete): (Vec<ItemId>, Vec<ItemId>) = functions
+        let program = self.program;
+        let mut candidates = self.candidates(functions);
+        if let Some(targs) = &targs {
+            self.with_type_args(id, &mut candidates, targs.len());
+        }
+        // Each candidate's type, if its type arguments are known.
+        let typed: Vec<(usize, Ty<'db>, Vec<Ty<'db>>)> = candidates
             .iter()
-            .partition(|&&f| signature(db, self.program, f).type_params > 0);
-        let fitting: Vec<ItemId> = match expected {
-            Some(expected) if concrete.len() > 1 => concrete
+            .enumerate()
+            .filter_map(|(i, c)| {
+                let params: Vec<Ty<'db>> = c.params.iter().map(|p| p.ty).collect();
+                let result = match c.kind {
+                    CandidateKind::Slot(k) => self.slots()[k as usize].result,
+                    _ => self.result_of(c.function).unwrap_or_else(|| self.err_ty()),
+                };
+                let ty = Ty::new(db, TyKind::Fn { params, result });
+                if c.kind != CandidateKind::Generic {
+                    return Some((i, ty, Vec::new()));
+                }
+                let args = match &targs {
+                    Some(targs) => targs.clone(),
+                    None => {
+                        let count = signature(db, program, c.function).type_params;
+                        let mut args = vec![None; count];
+                        for member in expected.into_iter().flat_map(|e| e.members(db)) {
+                            if matches!(member.kind(db), TyKind::Fn { .. }) {
+                                bind(db, program, c.function, ty, member, &mut args);
+                            }
+                        }
+                        args.into_iter().collect::<Option<Vec<_>>>()?
+                    }
+                };
+                let ty = crate::relate::subst(db, program, ty, c.function, &args);
+                Some((i, ty, args))
+            })
+            .collect();
+        let fitting: Vec<&(usize, Ty<'db>, Vec<Ty<'db>>)> = match expected {
+            Some(expected) if typed.len() > 1 => typed
                 .iter()
-                .copied()
-                .filter(|&f| {
-                    let sig = signature(db, self.program, f);
-                    let params = sig.params.iter().map(|p| p.ty).collect();
-                    let result = self.result_of(f).unwrap_or_else(|| Ty::error(db));
-                    self.fits(Ty::new(db, TyKind::Fn { params, result }), expected)
-                })
+                .filter(|(_, ty, _)| self.fits(*ty, expected))
                 .collect(),
-            _ => concrete,
+            _ => typed.iter().collect(),
         };
         match fitting.as_slice() {
-            [function] => {
-                self.callees.push((id, Callee::Function(*function)));
-                self.fn_ty(id, *function)
-            }
-            [] if !generic.is_empty() => {
-                let kind = ErrorKind::Unsupported("generic functions as values");
-                self.error(Site::Expr(id), kind);
-                self.err_ty()
+            [(i, ty, args)] => {
+                let candidate = &candidates[*i];
+                match candidate.kind {
+                    CandidateKind::Plain => {
+                        let function = candidate.function;
+                        self.callees.push((id, Callee::Function(function)));
+                        self.fn_ty(id, function)
+                    }
+                    CandidateKind::Slot(k) => {
+                        self.callees.push((id, Callee::Slot(k)));
+                        *ty
+                    }
+                    CandidateKind::Generic => {
+                        let function = candidate.function;
+                        if self.result_of(function).is_none() {
+                            self.error(Site::Expr(id), ErrorKind::RecursiveSuccess { function });
+                            return self.err_ty();
+                        }
+                        match instantiate(db, program, function, args, self.call_site()) {
+                            Ok(instance) => self.callees.push((id, Callee::Instance(instance))),
+                            Err(fit) => self.error(Site::Expr(id), ErrorKind::Unfit(fit)),
+                        }
+                        *ty
+                    }
+                }
             }
             [] => {
-                let kind = ErrorKind::NoMatch {
-                    name,
-                    args: Vec::new(),
+                let generic = candidates.iter().find(|c| c.kind == CandidateKind::Generic);
+                let kind = match generic {
+                    Some(c) if typed.is_empty() => ErrorKind::UninferredTypeArg {
+                        function: c.function,
+                        name: type_param_names(db, program, c.function)[0],
+                    },
+                    _ => ErrorKind::NoMatch {
+                        name,
+                        args: Vec::new(),
+                    },
                 };
                 self.error(Site::Expr(id), kind);
                 self.err_ty()
             }
-            candidates => {
+            several => {
                 let kind = ErrorKind::Ambiguous {
                     name,
-                    candidates: candidates.to_vec(),
+                    candidates: several
+                        .iter()
+                        .map(|(i, ..)| candidates[*i].function)
+                        .collect(),
                 };
                 self.error(Site::Expr(id), kind);
                 self.err_ty()
@@ -893,6 +992,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                 *name,
                 functions,
                 None,
+                None,
                 args,
                 fields,
                 expected,
@@ -923,8 +1023,33 @@ impl<'a, 'db> Infer<'a, 'db> {
                     self.exprs[callee.index()] = self.exprs[base.index()];
                     ty
                 }
+                Expr::Name {
+                    name,
+                    local: None,
+                    item:
+                        Some(Resolution::Value {
+                            value: None,
+                            functions,
+                        }),
+                } => {
+                    let targs = self.type_args(targs);
+                    let ty = self.resolve(
+                        id,
+                        Some(*base),
+                        *name,
+                        functions,
+                        Some(targs),
+                        None,
+                        args,
+                        fields,
+                        expected,
+                        None,
+                    );
+                    self.exprs[callee.index()] = self.exprs[base.index()];
+                    ty
+                }
                 _ => {
-                    let kind = ErrorKind::Unsupported("type arguments of functions");
+                    let kind = ErrorKind::Unsupported("type arguments of values");
                     self.error(Site::Expr(callee), kind);
                     self.synth_args(args, fields);
                     self.err_ty()
@@ -1102,7 +1227,9 @@ impl<'a, 'db> Infer<'a, 'db> {
     /// Resolves a call of one of `functions` (§5.6.1) and checks its
     /// arguments. M1 picks the only candidate that fits, filtered by the
     /// expected type and then by the default types of literals; ranking
-    /// by specificity comes with M2.
+    /// by specificity comes with §11.5.4. A generic function takes its
+    /// type arguments from `targs` or infers them (§11.5.3); a slot of the
+    /// generic function being checked is a candidate like a function.
     #[allow(clippy::too_many_arguments)]
     fn resolve(
         &mut self,
@@ -1110,6 +1237,7 @@ impl<'a, 'db> Infer<'a, 'db> {
         callee: Option<ExprId>,
         name: Name<'db>,
         functions: &[ItemId<'db>],
+        targs: Option<Vec<Ty<'db>>>,
         receiver: Option<Arg<'db>>,
         args: &[ExprId],
         fields: Option<&[FieldArg<'db>]>,
@@ -1117,7 +1245,6 @@ impl<'a, 'db> Infer<'a, 'db> {
         success: Option<Ty<'db>>,
     ) -> Ty<'db> {
         let db = self.db;
-        let program = self.program;
         let mut positional: Vec<Arg<'db>> = receiver.into_iter().collect();
         for &arg in args {
             positional.push(if self.is_pending(arg) {
@@ -1138,26 +1265,37 @@ impl<'a, 'db> Infer<'a, 'db> {
             .map(|(n, v)| (n, Arg::Pending(v)))
             .collect();
         let builds_record = fields.is_some_and(|f| f.len() != named.len());
-        let (generic, concrete): (Vec<ItemId>, Vec<ItemId>) = functions
+        let mut candidates = self.candidates(functions);
+        if let Some(targs) = &targs {
+            self.with_type_args(id, &mut candidates, targs.len());
+        }
+        // What each candidate's parameters are with the type arguments
+        // the typed arguments give; those still unknown fit anything.
+        let provisional: Vec<Vec<SigParam<'db>>> = candidates
             .iter()
-            .partition(|&&f| signature(db, program, f).type_params > 0);
-        let plans: Vec<(ItemId<'db>, Option<Plan>)> = concrete
-            .iter()
-            .map(|&f| (f, self.plan(f, &positional, &named, builds_record)))
+            .map(|c| {
+                let plan = self.plan(&c.params, &positional, &named, builds_record);
+                let args = self.provisional_args(c, plan.as_ref(), targs.as_deref(), &positional);
+                self.at_args(c, &args)
+            })
             .collect();
-        let chosen = if plans.len() == 1 && generic.is_empty() {
-            Some(plans[0].0)
+        let chosen = if candidates.len() == 1 {
+            Some(0)
         } else {
-            let mut viable: Vec<ItemId<'db>> = plans
-                .iter()
-                .filter(|(f, plan)| {
-                    plan.as_ref()
-                        .is_some_and(|p| self.plan_fits(*f, p, &positional, &named))
+            let mut viable: Vec<usize> = (0..candidates.len())
+                .filter(|&i| {
+                    let params = &provisional[i];
+                    self.plan(params, &positional, &named, builds_record)
+                        .is_some_and(|p| self.plan_fits(params, &p, &positional, &named))
                 })
-                .map(|(f, _)| *f)
                 .collect();
+            let gives = |this: &Self, i: usize| {
+                let c = &candidates[i];
+                let args = this.provisional_args(c, None, targs.as_deref(), &positional);
+                this.candidate_success(c, &args)
+            };
             if let Some(success) = success {
-                viable.retain(|&f| self.success_of(f).is_some_and(|r| self.fits(success, r)));
+                viable.retain(|&i| gives(self, i).is_some_and(|r| self.fits(success, r)));
             }
             if viable.len() > 1
                 && let Some(expected) = expected
@@ -1165,7 +1303,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                 let fitting: Vec<_> = viable
                     .iter()
                     .copied()
-                    .filter(|&f| self.success_of(f).is_some_and(|r| self.fits(r, expected)))
+                    .filter(|&i| gives(self, i).is_some_and(|r| self.fits(r, expected)))
                     .collect();
                 if !fitting.is_empty() {
                     viable = fitting;
@@ -1175,7 +1313,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                 let defaults: Vec<_> = viable
                     .iter()
                     .copied()
-                    .filter(|&f| self.defaults_fit(f, &positional))
+                    .filter(|&i| self.defaults_fit(&provisional[i], &positional))
                     .collect();
                 if !defaults.is_empty() {
                     viable = defaults;
@@ -1184,34 +1322,29 @@ impl<'a, 'db> Infer<'a, 'db> {
             match viable.as_slice() {
                 [one] => Some(*one),
                 [] => {
-                    let kind = if generic.is_empty() {
-                        let args = positional
-                            .iter()
-                            .map(|&a| match a {
-                                Arg::Typed(_, t) | Arg::Receiver(_, t) => t,
-                                Arg::Pending(e) => self.synth(e),
-                            })
-                            .collect();
-                        ErrorKind::NoMatch { name, args }
-                    } else {
-                        ErrorKind::Unsupported("calls of generic functions")
-                    };
-                    if !self.any_error(&positional) {
-                        self.error(Site::Expr(id), kind);
+                    let args = positional
+                        .iter()
+                        .map(|&a| match a {
+                            Arg::Typed(_, t) | Arg::Receiver(_, t) => t,
+                            Arg::Pending(e) => self.synth(e),
+                        })
+                        .collect();
+                    if !self.any_error(&positional) && !candidates.is_empty() {
+                        self.error(Site::Expr(id), ErrorKind::NoMatch { name, args });
                     }
                     None
                 }
-                candidates => {
+                several => {
                     let kind = ErrorKind::Ambiguous {
                         name,
-                        candidates: candidates.to_vec(),
+                        candidates: several.iter().map(|&i| candidates[i].function).collect(),
                     };
                     self.error(Site::Expr(id), kind);
                     None
                 }
             }
         };
-        let Some(function) = chosen else {
+        let Some(chosen) = chosen else {
             for arg in positional {
                 if let Arg::Pending(e) = arg {
                     self.unchecked(e);
@@ -1224,25 +1357,343 @@ impl<'a, 'db> Infer<'a, 'db> {
             }
             return self.err_ty();
         };
-        self.apply(
-            id,
-            function,
-            &positional,
-            fields.unwrap_or_default(),
-            &named,
-            builds_record,
-        );
-        self.callees.push((id, Callee::Function(function)));
-        let result = self.success(id, function);
+        let candidate = candidates.swap_remove(chosen);
+        let fields = fields.unwrap_or_default();
+        let (params, result) = match candidate.kind {
+            CandidateKind::Plain => {
+                let function = candidate.function;
+                self.apply(
+                    id,
+                    name,
+                    &candidate.params,
+                    &positional,
+                    fields,
+                    &named,
+                    builds_record,
+                );
+                self.callees.push((id, Callee::Function(function)));
+                (candidate.params, self.success(id, function))
+            }
+            CandidateKind::Slot(k) => {
+                self.apply(
+                    id,
+                    name,
+                    &candidate.params,
+                    &positional,
+                    fields,
+                    &named,
+                    builds_record,
+                );
+                self.callees.push((id, Callee::Slot(k)));
+                let result = self.slots()[k as usize].result;
+                (candidate.params, result)
+            }
+            CandidateKind::Generic => self.generic_call(
+                id,
+                name,
+                &candidate,
+                targs,
+                positional,
+                fields,
+                named,
+                builds_record,
+                expected,
+            ),
+        };
         if let Some(callee) = callee {
-            let params = signature(db, program, function)
-                .params
-                .iter()
-                .map(|p| p.ty)
-                .collect();
+            let params = params.iter().map(|p| p.ty).collect();
             self.exprs[callee.index()] = Some(Ty::new(db, TyKind::Fn { params, result }));
         }
         result
+    }
+
+    /// The functions a name may call: declared functions, and the slots
+    /// of the generic function being checked, one per bound that requires
+    /// the form's function.
+    fn candidates(&self, functions: &[ItemId<'db>]) -> Vec<Candidate<'db>> {
+        let db = self.db;
+        let mut candidates = Vec::new();
+        for &function in functions {
+            if *function.kind(db) == ItemKind::Slot {
+                for (k, slot) in self.slots().iter().enumerate() {
+                    if slot.function == function {
+                        candidates.push(Candidate {
+                            function,
+                            params: slot.params.clone(),
+                            kind: CandidateKind::Slot(k as u32),
+                        });
+                    }
+                }
+                continue;
+            }
+            let sig = signature(db, self.program, function);
+            candidates.push(Candidate {
+                function,
+                params: sig.params.clone(),
+                kind: if sig.type_params > 0 {
+                    CandidateKind::Generic
+                } else {
+                    CandidateKind::Plain
+                },
+            });
+        }
+        candidates
+    }
+
+    /// The rules of the prelude's `check` and `expect` (§8.4): their value
+    /// must have errors, and `check`'s successes must not contain `Empty`.
+    fn mapping_rules(&mut self, id: ExprId, function: ItemId<'db>, args: &[Ty<'db>]) {
+        let db = self.db;
+        let mapping = function.module(db).path(db) == PRELUDE
+            && matches!(function.name(db).text(db).as_str(), "check" | "expect");
+        let [x] = args else { return };
+        if !mapping || x.is_error(db) {
+            return;
+        }
+        if self.errors_of(*x).is_never(db) {
+            self.error(Site::Expr(id), ErrorKind::NoErrors { function });
+        } else if function.name(db).text(db) == "check"
+            && self
+                .successes_of(*x)
+                .members(db)
+                .iter()
+                .any(|m| matches!(m.kind(db), TyKind::Named(i, _) if Some(*i) == self.empty))
+        {
+            self.error(Site::Expr(id), ErrorKind::EmptyMerges);
+        }
+    }
+
+    /// Keeps the generic candidates that take `count` type arguments, and
+    /// says what is wrong when none does.
+    fn with_type_args(&mut self, id: ExprId, candidates: &mut Vec<Candidate<'db>>, count: usize) {
+        let db = self.db;
+        let arity = |c: &Candidate<'db>| signature(db, self.program, c.function).type_params;
+        let generic: Vec<usize> = candidates
+            .iter()
+            .filter(|c| c.kind == CandidateKind::Generic)
+            .map(arity)
+            .collect();
+        candidates.retain(|c| c.kind == CandidateKind::Generic && arity(c) == count);
+        if candidates.is_empty() {
+            let kind = match generic.as_slice() {
+                [] => ErrorKind::TypeArgCount {
+                    expected: 0,
+                    found: count,
+                },
+                [expected, ..] => ErrorKind::TypeArgCount {
+                    expected: *expected,
+                    found: count,
+                },
+            };
+            self.error(Site::Expr(id), kind);
+        }
+    }
+
+    /// The slots of the generic function being checked.
+    fn slots(&self) -> &'db [Slot<'db>] {
+        match self.generic {
+            Some(item) => slots(self.db, self.program, item),
+            None => &[],
+        }
+    }
+
+    /// Where the body is written, for the slot fillings of its calls.
+    fn call_site(&self) -> CallSite<'db> {
+        CallSite {
+            module: self.module,
+            caller: self.generic,
+        }
+    }
+
+    /// The type arguments of a candidate that the given ones and the typed
+    /// arguments fix.
+    fn provisional_args(
+        &self,
+        candidate: &Candidate<'db>,
+        plan: Option<&Plan>,
+        targs: Option<&[Ty<'db>]>,
+        positional: &[Arg<'db>],
+    ) -> Vec<Option<Ty<'db>>> {
+        if candidate.kind != CandidateKind::Generic {
+            return Vec::new();
+        }
+        let function = candidate.function;
+        let count = signature(self.db, self.program, function).type_params;
+        if let Some(targs) = targs {
+            return targs.iter().copied().map(Some).collect();
+        }
+        let mut args = vec![None; count];
+        let Some(Plan::Params(given)) = plan else {
+            return args;
+        };
+        for (i, g) in given.iter().enumerate() {
+            if let Some(&(Arg::Typed(_, t) | Arg::Receiver(_, t))) =
+                g.and_then(|g| positional.get(g))
+            {
+                bind(
+                    self.db,
+                    self.program,
+                    function,
+                    candidate.params[i].ty,
+                    t,
+                    &mut args,
+                );
+            }
+        }
+        args
+    }
+
+    /// A candidate's parameters with type arguments, those unknown taking
+    /// the error type, which fits everything.
+    fn at_args(&self, candidate: &Candidate<'db>, args: &[Option<Ty<'db>>]) -> Vec<SigParam<'db>> {
+        if candidate.kind != CandidateKind::Generic {
+            return candidate.params.clone();
+        }
+        let args = self.known(args);
+        candidate
+            .params
+            .iter()
+            .map(|p| SigParam {
+                ty: crate::relate::subst(self.db, self.program, p.ty, candidate.function, &args),
+                ..p.clone()
+            })
+            .collect()
+    }
+
+    fn known(&self, args: &[Option<Ty<'db>>]) -> Vec<Ty<'db>> {
+        args.iter()
+            .map(|a| a.unwrap_or_else(|| self.err_ty()))
+            .collect()
+    }
+
+    /// What a candidate gives on success, which the return-type filter
+    /// compares (§5.6.1).
+    fn candidate_success(
+        &self,
+        candidate: &Candidate<'db>,
+        args: &[Option<Ty<'db>>],
+    ) -> Option<Ty<'db>> {
+        match candidate.kind {
+            CandidateKind::Plain => self.success_of(candidate.function),
+            CandidateKind::Slot(k) => Some(self.successes_of(self.slots()[k as usize].result)),
+            CandidateKind::Generic => {
+                let success = self.success_of(candidate.function)?;
+                let args = self.known(args);
+                Some(crate::relate::subst(
+                    self.db,
+                    self.program,
+                    success,
+                    candidate.function,
+                    &args,
+                ))
+            }
+        }
+    }
+
+    /// A call of a generic function: infers its type arguments from the
+    /// typed arguments, the context, and then the arguments that take
+    /// their type from the context, checks the arguments, and instantiates
+    /// the function where the call is written. Returns the parameters and
+    /// the result with the type arguments.
+    #[allow(clippy::too_many_arguments)]
+    fn generic_call(
+        &mut self,
+        id: ExprId,
+        name: Name<'db>,
+        candidate: &Candidate<'db>,
+        targs: Option<Vec<Ty<'db>>>,
+        mut positional: Vec<Arg<'db>>,
+        fields: &[FieldArg<'db>],
+        mut named: Vec<(Name<'db>, Arg<'db>)>,
+        builds_record: bool,
+        expected: Option<Ty<'db>>,
+    ) -> (Vec<SigParam<'db>>, Ty<'db>) {
+        let db = self.db;
+        let program = self.program;
+        let function = candidate.function;
+        let plan = self.plan(&candidate.params, &positional, &named, builds_record);
+        let mut args =
+            self.provisional_args(candidate, plan.as_ref(), targs.as_deref(), &positional);
+        let result = self.result_of(function);
+        if args.iter().any(Option::is_none)
+            && let (Some(expected), Some(result)) = (expected, result)
+        {
+            let mut from_context = args.clone();
+            bind(db, program, function, result, expected, &mut from_context);
+            for (arg, context) in args.iter_mut().zip(from_context) {
+                if arg.is_none() {
+                    *arg = context;
+                }
+            }
+        }
+        // The arguments that take their type from the context, in order:
+        // a closure gets the parameter types known so far and gives its
+        // result.
+        if let Some(Plan::Params(given)) = &plan {
+            for (i, g) in given.iter().enumerate() {
+                let Some(g) = *g else { continue };
+                let param = candidate.params[i].ty;
+                let unknown = |j: u32| args.get(j as usize).is_some_and(Option::is_none);
+                if !mentions(db, param, function, &unknown) {
+                    continue;
+                }
+                let arg = if g < positional.len() {
+                    &mut positional[g]
+                } else {
+                    &mut named[g - positional.len()].1
+                };
+                let Arg::Pending(e) = *arg else { continue };
+                let partial = self.at_args(candidate, &args)[i].ty;
+                let ty = match self.body.expr(e) {
+                    Expr::Closure { .. } => self.infer(e, Some(partial)),
+                    _ => self.synth(e),
+                };
+                bind(db, program, function, param, ty, &mut args);
+                *arg = Arg::Typed(e, ty);
+            }
+        }
+        let names = type_param_names(db, program, function);
+        let mut uninferred = false;
+        for (i, arg) in args.iter_mut().enumerate() {
+            if arg.is_none() {
+                let name = names.get(i).copied().unwrap_or(name);
+                self.error(
+                    Site::Expr(id),
+                    ErrorKind::UninferredTypeArg { function, name },
+                );
+                uninferred = true;
+                *arg = Some(self.err_ty());
+            }
+        }
+        let args = self.known(&args);
+        let params = self.at_args(
+            candidate,
+            &args.iter().copied().map(Some).collect::<Vec<_>>(),
+        );
+        self.apply(
+            id,
+            name,
+            &params,
+            &positional,
+            fields,
+            &named,
+            builds_record,
+        );
+        self.mapping_rules(id, function, &args);
+        if !uninferred && !args.iter().any(|a| a.is_error(db)) {
+            match instantiate(db, program, function, &args, self.call_site()) {
+                Ok(instance) => self.callees.push((id, Callee::Instance(instance))),
+                Err(fit) => self.error(Site::Expr(id), ErrorKind::Unfit(fit)),
+            }
+        }
+        let result = match result {
+            Some(result) => crate::relate::subst(db, program, result, function, &args),
+            None => {
+                self.error(Site::Expr(id), ErrorKind::RecursiveSuccess { function });
+                self.err_ty()
+            }
+        };
+        (params, result)
     }
 
     /// Types an argument of a call that failed to resolve, without errors
@@ -1271,13 +1722,11 @@ impl<'a, 'db> Infer<'a, 'db> {
     /// How the arguments meet a candidate's parameters, if they can.
     fn plan(
         &self,
-        function: ItemId<'db>,
+        params: &[SigParam<'db>],
         positional: &[Arg<'db>],
         named: &[(Name<'db>, Arg<'db>)],
         builds_record: bool,
     ) -> Option<Plan> {
-        let sig = signature(self.db, self.program, function);
-        let params = &sig.params;
         if positional.len() > params.len() {
             return None;
         }
@@ -1311,28 +1760,27 @@ impl<'a, 'db> Infer<'a, 'db> {
     /// one could.
     fn plan_fits(
         &self,
-        function: ItemId<'db>,
+        params: &[SigParam<'db>],
         plan: &Plan,
         positional: &[Arg<'db>],
         named: &[(Name<'db>, Arg<'db>)],
     ) -> bool {
-        let sig = signature(self.db, self.program, function);
         let arg_fits = |arg: Arg<'db>, param: Ty<'db>| match arg {
             Arg::Typed(_, t) | Arg::Receiver(_, t) => self.fits(t, param),
             Arg::Pending(e) => self.could_fit(e, param),
         };
         match plan {
-            Plan::Params(given) => given.iter().zip(&sig.params).all(|(g, p)| match g {
+            Plan::Params(given) => given.iter().zip(params).all(|(g, p)| match g {
                 Some(i) if *i < positional.len() => arg_fits(positional[*i], p.ty),
                 Some(i) => arg_fits(named[*i - positional.len()].1, p.ty),
                 None => true,
             }),
             Plan::Record => {
-                let record = sig.params[positional.len()].ty;
+                let record = params[positional.len()].ty;
                 let fields = fields_of(self.db, self.program, record).unwrap_or_default();
                 positional
                     .iter()
-                    .zip(&sig.params)
+                    .zip(params)
                     .all(|(&a, p)| arg_fits(a, p.ty))
                     && named
                         .iter()
@@ -1341,29 +1789,30 @@ impl<'a, 'db> Infer<'a, 'db> {
         }
     }
 
-    fn defaults_fit(&self, function: ItemId<'db>, positional: &[Arg<'db>]) -> bool {
-        let sig = signature(self.db, self.program, function);
-        positional.iter().zip(&sig.params).all(|(a, p)| match a {
+    fn defaults_fit(&self, params: &[SigParam<'db>], positional: &[Arg<'db>]) -> bool {
+        positional.iter().zip(params).all(|(a, p)| match a {
             Arg::Pending(e) => self.default_fits(*e, p.ty),
             _ => true,
         })
     }
 
-    /// Checks the arguments of a call against the chosen function.
+    /// Checks the arguments of a call against the chosen function's
+    /// parameters.
+    #[allow(clippy::too_many_arguments)]
     fn apply(
         &mut self,
         id: ExprId,
-        function: ItemId<'db>,
+        name: Name<'db>,
+        params: &[SigParam<'db>],
         positional: &[Arg<'db>],
         fields: &[FieldArg<'db>],
         named: &[(Name<'db>, Arg<'db>)],
         builds_record: bool,
     ) {
         let db = self.db;
-        let sig = signature(db, self.program, function);
         let negative = self.negative;
-        self.negative = function.name(db).text(db) == "negate";
-        let plan = self.plan(function, positional, named, builds_record);
+        self.negative = name.text(db) == "negate";
+        let plan = self.plan(params, positional, named, builds_record);
         match plan {
             Some(Plan::Params(given)) => {
                 for (i, g) in given.iter().enumerate() {
@@ -1373,21 +1822,21 @@ impl<'a, 'db> Infer<'a, 'db> {
                     } else {
                         named[g - positional.len()].1
                     };
-                    self.check_arg(arg, sig.params[i].ty);
+                    self.check_arg(arg, params[i].ty);
                 }
             }
             Some(Plan::Record) => {
-                for (&arg, param) in positional.iter().zip(&sig.params) {
+                for (&arg, param) in positional.iter().zip(params) {
                     self.check_arg(arg, param.ty);
                 }
-                let record = sig.params[positional.len()].ty;
+                let record = params[positional.len()].ty;
                 self.build_record(id, record, fields);
             }
             None => {
                 // Only a lone candidate gets here; say what is wrong.
-                let mut seen = vec![false; sig.params.len()];
+                let mut seen = vec![false; params.len()];
                 for (i, &arg) in positional.iter().enumerate() {
-                    match sig.params.get(i) {
+                    match params.get(i) {
                         Some(param) => {
                             seen[i] = true;
                             self.check_arg(arg, param.ty);
@@ -1395,9 +1844,9 @@ impl<'a, 'db> Infer<'a, 'db> {
                         None => self.check_arg(arg, Ty::error(db)),
                     }
                 }
-                if positional.len() > sig.params.len() {
+                if positional.len() > params.len() {
                     let kind = ErrorKind::ArgCount {
-                        expected: sig.params.len(),
+                        expected: params.len(),
                         found: positional.len(),
                     };
                     self.error(Site::Expr(id), kind);
@@ -1406,14 +1855,14 @@ impl<'a, 'db> Infer<'a, 'db> {
                     let value = field_value(field);
                     let param = match field {
                         FieldArg::Field { path, .. } if path.len() == 1 => {
-                            sig.params.iter().position(|p| p.name == Some(path[0]))
+                            params.iter().position(|p| p.name == Some(path[0]))
                         }
                         _ => None,
                     };
                     match param {
                         Some(i) if !seen[i] => {
                             seen[i] = true;
-                            self.check(value, sig.params[i].ty);
+                            self.check(value, params[i].ty);
                         }
                         _ => {
                             if let FieldArg::Field { path, .. } = field {
@@ -1424,12 +1873,12 @@ impl<'a, 'db> Infer<'a, 'db> {
                         }
                     }
                 }
-                for (i, param) in sig.params.iter().enumerate() {
+                for (i, param) in params.iter().enumerate() {
                     if !seen[i] && !param.default {
                         let kind = match param.name {
                             Some(name) => ErrorKind::MissingArg { name },
                             None => ErrorKind::ArgCount {
-                                expected: sig.params.len(),
+                                expected: params.len(),
                                 found: positional.len(),
                             },
                         };
@@ -2489,6 +2938,10 @@ impl<'a, 'db> Infer<'a, 'db> {
     /// itself; without one its type is known only after its body.
     fn local_fn(&mut self, binding: BindingId, function: &LocalFn) {
         let db = self.db;
+        if function.generic {
+            let kind = ErrorKind::Unsupported("generic local functions");
+            self.error(Site::Binding(binding), kind);
+        }
         let mut params = Vec::new();
         for param in &function.params {
             let ty = self.lower_type(param.ty);

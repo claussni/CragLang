@@ -80,6 +80,11 @@ pub enum Builtin {
     Grid,
     Ref,
     Lazy,
+    /// The type functions `Oks[X]` and `Errs[X]`, the members of `X` that
+    /// are not errors and those that are (§8.1). They stay applied only to
+    /// what names type parameters.
+    Oks,
+    Errs,
 }
 
 impl Builtin {
@@ -106,6 +111,8 @@ impl Builtin {
             "Grid" => (Builtin::Grid, 1),
             "Ref" => (Builtin::Ref, 1),
             "Lazy" => (Builtin::Lazy, 1),
+            "Oks" => (Builtin::Oks, 1),
+            "Errs" => (Builtin::Errs, 1),
             _ => return None,
         })
     }
@@ -131,6 +138,8 @@ impl Builtin {
             Builtin::Grid => "Grid",
             Builtin::Ref => "Ref",
             Builtin::Lazy => "Lazy",
+            Builtin::Oks => "Oks",
+            Builtin::Errs => "Errs",
         }
     }
 

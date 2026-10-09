@@ -503,7 +503,7 @@ Lowering resolves local names itself, so it also checks the no-shadowing rule, t
 
 Inference gives every expression a type and reports type errors. Crag infers locally, within one function, using bidirectional checking ([survey](https://arxiv.org/abs/1908.05839)): the checker either checks an expression against an expected type that flows down from the context, or synthesizes a type from the expression itself. Literals, closures, collection and record literals and generic tags such as `Empty` take their types from the context.
 
-M1 covers primitives, records, functions and unions as written. Where branches meet, their types join into a union, absorbed as in §3.6.1. A call picks the one candidate that fits its arguments, filtered by the expected type and then by the default types of literals, so `1 + 2` is an `Int` addition. Bodies of generic functions are checked with their type parameters as opaque types. What needs M2 is reported as not supported yet: calls of generic functions, `pass`, `?.`, conversions, refs, signals and handlers. A range is a `Range[T]` or `RangeFrom[T]` of the prelude; `T` fits `Discrete` when it is a built-in integer, `CodePoint`, `Fixed[S]`, or a type with a concrete `compare` and `next` in scope. A decimal literal end has the scale it is written with, and constant ends that decrease are an error.
+M1 covers primitives, records, functions and unions as written. Where branches meet, their types join into a union, absorbed as in §3.6.1. A call picks the one candidate that fits its arguments, filtered by the expected type and then by the default types of literals, so `1 + 2` is an `Int` addition. Bodies of generic functions are checked with their type parameters as opaque types. What needs M2 or later was reported as not supported yet; narrowing, `pass` and calls of generic functions have since arrived (§11.5.1–11.5.3), and `?.`, conversions, refs, signals and handlers still are. A range is a `Range[T]` or `RangeFrom[T]` of the prelude; `T` fits `Discrete` when it is a built-in integer, `CodePoint`, `Fixed[S]`, or a type with a concrete `compare` and `next` in scope. A decimal literal end has the scale it is written with, and constant ends that decrease are an error.
 
 Builtin types are declarations of the prelude with a builtin's name and number of type parameters and no body, such as `type Int` and `type List[T]` (§19.1). A named type's identity is the declaration that stands for all declarations merging with it (§3.3). The crate is `crag-types`.
 
@@ -714,7 +714,7 @@ An error type is one that fits the prelude's `distinct type Error`. A function's
 
 The graph is that of the functions each body names, in calls, as values and as the candidates of method calls and fields, every overload included, because inference compares them all (§3.13.1); it needs no inference, so finding a group never depends on the group's types. While a group is solved, each member's body is inferred with the errors found so far, and a call of a member gives its written success type and those errors. A member of a recursive group without a written success type gives none, which the call reports. Calls outside the group read `result_type`, which takes a group's errors from its solution.
 
-`pass` as the body of a `case` arm gives the values no earlier arm handled, those the arm matches, to the caller as `return` does (§8.2); MIR converts the subject to them and returns it. `pass` anywhere else is an error. The `check` prefix `?` does not propagate: it replaces the error members with `Empty` (§8.4), and comes with generic functions (§11.5.3).
+`pass` as the body of a `case` arm gives the values no earlier arm handled, those the arm matches, to the caller as `return` does (§8.2); MIR converts the subject to them and returns it. `pass` anywhere else is an error. The `check` prefix `?` does not propagate: it replaces the error members with `Empty` (§8.4); it is a generic prelude function typed with `Oks` (§11.5.3).
 
 **Data structures**
 
@@ -732,19 +732,29 @@ The graph is that of the functions each body names, in calls, as values and as t
 
 #### 11.5.3 Generics and forms
 
-A generic function is checked once against its bounds, not once per use. A bound that is a form (a set of required functions, Chapter 4) becomes a list of slots in the body; each call through the bound uses a slot. When a caller instantiates the generic, it records which concrete functions fill the slots, chosen from what is visible at the caller.
+A generic function is checked once against its bounds, not once per use. Inside it, a type parameter is opaque: one bounded by a named type fits that type and has its fields, and one bounded by a form can be passed to the form's functions. A form used as a parameter type stands for a type parameter of its own after the written ones (§4.3). The forms of a function's bounds, with the forms they require in their `where` clause or stand for, give the function its slots: each of their functions with the bound's type arguments, in a fixed order. HIR adds the slots' names to the names a generic body sees, and a call in the body may resolve to a slot like to a function. A union of forms holds when one of them does; which one is known only per type argument, so it gives no slots (§4.7).
+
+A call of a generic function infers the type arguments: first from the arguments that have their own type, then from the expected type, then from the arguments that take their type from the context, a closure getting the parameter types known so far and giving its result. Type arguments written in brackets replace the inference. Each type argument must fit its named bound, and each slot must be filled by a function visible where the call is written that accepts the slot's parameters and gives its result. In a generic caller a slot may be filled by one of the caller's own slots, and a generic function may fill a slot with type arguments inferred from the slot's parameters, to a fixed depth. A filling that is not generic, or a caller's slot, beats a generic one; ranking the rest is §11.5.4. The call records the instance, the function with its type arguments and slot fillings, which monomorphization compiles (§11.5.10); until then MIR reports calls of instances and slots as not supported. Generic functions may be used as values when the expected type or type arguments in brackets fix them.
+
+`Oks[X]` and `Errs[X]` are builtin type functions over error unions (§8.1). Applied to a type without type parameters they become the members that are not errors, or those that are; applied to a type parameter they stay until substitution. With them the prelude declares the type mapping functions `discard`, `check` and `expect` and their prefixes `~`, `?` and `!!` as generic functions without bodies (§8.4). Inference checks their two rules: `check` and `expect` need a value with errors, and `check` a value whose successes do not contain `Empty`.
+
+Generic local functions, bounds on the type parameters of types and functions of forms that have type parameters of their own are reported as not supported yet.
 
 **Data structures**
 
-- `Bound` — a type parameter's requirements: named types and forms.
-- `Slot` — one required function of a form, with its expected signature.
-- `SlotFilling` — for one instantiation: the concrete function per slot.
+- `Requirement` — in HIR, a bound in brackets or an entry of a `where` clause; `FormDecl` and `SlotDecl` — a form's functions or the forms it stands for; `ItemKind::Slot` — a form's function as an item, outside the module's scope.
+- `FormBound` — a form applied to types. `Bounds` — what a generic function's type parameters must fit: named types, forms with what they require, and unions of forms. `FormDef` — what a form requires and its functions.
+- `Slot` — one function of a bound's form, with its parameter and result types.
+- `Instance` — a generic function with its type arguments and one `Filling` per slot: a declared function's instance or a slot of the caller.
+- `FitError` — a type argument outside its bound, a slot with no filling or with several, or a union of forms of which none holds.
 
 **Functions**
 
-- `fn check_generic_body(db: &dyn Db, function: FunctionId) -> Arc<InferenceResult>` — inference with type parameters treated as opaque types that satisfy their bounds.
-- `fn fits(db: &dyn Db, ty: TypeId, form: FormId, scope: &ModuleScope) -> Result<SlotFilling, FitError>` — does a type fit a form with the functions visible in this scope?
-- `fn instantiate(db: &dyn Db, function: FunctionId, type_args: &[TypeId], scope: &ModuleScope) -> Result<InstanceKey, FitError>`.
+- `fn bounds(db: &dyn Db, program: Program, function: ItemId) -> &Bounds`, `fn form_def(db, program, form: ItemId) -> &FormDef` and `fn slots(db, program, function: ItemId) -> &Vec<Slot>`.
+- `fn param_bound(db, program, owner: ItemId, index: u32) -> Option<Ty>` — the named bound subtyping and field access use for a type parameter.
+- `fn instantiate(db, program, function: ItemId, args: &[Ty], at: CallSite) -> Result<Instance, FitError>` — checks the bounds and fills the slots where the call is written.
+- `fn bind(db, program, owner: ItemId, pattern: Ty, found: Ty, args: &mut [Option<Ty>])` — infers type arguments by matching a parameter type against an argument type.
+- `fn type_function(db, program, f: Builtin, x: Ty) -> Ty` — evaluates `Oks` and `Errs`.
 
 #### 11.5.4 Overload resolution and UFCS
 

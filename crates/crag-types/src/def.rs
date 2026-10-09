@@ -229,8 +229,13 @@ pub struct SigParam<'db> {
     pub default: bool,
 }
 
+/// A function's written signature. A form's function has the form's type
+/// parameters (§4.1).
 #[crag_db::tracked(returns(ref))]
 pub fn signature<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> Signature<'db> {
+    if *item.kind(db) == ItemKind::Slot {
+        return slot_signature(db, program, item);
+    }
     let body = hir_body(db, program, Owner::Item(item));
     let mut lower = TypeLowerer::new(db, program, body, Some(item));
     let params = body
@@ -247,14 +252,59 @@ pub fn signature<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> S
         .filter(|&r| *body.type_ref(r) != TypeRef::Infer)
         .map(|r| lower.lower(r));
     Signature {
-        type_params: own_type_params(db, item),
+        type_params: own_type_params(db, item) + lower.implicit.len(),
         params,
         result,
     }
 }
 
+fn slot_signature<'db>(db: &'db dyn Db, program: Program, slot: ItemId<'db>) -> Signature<'db> {
+    let decl = crag_hir::slot_item(db, slot).and_then(|(form, index)| {
+        let body = hir_body(db, program, Owner::Item(form));
+        Some((form, body, body.form.as_ref()?.slots.get(index as usize)?))
+    });
+    let Some((form, body, decl)) = decl else {
+        return Signature {
+            type_params: 0,
+            params: Vec::new(),
+            result: None,
+        };
+    };
+    let mut lower = TypeLowerer::new(db, program, body, Some(form));
+    let params = decl
+        .params
+        .iter()
+        .map(|&(name, ty)| SigParam {
+            name,
+            ty: lower.lower(ty),
+            default: false,
+        })
+        .collect();
+    Signature {
+        type_params: 0,
+        params,
+        result: Some(lower.lower(decl.result)),
+    }
+}
+
+/// The parameter types of a function body that name a form without type
+/// arguments: each stands for a type parameter of its own (§4.3).
+pub(crate) fn implicit_params<'db>(db: &'db dyn Db, body: &Body<'db>) -> Vec<TypeRefId> {
+    body.params
+        .iter()
+        .map(|p| p.ty)
+        .filter(|&ty| {
+            matches!(body.type_ref(ty), TypeRef::Named {
+                target: TypeTarget::Item(item),
+                args,
+                ..
+            } if *item.kind(db) == ItemKind::Form && args.is_empty())
+        })
+        .collect()
+}
+
 /// A function's own type parameters, not those of its local functions.
-fn own_type_params(db: &dyn Db, item: ItemId) -> usize {
+pub(crate) fn own_type_params(db: &dyn Db, item: ItemId) -> usize {
     let tree = item_tree(db, *item.module(db));
     let Some(item) = tree.items.iter().find(|i| i.id == item) else {
         return 0;
@@ -333,6 +383,11 @@ pub(crate) struct TypeLowerer<'a, 'db> {
     pub owner: Option<ItemId<'db>>,
     pub types: Vec<Option<Ty<'db>>>,
     pub errors: Vec<TypeError<'db>>,
+    /// The parameter types of a function that are forms, each standing
+    /// for a type parameter after the written ones (§4.3).
+    pub implicit: Vec<TypeRefId>,
+    /// The number of written type parameters of the function.
+    explicit: u32,
 }
 
 impl<'a, 'db> TypeLowerer<'a, 'db> {
@@ -342,6 +397,12 @@ impl<'a, 'db> TypeLowerer<'a, 'db> {
         body: &'a Body<'db>,
         owner: Option<ItemId<'db>>,
     ) -> Self {
+        let (implicit, explicit) = match owner {
+            Some(item) if *item.kind(db) == ItemKind::Function => {
+                (implicit_params(db, body), own_type_params(db, item) as u32)
+            }
+            _ => (Vec::new(), 0),
+        };
         TypeLowerer {
             db,
             program,
@@ -349,6 +410,8 @@ impl<'a, 'db> TypeLowerer<'a, 'db> {
             owner,
             types: vec![None; body.types.len()],
             errors: Vec::new(),
+            implicit,
+            explicit,
         }
     }
 
@@ -358,6 +421,15 @@ impl<'a, 'db> TypeLowerer<'a, 'db> {
 
     pub fn lower(&mut self, id: TypeRefId) -> Ty<'db> {
         let db = self.db;
+        if let Some(k) = self.implicit.iter().position(|&t| t == id) {
+            let TypeRef::Named { name, .. } = self.body.type_ref(id) else {
+                unreachable!("an implicit parameter is named by its form");
+            };
+            let index = self.explicit + k as u32;
+            let ty = Ty::new(db, TyKind::Param(self.owner, index, *name));
+            self.types[id.index()] = Some(ty);
+            return ty;
+        }
         let ty = match self.body.type_ref(id) {
             TypeRef::Missing => Ty::error(db),
             TypeRef::Infer => {
@@ -485,6 +557,9 @@ impl<'a, 'db> TypeLowerer<'a, 'db> {
             }
         }
         match kind {
+            HeaderKind::Builtin(f @ (Builtin::Oks | Builtin::Errs)) => {
+                relate::type_function(db, self.program, f, lowered[0])
+            }
             HeaderKind::Builtin(builtin) => Ty::new(db, TyKind::Builtin(builtin, lowered)),
             HeaderKind::Alias => match alias_target(db, self.program, item) {
                 Some(target) => subst(db, self.program, target, item, &lowered),

@@ -19,15 +19,18 @@
 //! Written types are lowered to interned `Ty` terms: `type_def` and
 //! `signature` lower declarations, `result_type` and `value_type` give
 //! the types other bodies use: a call gives the callee's success type and
-//! the errors inferred for its recursive group (§11.5.2). `body_types` infers one body: a type for
-//! every expression, pattern and binding, the target of every call, and
-//! the type errors.
+//! the errors inferred for its recursive group (§11.5.2). `bounds`,
+//! `form_def` and `slots` lower what generic functions require, and
+//! `instantiate` fits type arguments to them (§11.5.3). `body_types`
+//! infers one body: a type for every expression, pattern and binding, the
+//! target of every call, and the type errors.
 
 extern crate crag_db as salsa;
 
 mod case;
 mod decision;
 mod def;
+mod generic;
 mod group;
 mod infer;
 mod relate;
@@ -42,6 +45,10 @@ pub use decision::{Bindings, DecisionTree, Position, Step, decision_tree};
 pub use def::{
     FieldDef, HeaderKind, SigParam, Signature, TypeDef, TypeDefKind, TypeHeader, alias_target,
     prelude_item, signature, success_type, type_def, type_header, type_parent, value_type,
+};
+pub use generic::{
+    Bounds, CallSite, Filling, FitError, FormBound, FormDef, Instance, Slot, bounds, form_def,
+    instantiate, param_bound, slots, type_param_names,
 };
 pub use group::{
     Group, callees, error_members, error_type, group_errors, group_of, result_type, success_members,
@@ -76,6 +83,14 @@ pub fn module_type_errors<'db>(
         {
             let def = type_def(db, program, item);
             errors.extend(def.errors.iter().map(|e| (owner, e.clone())));
+        }
+        if let Owner::Item(item) = owner {
+            let found = match *item.kind(db) {
+                ItemKind::Function | ItemKind::Type => &bounds(db, program, item).errors,
+                ItemKind::Form => &form_def(db, program, item).errors,
+                _ => &Vec::new(),
+            };
+            errors.extend(found.iter().map(|e| (owner, e.clone())));
         }
         let result = body_types(db, program, owner);
         errors.extend(result.errors.iter().map(|e| (owner, e.clone())));

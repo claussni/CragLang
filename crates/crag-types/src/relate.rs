@@ -22,6 +22,7 @@ use crag_db::Db;
 use crag_hir::{ItemId, Name, Program};
 
 use crate::def::{TypeDefKind, type_def, type_parent};
+use crate::generic::param_bound;
 use crate::ty::{Builtin, Ty, TyKind};
 
 /// How deep a chain of parents is followed. Longer chains are cycles,
@@ -48,6 +49,9 @@ fn subtype<'db>(db: &'db dyn Db, program: Program, s: Ty<'db>, t: Ty<'db>, depth
         (TyKind::Named(a, a_args), TyKind::Named(b, b_args)) if a == b => {
             a_args.iter().zip(b_args).all(|(&x, &y)| fits(x, y))
         }
+        // A type parameter fits what its named bound fits (§4.2).
+        (TyKind::Param(Some(owner), index, _), _) => param_bound(db, program, *owner, *index)
+            .is_some_and(|b| subtype(db, program, b, t, depth + 1)),
         (TyKind::Named(..), _) => {
             let by_parent =
                 parent(db, program, s).is_some_and(|p| subtype(db, program, p, t, depth + 1));
@@ -190,6 +194,12 @@ fn fields<'db>(
 ) -> Option<Vec<(Name<'db>, Ty<'db>)>> {
     match ty.kind(db) {
         TyKind::Record { fields, .. } => Some(fields.clone()),
+        TyKind::Param(Some(owner), index, _) if depth <= MAX_PARENTS => fields(
+            db,
+            program,
+            param_bound(db, program, *owner, *index)?,
+            depth + 1,
+        ),
         TyKind::Named(item, args) if depth <= MAX_PARENTS => {
             match &type_def(db, program, *item).kind {
                 TypeDefKind::Tag => Some(Vec::new()),
@@ -265,6 +275,28 @@ pub fn parent<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Ty<
     Some(subst(db, program, parent, *item, args))
 }
 
+/// `Oks[x]` or `Errs[x]`: the members of `x` that are not errors, or
+/// those that are (§8.1). A member that names a type parameter keeps the
+/// function applied.
+pub fn type_function<'db>(db: &'db dyn Db, program: Program, f: Builtin, x: Ty<'db>) -> Ty<'db> {
+    let error = crate::group::error_type(db, program);
+    let members = x
+        .members(db)
+        .into_iter()
+        .filter_map(|m| {
+            if m.is_error(db) {
+                return Some(m);
+            }
+            if crate::generic::mentions_any(db, m) {
+                return Some(Ty::new(db, TyKind::Builtin(f, vec![m])));
+            }
+            let is_error = error.is_some_and(|e| is_subtype(db, program, m, e));
+            (is_error == (f == Builtin::Errs)).then_some(m)
+        })
+        .collect();
+    normalize(db, program, members).0
+}
+
 /// `ty` with the type parameters of `owner` replaced by `args`.
 pub fn subst<'db>(
     db: &'db dyn Db,
@@ -283,6 +315,9 @@ pub fn subst<'db>(
         }
         TyKind::Error | TyKind::Param(..) => return ty,
         TyKind::Builtin(b, a) if a.is_empty() => return Ty::builtin(db, *b),
+        TyKind::Builtin(b @ (Builtin::Oks | Builtin::Errs), a) => {
+            return type_function(db, program, *b, go(a[0]));
+        }
         TyKind::Builtin(b, a) => TyKind::Builtin(*b, a.iter().map(|&t| go(t)).collect()),
         TyKind::Named(_, a) if a.is_empty() => return ty,
         TyKind::Named(item, a) => TyKind::Named(*item, a.iter().map(|&t| go(t)).collect()),

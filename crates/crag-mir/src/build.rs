@@ -81,6 +81,8 @@ pub(crate) fn counted<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bo
                 | Builtin::Grid
                 | Builtin::Ref
                 | Builtin::Lazy
+                | Builtin::Oks
+                | Builtin::Errs
         ),
         TyKind::Named(item, _) => !matches!(type_def(db, program, *item).kind, TypeDefKind::Tag),
         TyKind::Record { fields, open } => !fields.is_empty() || *open,
@@ -774,6 +776,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 self.call_function(expr, function, &positional, fields, tail)
             }
             Some(Callee::Construct(ty)) => self.construct(expr, ty, &positional, fields),
+            // Instances are compiled with monomorphization (§11.5.10).
+            Some(Callee::Instance(_)) => self.unsupported(expr, "calls of generic functions"),
+            Some(Callee::Slot(_)) => self.unsupported(expr, "calls through forms"),
             _ => self.unsupported(expr, "calls of function values"),
         }
     }

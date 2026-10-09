@@ -63,6 +63,7 @@ pub fn layout<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Lay
     Some(match ty.kind(db) {
         TyKind::Error | TyKind::Param(..) => return None,
         TyKind::Builtin(b, _) => match b {
+            Builtin::Oks | Builtin::Errs => return None,
             Builtin::Str | Builtin::Bytes => Layout::Pair,
             Builtin::List
             | Builtin::Map

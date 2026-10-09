@@ -67,6 +67,38 @@ pub struct Body<'db> {
     pub root: Option<ExprId>,
     /// A type declaration's fields, parent and alias target.
     pub type_decl: Option<TypeDecl<'db>>,
+    /// The bounds in a function's or form's brackets and the entries of
+    /// its `where` clause (§4.2, §4.4).
+    pub requirements: Vec<Requirement>,
+    /// A form declaration's functions or alias target (§4.1, §4.7).
+    pub form: Option<FormDecl<'db>>,
+}
+
+/// A requirement on type parameters: a bound `T: B` in brackets, of the
+/// type parameter at `param`, or an entry of a `where` clause, which
+/// names its types itself.
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct Requirement {
+    pub param: Option<u32>,
+    pub ty: TypeRefId,
+}
+
+/// A form: the functions it requires, or the union of forms it stands
+/// for.
+#[derive(Clone, Debug, Default, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct FormDecl<'db> {
+    pub alias: Option<TypeRefId>,
+    pub slots: Vec<SlotDecl<'db>>,
+}
+
+/// A function a form requires, by its signature.
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct SlotDecl<'db> {
+    pub name: Name<'db>,
+    pub params: Vec<(Option<Name<'db>>, TypeRefId)>,
+    pub result: TypeRefId,
+    /// Whether it declares type parameters of its own.
+    pub generic: bool,
 }
 
 /// A type declaration (§3.2–3.9). Its clauses are not lowered yet.
@@ -444,6 +476,8 @@ pub enum EmitKind {
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
 pub struct LocalFn {
+    /// Whether it declares type parameters or requirements.
+    pub generic: bool,
     pub params: Vec<Param>,
     pub result: Option<TypeRefId>,
     pub body: Option<ExprId>,

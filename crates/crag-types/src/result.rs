@@ -20,6 +20,7 @@
 use crag_db::Db;
 use crag_hir::{BindingId, BodySourceMap, ExprId, ItemId, Name, PatId, TypeRefId};
 
+use crate::generic::{FitError, Instance};
 use crate::ty::Ty;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, crag_db::SalsaValue)]
@@ -63,6 +64,11 @@ impl<'db> InferenceResult<'db> {
 pub enum Callee<'db> {
     /// A declared function.
     Function(ItemId<'db>),
+    /// A generic function with its type arguments and slot fillings
+    /// (§11.5.3).
+    Instance(Instance<'db>),
+    /// A slot of the generic function being checked, by its index.
+    Slot(u32),
     /// A function value: a local function, a closure or a field.
     Value,
     /// The construction of a record or collection type (§6.7).
@@ -204,6 +210,27 @@ pub enum ErrorKind<'db> {
     },
     /// `pass` anywhere but as the body of a `case` arm (§8.2).
     PassOutsideCase,
+    /// A type parameter of a called generic function that neither the
+    /// arguments nor the context fix.
+    UninferredTypeArg {
+        function: ItemId<'db>,
+        name: Name<'db>,
+    },
+    /// Type arguments that do not fit the bounds of a generic function.
+    Unfit(FitError<'db>),
+    /// A `where` entry that names no form (§4.4).
+    NotAForm {
+        ty: Ty<'db>,
+    },
+    /// A bound that unites forms with types (§4.7).
+    MixedBound,
+    /// `check` or `expect` of a value without errors (§8.4).
+    NoErrors {
+        function: ItemId<'db>,
+    },
+    /// `check` of a value whose successes contain `Empty`, which its
+    /// failure would merge with (§8.4).
+    EmptyMerges,
     /// Something core inference does not handle yet; later milestones of
     /// the Implementation Plan add it.
     Unsupported(&'static str),
@@ -291,6 +318,20 @@ impl<'db> ErrorKind<'db> {
                 format!("the pattern does not cover `{missing}`")
             }
             ErrorKind::PassOutsideCase => "`pass` stands only as the body of a `case` arm".into(),
+            ErrorKind::UninferredTypeArg { function, name: n } => format!(
+                "the type parameter `{}` of `{}` cannot be inferred",
+                name(n),
+                item(function)
+            ),
+            ErrorKind::Unfit(fit) => fit.message(db),
+            ErrorKind::NotAForm { ty } => format!("{} is not a form", ty.display(db)),
+            ErrorKind::MixedBound => "a bound unites forms or types, not both".into(),
+            ErrorKind::NoErrors { function } => {
+                format!("`{}` of a value that has no errors", item(function))
+            }
+            ErrorKind::EmptyMerges => {
+                "`check` of a value that can be `Empty` would merge success and failure".into()
+            }
             ErrorKind::Unsupported(what) => format!("{what} are not supported yet"),
         }
     }

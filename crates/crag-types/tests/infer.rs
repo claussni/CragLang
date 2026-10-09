@@ -45,6 +45,11 @@ pub type Ordering = Less | Equal | Greater
 pub type Range[T](first: T, last: T)
 pub type RangeFrom[T](first: T)
 pub distinct type Error
+pub type Oks[X]
+pub type Errs[X]
+pub fn discard[X](x: X) -> () | Errs[X] prefix "~"
+pub fn check[X](x: X) -> Option[Oks[X]] prefix "?"
+pub fn expect[X](x: X) -> Oks[X] prefix "!!"
 pub fn add(a: Int, b: Int) -> Int
 pub fn add(a: Int8, b: Int8) -> Int8
 pub fn add(a: Float, b: Float) -> Float
@@ -89,7 +94,8 @@ fn check(text: &str) -> Checked {
     let (program, core, module) = setup(&db, text);
     let mut bindings = Vec::new();
     for owner in owners(&db, module) {
-        if matches!(owner, Owner::Item(item) if *item.kind(&db) == ItemKind::Type) {
+        if matches!(owner, Owner::Item(item) if matches!(*item.kind(&db), ItemKind::Type | ItemKind::Form))
+        {
             continue;
         }
         let body = &lower_body(&db, program, owner).body;
@@ -567,13 +573,13 @@ fn f(p: Pair[Int], q: Pair, r: Fixed[Int], t: Tree) -> Int {
 #[test]
 fn not_yet_supported_is_reported() {
     let text = "fn f(xs: List[Int]) {
-  let a = xs.map { x -> x }
+  fn local[T](x: T) -> T { x }
   ref r = 1
 }";
     assert_eq!(
         errors(text),
         [
-            "`xs.map { x -> x }`: calls of generic functions are not supported yet",
+            "`local`: generic local functions are not supported yet",
             "`r`: `ref` and `ext` bindings are not supported yet",
         ]
     );
@@ -984,6 +990,244 @@ fn stray(id: Int) -> Int {
             "`Bad`: expected Int, found Bad",
             "`{\n  session(id)\n}`: expected Int | NotFound, found Expired | Int | NotFound",
             "`pass`: `pass` stands only as the body of a `case` arm",
+        ]
+    );
+}
+
+/// Each generic call of the module, its function with type arguments and
+/// slot fillings, as `name[Args] {fillings}`.
+fn instances(text: &str) -> Vec<String> {
+    fn show(db: &RootDatabase, i: &crag_types::Instance) -> String {
+        let args: Vec<String> = i.args.iter().map(|t| t.display(db)).collect();
+        let fillings: Vec<String> = i
+            .fillings
+            .iter()
+            .map(|f| match f {
+                crag_types::Filling::Function(f) if f.args.is_empty() => {
+                    f.function.name(db).text(db).clone()
+                }
+                crag_types::Filling::Function(f) => show(db, f),
+                crag_types::Filling::Slot(k) => format!("slot {k}"),
+            })
+            .collect();
+        format!(
+            "{}[{}] {{{}}}",
+            i.function.name(db).text(db),
+            args.join(", "),
+            fillings.join(", ")
+        )
+    }
+    let db = RootDatabase::new();
+    let (program, _, module) = setup(&db, text);
+    let mut out = Vec::new();
+    for owner in owners(&db, module) {
+        for (_, callee) in &body_types(&db, program, owner).callees {
+            match callee {
+                crag_types::Callee::Instance(i) => out.push(show(&db, i)),
+                crag_types::Callee::Slot(k) => out.push(format!("slot {k}")),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn generic_calls_infer_type_arguments_and_fill_slots() {
+    let text = "type Shape(pos: Int)
+type Circle(..Shape, r: Int)
+type Point(x: Int, y: Int)
+form Sizable[U] {
+  size(u: U) -> Int
+}
+form Convert[A, B] {
+  convert(a: A) -> B
+}
+form Measured[T] where Sizable[T] {}
+fn size(p: Point) -> Int { p.x }
+fn convert(n: Int) -> Str { \"n\" }
+fn identity[T](x: T) -> T { x }
+fn biggest[T: Sizable](a: T, b: T) -> T {
+  if size(a) < size(b) { b } else { a }
+}
+fn measure(m: Measured) -> Int { m.size() }
+fn pos[S: Shape](s: S) -> Int { s.pos }
+fn keep[S: Shape](s: S) -> S { s }
+fn apply[A, B](a: A, f: (A) -> B) -> B { f(a) }
+fn twice[A: Sizable](a: A) -> Int { size(biggest(a, a)) }
+fn conv[A, B](a: A) -> B where Convert[A, B] { convert(a) }
+fn f(p: Point, c: Circle) {
+  let a = identity(1)
+  let b = identity(p)
+  let d = biggest(p, p)
+  let e = measure(p)
+  let g = pos(c)
+  let h = keep(c)
+  let i = apply(2, { n -> n + 1 })
+  let j: Str = conv(3)
+  let k = identity[Int8](1)
+  let l: (Int) -> Int = identity
+  let m = twice(p)
+  let o: Option[Int] = identity(Empty)
+}";
+    assert_eq!(
+        ok(text),
+        [
+            "p: Point, -> Int",
+            "n: Int, -> Str",
+            "x: T, -> T",
+            "a: T, b: T, -> T",
+            "m: Measured, -> Int",
+            "s: S, -> Int",
+            "s: S, -> S",
+            "a: A, f: (A) -> B, -> B",
+            "a: A, -> Int",
+            "a: A, -> B",
+            "p: Point, c: Circle, a: Int, b: Point, d: Point, e: Int, g: Int, h: Circle, \
+             n: Int, i: Int, j: Str, k: Int8, l: (Int) -> Int, m: Int, o: Empty[Int] | Int, -> ()",
+        ]
+    );
+    assert_eq!(
+        instances(text),
+        [
+            // In the generic bodies: `size` and `convert` through their
+            // slots, and `biggest` with `twice`'s slot.
+            "slot 0",
+            "slot 0",
+            "slot 0",
+            "biggest[A] {slot 0}",
+            "slot 0",
+            "slot 0",
+            "identity[Int] {}",
+            "identity[Point] {}",
+            "biggest[Point] {size}",
+            "measure[Point] {size}",
+            "pos[Circle] {}",
+            "keep[Circle] {}",
+            "apply[Int, Int] {}",
+            "conv[Int, Str] {convert}",
+            "identity[Int8] {}",
+            "identity[Int] {}",
+            "twice[Point] {size}",
+            "identity[Empty[Int] | Int] {}",
+        ]
+    );
+}
+
+#[test]
+fn bounds_and_forms_are_checked() {
+    let text = "type Shape(pos: Int)
+type Circle(..Shape, r: Int)
+form Sizable[U] {
+  size(u: U) -> Int
+}
+form Convert[A, B] {
+  convert(a: A) -> B
+}
+fn size(c: Circle) -> Int { c.r }
+fn size(c: Circle) -> Int8 { 1 }
+fn biggest[T: Sizable](a: T, b: T) -> T { a }
+fn pos[S: Shape](s: S) -> Int { s.pos }
+fn conv[A, B](a: A) -> B where Convert[A, B] { convert(a) }
+fn identity[T](x: T) -> T { x }
+fn f(c: Circle, n: Int) {
+  let a = biggest(n, n)
+  let b = pos(n)
+  let d = conv(n)
+  let e = identity[Int, Int](n)
+  let g = identity
+}
+fn hidden[T](x: T) -> Int { x.pos }
+fn mixed[T: Sizable | Int](x: T) {}
+fn noForm[T](x: T) where Int {}
+form Wrong[T] where Shape {}";
+    assert_eq!(
+        errors(text),
+        [
+            "`biggest(n, n)`: Sizable[Int] does not hold: no visible function `size` has the type (Int) -> Int",
+            "`pos(n)`: Int does not fit the bound Shape of `S`",
+            "`conv(n)`: the type parameter `B` of `conv` cannot be inferred",
+            "`identity[Int, Int](n)`: expected 1 type arguments, found 2",
+            "`identity`: the type parameter `T` of `identity` cannot be inferred",
+            "`x.pos`: T does not fit the bound Shape of `S`",
+            "`Sizable | Int`: a bound unites forms or types, not both",
+            "`Int`: Int is not a form",
+            "`Shape`: Shape is not a form",
+        ]
+    );
+}
+
+#[test]
+fn type_mapping_functions_map_errors() {
+    let text = "type NotFound(..Error)
+type Config(port: Int)
+fn load(path: Str) -> Config {
+  if path == \"\" { return NotFound() }
+  Config(port: 80)
+}
+fn errs[X](x: X) -> Errs[X] { ??? }
+fn f() {
+  let a = ? load(\"a\")
+  let b = !! load(\"b\")
+  let c = ~ load(\"c\")
+  let d = errs(load(\"d\"))
+}";
+    assert_eq!(
+        ok(text),
+        [
+            "path: Str, -> Config | NotFound",
+            "x: X, -> Errs[X]",
+            "a: Config | Empty[Config], b: Config, c: () | NotFound, d: NotFound, -> ()",
+        ]
+    );
+    let text = "type NotFound(..Error)
+fn find(n: Int) -> Int | Empty[Int] {
+  if n == 0 { return NotFound() }
+  n
+}
+fn f() {
+  let a = ? 1
+  let b = !! 2
+  let c = ? find(3)
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`? 1`: `check` of a value that has no errors",
+            "`!! 2`: `expect` of a value that has no errors",
+            "`? find(3)`: `check` of a value that can be `Empty` would merge success and failure",
+        ]
+    );
+}
+
+#[test]
+fn a_union_of_forms_needs_one_to_hold() {
+    let text = "form Hash[T] {
+  hash(x: T) -> Int
+}
+form Ordered[T] {
+  compare(a: T, b: T) -> Ordering
+}
+form Keyable[T] = Hash[T] | Ordered[T]
+type Point(x: Int)
+type Label(s: Str)
+fn hash(p: Point) -> Int { p.x }
+fn compare(a: Label, b: Label) -> Ordering { Less }
+fn key[K: Keyable](k: K) -> Int { hash(k) }
+fn either[K: Hash | Ordered](k: K) -> Int { 2 }
+fn f(p: Point, l: Label, i: Int) {
+  let a = key(p)
+  let b = key(l)
+  let c = either(p)
+  let d = either(i)
+}";
+    assert_eq!(
+        errors(text),
+        [
+            // A union of forms gives no slots: which one holds is known only
+            // for each type argument.
+            "`k`: expected Point, found K",
+            "`either(i)`: none of Hash[Int] | Ordered[Int] holds",
         ]
     );
 }

@@ -34,8 +34,10 @@ use std::ops::Range;
 use crag_db::Db;
 use crag_syntax::{LeafKind, SyntaxKind as S, SyntaxNode, SyntaxToken, TokenKind as T};
 
+use crate::body::Owner;
 use crate::hir::*;
-use crate::items::{ItemId, Name};
+use crate::input::Program;
+use crate::items::{ItemId, ItemKind, Name, form_slots};
 use crate::literal::{self, Literal, Piece};
 use crate::scope::{ModuleScope, Resolution};
 use crate::shadow::{Previous, Redeclaration};
@@ -127,6 +129,10 @@ pub(crate) struct Lowerer<'a, 'db> {
     type_scopes: Vec<(Name<'db>, u32)>,
     /// The `_`s of each partial application being lowered, innermost last.
     holes: Vec<Vec<BindingId>>,
+    program: Program,
+    /// The functions the forms of a generic function's bounds require,
+    /// which its body calls by name (§4.2).
+    slots: Vec<(Name<'db>, ItemId<'db>)>,
 }
 
 /// The state of one pattern while it is lowered.
@@ -146,6 +152,7 @@ struct PatCtx<'db> {
 impl<'a, 'db> Lowerer<'a, 'db> {
     pub fn new(
         db: &'db dyn Db,
+        program: Program,
         scope: &'a ModuleScope<'db>,
         prefixes: &'a [(String, ItemId<'db>)],
     ) -> Self {
@@ -161,6 +168,8 @@ impl<'a, 'db> Lowerer<'a, 'db> {
             closure_depth: 0,
             type_scopes: Vec::new(),
             holes: Vec::new(),
+            program,
+            slots: Vec::new(),
         }
     }
 
@@ -273,14 +282,146 @@ impl<'a, 'db> Lowerer<'a, 'db> {
     /// Declares the type parameters of a function or type, if it has any.
     fn type_params(&mut self, node: &SyntaxNode) {
         if let Some(params) = child(node, S::TypeParams) {
+            let mut bounds = Vec::new();
             for param in params.children() {
                 if let Some(token) = ident(&param) {
                     let name = self.name(token.text());
                     self.body.type_params.push(name);
                     let index = self.body.type_params.len() as u32 - 1;
                     self.type_scopes.push((name, index));
+                    if let Some(bound) = param.children().next() {
+                        bounds.push((index, bound));
+                    }
                 }
             }
+            // A bound may name any of the parameters.
+            for (index, bound) in bounds {
+                let ty = self.type_node(&bound);
+                self.body.requirements.push(Requirement {
+                    param: Some(index),
+                    ty,
+                });
+            }
+        }
+    }
+
+    /// The entries of a `where` clause of requirements (§4.4).
+    fn requirements(&mut self, node: &SyntaxNode) {
+        if let Some(clause) = child(node, S::WhereClause) {
+            for entry in clause.children() {
+                let ty = self.type_node(&entry);
+                self.body.requirements.push(Requirement { param: None, ty });
+            }
+        }
+    }
+
+    /// A form declaration: its type parameters, requirements and functions,
+    /// or the forms it stands for.
+    pub fn form_decl(&mut self, node: &SyntaxNode) -> FormDecl<'db> {
+        self.type_params(node);
+        self.requirements(node);
+        let mut decl = FormDecl::default();
+        for entry in node.children() {
+            match entry.kind() {
+                S::FormFn => {
+                    let Some(token) = ident(&entry) else {
+                        continue;
+                    };
+                    let name = self.name(token.text());
+                    let generic = child(&entry, S::TypeParams).is_some();
+                    let params = child(&entry, S::ParamList)
+                        .into_iter()
+                        .flat_map(|list| list.children().collect::<Vec<_>>())
+                        .map(|param| {
+                            let name = ident(&param).map(|t| self.name(t.text()));
+                            let ty = self.type_or_missing(param.children().next(), &param);
+                            (name, ty)
+                        })
+                        .collect();
+                    let result = entry
+                        .children()
+                        .filter(|n| !matches!(n.kind(), S::TypeParams | S::ParamList))
+                        .last();
+                    let result = self.type_or_missing(result, &entry);
+                    decl.slots.push(SlotDecl {
+                        name,
+                        params,
+                        result,
+                        generic,
+                    });
+                }
+                S::TypeParams | S::WhereClause => {}
+                _ => decl.alias = Some(self.type_node(&entry)),
+            }
+        }
+        decl
+    }
+
+    /// The functions the forms of the requirements and parameter types
+    /// require, through the requirements of those forms.
+    fn slots_of_bounds(&self, params: &[Param]) -> Vec<(Name<'db>, ItemId<'db>)> {
+        let db = self.db;
+        let form_of = |body: &Body<'db>, ty: TypeRefId| match body.type_ref(ty) {
+            TypeRef::Named {
+                target: TypeTarget::Item(item),
+                ..
+            } if *item.kind(db) == ItemKind::Form => Some(*item),
+            _ => None,
+        };
+        let mut forms: Vec<ItemId<'db>> = self
+            .body
+            .requirements
+            .iter()
+            .map(|r| r.ty)
+            .chain(params.iter().map(|p| p.ty))
+            .filter_map(|ty| form_of(&self.body, ty))
+            .collect();
+        let mut i = 0;
+        while i < forms.len() {
+            let body = crate::body::hir_body(db, self.program, Owner::Item(forms[i]));
+            let alias = body.form.as_ref().and_then(|f| f.alias);
+            for ty in body.requirements.iter().map(|r| r.ty).chain(alias) {
+                if let Some(form) = form_of(body, ty)
+                    && !forms.contains(&form)
+                {
+                    forms.push(form);
+                }
+            }
+            i += 1;
+        }
+        let mut slots = Vec::new();
+        for form in forms {
+            for slot in form_slots(db, form) {
+                if !slots.iter().any(|&(_, s)| s == slot) {
+                    slots.push((*slot.name(db), slot));
+                }
+            }
+        }
+        slots
+    }
+
+    /// What `name` refers to in the module's scope, with the functions the
+    /// bounds of a generic function require.
+    fn resolve(&self, name: Name<'db>) -> Option<Resolution<'db>> {
+        let slots: Vec<ItemId<'db>> = self
+            .slots
+            .iter()
+            .filter(|(n, _)| *n == name)
+            .map(|&(_, s)| s)
+            .collect();
+        match self.scope.resolve(name).cloned() {
+            Some(Resolution::Value {
+                value,
+                mut functions,
+            }) => {
+                functions.extend(slots);
+                Some(Resolution::Value { value, functions })
+            }
+            None if !slots.is_empty() => Some(Resolution::Value {
+                value: None,
+                functions: slots,
+            }),
+            other => other,
         }
     }
 
@@ -354,6 +495,11 @@ impl<'a, 'db> Lowerer<'a, 'db> {
         let result = child(node, S::ReturnType)
             .and_then(|r| r.children().next())
             .map(|t| self.type_node(&t));
+        // Local functions cannot be generic yet; inference says so.
+        if self.closure_depth == 0 {
+            self.requirements(node);
+            self.slots = self.slots_of_bounds(&params);
+        }
         let body = child(node, S::Block).map(|b| self.expr(&b));
         (params, result, body)
     }
@@ -484,6 +630,8 @@ impl<'a, 'db> Lowerer<'a, 'db> {
                 Stmt::Fn {
                     binding,
                     function: LocalFn {
+                        generic: child(node, S::TypeParams).is_some()
+                            || child(node, S::WhereClause).is_some(),
                         params,
                         result,
                         body,
@@ -923,7 +1071,7 @@ impl<'a, 'db> Lowerer<'a, 'db> {
     fn value_name(&mut self, token: &SyntaxToken) -> Expr<'db> {
         let name = self.name(token.text());
         let local = self.local(name);
-        let item = self.scope.resolve(name).cloned();
+        let item = self.resolve(name);
         if local.is_none() && item.is_none() {
             self.errors.push(LowerError::Unresolved {
                 name: token.text().to_string(),
@@ -936,8 +1084,8 @@ impl<'a, 'db> Lowerer<'a, 'db> {
 
     /// The functions in scope named `name`.
     fn functions(&self, name: Name<'db>) -> Vec<ItemId<'db>> {
-        match self.scope.resolve(name) {
-            Some(Resolution::Value { functions, .. }) => functions.clone(),
+        match self.resolve(name) {
+            Some(Resolution::Value { functions, .. }) => functions,
             _ => Vec::new(),
         }
     }

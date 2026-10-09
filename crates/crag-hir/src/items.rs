@@ -48,6 +48,9 @@ pub enum ItemKind {
     /// A module-level `let` binding (§5.5).
     Value,
     Embed,
+    /// A function a form requires (§4.1). It is no name of the module's
+    /// scope: a generic function sees it through its bounds.
+    Slot,
 }
 
 /// An item, stable across edits to bodies: its module, name and kind, and
@@ -69,6 +72,36 @@ pub struct ItemTree<'db> {
     /// order.
     pub items: Vec<Item<'db>>,
     pub tests: Vec<Test<'db>>,
+    /// The functions forms require, in source order.
+    pub slots: Vec<SlotItem<'db>>,
+}
+
+/// A function a form requires: the form, and its place among the form's
+/// functions.
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct SlotItem<'db> {
+    pub id: ItemId<'db>,
+    pub form: ItemId<'db>,
+    pub index: u32,
+}
+
+/// The form a slot belongs to, and its place among the form's functions.
+pub fn slot_item<'db>(db: &'db dyn Db, slot: ItemId<'db>) -> Option<(ItemId<'db>, u32)> {
+    item_tree(db, *slot.module(db))
+        .slots
+        .iter()
+        .find(|s| s.id == slot)
+        .map(|s| (s.form, s.index))
+}
+
+/// The functions a form requires, in order.
+pub fn form_slots<'db>(db: &'db dyn Db, form: ItemId<'db>) -> Vec<ItemId<'db>> {
+    item_tree(db, *form.module(db))
+        .slots
+        .iter()
+        .filter(|s| s.form == form)
+        .map(|s| s.id)
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -184,7 +217,24 @@ impl<'db> Collector<'db> {
                 });
             }
             S::TypeDecl => self.push(ItemKind::Type, node, decl, whole()),
-            S::FormDecl => self.push(ItemKind::Form, node, decl, whole()),
+            S::FormDecl => {
+                let before = self.tree.items.len();
+                self.push(ItemKind::Form, node, decl, whole());
+                if let Some(form) = self.tree.items.get(before).map(|i| i.id) {
+                    let fns = node.children().filter(|n| n.kind() == S::FormFn);
+                    for (index, slot) in fns.enumerate() {
+                        let signature = slot.green().without_trivia();
+                        if let Some(item) = self.item(ItemKind::Slot, &slot, false, decl, signature)
+                        {
+                            self.tree.slots.push(SlotItem {
+                                id: item.id,
+                                form,
+                                index: index as u32,
+                            });
+                        }
+                    }
+                }
+            }
             S::EmbedDecl => self.push(ItemKind::Embed, node, decl, whole()),
             S::FnDecl => {
                 let signature = without(

@@ -32,8 +32,8 @@ use crate::lower::{BodySourceMap, LowerError, Lowerer, let_parts};
 use crate::scope::{Resolution, module_scope};
 
 /// What has a body: a function, a module-level `let` (through any of the
-/// values it binds), a test, or a type declaration, whose field types and
-/// defaults are lowered like one.
+/// values it binds), a test, or a type or form declaration, whose types,
+/// and a type's defaults, are lowered like one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
 pub enum Owner<'db> {
     Item(ItemId<'db>),
@@ -56,7 +56,7 @@ pub fn owners<'db>(db: &'db dyn Db, module: ModuleId) -> Vec<Owner<'db>> {
     for item in &tree.items {
         let kind = *item.id.kind(db);
         let first_of_let = kind == ItemKind::Value && owners.iter().all(|(d, _)| *d != item.decl);
-        if matches!(kind, ItemKind::Function | ItemKind::Type) || first_of_let {
+        if matches!(kind, ItemKind::Function | ItemKind::Type | ItemKind::Form) || first_of_let {
             owners.push((item.decl, Owner::Item(item.id)));
         }
     }
@@ -87,7 +87,7 @@ pub fn lower_body<'db>(db: &'db dyn Db, program: Program, owner: Owner<'db>) -> 
     };
     let scope = module_scope(db, program, module);
     let prefixes = prefixes(db, program, module);
-    let mut lower = Lowerer::new(db, scope, prefixes);
+    let mut lower = Lowerer::new(db, program, scope, prefixes);
     match node.kind() {
         S::FnDecl => {
             let (params, result, root) = lower.function(&node);
@@ -105,6 +105,9 @@ pub fn lower_body<'db>(db: &'db dyn Db, program: Program, owner: Owner<'db>) -> 
         }
         S::TypeDecl => {
             lower.body.type_decl = Some(lower.type_decl(&node));
+        }
+        S::FormDecl => {
+            lower.body.form = Some(lower.form_decl(&node));
         }
         S::TestDecl => {
             lower.body.root = node

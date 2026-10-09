@@ -43,8 +43,8 @@ pub use body::{LoweredBody, Owner, hir_body, lower_body, owners, prefixes};
 pub use hir::*;
 pub use input::{ModuleId, Parse, Program, SourceFile, parse};
 pub use items::{
-    Import, ImportItem, Item, ItemId, ItemKind, ItemTree, Name, Test, TestId, item_tree,
-    type_param_count,
+    Import, ImportItem, Item, ItemId, ItemKind, ItemTree, Name, SlotItem, Test, TestId, form_slots,
+    item_tree, slot_item, type_param_count,
 };
 pub use literal::Literal;
 pub use lower::{BodySourceMap, LowerError};

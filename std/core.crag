@@ -51,6 +51,14 @@ pub type Ordering = Less | Equal | Greater
 // The parent of every error type (§8.1).
 pub distinct type Error
 
+// The type functions of error unions and the type mapping functions over
+// them (§8.4).
+pub type Oks[X]
+pub type Errs[X]
+pub fn discard[X](x: X) -> () | Errs[X] prefix "~"
+pub fn check[X](x: X) -> Option[Oks[X]] prefix "?"
+pub fn expect[X](x: X) -> Oks[X] prefix "!!"
+
 pub type Range[T](first: T, last: T)
 pub type RangeFrom[T](first: T)
 
