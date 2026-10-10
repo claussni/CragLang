@@ -807,17 +807,25 @@ A name that is a local binding, such as a parameter called `f`, names no functio
 
 #### 11.5.7 Effects
 
-Effects record what a function may do beyond computing: `io`, resolving refs (`ref`), emitting signals (`signal`). A function taking a closure has the closure's effects too, so its effect set contains an entry "the effects of parameter `f`" that each call site replaces with the effects of the closure actually passed (§3.14). Effects are solved in the same group fixpoint as errors. The `is Pure`, `atomic` and update-closure rules are checked against the result.
+Effects record what a function may do beyond computing: `io`, resolving refs (`ref`), emitting signals (`signal`). A function taking a closure has the closure's effects too, so its effect set contains an entry "the effects of parameter `f`" that each call site replaces with the effects of the closure actually passed (§3.14); a generic function has an entry per slot, which the call's slot fillings replace. Effects are solved in the same group fixpoint as errors. The `is Pure`, `atomic` and update-closure rules are checked against the result.
+
+The effects of a body come from a walk over it once inference has resolved its calls. Calling a C function is `io`, an `ext` access is `io` as well, a ref's access functions are `ref`, and `emit` is `signal`; the prelude's other functions without bodies call the functions passed to them. A call gives the callee's effects with its entries replaced: a closure argument by its body's effects, a parameter of the caller by the caller's entry, a declared function by its effects, and a value of a plain function type, such as a field, by every effect. Closures, local functions and `lazy` expressions do not run where they are written, so they count where they are called; reading a `Lazy` waits for lazy cells (§11.7.11).
+
+The restricted contexts are checked in the same walk. An `is Pure` function has no effects of its own but may call its closure parameters; a call of it must give it functions without effects. A closure or declared function without effects has a Pure type, so it fits a parameter marked `is Pure`, and one with effects does not. An `atomic` block and a ref's `update` closure do no `io`, which includes `ext` accesses; an `update` closure resolves no ref but its own; an `ext` closure accesses no other `ext`. The rules of M4 for suspending operations in atomic blocks wait for streams and tasks (§11.7.5).
+
+To make the rules checkable, inference now types `ref` and `ext` bindings as `Ref[T]` and `Ext[T]`, whose access functions the prelude declares as generic functions without bodies, `atomic` blocks, whose value is the block's or the error that aborts it, and `emit` of a `Signal`. MIR still reports them as not supported until M4 (§11.7.6–§11.7.10).
 
 **Data structures**
 
-- `EffectSet` — bits for `io`, `ref`, `signal`, plus a set of closure-parameter indices.
+- `EffectSet` — bits for `io`, `ref`, `signal` and, within `io`, `ext` accesses, plus the indices of the closure parameters and slots it takes on.
+- `GroupMember` — a member of a group's solution: its errors and its effects.
+- `Restriction` — `is Pure`, `atomic` or `update`, in the errors that name it.
 
 **Functions**
 
-- `fn body_effects(db: &dyn Db, function: FunctionId) -> EffectSet` — effects of the body's own operations.
-- `fn substitute(effects: EffectSet, closure_args: &[EffectSet]) -> EffectSet` — at a call site.
-- `fn check_pure(db: &dyn Db, function: FunctionId) -> Vec<Diagnostic>`, `fn check_atomic_block(cx: &CheckCtx, block: ExprId) -> Vec<Diagnostic>`, `fn check_update_closure(cx: &CheckCtx, closure: ExprId) -> Vec<Diagnostic>`.
+- `fn function_effects(db: &dyn Db, program: Program, function: ItemId) -> EffectSet` — of a body from its group's solution, or of a function without a body by `intrinsic_effects`.
+- `EffectSet::substitute(params, slots)` — at a call site; `EffectSet::closed` — for a function used as a value, whose entries stand for any effect.
+- `Walker::walk_body(pure)` — the effects of a body and the errors of its restricted contexts; `Walker::closure` — the effects of one closure, which give its type its Pure marker.
 
 #### 11.5.8 Escape and bindings-only analysis
 

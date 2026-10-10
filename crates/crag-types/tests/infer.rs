@@ -908,7 +908,7 @@ fn vars(x: Int | NotFound) {
             "o: Empty[Int] | Int, r: Int | NotFound | Timeout, e: Empty[Int], n: Int, m: Int, \
              rest: NotFound | Timeout, k: Int, -> Int",
             "x: Int | NotFound, v: Int | NotFound, a: Int, n: Int, q: Int | NotFound, y: Int, \
-             f: (Int) -> Int, i: Int, b: Int | NotFound, c: Int | NotFound, \
+             f: (Int) -> Int is Pure, i: Int, b: Int | NotFound, c: Int | NotFound, \
              d: Int | NotFound, -> ()",
         ]
     );
@@ -1454,6 +1454,118 @@ fn f() {
             "`hits.update { n -> \"x\" }`: expected Int, found Str",
             "`Note(text: \"n\")`: expected Signal, found Note",
             "`hits`: expected Int, found Ref[Int]",
+        ]
+    );
+}
+
+/// Each function of the module with its effects (§3.14).
+fn effects(text: &str) -> Vec<String> {
+    let db = RootDatabase::new();
+    let (program, _, module) = setup(&db, text);
+    let tree = crag_hir::item_tree(&db, module);
+    tree.items
+        .iter()
+        .filter(|i| *i.id.kind(&db) == ItemKind::Function)
+        .map(|i| {
+            let effects = crag_types::function_effects(&db, program, i.id);
+            format!("{}: {}", i.id.name(&db).text(&db), effects.describe())
+        })
+        .collect()
+}
+
+#[test]
+fn effects_are_inferred_with_their_closure_parameters() {
+    let text = "import cLib(\"m\").{ now() -> Int }
+type Note(..Signal, text: Str)
+form Show[T] {
+  show(x: T) -> Str
+}
+fn show(n: Int) -> Str { now()
+  \"i\" }
+fn clock() -> Int { now() }
+fn inc(n: Int) -> Int { n + 1 }
+fn apply(f: (Int) -> Int, x: Int) -> Int { f(x) }
+fn twice(f: (Int) -> Int, x: Int) -> Int { apply(f, apply(f, x)) }
+fn viaClosure(x: Int) -> Int { apply({ n -> n + clock() }, x) }
+fn viaPure(x: Int) -> Int { twice({ n -> n * 2 }, x) }
+fn viaName(x: Int) -> Int { twice(inc, x) }
+fn note() { emit Note(text: \"x\") }
+fn counter() -> Int {
+  ref c = 0
+  c.update { n -> n + 1 }
+  c.use()
+}
+fn stored(r: (g: (Int) -> Int)) -> Int { r.g(1) }
+fn ping(n: Int) -> Int { if n == 0 { clock() } else { pong(n - 1) } }
+fn pong(n: Int) -> Int { ping(n) }
+fn mapped(xs: List[Int]) -> List[Int] { xs.map({ n -> n + clock() }) }
+fn local() -> Int {
+  fn inner(x: Int) -> Int { clock() + x }
+  inner(1)
+}
+fn shown[T: Show](x: T) -> Str { show(x) }
+fn shownInt() -> Str { shown(1) }";
+    let checked = check(text);
+    assert_eq!(checked.errors, Vec::<String>::new());
+    assert_eq!(
+        effects(text),
+        [
+            "show: io",
+            "clock: io",
+            "inc: none",
+            "apply: param 0",
+            "twice: param 0",
+            "viaClosure: io",
+            "viaPure: none",
+            "viaName: none",
+            "note: signal",
+            "counter: ref",
+            "stored: io, ref, signal",
+            "ping: io",
+            "pong: io",
+            "mapped: io",
+            "local: io",
+            "shown: slot 0",
+            "shownInt: io",
+        ]
+    );
+}
+
+#[test]
+fn restricted_contexts_reject_effects() {
+    // §3.14, §9.5, §9.6.
+    let text = "import cLib(\"m\").{ now() -> Int }
+fn p(x: Int) -> Int is Pure { now() + x }
+fn q(f: (Int) -> Int, x: Int) -> Int is Pure { f(x) }
+fn r(x: Int) -> Int { q({ n -> now() }, x) }
+fn s(g: ((Int) -> Int is Pure)) -> Int { g(1) }
+fn t() -> Int { s({ n -> now() }) }
+fn u() {
+  ref a = 0
+  ref b = 0
+  ext h = 1
+  atomic {
+    a.update { n -> n + 1 }
+    now()
+  }
+  a.update { n -> n + b.use() }
+  a.update { n -> now() }
+  h.use { x -> h.use() }
+  atomic { h.use() }
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`now()`: this has the effect `io`, which an `is Pure` function does not allow",
+            "`q({ n -> now() }, x)`: `q` is Pure, so the functions passed to it must have no \
+             effects",
+            "`{ n -> now() }`: expected (Int) -> Int is Pure, found (Int) -> Int",
+            "`now()`: this has the effect `io`, which an `atomic` block does not allow",
+            "`b.use()`: an `update` closure resolves only its own ref; update several in an \
+             `atomic` block",
+            "`now()`: this has the effect `io`, which an `update` closure does not allow",
+            "`h.use()`: an `ext` closure accesses no other `ext`, so that locks never nest",
+            "`h.use()`: this accesses an `ext`, which an `atomic` block does not allow",
         ]
     );
 }

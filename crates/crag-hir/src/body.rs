@@ -82,7 +82,21 @@ pub fn lower_body<'db>(db: &'db dyn Db, program: Program, owner: Owner<'db>) -> 
         Owner::Item(id) => tree.items.iter().find(|i| i.id == id).map(|i| i.decl),
         Owner::Test(id) => tree.tests.iter().find(|t| t.id == id).map(|t| t.decl),
     };
-    let Some(node) = decl.and_then(|d| root.children().nth(d as usize)) else {
+    // A C function's signature is inside its import (§16.1).
+    let c = match owner {
+        Owner::Item(id) if decl.is_none() => crate::items::c_function(db, id),
+        _ => None,
+    };
+    let node = match c {
+        Some((decl, index)) => root.children().nth(decl as usize).and_then(|import| {
+            import
+                .children()
+                .filter(|n| n.kind() == S::CSig && crate::lower::ident(n).is_some())
+                .nth(index)
+        }),
+        None => decl.and_then(|d| root.children().nth(d as usize)),
+    };
+    let Some(node) = node else {
         return LoweredBody::default();
     };
     let scope = module_scope(db, program, module);
@@ -98,6 +112,15 @@ pub fn lower_body<'db>(db: &'db dyn Db, program: Program, owner: Owner<'db>) -> 
             lower.body.params = params;
             lower.body.result = result;
             lower.body.root = root;
+        }
+        S::CSig => {
+            let (params, _, _) = lower.function(&node);
+            lower.body.params = params;
+            lower.body.result = node
+                .children()
+                .skip_while(|n| n.kind() != S::ParamList)
+                .nth(1)
+                .map(|t| lower.type_node(&t));
         }
         S::LetDecl => {
             let parts = let_parts(&node);

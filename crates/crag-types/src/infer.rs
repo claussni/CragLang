@@ -29,9 +29,10 @@
 //! slots of its bounds are candidates of calls (§11.5.3). Viable
 //! candidates are ranked by specificity (§11.5.4). A call whose union
 //! arguments no candidate takes whole is lifted: split by their members
-//! and recorded as a dispatch (§11.5.5). The rest of M2 comes later
-//! (§11.5); what needs it is reported as not supported yet rather than
-//! guessed.
+//! and recorded as a dispatch (§11.5.5). Once a body is inferred, its
+//! effects are found by a walk over it (§11.5.7). The rest of M2 comes
+//! later (§11.5); what needs it is reported as not supported yet rather
+//! than guessed.
 
 use crag_db::Db;
 use crag_hir::{
@@ -45,8 +46,9 @@ use crate::def::SigParam;
 use crate::def::{
     HeaderKind, TypeLowerer, alias_target, prelude_item, signature, type_header, value_type,
 };
+use crate::effect::{EffectSet, Walker};
 use crate::generic::{CallSite, Slot, bind, instantiate, mentions, slots, type_param_names};
-use crate::group::{error_type, group_of, result_type};
+use crate::group::{GroupMember, error_type, function_effects, group_of, result_type};
 use crate::overload::{Ranked, most_specific};
 use crate::relate::{declared_fields, fields_of, is_subtype, join, normalize};
 use crate::result::{Callee, Dispatch, DispatchArm, ErrorKind, InferenceResult, Site, TypeError};
@@ -65,7 +67,7 @@ pub fn infer_in_group<'db>(
     db: &'db dyn Db,
     program: Program,
     owner: Owner<'db>,
-    group: &[(ItemId<'db>, Ty<'db>)],
+    group: &[GroupMember<'db>],
 ) -> InferenceResult<'db> {
     let body = hir_body(db, program, owner);
     let generic_owner = match owner {
@@ -111,6 +113,25 @@ pub fn infer_in_group<'db>(
             None
         }
     };
+    // Effects matter for what runs: functions and tests (§3.14).
+    let effects = match owner {
+        Owner::Item(item) if *item.kind(db) != ItemKind::Function => EffectSet::NONE,
+        _ => {
+            let effects_of = |f: ItemId<'db>| cx.effects_of(f);
+            let walker = Walker::new(
+                db,
+                program,
+                body,
+                &cx.exprs,
+                &cx.bindings,
+                &cx.callees,
+                &effects_of,
+            );
+            let walked = walker.walk_body(body.pure);
+            cx.lower.errors.extend(walked.errors);
+            walked.effects
+        }
+    };
     InferenceResult {
         exprs: cx.exprs,
         pats: cx.pats,
@@ -119,6 +140,7 @@ pub fn infer_in_group<'db>(
         callees: cx.callees,
         result,
         holes: cx.holes,
+        effects,
         errors: cx.lower.errors,
     }
 }
@@ -165,7 +187,7 @@ struct Infer<'a, 'db> {
     module: ModuleId,
     /// While a group's errors are solved, the errors of its members so
     /// far.
-    group: &'a [(ItemId<'db>, Ty<'db>)],
+    group: &'a [GroupMember<'db>],
     /// The prelude's `Error` (§8.1).
     error: Option<Ty<'db>>,
     /// The function being checked, whose type parameters are opaque here
@@ -393,11 +415,20 @@ impl<'a, 'db> Infer<'a, 'db> {
     /// What a call of `function` gives, or none for a recursive function
     /// without a written success type.
     fn result_of(&self, function: ItemId<'db>) -> Option<Ty<'db>> {
-        if let Some(&(_, errors)) = self.group.iter().find(|(m, _)| *m == function) {
+        if let Some(member) = self.group.iter().find(|m| m.function == function) {
             let success = signature(self.db, self.program, function).result?;
-            return Some(self.join(success, errors));
+            return Some(self.join(success, member.errors));
         }
         result_type(self.db, self.program, function)
+    }
+
+    /// The effects of `function`: of its group's solution so far while
+    /// that is solved.
+    fn effects_of(&self, function: ItemId<'db>) -> EffectSet {
+        match self.group.iter().find(|m| m.function == function) {
+            Some(member) => member.effects,
+            None => function_effects(self.db, self.program, function),
+        }
     }
 
     /// The success type of `function`, which a type-qualified call and
@@ -647,7 +678,10 @@ impl<'a, 'db> Infer<'a, 'db> {
                 };
                 if leaves { Ty::never(db) } else { ty }
             }
-            Expr::Closure { params, body: root } => self.closure(params, *root, expected),
+            Expr::Closure { params, body: root } => {
+                let ty = self.closure(params, *root, expected);
+                self.pure_if_effectless(id, ty)
+            }
             Expr::If {
                 condition,
                 then,
@@ -807,12 +841,41 @@ impl<'a, 'db> Infer<'a, 'db> {
             .map(|p| p.ty)
             .collect();
         let result = self.success(id, function);
+        // A function without effects is Pure as a value (§3.14).
+        let pure = self.effects_of(function).is_empty();
         Ty::new(
             db,
             TyKind::Fn {
                 params,
                 result,
-                pure: false,
+                pure,
+            },
+        )
+    }
+
+    /// A closure's type, Pure when its body has no effects.
+    fn pure_if_effectless(&mut self, closure: ExprId, ty: Ty<'db>) -> Ty<'db> {
+        let db = self.db;
+        let TyKind::Fn { params, result, .. } = ty.kind(db) else {
+            return ty;
+        };
+        let effects_of = |f: ItemId<'db>| self.effects_of(f);
+        let mut walker = Walker::new(
+            db,
+            self.program,
+            self.body,
+            &self.exprs,
+            &self.bindings,
+            &self.callees,
+            &effects_of,
+        );
+        let pure = walker.closure(closure).is_empty();
+        Ty::new(
+            db,
+            TyKind::Fn {
+                params: params.clone(),
+                result: *result,
+                pure,
             },
         )
     }

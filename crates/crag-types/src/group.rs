@@ -36,6 +36,7 @@ use crag_hir::{
 };
 
 use crate::def::{prelude_item, signature, success_type};
+use crate::effect::{EffectSet, intrinsic_effects};
 use crate::infer::infer_in_group;
 use crate::relate::{is_subtype, join, normalize};
 use crate::result::{ErrorKind, Site, TypeError};
@@ -231,32 +232,52 @@ fn linking_call<'db>(body: &Body<'db>, members: &[ItemId<'db>]) -> Option<ExprId
     })
 }
 
-/// The errors of each member of the group whose first member is `root`,
-/// solved together.
+/// What the solution of a group says of one member so far.
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct GroupMember<'db> {
+    pub function: ItemId<'db>,
+    pub errors: Ty<'db>,
+    pub effects: EffectSet,
+}
+
+/// The errors and effects of each member of the group whose first member
+/// is `root`, solved together: both start empty and grow until nothing
+/// changes (§11.5.2, §11.5.7).
 #[crag_db::tracked(returns(ref), cycle_result = group_errors_cycle)]
 pub fn group_errors<'db>(
     db: &'db dyn Db,
     program: Program,
     root: ItemId<'db>,
-) -> Vec<(ItemId<'db>, Ty<'db>)> {
+) -> Vec<GroupMember<'db>> {
     let group = group_of(db, program, root);
     let never = Ty::never(db);
-    let mut errors: Vec<(ItemId<'db>, Ty<'db>)> =
-        group.members.iter().map(|&m| (m, never)).collect();
+    let mut members: Vec<GroupMember<'db>> = group
+        .members
+        .iter()
+        .map(|&function| GroupMember {
+            function,
+            errors: never,
+            effects: EffectSet::NONE,
+        })
+        .collect();
     loop {
         let mut grew = false;
-        for i in 0..errors.len() {
-            let member = errors[i].0;
-            let result = infer_in_group(db, program, Owner::Item(member), &errors).result;
-            let found = result.map_or(never, |r| error_members(db, program, r));
-            let joined = join(db, program, errors[i].1, found);
-            if joined != errors[i].1 {
-                errors[i].1 = joined;
+        for i in 0..members.len() {
+            let function = members[i].function;
+            let inferred = infer_in_group(db, program, Owner::Item(function), &members);
+            let found = inferred
+                .result
+                .map_or(never, |r| error_members(db, program, r));
+            let errors = join(db, program, members[i].errors, found);
+            let effects = members[i].effects.union(inferred.effects);
+            if errors != members[i].errors || effects != members[i].effects {
+                members[i].errors = errors;
+                members[i].effects = effects;
                 grew = true;
             }
         }
         if !grew || !group.recursive {
-            return errors;
+            return members;
         }
     }
 }
@@ -266,8 +287,37 @@ fn group_errors_cycle<'db>(
     _id: crag_db::Id,
     _program: Program,
     _root: ItemId<'db>,
-) -> Vec<(ItemId<'db>, Ty<'db>)> {
+) -> Vec<GroupMember<'db>> {
     Vec::new()
+}
+
+/// The effects of a function: of its body and what it calls, with an
+/// entry for each closure parameter it calls and each slot (§3.14).
+#[crag_db::tracked(returns(copy), cycle_result = function_effects_cycle)]
+pub fn function_effects<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    function: ItemId<'db>,
+) -> EffectSet {
+    if let Some(effects) = intrinsic_effects(db, program, function) {
+        return effects;
+    }
+    let root = group_of(db, program, function).members[0];
+    group_errors(db, program, root)
+        .iter()
+        .find(|m| m.function == function)
+        .map_or(EffectSet::NONE, |m| m.effects)
+}
+
+/// A function whose effects depend on themselves outside a group, through
+/// a module-level value, admits any.
+fn function_effects_cycle<'db>(
+    _db: &'db dyn Db,
+    _id: crag_db::Id,
+    _program: Program,
+    _function: ItemId<'db>,
+) -> EffectSet {
+    EffectSet::all()
 }
 
 /// What a call of `function` gives: its success type and its errors. None
@@ -285,8 +335,8 @@ pub fn result_type<'db>(
             let root = group.members[0];
             let errors = group_errors(db, program, root)
                 .iter()
-                .find(|(m, _)| *m == function)
-                .map_or(Ty::never(db), |(_, e)| *e);
+                .find(|m| m.function == function)
+                .map_or(Ty::never(db), |m| m.errors);
             Some(join(db, program, success, errors))
         }
         None if group.recursive => None,

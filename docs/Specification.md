@@ -507,7 +507,15 @@ The language has three effects:
 
 Traps, allocation, non-termination and starting tasks are not effects; a combinator over pure closures is pure. There are no user-defined effects.
 
-A function's effects are the union of its body's effects, including those of everything it calls. They are inferred and never written in a signature; `:help` shows them, and `api.crag` records them for every `pub` function, so gaining an effect is a breaking change (§20.5). The only written form is the restriction `is Pure`: no effects at all.
+A function's effects are the union of its body's effects, including those of everything it calls. They are inferred and never written in a signature; `:help` shows them, and `api.crag` records them for every `pub` function, so gaining an effect is a breaking change (§20.5). The only written form is the restriction `is Pure`: no effects at all. A function is marked after its result type, which must then be written; a function type is marked inside parentheses, since everything after `->` is its result (§3.7):
+
+```
+fn twice(f: ((Int) -> Int is Pure), x: Int) -> Int is Pure {
+  f(f(x))
+}
+```
+
+An `is Pure` function may call its closure parameters; a call of it must then pass functions without effects, so the call stays pure. A closure or function without effects is Pure as a value.
 
 A function that calls a closure parameter takes on that closure's effects at each call site, so `xs.map(f)` has the effects of `f`, and mapping a pure closure is pure. A stored function value (a record field, a closure in a collection) has no known call site: a plain function type admits every effect, and `is Pure` on the type admits none.
 
@@ -1462,7 +1470,7 @@ Three outcomes stay apart: a conflict reruns the block and delivers `emit retry`
 
 ### 9.6 `ext`: pessimistic external state
 
-Mutable foreign state (typically FFI handles) cannot be retried safely, so it is bound with `ext`, a locking ref. `ext` offers the same access functions as `ref`; the closure runs exactly once while holding the lock.
+Mutable foreign state (typically FFI handles) cannot be retried safely, so it is bound with `ext`, a locking ref of the compiler-owned type `Ext[T]`. `ext` offers the same access functions as `ref`; the closure runs exactly once while holding the lock. Accessing an `ext` is an `io` operation (§3.14).
 
 Accessing another `ext` inside an `ext` closure is a compile error, as reading a second ref is in an update closure (§9.5), so locks never nest and cannot deadlock. Accessing an `ext` inside an atomic block or update closure is a compile error too, since an attempt may rerun. A fiber waiting for the lock suspends without blocking its thread.
 
@@ -2535,7 +2543,7 @@ The module `std.core` is the prelude. The runtime defines it and imports it into
 | Forms and operators | `Eq`, `Ordered`, `Show`, `Hash`, `Iterable`; `add`, `equals`, `lessThan`, `compare` and the other operator functions | Operators (§6.2); `for` and collectors |
 | Ranges | `Range[T]`, `RangeFrom[T]`, `Discrete`, `next` | `a..b` and `a..` (§7.4) |
 | Type mappings | `discard`, `check`, `expect` and their prefixes | Prefixes (§8.5) |
-| Shared state | `Ref[T]`, `update`, `use`, `swap`, `empty` | `ref` and `ext` bindings and their sugar (§9.3) |
+| Shared state | `Ref[T]`, `Ext[T]`, `update`, `use`, `swap`, `empty` | `ref` and `ext` bindings and their sugar (§9.3) |
 | Laziness | `Lazy[T]` | `lazy` (§6.10) |
 | Markers | `Solid`, `Pure`, `Secret`, `Immediate`, `Deferred` | `is` clauses |
 | Signals, traps and lifecycle handlers | `Signal`, Error, Trap and its family, TrapSignal, `LifecycleHandler`, `Dispose[T]`, `Embed`, `EmbedError` | `emit`, traps, `on`, `embed` |
@@ -3063,7 +3071,7 @@ Contextual keywords are reserved only in their position: `ok`, `fail` and `retry
 | --- | --- |
 | `Solid`, `Pure`, `Secret`, `Immediate`, `Deferred` | Markers |
 | `ThreadUnsafe`, `ThreadSafe`, `ThreadBound`, `Errno` | FFI markers |
-| `Ref[T]` | Compiler-owned ref type |
+| `Ref[T]`, `Ext[T]` | Compiler-owned ref types |
 | `Fields[R, T]` | Compiler-known form |
 | `Signal`, `TrapSignal` | Standard signal types |
 | `Error`, `Trap` and its family | Standard error and trap parents (§8.1, §8.3) |
@@ -3161,7 +3169,7 @@ formDecl   = "pub"? "form" name typeParams (whereClause? "{" NL* (formFn NL+)* "
                                            | "=" type ("|" type)*)
 formFn     = name typeParams? "(" params? ")" "->" type
 
-fnDecl     = "pub"? "fn" name typeParams? "(" params? ")" ("->" type)? (NL? whereClause)?
+fnDecl     = "pub"? "fn" name typeParams? "(" params? ")" ("->" type isClause?)? (NL? whereClause)?   // is Pure: §3.14
              prefixClause? block?                     // no body: intrinsics in std only, §19.2
 prefixClause = "prefix" strLit
 params     = param ("," param)* ","?
@@ -3260,7 +3268,7 @@ Whether a bare `name` is a type or a binding is decided by position (§6.9).
 type       = fnType | unionType
 fnType     = "(" (type ("," type)*)? ")" "->" type    // everything after -> is the result, §3.7
 unionType  = atomType ("|" atomType)*
-atomType   = name typeArgs? | "_" | "(" ")" | "(" type ")" | recordType
+atomType   = name typeArgs? | "_" | "(" ")" | "(" type isClause? ")" | recordType   // ((A) -> B is Pure): §3.14
 typeArgs   = "[" typeArg ("," typeArg)* ("," isClause)? "]"   // trailing is: §11.4
 typeArg    = type | intLit                            // Fixed[2]
 recordType = "(" recEntry ("," recEntry)* ("," "..")? ","? ")"
@@ -3298,3 +3306,4 @@ Writing the grammar showed where the chapters are silent or disagree:
 13. **Contextual keywords.** Resolved: listed after B.1.
 14. **Local functions.** Resolved: §5.6.4.
 15. **`is` in type arguments.** Resolved: a form's type arguments may end with an `is` clause (§11.4).
+16. **Pure functions.** Resolved: `is Pure` follows a function's result type, and a function type's is written inside its parentheses (§3.14).

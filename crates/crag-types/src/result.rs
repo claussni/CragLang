@@ -20,6 +20,7 @@
 use crag_db::Db;
 use crag_hir::{BindingId, BodySourceMap, ExprId, ItemId, Name, PatId, TypeRefId};
 
+use crate::effect::{EffectSet, Restriction};
 use crate::generic::{FitError, Instance};
 use crate::ty::Ty;
 
@@ -39,6 +40,8 @@ pub struct InferenceResult<'db> {
     pub result: Option<Ty<'db>>,
     /// Every `???` with the type it must have (§6.11).
     pub holes: Vec<(ExprId, Ty<'db>)>,
+    /// What the body does beyond computing (§3.14).
+    pub effects: EffectSet,
     pub errors: Vec<TypeError<'db>>,
 }
 
@@ -293,6 +296,22 @@ pub enum ErrorKind<'db> {
     /// `check` of a value whose successes contain `Empty`, which its
     /// failure would merge with (§8.4).
     EmptyMerges,
+    /// Effects a restricted context does not allow (§3.14): an `ext`
+    /// access is told apart from other `io`.
+    Effect {
+        effects: EffectSet,
+        ext: bool,
+        restriction: Restriction,
+    },
+    /// A call of an `is Pure` function that passes it a function with
+    /// effects.
+    PureCall {
+        function: ItemId<'db>,
+    },
+    /// A ref resolved in another ref's `update` closure (§9.5).
+    SecondRef,
+    /// An `ext` accessed in an `ext` closure (§9.6).
+    NestedExt,
     /// Something core inference does not handle yet; later milestones of
     /// the Implementation Plan add it.
     Unsupported(&'static str),
@@ -431,6 +450,39 @@ impl<'db> ErrorKind<'db> {
             ),
             ErrorKind::EmptyMerges => {
                 "`check` of a value that can be `Empty` would merge success and failure".into()
+            }
+            ErrorKind::Effect {
+                effects,
+                ext,
+                restriction,
+            } => {
+                let context = match restriction {
+                    Restriction::Pure => "an `is Pure` function",
+                    Restriction::Atomic => "an `atomic` block",
+                    Restriction::Update => "an `update` closure",
+                };
+                if *ext {
+                    format!("this accesses an `ext`, which {context} does not allow")
+                } else {
+                    let names: Vec<String> =
+                        effects.names().iter().map(|n| format!("`{n}`")).collect();
+                    let s = if names.len() == 1 { "" } else { "s" };
+                    format!(
+                        "this has the effect{s} {}, which {context} does not allow",
+                        names.join(", ")
+                    )
+                }
+            }
+            ErrorKind::PureCall { function } => format!(
+                "`{}` is Pure, so the functions passed to it must have no effects",
+                item(function)
+            ),
+            ErrorKind::SecondRef => {
+                "an `update` closure resolves only its own ref; update several in an `atomic` block"
+                    .into()
+            }
+            ErrorKind::NestedExt => {
+                "an `ext` closure accesses no other `ext`, so that locks never nest".into()
             }
             ErrorKind::Unsupported(what) => format!("{what} are not supported yet"),
         }

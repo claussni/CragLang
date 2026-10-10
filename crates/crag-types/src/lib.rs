@@ -30,6 +30,7 @@ extern crate crag_db as salsa;
 mod case;
 mod decision;
 mod def;
+mod effect;
 mod generic;
 mod group;
 mod infer;
@@ -47,13 +48,14 @@ pub use def::{
     FieldDef, HeaderKind, SigParam, Signature, TypeDef, TypeDefKind, TypeHeader, alias_target,
     prelude_item, signature, success_type, type_def, type_header, type_parent, value_type,
 };
+pub use effect::{EffectSet, Restriction};
 pub use generic::{
     Bounds, CallSite, Filling, FitError, FormBound, FormDef, Instance, Slot, bounds, form_def,
     instantiate, param_bound, slots, type_param_names,
 };
 pub use group::{
-    Group, callees, error_members, error_type, group_errors, group_of, recursion_errors,
-    result_type, success_members,
+    Group, GroupMember, callees, error_members, error_type, function_effects, group_errors,
+    group_of, recursion_errors, result_type, success_members,
 };
 pub use infer::constant as literal_value;
 pub use overload::{Ranked, Specificity, compare_param, most_specific, overload_errors};

@@ -157,6 +157,23 @@ pub struct TestId<'db> {
     pub ordinal: u32,
 }
 
+/// The function a `cLib` import binds, with the declaration of the import
+/// and its index among the import's functions (§16.1).
+pub fn c_function<'db>(db: &'db dyn Db, item: ItemId<'db>) -> Option<(u32, usize)> {
+    item_tree(db, *item.module(db))
+        .imports
+        .iter()
+        .find_map(|import| match import {
+            Import::C {
+                functions, decl, ..
+            } => functions
+                .iter()
+                .position(|f| f.id == item)
+                .map(|index| (*decl, index)),
+            Import::Module { .. } => None,
+        })
+}
+
 /// The number of type parameters a function or type signature declares.
 pub fn type_param_count(signature: &GreenNode) -> usize {
     SyntaxNode::new_root(signature.clone())

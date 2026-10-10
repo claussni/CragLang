@@ -929,6 +929,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         {
             return self.primitive_call(expr, primitive, positional);
         }
+        if crag_hir::c_function(db, function).is_some() {
+            return self.unsupported(expr, "calls of C functions");
+        }
         let sig = signature(db, self.program, function);
         if sig.type_params > 0 {
             return self.unsupported(expr, "calls of generic functions");
