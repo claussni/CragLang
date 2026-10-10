@@ -22,7 +22,7 @@
 //! reference away, and a place only borrows the local it starts at.
 
 use crag_db::Db;
-use crag_hir::{BindingId, ExprId, ItemId, Name, Owner};
+use crag_hir::{BindingId, ExprId, Name, Owner};
 use crag_types::{Builtin, Step, Ty, TyKind};
 
 use crate::{Entry, InstanceKey};
@@ -201,8 +201,6 @@ pub enum Rvalue<'db> {
         front: u32,
         back: u32,
     },
-    /// The value of a module-level `let`.
-    Global(ItemId<'db>),
     /// A function value: the code, and an environment of type `env`, a
     /// record of the captured values in its order, or null when there are
     /// none (§11.5.9). On the side stack the environment borrows the
@@ -397,7 +395,6 @@ impl<'db> Rvalue<'db> {
             Rvalue::Closure { captures, .. } => {
                 out.extend(captures.iter_mut().filter_map(Operand::locals_mut))
             }
-            Rvalue::Global(_) => {}
         }
         out
     }
@@ -595,7 +592,6 @@ fn rvalue_text<'db>(db: &'db dyn Db, rvalue: &Rvalue<'db>) -> String {
         Rvalue::Slice { list, front, back } => {
             format!("slice {}[{front}..-{back}]", place(list))
         }
-        Rvalue::Global(item) => format!("value {}", item.name(db).text(db)),
         Rvalue::Closure {
             code,
             captures,

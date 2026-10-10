@@ -48,9 +48,11 @@ use crate::{
 const NS_FUNCTION: u32 = 0;
 const NS_RUNTIME: u32 = 1;
 const NS_LOCAL: u32 = 2;
-/// A slot, by its place in `Imports::slots`, since a slot key does not fit
+/// A slot, by its place in `Imports::keys`, since a slot key does not fit
 /// a name's index.
 const NS_SLOT: u32 = 3;
+/// A value's cell, by its place in `Imports::keys` as for slots.
+const NS_CELL: u32 = 4;
 
 /// A machine the facade can generate code for.
 #[derive(Clone)]
@@ -121,8 +123,8 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
     lir.validate().map_err(CodegenError::InvalidLir)?;
     let isa = settings.target.isa(settings.opt);
 
-    let (func, slots) = build_body(lir, isa);
-    let body = run_backend(isa, func, &slots)?;
+    let (func, keys) = build_body(lir, isa);
+    let body = run_backend(isa, func, &keys)?;
     let footprint = body.footprint(isa, tail_args_growth(lir));
     if footprint <= FRAME_BUDGET {
         return Ok(CodeObject {
@@ -275,9 +277,10 @@ fn tail_args_growth(lir: &LirFunction) -> u32 {
 #[derive(Default)]
 struct Imports {
     functions: HashMap<(u32, u32, u32, u32), FuncRef>,
-    /// The slots, in the order of their names' indices.
-    slots: Vec<SlotKey>,
+    /// The keys of slots and cells, in the order of their names' indices.
+    keys: Vec<SlotKey>,
     slot_values: HashMap<SlotKey, GlobalValue>,
+    cell_values: HashMap<SlotKey, GlobalValue>,
 }
 
 /// How a call reaches its callee.
@@ -341,29 +344,35 @@ impl Imports {
             }
             CallTarget::Slot(key) => key,
         };
-        let slot = match self.slot_values.get(&key) {
-            Some(&slot) => slot,
-            None => {
-                let index = self.slots.len() as u32;
-                self.slots.push(key);
-                let name = b.func.declare_imported_user_function(UserExternalName {
-                    namespace: NS_SLOT,
-                    index,
-                });
-                let slot = b.create_global_value(GlobalValueData::Symbol {
-                    name: ExternalName::user(name),
-                    offset: Imm64::new(0),
-                    colocated: false,
-                    tls: false,
-                });
-                self.slot_values.insert(key, slot);
-                slot
-            }
-        };
+        let slot = self.symbol(b, NS_SLOT, key);
         let addr = b.ins().symbol_value(I64, slot);
         // Loaded at every call, never kept: the image replaces the entry
         // between calls.
         Reached::Loaded(b.ins().load(I64, MemFlagsData::trusted(), addr, 0))
+    }
+
+    /// The symbol of a slot or a cell, declared once.
+    fn symbol(&mut self, b: &mut FunctionBuilder, namespace: u32, key: SlotKey) -> GlobalValue {
+        let values = match namespace {
+            NS_SLOT => &mut self.slot_values,
+            _ => &mut self.cell_values,
+        };
+        if let Some(&value) = values.get(&key) {
+            return value;
+        }
+        let index = self.keys.len() as u32;
+        self.keys.push(key);
+        let name = b
+            .func
+            .declare_imported_user_function(UserExternalName { namespace, index });
+        let value = b.create_global_value(GlobalValueData::Symbol {
+            name: ExternalName::user(name),
+            offset: Imm64::new(0),
+            colocated: false,
+            tls: false,
+        });
+        values.insert(key, value);
+        value
     }
 
     /// `rt_morestack` preserves every register, so the call on the cold path
@@ -484,7 +493,8 @@ fn emit_side_push(
     start
 }
 
-/// The body and the slots it calls through.
+/// The body and the keys of the slots it calls through and the cells it
+/// names.
 fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> (Function, Vec<SlotKey>) {
     let sig = crag_signature(lir.params, lir.returns);
     let mut func = Function::with_name_signature(UserFuncName::default(), sig);
@@ -695,6 +705,11 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> (Function, Vec<SlotKey>
                     }
                 }
                 Inst::Context { dst } => b.def_var(vars[dst.0 as usize], ctx),
+                Inst::CellAddr { dst, cell } => {
+                    let symbol = imports.symbol(&mut b, NS_CELL, *cell);
+                    let v = b.ins().symbol_value(I64, symbol);
+                    b.def_var(vars[dst.0 as usize], v);
+                }
                 Inst::Load { dst, addr, offset } => {
                     let p = b.use_var(vars[addr.0 as usize]);
                     let v = b.ins().load(I64, MemFlagsData::trusted(), p, *offset);
@@ -791,7 +806,7 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> (Function, Vec<SlotKey>
 
     b.seal_all_blocks();
     b.finalize(isa.frontend_config());
-    (func, imports.slots)
+    (func, imports.keys)
 }
 
 /// The wrapper for a function whose frame exceeds the budget: the sized
@@ -845,7 +860,7 @@ impl Compiled {
 fn run_backend(
     isa: &dyn TargetIsa,
     func: Function,
-    slots: &[SlotKey],
+    keys: &[SlotKey],
 ) -> Result<Compiled, CodegenError> {
     let mut ctx = Context::for_function(func);
     ctx.compile(isa, &mut ControlPlane::default())
@@ -870,7 +885,8 @@ fn run_backend(
                 RelocTarget::Runtime(RuntimeFn::from_index(name.index).ok_or_else(unsupported)?)
             }
             NS_LOCAL => RelocTarget::Local(name.index),
-            NS_SLOT => RelocTarget::Slot(*slots.get(name.index as usize).ok_or_else(unsupported)?),
+            NS_SLOT => RelocTarget::Slot(*keys.get(name.index as usize).ok_or_else(unsupported)?),
+            NS_CELL => RelocTarget::Cell(*keys.get(name.index as usize).ok_or_else(unsupported)?),
             _ => return Err(unsupported()),
         };
         relocs.push(Reloc {

@@ -41,14 +41,24 @@
 //! signature, as a [`SlotKey`] names it; loading a function fills its slot.
 //! The table grows in chunks that never move, so a slot's address, which
 //! the code is patched with, stays valid as long as the table lives.
+//!
+//! # Cells
+//!
+//! The code that computes a module-level value keeps it in a cell
+//! (Implementation Plan §11.6.2), named like a slot by that code's key.
+//! Loading a group makes the cells its code names, empty; the code fills
+//! its cell on the first read. The image empties a cell to have the value
+//! computed again.
 
 #![cfg(unix)]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crag_abi::{CodeObject, FuncId, RelocKind, RelocTarget, RuntimeFn, SlotKey};
+use crag_abi::{
+    CELL_EMPTY, CELL_SIZE, CodeObject, FuncId, RelocKind, RelocTarget, RuntimeFn, SlotKey,
+};
 
 /// The address of a loaded code object's entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -97,20 +107,20 @@ impl SlotTable {
         index
     }
 
-    fn cell(&self, index: SlotIndex) -> &AtomicUsize {
+    fn word(&self, index: SlotIndex) -> &AtomicUsize {
         let i = index.0 as usize;
         &self.chunks[i / SLOT_CHUNK][i % SLOT_CHUNK]
     }
 
     /// The address of a slot, which calls load the entry point from.
     pub fn address(&self, index: SlotIndex) -> usize {
-        self.cell(index).as_ptr() as usize
+        self.word(index).as_ptr() as usize
     }
 
     /// The entry point a key's slot holds now; none when it has no slot or
     /// the slot is empty.
     pub fn get(&self, key: SlotKey) -> Option<CodeAddr> {
-        let entry = self.cell(self.index(key)?).load(Ordering::Acquire);
+        let entry = self.word(self.index(key)?).load(Ordering::Acquire);
         (entry != 0).then_some(CodeAddr(entry))
     }
 }
@@ -118,16 +128,68 @@ impl SlotTable {
 /// Stores an entry point in a slot. The store is atomic, so a call on
 /// another thread loads either the old entry or the new one.
 pub fn slot_set(table: &SlotTable, index: SlotIndex, addr: CodeAddr) {
-    table.cell(index).store(addr.0, Ordering::Release);
+    table.word(index).store(addr.0, Ordering::Release);
+}
+
+/// Cells per chunk of the cell table: a page of them.
+const CELL_CHUNK: usize = 4096 / CELL_SIZE;
+
+/// One cell: its state word and the value's words.
+type Cell = [AtomicU64; CELL_SIZE / 8];
+
+/// The cells of module-level values, one per slot key of the code that
+/// computes a value, which keeps the value there (`crag_abi::CELL_SIZE`).
+/// A cell is made empty when code that names it is first loaded; like
+/// slots, cells never move.
+#[derive(Default)]
+pub struct CellTable {
+    chunks: Vec<Box<[Cell; CELL_CHUNK]>>,
+    index: HashMap<SlotKey, usize>,
+}
+
+impl CellTable {
+    fn assign(&mut self, key: SlotKey) -> usize {
+        let next = self.index.len();
+        let index = *self.index.entry(key).or_insert(next);
+        if index == next && next == self.chunks.len() * CELL_CHUNK {
+            self.chunks.push(Box::new(
+                [const { [const { AtomicU64::new(0) }; CELL_SIZE / 8] }; CELL_CHUNK],
+            ));
+        }
+        index
+    }
+
+    fn cell(&self, index: usize) -> &Cell {
+        &self.chunks[index / CELL_CHUNK][index % CELL_CHUNK]
+    }
+
+    /// The address of a key's cell, if it has one.
+    pub fn address(&self, key: SlotKey) -> Option<usize> {
+        Some(self.cell(*self.index.get(&key)?).as_ptr() as usize)
+    }
+
+    /// The state of a key's cell: `CELL_EMPTY` or `CELL_FULL`.
+    pub fn state(&self, key: SlotKey) -> Option<u64> {
+        Some(self.cell(*self.index.get(&key)?)[0].load(Ordering::Acquire))
+    }
+
+    /// Empties a key's cell, so the value is computed again when it is next
+    /// read. The value it held is not released.
+    pub fn reset(&self, key: SlotKey) {
+        if let Some(&index) = self.index.get(&key) {
+            self.cell(index)[0].store(CELL_EMPTY, Ordering::Release);
+        }
+    }
 }
 
 /// What relocations resolve against: the runtime functions, the loaded
-/// Crag functions and their slots.
+/// Crag functions, their slots and the cells of values.
 #[derive(Default)]
 pub struct SymbolTable {
     runtime: [Option<usize>; RuntimeFn::ALL.len()],
     functions: HashMap<FuncId, CodeAddr>,
     slots: SlotTable,
+    cells: CellTable,
 }
 
 impl SymbolTable {
@@ -153,6 +215,10 @@ impl SymbolTable {
     pub fn slots(&self) -> &SlotTable {
         &self.slots
     }
+
+    pub fn cells(&self) -> &CellTable {
+        &self.cells
+    }
 }
 
 #[derive(Debug)]
@@ -168,6 +234,9 @@ pub enum LoadError {
     /// A relocation names the slot of a function with a signature that is
     /// neither loaded nor in the group.
     UnresolvedSlot(SlotKey),
+    /// A relocation names the cell of a value whose code is not loaded with
+    /// a group: an entry stub's.
+    UnresolvedCell(SlotKey),
     /// The function is already loaded, or appears twice in the group.
     DuplicateFunction(FuncId),
     /// The code object contradicts itself: an entry point, relocation or
@@ -189,6 +258,11 @@ impl std::fmt::Display for LoadError {
             LoadError::UnresolvedSlot(key) => write!(
                 f,
                 "function {} with signature {} is not loaded",
+                key.func.0, key.signature
+            ),
+            LoadError::UnresolvedCell(key) => write!(
+                f,
+                "the value of function {} with signature {} has no cell",
                 key.func.0, key.signature
             ),
             LoadError::DuplicateFunction(id) => {
@@ -407,6 +481,13 @@ fn enter(
         .iter()
         .map(|&(key, _)| symbols.slots.assign(key))
         .collect();
+    for (_, code) in group {
+        for reloc in &code.relocs {
+            if let RelocTarget::Cell(key) = reloc.target {
+                symbols.cells.assign(key);
+            }
+        }
+    }
     let items: Vec<_> = group.iter().map(|&(key, code)| (Some(key), code)).collect();
     let entries = place(arena, symbols, &items)?;
     // The code is executable now, so it may be published.
@@ -478,6 +559,10 @@ fn place(
                             _ => return Err(LoadError::UnresolvedSlot(key)),
                         }
                     }
+                    RelocTarget::Cell(key) => symbols
+                        .cells
+                        .address(key)
+                        .ok_or(LoadError::UnresolvedCell(key))?,
                     RelocTarget::Runtime(func) => symbols
                         .runtime(func)
                         .ok_or(LoadError::UnresolvedRuntime(func))?,
@@ -566,9 +651,9 @@ pub unsafe fn unload(
         .ok_or(LoadError::NotLoaded(entry))?;
     symbols.functions.retain(|_, addr| *addr != entry);
     for &slot in symbols.slots.index.values() {
-        let cell = symbols.slots.cell(slot);
+        let word = symbols.slots.word(slot);
         // Nothing may call the code any more, so its slots empty.
-        let _ = cell.compare_exchange(entry.0, 0, Ordering::AcqRel, Ordering::Relaxed);
+        let _ = word.compare_exchange(entry.0, 0, Ordering::AcqRel, Ordering::Relaxed);
     }
     let region = arena
         .regions

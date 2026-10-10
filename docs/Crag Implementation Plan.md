@@ -353,7 +353,7 @@ Protection applies to whole pages, so each load fills a region of fresh pages wh
 **Data structures**
 
 - `CodeArena` — one reserved address range, so all code stays within reach of relative branches, with pages committed on demand and a free list of returned page runs, so retired code can be reused later.
-- `SymbolTable` — runtime functions and loaded functions to addresses, and the slot table (§11.6.4).
+- `SymbolTable` — runtime functions and loaded functions to addresses, the slot table (§11.6.4) and the cells of module-level values (§11.4.10).
 
 **Functions**
 
@@ -571,12 +571,14 @@ Code generation translates MIR into the facade's `LirFunction` and has Cranelift
 
 Each local becomes as many registers as its layout has words (Compiler Architecture §11). Numbers are words: narrow integers stay sign- or zero-extended to 64 bits, and a `Float` is a word holding its bits. A box is a pointer to a 16-byte header, the count and then the type index, followed by the fields: the parent's at their own offsets, then the type's own by name. A union is a type index and a payload word, or the index alone when every member is a tag, so a `Bool` is the index of `True` or `False`. The index is that of the member the value belongs to, which may be a parent of the value's own type; a conversion to a wider union retags the members it absorbs. A type index is the interned type's own index for now. A type test compares the index; a test for a record type finer than the static one reads the box's header and compares it with the indices of the program's record types that fit. Overflow tests use Cranelift's overflow flags for 64-bit types and a range check of the exact result for narrower ones.
 
-Boxes are allocated inline from the worker's heap (§11.4.11) and counted inline (§11.4.12); an empty list or map is allocated inline too, and the runtime grows it and finds its elements (§11.4.13). Checks trap through a call of a runtime function the unwinder provides (§11.4.14). The LIR gained what MIR needs: division, bit operations, shifts, unsigned and `Float` comparisons, `Float` arithmetic on the bits, overflow tests, selects, runtime calls and a trap terminator. What code generation does not handle yet, strings, bytes, module-level values and calls of the prelude's builtins, ends its block with a trap and is listed with the code; function values came with closure conversion (§11.5.9). Stack maps cover the registers holding boxes; line tables wait for MIR to carry positions, and code objects go to the artifact store with the persisted store (§11.9.5). The crate is `crag-backend`.
+Boxes are allocated inline from the worker's heap (§11.4.11) and counted inline (§11.4.12); an empty list or map is allocated inline too, and the runtime grows it and finds its elements (§11.4.13). Checks trap through a call of a runtime function the unwinder provides (§11.4.14). The LIR gained what MIR needs: division, bit operations, shifts, unsigned and `Float` comparisons, `Float` arithmetic on the bits, overflow tests, selects, runtime calls and a trap terminator. What code generation does not handle yet, strings, bytes and calls of the prelude's builtins, ends its block with a trap and is listed with the code; function values came with closure conversion (§11.5.9). Stack maps cover the registers holding boxes; line tables wait for MIR to carry positions, and code objects go to the artifact store with the persisted store (§11.9.5). The crate is `crag-backend`.
+
+A module-level `let` is computed once, on first use (Specification §5.5); computing it at compile time comes with compile-time evaluation (§11.6.7). The value's code is an instance of its own, and MIR reads the value by calling it, so liveness, stack maps and traps treat the read like any call, and the instances a root reaches include the values it reads. That code keeps the value in a cell: a state word, empty or full, then the value's words, at most two. On entry it checks the cell, and when it is full returns what it holds, with a reference for the caller. Otherwise it computes the value and, before it returns, stores the words with a reference of the cell's own and marks the cell full. It makes no tail call, since it has work after its last call. A trap while it computes leaves the cell empty, so the next read computes the value again. A value that needs itself is a compile error, so no read finds its value being computed. The loader makes a cell for each key that code being loaded names, as it makes slots: the key is the slot key of the value's code (§11.6.4), so a value whose type changes gets a fresh cell. Only a `let` that binds one name is read so far; a pattern that takes the value apart is listed as unsupported. Cells are not yet safe for two workers that compute a value at once; that comes with the scheduler (§11.7.1).
 
 **Functions**
 
 - `fn layout(db: &dyn Db, program: Program, ty: Ty) -> Option<Layout>` and `fn record_layout(db: &dyn Db, program: Program, ty: Ty) -> Option<(Vec<FieldSlot>, u32)>` — the words of a type, and the fields of a box at their offsets.
-- `fn lower_to_lir(db: &dyn Db, program: Program, owner: Owner, mir: &MirBody) -> Lowered` — one case per MIR statement and terminator; the LIR, what it could not lower, and the instances it calls. The owner's source map gives the positions of traps.
+- `fn lower_to_lir(db: &dyn Db, program: Program, owner: Owner, mir: &MirBody, cell: Option<SlotKey>) -> Lowered` — one case per MIR statement and terminator; the LIR, what it could not lower, and the instances it calls. The owner's source map gives the positions of traps. The code of a module-level value gets its cell, which `Inst::CellAddr` addresses and a `RelocTarget::Cell` relocation names.
 - `fn code(db: &dyn Db, program: Program, instance: InstanceKey, tier: Tier) -> &Option<Result<Code, String>>` — the query: the code object, the `FuncId` it is loaded as, its words of parameters and results, and the instances to load with it.
 
 #### 11.4.11 Allocator
@@ -953,18 +955,20 @@ The host compiles; the image only loads, so it links no code generator. To run s
 
 The host remembers what each image has: functions by their id and the hash of their code, stubs by their words, and descriptors by type index. A shipment sends only what is missing, so the second root to call a function does not send it again, and a fresh image after a crash gets everything anew. A function that comes again with other code, as a changed definition does, is sent again and replaces the old code (§11.6.4).
 
+The image keeps the values of module-level `let`s in their cells between runs (§11.4.10). The host remembers, for each value, a hash of the code it is computed with: its own and that of every function it reaches. When the hash changes, the `Load` names the value's cell and the image empties it after loading, so the next read computes the value with the new code. Code the value does not run leaves it as it is. Every run ships its root first, and the root reaches every value the run may read, so no run reads a value computed with other code. The value an emptied cell held is not released yet.
+
 Result words that are references point into the image and mean nothing to the host; value printing reads values in the image (§11.6.5). A run that does not end blocks the request until `restart` kills the image; interrupting it at a safepoint comes with the REPL (§11.6.2).
 
 **Data structures**
 
 - `ShippedFunction` — a function's id, the signature of its slot, words of parameters and results, and code object; `Stub` — an entry stub and the words it was compiled for.
-- `Message::Load { types, stubs, functions }`, `Loaded`, `Run(FuncId)`, `Finished(words)`, `Trapped { kind, position, stack }` and `Failed(reason)`.
+- `Message::Load { types, stubs, functions, reset }`, `Loaded`, `Run(FuncId)`, `Finished(words)`, `Trapped { kind, position, stack }` and `Failed(reason)`.
 - `Image` — in the image: the code arena, symbol table, loaded functions and stubs, descriptors, code map and worker.
 - `Scratch` — in the driver: a session and the names of the functions shipped, for reports.
 
 **Functions**
 
-- `Session::ship(&mut self, types, stubs, functions) -> Result<usize, SessionError>` — on the host side; sends what the image lacks and returns how many functions it sent.
+- `Session::ship(&mut self, types, stubs, functions, reset) -> Result<usize, SessionError>` — on the host side; sends what the image lacks and the cells to empty, and returns how many functions it sent.
 - `Session::run(&mut self, func) -> Result<RunResult, SessionError>` — the result words or the trap.
 - `Image::answer(&mut self, message) -> Option<Message>` — in the image: loads, runs and answers.
 - `Scratch::ship(project, roots)` and `Scratch::run(project, root)` — compile, ship and run, with the trap reported against the source.

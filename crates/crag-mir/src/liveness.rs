@@ -185,7 +185,6 @@ fn statement_uses(body: &MirBody<'_>, holds: &[LocalSet], statement: &Statement<
                         uses.operand(o, consume);
                     }
                 }
-                Rvalue::Global(_) => {}
             }
         }
         Statement::Retain(l) => uses.borrowed.push(*l),

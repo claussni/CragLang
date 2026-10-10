@@ -43,7 +43,7 @@ use crag_types::{
     Builtin, Callee, DecisionTree, Dispatch, EscapeLevel, Filling, InferenceResult, Instance,
     ListLen, Position, SigParam, Signature, Step, Ty, TyKind, TypeDefKind, Value, body_types,
     decision_tree_with, declared_fields, fields_of, literal_value, prelude_item, result_type,
-    signature, subst, type_def,
+    signature, subst, type_def, value_type,
 };
 
 use crate::ir::{
@@ -308,6 +308,17 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Some(result) => self.subst(result),
             None => Ty::unit(self.db),
         };
+        if let Owner::Item(item) = *self.instance.owner(self.db)
+            && *item.kind(self.db) == ItemKind::Value
+        {
+            // The code of a value keeps what it gives (§11.6.2), so it ends
+            // in no tail call.
+            return Some(Box::new(move |b| {
+                let value = b.temp(b.result);
+                b.eval(root, Dest::Value(value));
+                b.terminate(Terminator::Return(Operand::Local(value)));
+            }));
+        }
         Some(Box::new(move |b| b.eval(root, Dest::Return)))
     }
 
@@ -1076,6 +1087,36 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         }
     }
 
+    /// The value of a module-level `let`: a call of the code that computes
+    /// it, which keeps the value once computed (§11.6.2). That code gives
+    /// the whole value of the `let`, so only a `let` that binds one name is
+    /// read so far.
+    fn module_value(&mut self, expr: ExprId, item: ItemId<'db>) -> Operand<'db> {
+        let db = self.db;
+        let owner = Owner::Item(item);
+        let body = hir_body(db, self.program, owner);
+        let single = body
+            .pattern
+            .is_some_and(|(pat, _)| matches!(body.pat(pat), Pat::Bind { sub: None, .. }));
+        if !single {
+            return self.unsupported(expr, "module-level `let`s with patterns");
+        }
+        let Some(ty) = value_type(db, self.program, item) else {
+            return self.trap(TrapKind::Error, Some(expr));
+        };
+        let dst = self.temp(ty);
+        let target = self.new_block();
+        self.terminate(Terminator::Call {
+            func: InstanceKey::body(db, owner),
+            args: Vec::new(),
+            dst,
+            target,
+            site: expr,
+        });
+        self.switch_to(target);
+        self.coerce(Operand::Local(dst), ty, self.ty(expr))
+    }
+
     /// The local an expression's value is in.
     fn place_of(&mut self, expr: ExprId) -> Local {
         let op = self.expr(expr);
@@ -1127,9 +1168,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             return self.assign(self.ty(expr), value);
         }
         match item {
-            Some(Resolution::Value { value: Some(v), .. }) => {
-                self.assign(self.ty(expr), Rvalue::Global(*v))
-            }
+            Some(Resolution::Value { value: Some(v), .. }) => self.module_value(expr, *v),
             // A unit record is built like `T()` (§3.3).
             Some(Resolution::Type(item))
                 if matches!(

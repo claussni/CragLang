@@ -771,9 +771,23 @@ fn what_cannot_compile_is_listed() {
 fn plain(n: Int) -> Int {
   n * 2
 }
+
+type Pair(a: Int, b: Int)
+
+let Pair(a:, b:) = Pair(a: 1, b: 2)
+
+fn first() -> Int {
+  a
+}
 "#,
     );
-    assert_eq!(m.unsupported, ["label: strings and bytes"]);
+    assert_eq!(
+        m.unsupported,
+        [
+            "label: strings and bytes",
+            "first: module-level `let`s with patterns"
+        ]
+    );
     assert_eq!(m.int("plain", &[21]), 42);
 }
 
@@ -949,6 +963,59 @@ fn pick(i: Int) -> Int {
         (TrapKind::Index, at("points[i]"))
     );
     assert_eq!(m.worker.heap().live_blocks(), 0);
+}
+
+#[test]
+fn module_values_are_computed_once_and_kept() {
+    let text = r#"type Point(x: Int, y: Int)
+
+let base = 40
+let origin = Point(x: base, y: 2)
+let answer: Int = base + two()
+let bad: Int = 1 / zero()
+let made = make()
+
+fn make() -> Point { Point(x: 1, y: 1) }
+fn two() -> Int { 2 }
+fn zero() -> Int { 0 }
+
+fn read() -> Int { answer + origin.y }
+fn point() -> Point { origin }
+fn madePoint() -> Point { made }
+fn broken() -> Int { bad }
+"#;
+    let mut m = Module::new(text);
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    RELEASED.set(0);
+    assert_eq!(m.int("read", &[]), 44);
+    // The cell keeps the point, and every read gives the same one with a
+    // reference of its own.
+    assert_eq!(m.heap.live_blocks(), 1);
+    let (p, q) = (m.call("point", &[]), m.call("point", &[]));
+    assert_eq!(p, q);
+    // SAFETY: the point is alive, held by its cell and both results.
+    let count = unsafe { (p[0] as *const u64).read() };
+    assert_eq!(count, 3);
+    assert_eq!(RELEASED.get(), 0);
+    assert_eq!(m.heap.live_blocks(), 1);
+    // A value that is a call keeps what the call gives: it is no tail call.
+    assert_eq!(m.call("madePoint", &[]), m.call("madePoint", &[]));
+    assert_eq!(m.heap.live_blocks(), 2);
+
+    // A trap while a value is computed leaves its cell empty, so the next
+    // read computes it again.
+    for _ in 0..2 {
+        let trap = m.run("broken", &[]).unwrap_err();
+        let at = text.find("1 / zero()").unwrap() as u32;
+        assert_eq!(
+            (trap.kind, trap.position),
+            (TrapKind::DivideByZero, Some(at))
+        );
+        // `broken` and the code of `bad`.
+        assert_eq!(trap.stack.len(), 2);
+    }
+    assert_eq!(m.run("read", &[]), Ok(vec![44]));
+    assert_eq!(m.worker.heap().live_blocks(), 1);
 }
 
 #[test]

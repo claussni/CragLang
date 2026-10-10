@@ -86,8 +86,14 @@ impl Image {
                 types,
                 stubs,
                 functions,
+                reset,
             } => match self.load(types, stubs, functions) {
-                Ok(()) => Message::Loaded,
+                Ok(()) => {
+                    for key in reset {
+                        self.symbols.cells().reset(key);
+                    }
+                    Message::Loaded
+                }
                 Err(why) => Message::Failed(why),
             },
             Message::Run(func) => self.run(func),

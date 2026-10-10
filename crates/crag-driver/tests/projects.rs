@@ -57,9 +57,11 @@ test "area multiplies" {
 
 const APP: &str = r#"import demo.geo.shape
 
+let offset = sum([1, 2, 3])
+
 fn main() -> ExitCode {
   let p = Point(x: 2, y: 3)
-  ExitCode(code: area(p) + sum([1, 2, 3]))
+  ExitCode(code: area(p) + offset)
 }
 
 test "sums" {
@@ -110,7 +112,7 @@ fn test_runs_every_test_in_a_fiber_of_its_own() {
     assert_eq!(name, "app.crag \"reads past the end\"");
     assert_eq!(
         trap,
-        "trap: index out of range\n  --> app.crag:14:11\n   |\n14 |   let y = xs[5]\n   |           ^\n  in test \"reads past the end\"\n"
+        "trap: index out of range\n  --> app.crag:16:11\n   |\n16 |   let y = xs[5]\n   |           ^\n  in test \"reads past the end\"\n"
     );
     assert!(out.ends_with("\n2 passed, 1 failed\n"), "{out}");
     assert!(!report.success());

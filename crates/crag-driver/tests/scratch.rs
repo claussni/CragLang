@@ -71,6 +71,16 @@ fn apply(f: (Int) -> Int, x: Int) -> Int {
 fn bump() -> Int {
   apply({ n -> n + 1 }, 1)
 }
+
+let corner = Point(x: 40, y: two())
+
+fn cornered() -> Int {
+  corner.x + corner.y
+}
+
+fn theCorner() -> Point {
+  corner
+}
 "#;
 
 /// A project of one module, `demo.app`, loaded.
@@ -193,4 +203,38 @@ fn a_changed_definition_replaces_the_old_code() {
     p.set_source(module, APP.into());
     assert_eq!(s.ship(&p, &[function(&p, "answer")]).unwrap(), 2);
     assert_eq!(s.run(&p, function(&p, "answer")).unwrap(), Ok(vec![42]));
+}
+
+#[test]
+fn a_value_is_computed_again_once_its_code_changed() {
+    let mut p = project("value", APP);
+    let mut s = scratch();
+    assert_eq!(s.run(&p, function(&p, "cornered")).unwrap(), Ok(vec![42]));
+    // The image keeps the value: each read gives the same point.
+    let corner = s.run(&p, function(&p, "theCorner")).unwrap().unwrap();
+    assert_eq!(
+        s.run(&p, function(&p, "theCorner")).unwrap(),
+        Ok(corner.clone())
+    );
+    let module = p.module("demo.app").unwrap();
+
+    // Code the value does not run leaves it as it is.
+    p.set_source(module, APP.replace("p.x * p.y\n}", "p.y * p.x\n}"));
+    assert_eq!(s.ship(&p, &[function(&p, "area")]).unwrap(), 1);
+    assert_eq!(
+        s.run(&p, function(&p, "theCorner")).unwrap(),
+        Ok(corner.clone())
+    );
+
+    // `corner` calls `two`, whose new code computes it anew; only `two`
+    // is sent.
+    p.set_source(module, APP.replace("  2\n", "  3\n"));
+    assert_eq!(s.ship(&p, &[function(&p, "cornered")]).unwrap(), 1);
+    assert_eq!(s.run(&p, function(&p, "cornered")).unwrap(), Ok(vec![43]));
+    let again = s.run(&p, function(&p, "theCorner")).unwrap().unwrap();
+    assert_ne!(again, corner);
+
+    // So does a change of its own code.
+    p.set_source(module, APP.replace("x: 40, y: two()", "x: 50, y: two()"));
+    assert_eq!(s.run(&p, function(&p, "cornered")).unwrap(), Ok(vec![52]));
 }

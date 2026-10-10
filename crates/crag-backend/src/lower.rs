@@ -35,12 +35,13 @@
 use std::ops::Range;
 
 use crag_abi::{
-    COUNT_OFFSET, HEAP_OFFSET, LEN_OFFSET, LIST_SIZE, MAP_SIZE, PAGE_FREE_OFFSET, PAGE_USED_OFFSET,
-    STATIC_COUNT, TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TypeDescriptor, size_class,
+    CELL_FULL, CELL_STATE_OFFSET, CELL_VALUE_OFFSET, COUNT_OFFSET, HEAP_OFFSET, LEN_OFFSET,
+    LIST_SIZE, MAP_SIZE, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, STATIC_COUNT, TYPE_INDEX_OFFSET,
+    TrapKind as AbiTrap, TypeDescriptor, size_class,
 };
 use crag_codegen::{
     BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, CallTarget, Cond, FuncId, Inst,
-    LirFunction, OverflowOp, RuntimeFn, Term, VReg,
+    LirFunction, OverflowOp, RuntimeFn, SlotKey, Term, VReg,
 };
 use crag_db::Db;
 use crag_db::plumbing::AsId;
@@ -76,12 +77,14 @@ pub fn func_id(instance: InstanceKey<'_>) -> FuncId {
 type Unsupported = &'static str;
 
 /// Lowers the MIR of a body of `owner`, whose source map gives the
-/// positions of traps.
+/// positions of traps. The code of a module-level value keeps the value in
+/// `cell` (§11.6.2).
 pub fn lower_to_lir<'db>(
     db: &'db dyn Db,
     program: Program,
     owner: Owner<'db>,
     mir: &MirBody<'db>,
+    cell: Option<SlotKey>,
 ) -> Lowered<'db> {
     let named = |name: &str| {
         prelude_item(db, program, name).map(|i| Ty::new(db, TyKind::Named(i, Vec::new())))
@@ -102,6 +105,7 @@ pub fn lower_to_lir<'db>(
         tracked: Vec::new(),
         true_index: named("True").map_or(-1, type_index),
         false_index: named("False").map_or(-1, type_index),
+        cell,
     };
     for (i, decl) in mir.locals.iter().enumerate() {
         let layout = layout(db, program, decl.ty);
@@ -136,6 +140,12 @@ pub fn lower_to_lir<'db>(
         if let Err(what) = lowered {
             l.unsupported(what);
         }
+    }
+    if let Some(cell) = cell
+        && !unknown_param
+        && returns <= 2
+    {
+        l.cell_entry(cell, returns);
     }
     // A block a failed lowering left unfinished is never reached.
     let blocks = l
@@ -185,6 +195,8 @@ struct Lower<'a, 'db> {
     tracked: Vec<VReg>,
     true_index: i64,
     false_index: i64,
+    /// The cell of the value the code computes, if it is a value's.
+    cell: Option<SlotKey>,
 }
 
 impl<'a, 'db> Lower<'a, 'db> {
@@ -331,14 +343,27 @@ impl<'a, 'db> Lower<'a, 'db> {
     /// Retains or releases the box a local holds, if it holds one.
     fn count(&mut self, local: Local, op: fn(&mut Self, VReg)) -> Result<(), Unsupported> {
         let regs = self.locals[local.index()].clone();
-        match self.layouts[local.index()] {
+        let (layout, ty) = (self.layouts[local.index()], self.local_ty(local));
+        self.count_words(layout, ty, &regs, op)
+    }
+
+    /// Retains or releases the box the words of a value hold, if they hold
+    /// one.
+    fn count_words(
+        &mut self,
+        layout: Option<Layout>,
+        ty: Ty<'db>,
+        regs: &[VReg],
+        op: fn(&mut Self, VReg),
+    ) -> Result<(), Unsupported> {
+        match layout {
             Some(Layout::Box) => {
                 op(self, regs[0]);
                 Ok(())
             }
             Some(Layout::Union) => {
-                let boxed = boxed_indices(self.db, self.program, self.local_ty(local))
-                    .ok_or("values of this type")?;
+                let boxed =
+                    boxed_indices(self.db, self.program, ty).ok_or("values of this type")?;
                 let boxed: Vec<i64> = boxed.into_iter().map(i64::from).collect();
                 let (call, done) = (self.new_block(), self.new_block());
                 self.test_index(regs[0], &boxed, call, done);
@@ -669,7 +694,6 @@ impl<'a, 'db> Lower<'a, 'db> {
                 ])
             }
             Rvalue::Concat(_) => Err("strings and bytes"),
-            Rvalue::Global(_) => Err("module-level values"),
             Rvalue::Closure {
                 code,
                 env,
@@ -1245,6 +1269,9 @@ impl<'a, 'db> Lower<'a, 'db> {
                 if values.len() != returns {
                     return Err("this conversion");
                 }
+                if let Some(cell) = self.cell {
+                    self.keep(cell, op, &values)?;
+                }
                 self.end(Term::Return(values), None);
             }
             Terminator::Trap { kind, site } => {
@@ -1263,6 +1290,84 @@ impl<'a, 'db> Lower<'a, 'db> {
             }
         }
         Ok(())
+    }
+
+    /// Keeps the value the code of a module-level value gives in its cell,
+    /// with a reference of the cell's own, and marks the cell full.
+    fn keep(
+        &mut self,
+        cell: SlotKey,
+        op: &Operand<'db>,
+        values: &[VReg],
+    ) -> Result<(), Unsupported> {
+        let addr = self.reg();
+        self.push(Inst::CellAddr { dst: addr, cell });
+        for (i, &src) in values.iter().enumerate() {
+            let offset = CELL_VALUE_OFFSET + 8 * i as i32;
+            self.push(Inst::Store { src, addr, offset });
+        }
+        if let Operand::Local(local) = op {
+            self.count(*local, Self::retain)?;
+        }
+        let full = self.constant(CELL_FULL as i64);
+        self.push(Inst::Store {
+            src: full,
+            addr,
+            offset: CELL_STATE_OFFSET,
+        });
+        Ok(())
+    }
+
+    /// The entry of a module-level value's code: the value in its cell,
+    /// once computed. Otherwise the code that computes it runs, which moves
+    /// from block 0 to a block of its own; a trap there leaves the cell
+    /// empty.
+    fn cell_entry(&mut self, cell: SlotKey, returns: usize) {
+        let compute = self.new_block();
+        self.blocks[compute.0 as usize] = self.blocks[0].take();
+        // MIR's entry block is no branch target, so nothing jumps to the
+        // code where it was.
+        debug_assert!(self.blocks.iter().flatten().all(|block| match block.term {
+            Term::Jump(b) => b.0 != 0,
+            Term::Branch {
+                then, otherwise, ..
+            } => then.0 != 0 && otherwise.0 != 0,
+            _ => true,
+        }));
+        let read = self.new_block();
+        self.current = (0, Vec::new());
+        let addr = self.reg();
+        self.push(Inst::CellAddr { dst: addr, cell });
+        let state = self.reg();
+        self.push(Inst::Load {
+            dst: state,
+            addr,
+            offset: CELL_STATE_OFFSET,
+        });
+        let full = self.constant(CELL_FULL as i64);
+        let is_full = self.cmp(Cond::Eq, state, full);
+        self.end(
+            Term::Branch {
+                cond: is_full,
+                then: read,
+                otherwise: compute,
+            },
+            Some(read),
+        );
+        // The caller gets a reference of its own.
+        let words: Vec<VReg> = (0..returns)
+            .map(|i| {
+                let dst = self.reg();
+                let offset = CELL_VALUE_OFFSET + 8 * i as i32;
+                self.push(Inst::Load { dst, addr, offset });
+                dst
+            })
+            .collect();
+        let result = layout(self.db, self.program, self.mir.result);
+        match self.count_words(result, self.mir.result, &words, Self::retain) {
+            Ok(()) => self.end(Term::Return(words), None),
+            Err(what) => self.unsupported(what),
+        }
     }
 
     /// The words of a call's arguments, laid out for the callee's

@@ -421,8 +421,21 @@ pub struct SlotKey {
     pub signature: u32,
 }
 
+/// The bytes of a module-level value's cell: a state word, then the value's
+/// words, at most two (Implementation Plan §11.6.2). The code that computes
+/// the value keeps it there, with a reference of its own.
+pub const CELL_SIZE: usize = 32;
+pub const CELL_STATE_OFFSET: i32 = 0;
+pub const CELL_VALUE_OFFSET: i32 = 8;
+
+/// The states of a cell: no value yet, or holding the value. A value that
+/// needs itself is a compile error, so a value is never read while it is
+/// computed.
+pub const CELL_EMPTY: u64 = 0;
+pub const CELL_FULL: u64 = 1;
+
 /// The machine code of one function plus what the loader needs to place it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CodeObject {
     /// Machine code. It may hold more than one routine; execution starts at
     /// `entry`.
@@ -449,7 +462,7 @@ pub struct CodeObject {
 /// stack while the frame waits for the call to return, and `rt_morestack` is
 /// such a call. At a safepoint each live tracked value is in a stack slot,
 /// not in a register.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StackMap {
     /// Offset in `CodeObject::code` of the instruction after the call, which
     /// is the return address found on the stack.
@@ -459,7 +472,7 @@ pub struct StackMap {
 }
 
 /// The form of the entry stack check.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StackCheck {
     /// No check: the entry stub, which runs on the system stack.
     None,
@@ -471,7 +484,7 @@ pub enum StackCheck {
 }
 
 /// One place in the code to patch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Reloc {
     /// Offset in `CodeObject::code` of the bytes to patch.
     pub offset: u32,
@@ -481,13 +494,13 @@ pub struct Reloc {
     pub addend: i64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RelocKind {
     /// Write the 64-bit absolute address, little-endian.
     Abs64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RelocTarget {
     /// The entry point of another Crag function.
     Function(FuncId),
@@ -497,6 +510,9 @@ pub enum RelocTarget {
     Local(u32),
     /// The slot of a function, which holds its entry point.
     Slot(SlotKey),
+    /// The cell of a module-level value, by the slot key of the code that
+    /// computes it.
+    Cell(SlotKey),
 }
 
 #[cfg(test)]

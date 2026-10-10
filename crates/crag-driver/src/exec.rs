@@ -20,9 +20,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crag_abi::{FuncId, RuntimeFn, SlotKey, TrapKind, TypeDescriptor};
-use crag_backend::code;
+use crag_backend::{code, func_id};
 use crag_codegen::{CodeObject, CodegenSettings, OptLevel, compile_entry_stub, target_for};
-use crag_hir::{ModuleId, Owner};
+use crag_hir::{ItemKind, ModuleId, Owner};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{Entry, InstanceKey, Tier, collect_instances};
 use crag_runtime::{CodeMap, Fiber, FiberConfig, FiberState, Trap, Types, Worker};
@@ -50,6 +50,11 @@ pub struct Function {
     /// The name reports give it, and where its code is written.
     pub name: String,
     pub module: ModuleId,
+    /// The functions it calls.
+    pub calls: Vec<FuncId>,
+    /// The cell it keeps its value in, for the code of a module-level
+    /// value.
+    pub cell: Option<SlotKey>,
 }
 
 /// The code of what some roots reach.
@@ -81,6 +86,7 @@ pub fn compile<'a>(
                 format!("a function value in {}", owner_name(project, owner))
             }
         };
+        let value = matches!(owner, Owner::Item(item) if *item.kind(db) == ItemKind::Value);
         let code = match code(db, program, instance, Tier::Baseline) {
             Some(Ok(code)) => code,
             Some(Err(e)) => return Err(format!("cannot compile {name}: {e}")),
@@ -99,6 +105,8 @@ pub fn compile<'a>(
                 returns: code.returns,
                 name,
                 module: owner.module(db),
+                calls: code.calls.iter().map(|&c| func_id(c)).collect(),
+                cell: (value && *instance.entry(db) == Entry::Body).then_some(code.slot),
             },
         );
     }

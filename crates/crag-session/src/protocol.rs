@@ -33,7 +33,7 @@ use crag_abi::{
 };
 
 /// The version of the protocol, raised whenever a message changes.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -51,11 +51,14 @@ pub enum Message {
     Shutdown,
     /// From the host: code to load, with the descriptors of the types it
     /// uses and the entry stubs to run it with. The functions are loaded
-    /// together, and may call each other and what is already loaded.
+    /// together, and may call each other and what is already loaded. Then
+    /// the cells of the values in `reset` are emptied, so the values are
+    /// computed again (§11.6.2).
     Load {
         types: Vec<(u32, TypeDescriptor)>,
         stubs: Vec<Stub>,
         functions: Vec<ShippedFunction>,
+        reset: Vec<SlotKey>,
     },
     /// From the image: everything in the `Load` is loaded.
     Loaded,
@@ -130,6 +133,7 @@ impl Message {
                 types,
                 stubs,
                 functions,
+                reset,
             } => {
                 w.u8(LOAD);
                 w.seq(types, |w, (index, d)| {
@@ -142,6 +146,7 @@ impl Message {
                     w.object(&s.object);
                 });
                 w.seq(functions, |w, f| w.function(f));
+                w.seq(reset, |w, key| w.slot_key(key));
             }
             Message::Loaded => w.u8(LOADED),
             Message::Run(id) => {
@@ -197,6 +202,7 @@ impl Message {
                     })
                 })?,
                 functions: r.seq(Reader::function)?,
+                reset: r.seq(Reader::slot_key)?,
             },
             LOADED => Message::Loaded,
             RUN => Message::Run(FuncId(r.u32()?)),
@@ -296,6 +302,11 @@ impl Writer {
         }
     }
 
+    fn slot_key(&mut self, key: &SlotKey) {
+        self.u32(key.func.0);
+        self.u32(key.signature);
+    }
+
     fn function(&mut self, f: &ShippedFunction) {
         self.u32(f.id.0);
         self.u32(f.signature);
@@ -327,8 +338,11 @@ impl Writer {
                 }
                 RelocTarget::Slot(key) => {
                     w.u8(3);
-                    w.u32(key.func.0);
-                    w.u32(key.signature);
+                    w.slot_key(&key);
+                }
+                RelocTarget::Cell(key) => {
+                    w.u8(4);
+                    w.slot_key(&key);
                 }
             }
             w.u64(r.addend as u64);
@@ -425,6 +439,13 @@ impl Reader<'_> {
         Ok(items)
     }
 
+    fn slot_key(&mut self) -> io::Result<SlotKey> {
+        Ok(SlotKey {
+            func: FuncId(self.u32()?),
+            signature: self.u32()?,
+        })
+    }
+
     fn function(&mut self) -> io::Result<ShippedFunction> {
         Ok(ShippedFunction {
             id: FuncId(self.u32()?),
@@ -455,10 +476,8 @@ impl Reader<'_> {
                         })?)
                     }
                     2 => RelocTarget::Local(r.u32()?),
-                    3 => RelocTarget::Slot(SlotKey {
-                        func: FuncId(r.u32()?),
-                        signature: r.u32()?,
-                    }),
+                    3 => RelocTarget::Slot(r.slot_key()?),
+                    4 => RelocTarget::Cell(r.slot_key()?),
                     tag => return Err(invalid(format!("a relocation target with the tag {tag}"))),
                 };
                 Ok(Reloc {
@@ -591,6 +610,10 @@ mod tests {
                         object: object(StackCheck::Sized { needed: 4096 }),
                     },
                 ],
+                reset: vec![SlotKey {
+                    func: FuncId(10),
+                    signature: 2,
+                }],
             },
             Message::Loaded,
             Message::Run(FuncId(9)),
@@ -639,6 +662,15 @@ mod tests {
                     target: RelocTarget::Slot(SlotKey {
                         func: FuncId(9),
                         signature: u32::MAX,
+                    }),
+                    addend: 0,
+                },
+                Reloc {
+                    offset: 2,
+                    kind: RelocKind::Abs64,
+                    target: RelocTarget::Cell(SlotKey {
+                        func: FuncId(10),
+                        signature: 2,
                     }),
                     addend: 0,
                 },
@@ -725,6 +757,8 @@ mod tests {
             }
             .encode(),
         );
+        // No cells to empty.
+        load.extend([0, 0, 0, 0]);
         // The runtime function's index, after the function's id, signature,
         // words, code, alignment, entry, relocation count, offset and kinds.
         let at = 13 + 16 + 4 + 10 + 8 + 4 + 4 + 2;
@@ -737,8 +771,11 @@ mod tests {
             frame.extend(load);
             invalid(&frame)
         };
+        let mut frame = (load.len() as u32).to_le_bytes().to_vec();
+        frame.extend(&load);
+        assert!(read_message(&mut frame.as_slice()).is_ok());
         assert_eq!(broken(at, 200), io::ErrorKind::InvalidData);
-        // A relocation target after the slot's tag.
-        assert_eq!(broken(at - 1, 4), io::ErrorKind::InvalidData);
+        // A relocation target after the cell's tag.
+        assert_eq!(broken(at - 1, 5), io::ErrorKind::InvalidData);
     }
 }

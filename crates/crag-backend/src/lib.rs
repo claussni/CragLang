@@ -29,6 +29,10 @@
 //! without reloading its callers. A slot is the function's id and its
 //! signature: the index of the function type its MIR has, parameters and
 //! result, which stays the same while the signature does.
+//!
+//! A read of a module-level value calls the code that computes it. That
+//! code keeps the value in a cell the loader makes, and gives what the cell
+//! holds once it is full (Implementation Plan §11.6.2).
 
 extern crate crag_db as salsa;
 
@@ -42,8 +46,8 @@ use crag_abi::{SlotKey, TypeDescriptor};
 use crag_codegen::{CodeObject, CodegenSettings, OptLevel, Target, compile, target_for};
 use crag_db::Db;
 use crag_db::plumbing::AsId;
-use crag_hir::Program;
-use crag_mir::{InstanceKey, Tier, mir};
+use crag_hir::{ItemKind, Owner, Program};
+use crag_mir::{Entry, InstanceKey, Tier, mir};
 use crag_types::{Ty, TyKind};
 
 pub use layout::{
@@ -114,7 +118,11 @@ pub fn code<'db>(
     tier: Tier,
 ) -> Option<Result<Code<'db>, String>> {
     let body = mir(db, program, instance, tier).as_ref()?;
-    let lowered = lower_to_lir(db, program, *instance.owner(db), body);
+    let owner = *instance.owner(db);
+    let value = matches!(owner, Owner::Item(item) if *item.kind(db) == ItemKind::Value);
+    let cell =
+        (value && *instance.entry(db) == Entry::Body).then(|| slot_key(db, program, instance));
+    let lowered = lower_to_lir(db, program, owner, body, cell);
     let settings = CodegenSettings {
         target: host().clone(),
         opt: match tier {

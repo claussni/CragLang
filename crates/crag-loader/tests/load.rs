@@ -18,7 +18,10 @@
 //! without the code generator.
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
-use crag_abi::{CodeObject, FuncId, Reloc, RelocKind, RelocTarget, RuntimeFn, SlotKey, StackCheck};
+use crag_abi::{
+    CELL_EMPTY, CELL_FULL, CodeObject, FuncId, Reloc, RelocKind, RelocTarget, RuntimeFn, SlotKey,
+    StackCheck,
+};
 use crag_loader::{
     CodeAddr, CodeArena, LoadError, SymbolTable, load, load_group, replace_group, slot_set, unload,
 };
@@ -83,6 +86,26 @@ fn through(slot: SlotKey) -> CodeObject {
             addend: 0,
         }],
     )
+}
+
+/// `movabs rax, <cell>; mov eax, [rax + 8]; ret`: the low half of the
+/// first word of a value's cell, with every cell in `also` named too.
+fn reads(cell: SlotKey, also: &[SlotKey]) -> CodeObject {
+    let mut code = vec![0x48, 0xb8];
+    code.extend([0u8; 8]);
+    code.extend([0x8b, 0x40, 0x08, 0xc3]);
+    // The extra relocations patch the same bytes before the last one.
+    let relocs = also
+        .iter()
+        .chain([&cell])
+        .map(|&key| Reloc {
+            offset: 2,
+            kind: RelocKind::Abs64,
+            target: RelocTarget::Cell(key),
+            addend: 0,
+        })
+        .collect();
+    object(code, relocs)
 }
 
 fn call(addr: CodeAddr) -> u32 {
@@ -462,4 +485,63 @@ fn the_slot_table_grows_without_moving_slots() {
         first
     );
     assert_eq!(call(caller), 1);
+}
+
+#[test]
+fn loading_makes_the_cells_code_names() {
+    let mut arena = CodeArena::new(16 * PAGE).unwrap();
+    let mut symbols = SymbolTable::new();
+    // Only a group's code gets cells.
+    assert!(matches!(
+        load(&mut arena, &symbols, &reads(key(5), &[])),
+        Err(LoadError::UnresolvedCell(k)) if k == key(5)
+    ));
+    assert_eq!(symbols.cells().address(key(5)), None);
+    let reader = load_group(&mut arena, &mut symbols, &[(key(1), &reads(key(5), &[]))]).unwrap()[0];
+    assert_eq!(symbols.cells().state(key(5)), Some(CELL_EMPTY));
+    assert_eq!(call(reader), 0);
+
+    // The code that computes the value fills the cell, as this does.
+    let cell = symbols.cells().address(key(5)).unwrap() as *mut u64;
+    // SAFETY: a cell is a state word and three words for the value.
+    unsafe {
+        cell.add(1).write(7);
+        cell.write(CELL_FULL);
+    }
+    assert_eq!(symbols.cells().state(key(5)), Some(CELL_FULL));
+    assert_eq!(call(reader), 7);
+    // Code loaded later finds the same cell, and a stub may name it now.
+    let other = load_group(&mut arena, &mut symbols, &[(key(2), &reads(key(5), &[]))]).unwrap()[0];
+    assert_eq!(call(other), 7);
+    assert_eq!(
+        call(load(&mut arena, &symbols, &reads(key(5), &[])).unwrap()),
+        7
+    );
+
+    // Emptying a cell has its value computed again; the words stay.
+    symbols.cells().reset(key(5));
+    assert_eq!(symbols.cells().state(key(5)), Some(CELL_EMPTY));
+    assert_eq!(call(reader), 7);
+    // A key without a cell has nothing to empty.
+    symbols.cells().reset(key(6));
+    assert_eq!(symbols.cells().state(key(6)), None);
+}
+
+#[test]
+fn the_cell_table_grows_without_moving_cells() {
+    let mut arena = CodeArena::new(16 * PAGE).unwrap();
+    let mut symbols = SymbolTable::new();
+    load_group(&mut arena, &mut symbols, &[(key(1), &reads(key(0), &[]))]).unwrap();
+    let first = symbols.cells().address(key(0)).unwrap();
+    let many: Vec<SlotKey> = (100..400).map(key).collect();
+    load_group(&mut arena, &mut symbols, &[(key(2), &reads(key(0), &many))]).unwrap();
+    let mut addresses: Vec<usize> = many
+        .iter()
+        .map(|&k| symbols.cells().address(k).unwrap())
+        .collect();
+    assert_eq!(symbols.cells().address(key(0)), Some(first));
+    addresses.push(first);
+    addresses.sort();
+    addresses.dedup();
+    assert_eq!(addresses.len(), many.len() + 1);
 }

@@ -178,6 +178,13 @@ pub enum Inst {
     Context {
         dst: VReg,
     },
+    /// `dst` becomes the address of the cell of a module-level value
+    /// (`crag_abi::CELL_SIZE`), named by the slot key of the code that
+    /// computes it.
+    CellAddr {
+        dst: VReg,
+        cell: SlotKey,
+    },
     /// Reads the word at `addr + offset`.
     Load {
         dst: VReg,
@@ -297,7 +304,9 @@ impl LirFunction {
         for b in &self.blocks {
             for inst in &b.insts {
                 match inst {
-                    Inst::Const { dst, .. } | Inst::Context { dst } => reg(dst)?,
+                    Inst::Const { dst, .. }
+                    | Inst::Context { dst }
+                    | Inst::CellAddr { dst, .. } => reg(dst)?,
                     Inst::Move { dst, src } => {
                         reg(dst)?;
                         reg(src)?;

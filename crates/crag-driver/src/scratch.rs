@@ -18,12 +18,13 @@
 //! host compiles what the roots reach, ships what the image lacks, and asks
 //! the image to run a root. A crash in the code ends only the image.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 
-use crag_abi::FuncId;
+use crag_abi::{FuncId, SlotKey};
 use crag_backend::func_id;
-use crag_codegen::{CodegenSettings, compile_entry_stub};
+use crag_codegen::{CodeObject, CodegenSettings, compile_entry_stub};
 use crag_mir::InstanceKey;
 use crag_session::{ImageCommand, RunResult, Session, ShippedFunction, Stub};
 
@@ -36,6 +37,9 @@ pub struct Scratch {
     session: Session,
     settings: CodegenSettings,
     functions: HashMap<FuncId, Function>,
+    /// For each module-level value, a hash of the code its value was
+    /// computed with: its own and what that calls.
+    values: HashMap<SlotKey, u64>,
 }
 
 impl Scratch {
@@ -44,6 +48,7 @@ impl Scratch {
             session: Session::start(command)?,
             settings: stub_settings().map_err(io::Error::other)?,
             functions: HashMap::new(),
+            values: HashMap::new(),
         })
     }
 
@@ -82,11 +87,31 @@ impl Scratch {
                 });
             }
         }
+        // A value is computed again once the code it is computed with
+        // changed. Every run ships its root first, which reaches every value
+        // the run may read, so the image never reads a value computed with
+        // other code.
+        let codes: HashMap<FuncId, &CodeObject> = compiled
+            .objects
+            .iter()
+            .map(|&(slot, o)| (slot.func, o))
+            .collect();
+        let mut values = Vec::new();
+        for (&id, f) in &compiled.functions {
+            if let Some(cell) = f.cell {
+                let hash = code_hash(id, &compiled.functions, &codes);
+                if self.values.get(&cell) != Some(&hash) {
+                    values.push((cell, hash));
+                }
+            }
+        }
+        let reset: Vec<SlotKey> = values.iter().map(|&(cell, _)| cell).collect();
         let sent = self
             .session
-            .ship(&compiled.types, &stubs, &functions)
+            .ship(&compiled.types, &stubs, &functions, &reset)
             .map_err(|e| e.to_string())?;
         self.functions.extend(compiled.functions);
+        self.values.extend(values);
         Ok(sent)
     }
 
@@ -103,4 +128,28 @@ impl Scratch {
             RunResult::Trapped(trap) => Ok(Err(report(project, &self.functions, &trap))),
         }
     }
+}
+
+/// A hash of the code a function runs: its own and that of every function
+/// it reaches.
+fn code_hash(
+    root: FuncId,
+    functions: &HashMap<FuncId, Function>,
+    codes: &HashMap<FuncId, &CodeObject>,
+) -> u64 {
+    let mut reached = BTreeSet::from([root.0]);
+    let mut work = vec![root];
+    while let Some(f) = work.pop() {
+        for &callee in functions.get(&f).map_or(&[][..], |f| &f.calls) {
+            if reached.insert(callee.0) {
+                work.push(callee);
+            }
+        }
+    }
+    let mut hasher = DefaultHasher::new();
+    for f in reached {
+        f.hash(&mut hasher);
+        codes.get(&FuncId(f)).hash(&mut hasher);
+    }
+    hasher.finish()
 }
