@@ -146,7 +146,7 @@ pub(crate) use {restore_registers, save_registers};
 const XMM_BYTES: usize = 16 * 16;
 const _: () = assert!(XMM_BYTES == 256); // the literal in the macros
 /// Offset of the saved rdi, the task context.
-const RDI_SLOT: usize = XMM_BYTES + 8 * 8;
+pub(crate) const RDI_SLOT: usize = XMM_BYTES + 8 * 8;
 /// Offset of the saved rbp, the head of the frame-pointer chain.
 const RBP_SLOT: usize = XMM_BYTES + 10 * 8;
 /// Size of the whole area: the stack pointer at the failed check was this

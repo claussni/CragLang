@@ -31,8 +31,9 @@ use crag_abi::{
     RuntimeFn, Shape, ShapeField, Shapes, SlotKey, StackCheck, StackMap, TrapKind, TypeDescriptor,
 };
 
-/// The version of the protocol, raised whenever a message changes.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// The version of the protocol, raised whenever a message changes, or
+/// the values a message may carry, such as the kinds of traps.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.

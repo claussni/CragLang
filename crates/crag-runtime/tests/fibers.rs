@@ -18,15 +18,17 @@
 //! calls, and stop requests through the sentinel. The last test is the M0
 //! exit criterion.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 mod common;
 
 use common::{Image, finish, r};
-use crag_abi::{FuncId, StackCheck};
+use crag_abi::{FuncId, StackCheck, TrapKind};
 use crag_codegen::{BinOp, Block, BlockId, Cond, Inst, LirFunction, Term, compile};
+use crag_runtime::meter::REFUEL;
 use crag_runtime::stress::run_tortured;
-use crag_runtime::{FiberConfig, FiberState, StopReason, Worker, request_stop};
+use crag_runtime::{FiberConfig, FiberState, Meter, StopReason, Worker, request_stop};
 
 /// `f(a, b) = a + b`
 fn add_fn() -> LirFunction {
@@ -391,6 +393,93 @@ fn the_run_loop_gives_preempted_fibers_another_turn() {
 
 /// The M0 exit criterion: a hand-written function runs on a fiber, grows its
 /// stack a thousand times, and tail-calls without stack growth.
+/// Runs function `func` of the image on a fiber with `steps` steps, on a
+/// worker with the image's code map: its state, and the steps left.
+fn metered(
+    image: &mut Image,
+    worker: &mut Worker,
+    func: usize,
+    args: &[u64],
+    steps: u64,
+    config: FiberConfig,
+) -> (FiberState, u64) {
+    let mut fiber = image.fiber(func, args, config);
+    fiber.set_meter(Meter {
+        steps,
+        memory: usize::MAX,
+    });
+    let state = worker.resume(&mut fiber);
+    if state == FiberState::Trapped {
+        let trap = fiber.trap().unwrap();
+        assert_eq!(trap.kind, TrapKind::OutOfSteps);
+        assert_eq!(trap.position, None);
+        assert_eq!(trap.stack.first(), Some(&FuncId(func as u32)));
+    }
+    (state, fiber.steps_left().unwrap())
+}
+
+#[test]
+fn metered_code_takes_a_step_per_entry_and_back_edge() {
+    use FiberState::{Finished, Trapped};
+    run_tortured(|config| {
+        let mut image = Image::metered(&[sum_loop_fn(), sum_squares_fn(1), countdown_fn(2)]);
+        let mut worker = Worker::new();
+        worker.set_code_map(Arc::new(std::mem::take(&mut image.code)));
+        let w = &mut worker;
+        // The entry, then each iteration's back-edge.
+        assert_eq!(metered(&mut image, w, 0, &[10], 11, config), (Finished, 0));
+        assert_eq!(metered(&mut image, w, 0, &[10], 10, config), (Trapped, 0));
+        assert_eq!(metered(&mut image, w, 0, &[10], 15, config), (Finished, 4));
+        // Many refills, and the last one partial.
+        let n = 3 * REFUEL + 17;
+        assert_eq!(
+            metered(&mut image, w, 0, &[n], n + 1, config),
+            (Finished, 0)
+        );
+        assert_eq!(metered(&mut image, w, 0, &[n], n, config), (Trapped, 0));
+        assert_eq!(
+            metered(&mut image, w, 0, &[n], n + 100, config),
+            (Finished, 99)
+        );
+        // Each call is an entry, a tail call too.
+        assert_eq!(
+            metered(&mut image, w, 1, &[500], 501, config),
+            (Finished, 0)
+        );
+        assert_eq!(metered(&mut image, w, 1, &[500], 500, config), (Trapped, 0));
+        let calls = 2 * REFUEL;
+        assert_eq!(
+            metered(&mut image, w, 2, &[calls, 0], calls + 1, config),
+            (Finished, 0)
+        );
+        assert_eq!(
+            metered(&mut image, w, 2, &[calls, 0], calls, config),
+            (Trapped, 0)
+        );
+        // A trap deep in the recursion names every frame, the one whose
+        // entry found no step left among them.
+        let mut fiber = image.fiber(1, &[500], config);
+        fiber.set_meter(Meter {
+            steps: 100,
+            memory: usize::MAX,
+        });
+        assert_eq!(w.resume(&mut fiber), Trapped);
+        assert_eq!(fiber.trap().unwrap().stack, vec![FuncId(1); 101]);
+
+        // Without a meter, metered code does not run out.
+        let mut fiber = image.fiber(0, &[n], config);
+        assert_eq!(finish(&mut fiber), (1..=n).sum::<u64>());
+        assert_eq!(fiber.steps_left(), None);
+    });
+    // Code of other tiers takes no steps.
+    let mut image = Image::new(&[sum_loop_fn()]);
+    let config = FiberConfig::default();
+    assert_eq!(
+        metered(&mut image, &mut Worker::new(), 0, &[10], 0, config),
+        (FiberState::Finished, 0)
+    );
+}
+
 #[test]
 fn m0_exit() {
     run_tortured(|config| {

@@ -32,6 +32,14 @@
 //! empty, or for a block above [`SMALL_SIZE_MAX`], which gets a segment of
 //! its own.
 //!
+//! While a metered fiber runs, the heap charges it for the memory it takes
+//! (Implementation Plan §11.6.6): the bytes of fresh blocks a refill carves
+//! out of a page's unused end and the mappings of large blocks, less what
+//! retiring pages and unmapping large blocks gives back. Both happen on the
+//! slow path only. A block reused from a free list costs nothing, as it was
+//! charged when it was carved. A charge beyond the budget empties the
+//! fiber's fuel, so its next step traps; the allocation itself succeeds.
+//!
 //! A heap that is dropped unmaps the segments without live blocks. It
 //! leaves the others mapped, so blocks other threads still hold stay valid,
 //! and their frees go to thread-free lists that nobody collects: those
@@ -40,7 +48,7 @@
 
 use std::mem::offset_of;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU64, Ordering};
 
 use crag_abi::{
     COUNT_OFFSET, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, SIZE_CLASSES, SMALL_SIZE_MAX,
@@ -210,6 +218,16 @@ pub struct Heap {
     segments: Vec<*mut Segment>,
     /// Pages of this heap's segments not in use.
     free_pages: Vec<*mut Page>,
+    /// The budget of the metered fiber running, if one is.
+    meter: Option<HeapMeter>,
+}
+
+/// What a metered fiber may still make the heap take.
+struct HeapMeter {
+    /// Bytes, or none once a charge went beyond them.
+    left: Option<usize>,
+    /// The fiber's fuel, emptied when the budget is gone.
+    fuel: *const AtomicI64,
 }
 
 const _: () = assert!(offset_of!(Heap, pages) == 0);
@@ -232,6 +250,51 @@ impl Heap {
             classes: std::array::from_fn(|_| Vec::new()),
             segments: Vec::new(),
             free_pages: Vec::new(),
+            meter: None,
+        }
+    }
+
+    /// Charges what the heap takes from now on to a budget of `left`
+    /// bytes, none if it is used up already. Going beyond it stores zero in
+    /// `fuel`.
+    ///
+    /// # Safety
+    ///
+    /// `fuel` stays valid until `unmeter`.
+    pub(crate) unsafe fn meter(&mut self, left: Option<usize>, fuel: *const AtomicI64) {
+        self.meter = Some(HeapMeter { left, fuel });
+    }
+
+    /// Stops charging and returns the bytes left of the budget, or none if
+    /// it was used up.
+    pub(crate) fn unmeter(&mut self) -> Option<usize> {
+        self.meter.take().and_then(|m| m.left)
+    }
+
+    /// Whether the budget of the metered fiber running is used up.
+    pub(crate) fn over_budget(&self) -> bool {
+        matches!(self.meter, Some(HeapMeter { left: None, .. }))
+    }
+
+    fn charge(&mut self, bytes: usize) {
+        let Some(meter) = &mut self.meter else { return };
+        match meter.left {
+            Some(left) if bytes <= left => meter.left = Some(left - bytes),
+            Some(_) => {
+                meter.left = None;
+                // SAFETY: valid while metered, as `meter` requires.
+                unsafe { (*meter.fuel).store(0, Ordering::Relaxed) };
+            }
+            None => {}
+        }
+    }
+
+    fn credit(&mut self, bytes: usize) {
+        if let Some(HeapMeter {
+            left: Some(left), ..
+        }) = &mut self.meter
+        {
+            *left = left.saturating_add(bytes);
         }
     }
 
@@ -260,18 +323,20 @@ impl Heap {
     /// another page of the class, a fresh one if none has room.
     pub fn alloc_slow(&mut self, class: usize) -> *mut u8 {
         let current = self.pages[class];
-        let page = match current != empty_page() && refill(current) {
+        let mut carved = 0;
+        let page = match current != empty_page() && refill(current, &mut carved) {
             true => current,
             false => {
                 let other = self.classes[class]
                     .iter()
                     .copied()
-                    .find(|&p| p != current && refill(p));
-                let page = other.unwrap_or_else(|| self.new_page(class));
+                    .find(|&p| p != current && refill(p, &mut carved));
+                let page = other.unwrap_or_else(|| self.new_page(class, &mut carved));
                 self.pages[class] = page;
                 page
             }
         };
+        self.charge(carved);
         // SAFETY: the page is in use by this heap and has a free block.
         unsafe {
             let block = (*page).free;
@@ -292,10 +357,11 @@ impl Heap {
         let segment = map_segment(mapped);
         // SAFETY: the mapping is fresh and starts with the header.
         unsafe { (*segment).huge = mapped };
+        self.charge(mapped);
         (segment as usize + SEGMENT_HEADER) as *mut u8
     }
 
-    fn new_page(&mut self, class: usize) -> *mut Page {
+    fn new_page(&mut self, class: usize, carved: &mut usize) -> *mut Page {
         if self.free_pages.is_empty() {
             self.new_segment();
         }
@@ -312,7 +378,7 @@ impl Heap {
             (*page).end = start + (end - start) / size * size;
             (*page).owner.store(self.id, Ordering::Relaxed);
             (*segment_of(page as usize)).used_pages += 1;
-            refill(page);
+            refill(page, carved);
         }
         self.classes[class].push(page);
         page
@@ -346,6 +412,7 @@ impl Heap {
         // owns it.
         unsafe {
             if (*segment).huge != 0 {
+                self.credit((*segment).huge);
                 unmap_segment(segment, (*segment).huge);
                 return;
             }
@@ -391,6 +458,7 @@ impl Heap {
             let list = &mut self.classes[class];
             let at = list.iter().position(|&p| p == page).expect("in its class");
             list.swap_remove(at);
+            self.credit((*page).bump - page_area(page).0);
             *page = Page::unused();
             let segment = segment_of(page as usize);
             (*segment).used_pages -= 1;
@@ -469,8 +537,9 @@ fn collect(page: *mut Page) {
 }
 
 /// Gives a page in use free blocks if it can: those other threads freed,
-/// else some of its unused end. Whether it has a free block now.
-fn refill(page: *mut Page) -> bool {
+/// else some of its unused end, whose bytes it adds to `carved`. Whether it
+/// has a free block now.
+fn refill(page: *mut Page, carved: &mut usize) -> bool {
     collect(page);
     // SAFETY: called by the owner of a page in use.
     unsafe {
@@ -484,7 +553,9 @@ fn refill(page: *mut Page) -> bool {
                 (*block).next = (*page).free;
                 (*page).free = block;
             }
-            (*page).bump = stop - (stop - (*page).bump) % size;
+            let bump = stop - (stop - (*page).bump) % size;
+            *carved += bump - (*page).bump;
+            (*page).bump = bump;
         }
         !(*page).free.is_null()
     }

@@ -21,7 +21,9 @@
 //!
 //! Every function this crate compiles starts with the stack check described
 //! in `crag_abi`. The facade emits it; producers of LIR only mark loop
-//! back-edges with [`Inst::Poll`].
+//! back-edges with [`Inst::Poll`]. Metered code (Implementation Plan
+//! §11.6.6) takes a step off its fuel after the entry check and after each
+//! poll.
 //!
 //! Not built yet: frame tables and typed virtual registers. Every value is
 //! one machine word; `LirFunction::tracked` names the registers that hold
@@ -51,6 +53,8 @@ pub enum OptLevel {
 pub struct CodegenSettings {
     pub target: Target,
     pub opt: OptLevel,
+    /// The metered tier: fuel checks at the entry and at every poll.
+    pub metered: bool,
 }
 
 #[derive(Debug)]

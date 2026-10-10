@@ -124,11 +124,15 @@ impl Entry {
     }
 }
 
-/// How code is compiled (Compiler Architecture §5). The optimizing and
-/// metered tiers arrive with their milestones.
+/// How code is compiled (Compiler Architecture §5). The optimizing tier
+/// arrives with its milestone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
 pub enum Tier {
     Baseline,
+    /// The baseline tier with fuel checks (Implementation Plan §11.6.6),
+    /// for code run at compile time or received from elsewhere. Its MIR is
+    /// the baseline tier's.
+    Metered,
 }
 
 /// The MIR of an instance; none for what has no body, such as a builtin
@@ -140,7 +144,9 @@ pub fn mir<'db>(
     instance: InstanceKey<'db>,
     tier: Tier,
 ) -> Option<MirBody<'db>> {
-    let Tier::Baseline = tier;
+    if tier == Tier::Metered {
+        return mir(db, program, instance, Tier::Baseline).clone();
+    }
     let mut body = build::build(db, program, instance)?;
     tail::place_tail_closures(&mut body);
     insert_overflow_checks(&mut body);

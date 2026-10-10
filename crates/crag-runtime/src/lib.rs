@@ -19,7 +19,8 @@
 //! M0 scope (Implementation Plan §11.3.1 to §11.3.4 and §11.3.9): fibers and
 //! the context switch, stack growth by copying, the side stack, the sentinel
 //! stop request and the stress harness. M1 adds the allocator, reference
-//! counting, lists and maps, and traps (§11.4.11 to §11.4.14).
+//! counting, lists and maps, and traps (§11.4.11 to §11.4.14). M3 adds the
+//! metered tier's budgets (§11.6.6).
 //!
 //! Runtime discipline (Compiler Architecture §2.1): no thread-locals, no
 //! callbacks into Crag code from the runtime stack, panics abort in images
@@ -44,6 +45,7 @@ pub mod fiber;
 pub mod heap;
 pub mod list;
 pub mod map;
+pub mod meter;
 pub mod print;
 pub mod rc;
 pub mod sentinel;
@@ -56,6 +58,7 @@ pub mod unwind;
 
 pub use fiber::{Fiber, FiberConfig, FiberState, TaskContext, Worker};
 pub use heap::{Heap, alloc_box};
+pub use meter::Meter;
 pub use print::{PrintLimits, print_value, release_value};
 pub use rc::{Types, release_box};
 pub use sentinel::{StopHandle, StopReason, request_stop};
@@ -76,6 +79,7 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::MapInsert => map::rt_map_insert as *const () as usize,
         RuntimeFn::MapGet => map::rt_map_get as *const () as usize,
         RuntimeFn::Trap => unwind::rt_trap as *const () as usize,
+        RuntimeFn::Refuel => meter::rt_refuel as *const () as usize,
     }
 }
 

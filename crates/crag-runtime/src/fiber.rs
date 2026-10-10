@@ -26,11 +26,14 @@ use std::collections::VecDeque;
 use std::io;
 use std::mem::offset_of;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicUsize, Ordering};
 
-use crag_abi::{HEAP_OFFSET, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET, STACK_MARGIN};
+use crag_abi::{
+    FUEL_OFFSET, HEAP_OFFSET, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET, STACK_MARGIN,
+};
 
 use crate::heap::Heap;
+use crate::meter::{Meter, Metering};
 use crate::rc::Types;
 use crate::side_stack::SideStack;
 use crate::stack::StackMemory;
@@ -55,6 +58,8 @@ pub struct TaskContext {
     /// The heap of the worker running the fiber, which generated code
     /// allocates from.
     pub(crate) heap: AtomicPtr<Heap>,
+    /// The steps metered code may take before it calls `rt_refuel`.
+    pub(crate) fuel: AtomicI64,
     /// The worker running the fiber. The assembly routines find the system
     /// stack through it.
     pub(crate) worker: AtomicPtr<Worker>,
@@ -73,6 +78,7 @@ const _: () = assert!(offset_of!(TaskContext, stack_limit) == STACK_LIMIT_OFFSET
 const _: () = assert!(offset_of!(TaskContext, side_ptr) == SIDE_PTR_OFFSET as usize);
 const _: () = assert!(offset_of!(TaskContext, side_end) == SIDE_END_OFFSET as usize);
 const _: () = assert!(offset_of!(TaskContext, heap) == HEAP_OFFSET as usize);
+const _: () = assert!(offset_of!(TaskContext, fuel) == FUEL_OFFSET as usize);
 
 pub(crate) const STATUS_FINISHED: usize = 1;
 pub(crate) const STATUS_TRAPPED: usize = 2;
@@ -155,6 +161,8 @@ pub struct Fiber {
     results: Box<[u64; 2]>,
     /// Why it trapped, once it has.
     pub(crate) trap: Option<Trap>,
+    /// What metered code it runs may still use, if it is metered.
+    pub(crate) metering: Option<Metering>,
 }
 
 impl Fiber {
@@ -183,6 +191,8 @@ impl Fiber {
             side_ptr: AtomicUsize::new(0),
             side_end: AtomicUsize::new(0),
             heap: AtomicPtr::new(std::ptr::null_mut()),
+            // Unmetered: metered code it calls never runs out.
+            fuel: AtomicI64::new(i64::MAX),
             worker: AtomicPtr::new(std::ptr::null_mut()),
             saved_sp: AtomicUsize::new(0),
             status: AtomicUsize::new(0),
@@ -230,6 +240,7 @@ impl Fiber {
             _args: args,
             results,
             trap: None,
+            metering: None,
         }))
     }
 
@@ -241,6 +252,22 @@ impl Fiber {
     /// fewer than two results leaves the rest zero.
     pub fn results(&self) -> Option<[u64; 2]> {
         (self.state == FiberState::Finished).then_some(*self.results)
+    }
+
+    /// Meters the fiber: the metered code it runs traps when it has taken
+    /// `meter.steps` steps or made the heap take more than `meter.memory`
+    /// bytes. Called before the fiber first runs.
+    pub fn set_meter(&mut self, meter: Meter) {
+        let metering = Metering::new(meter);
+        self.ctx.fuel.store(0, Ordering::Relaxed);
+        self.metering = Some(metering);
+    }
+
+    /// The steps the fiber may still take, if it is metered.
+    pub fn steps_left(&self) -> Option<u64> {
+        let metering = self.metering.as_ref()?;
+        let fuel = self.ctx.fuel.load(Ordering::Relaxed).max(0) as u64;
+        Some(metering.steps + fuel)
     }
 
     /// The trap that ended the fiber, if one did.
@@ -373,12 +400,18 @@ impl Worker {
                 .heap
                 .store(&raw mut (*worker).heap, Ordering::Relaxed);
             (*fiber).state = FiberState::Running;
+            if let Some(metering) = &(*fiber).metering {
+                (*worker).heap.meter(metering.memory, &(*ctx).fuel);
+            }
 
             switch(
                 &raw mut (*worker).sp,
                 (*ctx).saved_sp.load(Ordering::Relaxed),
             );
 
+            if let Some(metering) = &mut (*fiber).metering {
+                metering.memory = (*worker).heap.unmeter();
+            }
             (*ctx).worker.store(std::ptr::null_mut(), Ordering::Relaxed);
             (*ctx).heap.store(std::ptr::null_mut(), Ordering::Relaxed);
             (*ctx).fiber.store(std::ptr::null_mut(), Ordering::Relaxed);

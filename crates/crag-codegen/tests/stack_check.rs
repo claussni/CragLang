@@ -36,6 +36,7 @@ fn settings(opt: OptLevel) -> CodegenSettings {
     CodegenSettings {
         target: target_for(TRIPLE).unwrap(),
         opt,
+        metered: false,
     }
 }
 
@@ -426,6 +427,25 @@ fn poll_checks_on_every_iteration() {
         assert_eq!(run(&image, 1, 0, &mut ctx, &[10])[0], 55);
         assert_eq!(ctx.calls, 4);
     }
+}
+
+#[test]
+fn only_metered_code_calls_for_fuel() {
+    let refuels = |metered| {
+        let s = CodegenSettings {
+            metered,
+            ..settings(OptLevel::None)
+        };
+        let object = compile(&sum_loop_fn(), &s).unwrap();
+        object
+            .relocs
+            .iter()
+            .filter(|r| r.target == RelocTarget::Runtime(RuntimeFn::Refuel))
+            .count()
+    };
+    // At the entry and at the poll; the runs are in the runtime's tests.
+    assert_eq!(refuels(true), 2);
+    assert_eq!(refuels(false), 0);
 }
 
 #[test]

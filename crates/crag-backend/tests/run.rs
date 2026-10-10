@@ -24,7 +24,8 @@
 //! calls, and the list and map functions call the runtime's Rust halves.
 //! `rt_trap` aborts. `Module::run` runs a function on a fiber instead, with
 //! a second copy of the code that calls the runtime itself, so a trap ends
-//! the fiber.
+//! the fiber. `Module::metered` compiles the code in the metered tier,
+//! whose fibers `Module::run_metered` runs under a meter.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -39,8 +40,8 @@ use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, lower_body, owner
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{InstanceKey, Tier, collect_instances};
 use crag_runtime::{
-    CodeMap, Fiber, FiberConfig, FiberState, Heap, PrintLimits, Trap, Types, Worker, alloc_box,
-    list, map, print_value, release_box, release_value,
+    CodeMap, Fiber, FiberConfig, FiberState, Heap, Meter, PrintLimits, StopReason, Trap, Types,
+    Worker, alloc_box, list, map, print_value, release_box, release_value, request_stop,
 };
 use crag_types::{Ty, TyKind, prelude_item, signature};
 
@@ -184,6 +185,14 @@ struct Module {
 
 impl Module {
     fn new(text: &str) -> Module {
+        Module::compiled(text, Tier::Baseline)
+    }
+
+    fn metered(text: &str) -> Module {
+        Module::compiled(text, Tier::Metered)
+    }
+
+    fn compiled(text: &str, tier: Tier) -> Module {
         let db = RootDatabase::new();
         let core = ModuleId::new(
             &db,
@@ -227,8 +236,8 @@ impl Module {
                 roots.push(InstanceKey::body(&db, owner));
             }
         }
-        for key in collect_instances(&db, program, &roots, Tier::Baseline) {
-            let compiled = code(&db, program, key, Tier::Baseline)
+        for key in collect_instances(&db, program, &roots, tier) {
+            let compiled = code(&db, program, key, tier)
                 .as_ref()
                 .expect("a function with a body")
                 .as_ref()
@@ -293,6 +302,7 @@ impl Module {
         let settings = CodegenSettings {
             target: target_for("x86_64-unknown-linux-gnu").unwrap(),
             opt: OptLevel::None,
+            metered: false,
         };
         Module {
             db,
@@ -341,6 +351,33 @@ impl Module {
     /// Runs a function on a fiber with the runtime's own functions: its
     /// result words, or the trap that ended it.
     fn run(&mut self, name: &str, args: &[i64]) -> Result<Vec<u64>, Trap> {
+        self.run_with(name, args, None, false).0
+    }
+
+    /// Runs a function as `run` does, under a meter: also the steps left.
+    fn run_metered(
+        &mut self,
+        name: &str,
+        args: &[i64],
+        meter: Meter,
+    ) -> (Result<Vec<u64>, Trap>, u64) {
+        let (result, left) = self.run_with(name, args, Some(meter), false);
+        (result, left.unwrap())
+    }
+
+    /// Runs a function as `run_metered` does, paused at every check and
+    /// resumed: the meter goes on where it stopped.
+    fn run_paused(&mut self, name: &str, args: &[i64], meter: Meter) -> Result<Vec<u64>, Trap> {
+        self.run_with(name, args, Some(meter), true).0
+    }
+
+    fn run_with(
+        &mut self,
+        name: &str,
+        args: &[i64],
+        meter: Option<Meter>,
+        pause: bool,
+    ) -> (Result<Vec<u64>, Trap>, Option<u64>) {
         let (_, params, returns) = self.functions[name];
         assert_eq!(args.len(), params as usize, "arguments of {name}");
         let (arena, symbols, functions) = &mut self.fibers;
@@ -353,11 +390,22 @@ impl Module {
         let mut fiber = unsafe {
             Fiber::new(stub.addr(), functions[name], &args, FiberConfig::default()).unwrap()
         };
-        match self.worker.resume(&mut fiber) {
+        if let Some(meter) = meter {
+            fiber.set_meter(meter);
+        }
+        let mut state = FiberState::Paused;
+        while state == FiberState::Paused {
+            if pause {
+                request_stop(&fiber, StopReason::Pause);
+            }
+            state = self.worker.resume(&mut fiber);
+        }
+        let result = match state {
             FiberState::Finished => Ok(fiber.results().unwrap()[..returns as usize].to_vec()),
             FiberState::Trapped => Err(fiber.trap().unwrap().clone()),
             state => panic!("{name} stopped {state:?}"),
-        }
+        };
+        (result, fiber.steps_left())
     }
 
     fn int(&mut self, name: &str, args: &[i64]) -> i64 {
@@ -996,6 +1044,114 @@ fn pick(i: Int) -> Int {
         (TrapKind::Index, at("points[i]"))
     );
     assert_eq!(m.worker.heap().live_blocks(), 0);
+}
+
+#[test]
+fn metered_code_runs_out_of_steps_and_memory() {
+    let text = r#"type Point(x: Int, y: Int)
+
+fn spin(n: Int) -> Int {
+  var t = 0
+  for i in 1..n {
+    t = t + i
+  }
+  t
+}
+
+fn hold(n: Int, p: Point) -> Int {
+  if n == 0 { p.x } else { hold(n - 1, Point(x: p.x + 1, y: p.y)) + p.y }
+}
+
+fn start(n: Int) -> Int {
+  hold(n, Point(x: 0, y: 1))
+}
+
+fn churn(n: Int) -> Int {
+  var t = 0
+  for i in 1..n {
+    let p = Point(x: i, y: i)
+    t = t + p.x - p.y
+  }
+  t
+}
+
+fn waves(k: Int) -> Int {
+  var t = 0
+  for i in 1..k {
+    t = t + start(5000)
+  }
+  t
+}
+"#;
+    let mut m = Module::metered(text);
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    let ample = |steps| Meter {
+        steps,
+        memory: usize::MAX,
+    };
+    // Ten steps: the entry, and the back-edge after each turn of the loop
+    // but the last.
+    assert_eq!(m.run_metered("spin", &[10], ample(100)), (Ok(vec![55]), 90));
+    assert_eq!(m.run_metered("spin", &[10], ample(10)), (Ok(vec![55]), 0));
+    let (trap, left) = m.run_metered("spin", &[10], ample(9));
+    let trap = trap.unwrap_err();
+    assert_eq!(
+        (trap.kind, trap.position, left),
+        (TrapKind::OutOfSteps, None, 0)
+    );
+    assert_eq!(trap.stack.len(), 1);
+    // A long computation is stopped, and what its frames hold released.
+    let (trap, _) = m.run_metered("start", &[1_000_000], ample(1000));
+    assert_eq!(trap.unwrap_err().kind, TrapKind::OutOfSteps);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+    assert_eq!(
+        m.run_metered("start", &[1000], ample(10_000)).0,
+        Ok(vec![2000])
+    );
+
+    // Each frame holds a point: a hundred thousand of them do not fit 32
+    // KiB, and the trap releases them. A fresh heap has no free blocks, so
+    // every point is charged.
+    let mut m = Module::metered(text);
+    let budget = |memory| Meter {
+        steps: u64::MAX,
+        memory,
+    };
+    let (trap, _) = m.run_metered("start", &[100_000], budget(32 << 10));
+    let trap = trap.unwrap_err();
+    assert_eq!(trap.kind, TrapKind::OutOfMemory);
+    // The budget holds 1024 points of 32 bytes. The frame that made the
+    // next one called `hold` once more, whose entry trapped.
+    assert_eq!(trap.stack.len(), 1025);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+    // A point made and dropped each turn reuses its block.
+    assert_eq!(
+        m.run_metered("churn", &[100_000], budget(32 << 10)).0,
+        Ok(vec![0])
+    );
+    assert_eq!(
+        m.run_metered("start", &[1000], budget(32 << 10)).0,
+        Ok(vec![2000])
+    );
+    // Each wave holds 5000 points, three pages, and gives them back when it
+    // is done: what pages that empty give back is charged again.
+    assert_eq!(
+        m.run_metered("waves", &[10], budget(256 << 10)).0,
+        Ok(vec![100_000])
+    );
+    // A fiber stopped and resumed keeps what is left of its budget, so the
+    // trap comes as before however often it is resumed.
+    let mut m = Module::metered(text);
+    let trap = m
+        .run_paused("start", &[100_000], budget(32 << 10))
+        .unwrap_err();
+    assert_eq!((trap.kind, trap.stack.len()), (TrapKind::OutOfMemory, 1025));
+    assert_eq!(
+        m.run_paused("spin", &[100_000], ample(1000))
+            .unwrap_err()
+            .kind,
+        TrapKind::OutOfSteps
+    );
 }
 
 #[test]

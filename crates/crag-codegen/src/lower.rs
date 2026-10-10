@@ -20,7 +20,8 @@
 use std::collections::HashMap;
 
 use crag_abi::{
-    FRAME_BUDGET, NO_POSITION, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET,
+    FRAME_BUDGET, FUEL_OFFSET, NO_POSITION, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET,
+    STACK_LIMIT_OFFSET,
 };
 use cranelift_codegen::binemit::Reloc as ClifReloc;
 use cranelift_codegen::control::ControlPlane;
@@ -123,7 +124,7 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
     lir.validate().map_err(CodegenError::InvalidLir)?;
     let isa = settings.target.isa(settings.opt);
 
-    let (func, keys) = build_body(lir, isa);
+    let (func, keys) = build_body(lir, isa, settings.metered);
     let body = run_backend(isa, func, &keys)?;
     let footprint = body.footprint(isa, tail_args_growth(lir));
     if footprint <= FRAME_BUDGET {
@@ -400,6 +401,13 @@ impl Imports {
         self.get(b, (NS_RUNTIME, func as u32), sig)
     }
 
+    /// `rt_refuel` has the same convention, for the same reason.
+    fn refuel(&mut self, b: &mut FunctionBuilder) -> FuncRef {
+        let mut sig = Signature::new(CallConv::PreserveAll);
+        sig.params.push(AbiParam::new(I64));
+        self.get(b, (NS_RUNTIME, RuntimeFn::Refuel as u32), sig)
+    }
+
     /// `rt_side_grow` has the same convention, for the same reason.
     fn side_grow(&mut self, b: &mut FunctionBuilder) -> FuncRef {
         let mut sig = Signature::new(CallConv::PreserveAll);
@@ -439,6 +447,30 @@ fn emit_stack_check(b: &mut FunctionBuilder, imports: &mut Imports, ctx: Value, 
     let morestack = imports.morestack(b);
     let needed = b.ins().iconst(I64, i64::from(needed));
     b.ins().call(morestack, &[ctx, needed]);
+    b.ins().jump(done, &[]);
+
+    b.switch_to_block(done);
+}
+
+/// Emits the fuel check of metered code at the current position and leaves
+/// the builder in the block that follows it: one step off the fuel, and a
+/// call of `rt_refuel` when it went negative. The call is a safepoint, so
+/// the runtime can trap there and release what the frame holds.
+fn emit_fuel_check(b: &mut FunctionBuilder, imports: &mut Imports, ctx: Value) {
+    let fuel = b.ins().load(I64, MemFlagsData::trusted(), ctx, FUEL_OFFSET);
+    let left = b.ins().iadd_imm_s(fuel, -1);
+    b.ins()
+        .store(MemFlagsData::trusted(), left, ctx, FUEL_OFFSET);
+    let empty = b.ins().icmp_imm_s(IntCC::SignedLessThan, left, 0);
+
+    let slow = b.create_block();
+    let done = b.create_block();
+    b.set_cold_block(slow);
+    b.ins().brif(empty, slow, &[], done, &[]);
+
+    b.switch_to_block(slow);
+    let refuel = imports.refuel(b);
+    b.ins().call(refuel, &[ctx]);
     b.ins().jump(done, &[]);
 
     b.switch_to_block(done);
@@ -495,7 +527,7 @@ fn emit_side_push(
 
 /// The body and the keys of the slots it calls through and the cells it
 /// names.
-fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> (Function, Vec<SlotKey>) {
+fn build_body(lir: &LirFunction, isa: &dyn TargetIsa, metered: bool) -> (Function, Vec<SlotKey>) {
     let sig = crag_signature(lir.params, lir.returns);
     let mut func = Function::with_name_signature(UserFuncName::default(), sig);
     let mut fb_ctx = FunctionBuilderContext::new();
@@ -520,6 +552,9 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> (Function, Vec<SlotKey>
     }
 
     emit_stack_check(&mut b, &mut imports, ctx, 0);
+    if metered {
+        emit_fuel_check(&mut b, &mut imports, ctx);
+    }
 
     // The side-stack mark: both fields as they were on entry. Storing them
     // back frees what this function pushed, whichever chunk it ended up in.
@@ -740,7 +775,12 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> (Function, Vec<SlotKey>
                     let p = emit_side_push(&mut b, &mut imports, ctx, *size, *align);
                     b.def_var(vars[dst.0 as usize], p);
                 }
-                Inst::Poll => emit_stack_check(&mut b, &mut imports, ctx, 0),
+                Inst::Poll => {
+                    emit_stack_check(&mut b, &mut imports, ctx, 0);
+                    if metered {
+                        emit_fuel_check(&mut b, &mut imports, ctx);
+                    }
+                }
             }
         }
         match &block.term {

@@ -1039,16 +1039,25 @@ This is not the `TypeDescriptor` of the first plan: the runtime's descriptors ke
 
 #### 11.6.6 Metered tier
 
-Code run at compile time, and code received from elsewhere (§18.7), must not run forever or exhaust memory. The metered tier is the baseline tier plus a fuel counter in the task context, decremented at each function entry and loop back-edge, and a memory budget checked when allocation takes the slow path. Running out of either traps.
+Code run at compile time, and code received from elsewhere (§18.7), must not run forever or exhaust memory. The metered tier is the baseline tier, `Tier::Metered` with the baseline's MIR, plus a fuel check after the stack check at each function entry and loop back-edge. A step is one of those: a call, a tail call included, or a turn of a loop. Running out of steps or of the memory budget traps with `OutOfSteps` or `OutOfMemory`, and the trap releases what the frames hold, as any trap does.
+
+The check takes one step off the fuel in the task context and calls `rt_refuel` when it goes negative. That routine preserves every register, as `rt_morestack` does, so the passing path is a load, a subtract, a store and a branch. A metered fiber holds the rest of its steps and gives the fuel 65,536 of them at a time, so the runtime regains control regularly: there §11.6.7 is to poll for cancellation. When no step is left, `rt_refuel` traps at its call, which is a safepoint whose stack map lists what the frame holds, so the unwinder starts there. A fiber that is not metered starts with fuel that never runs out, and code of other tiers has no checks.
+
+The memory budget is charged by the heap while a metered fiber runs, on the slow path only: the fresh blocks a refill carves out of a page's unused end, in portions of 4 KiB, and the mapping of a large block. A page that empties and is retired gives its bytes back, as does a large block when it is unmapped. A block reused from a free list costs nothing, being charged when it was carved, so a loop that makes and drops a value each turn runs in a small budget. A charge beyond the budget does not fail the allocation, which may be in the middle of a runtime function that holds references no stack map lists. It empties the fuel instead, so the trap comes at the next step. Between steps a computation allocates a bounded amount, so the overshoot is bounded too. A paused fiber keeps what is left of both budgets.
+
+This differs from the first plan's `charge_allocation(ctx, size) -> Result<(), OutOfMemory>` in where the trap happens, for the reason above. The budget is the heap's memory taken during the fiber's run, not a count of live bytes, which the inline path cannot keep.
 
 **Data structures**
 
-- `fuel` and `memory_budget` in the task context.
+- `fuel` in the task context, at `FUEL_OFFSET`; `RuntimeFn::Refuel`; `TrapKind::OutOfSteps` and `OutOfMemory`.
+- `Meter { steps, memory }` — what a fiber may use; `Fiber::set_meter` and `Fiber::steps_left`.
+- `CodegenSettings::metered`.
 
 **Functions**
 
-- Generated fuel check — subtract the cost of the block from `ctx.fuel`, call `rt_trap(TrapKind::OutOfSteps, pos)` if it goes negative.
-- `fn charge_allocation(ctx: &mut TaskContext, size: usize) -> Result<(), OutOfMemory>` — in the allocator's slow path.
+- Generated fuel check — `ctx.fuel -= 1; if ctx.fuel < 0 { rt_refuel(ctx) }`.
+- `rt_refuel(ctx)` — refills the fuel from the fiber's steps, or traps with `OutOfSteps`, or with `OutOfMemory` once the heap found the budget used up.
+- `Heap::charge` and `Heap::credit` — on the slow paths, while a metered fiber runs; the charge beyond the budget empties the fuel.
 
 #### 11.6.7 Compile-time evaluation
 

@@ -96,6 +96,20 @@ pub const SIDE_END_OFFSET: i32 = 16;
 /// allocates from inline (Implementation Plan §11.4.11).
 pub const HEAP_OFFSET: i32 = 24;
 
+/// Offset of the fuel of metered code in the task context (Implementation
+/// Plan §11.6.6), a signed word. Metered code takes a step off it at each
+/// function entry and loop back-edge:
+///
+/// ```text
+/// ctx.fuel -= 1
+/// if ctx.fuel < 0 { rt_refuel(ctx) }
+/// ```
+///
+/// The runtime gives a task its steps a portion at a time, so a refill is
+/// also where it notices that a budget is used up. Other code never reads
+/// the fuel.
+pub const FUEL_OFFSET: i32 = 32;
+
 /// The value the runtime stores in `stack_limit` to force the next check into
 /// the runtime (Plan §11.3.4). The check compares unsigned, so no stack
 /// pointer passes it.
@@ -199,11 +213,21 @@ pub enum RuntimeFn {
     /// has none. It borrows the map, and the address is valid while the map
     /// is.
     MapGet = 9,
+
+    /// `rt_refuel(ctx: *mut TaskContext)`.
+    ///
+    /// Called by metered code when its fuel went negative. It has the
+    /// convention of `rt_morestack`: every register preserved, no result.
+    /// The runtime refills the fuel and returns, or, when the task's steps
+    /// or its memory budget are used up, traps with `OutOfSteps` or
+    /// `OutOfMemory` as `rt_trap` would at this call, releasing what the
+    /// frames hold as the call's stack map lists it.
+    Refuel = 10,
 }
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 10] = [
+    pub const ALL: [RuntimeFn; 11] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -214,6 +238,7 @@ impl RuntimeFn {
         RuntimeFn::ListSlice,
         RuntimeFn::MapInsert,
         RuntimeFn::MapGet,
+        RuntimeFn::Refuel,
     ];
 
     /// The symbol the loader looks up.
@@ -229,6 +254,7 @@ impl RuntimeFn {
             RuntimeFn::ListSlice => "rt_list_slice",
             RuntimeFn::MapInsert => "rt_map_insert",
             RuntimeFn::MapGet => "rt_map_get",
+            RuntimeFn::Refuel => "rt_refuel",
         }
     }
 
@@ -254,10 +280,14 @@ pub enum TrapKind {
     Error = 5,
     /// The compiler does not support what was reached yet.
     Unsupported = 6,
+    /// Metered code used up its steps.
+    OutOfSteps = 7,
+    /// Metered code used up its memory budget.
+    OutOfMemory = 8,
 }
 
 impl TrapKind {
-    pub const ALL: [TrapKind; 7] = [
+    pub const ALL: [TrapKind; 9] = [
         TrapKind::Overflow,
         TrapKind::DivideByZero,
         TrapKind::Index,
@@ -265,6 +295,8 @@ impl TrapKind {
         TrapKind::NoMatch,
         TrapKind::Error,
         TrapKind::Unsupported,
+        TrapKind::OutOfSteps,
+        TrapKind::OutOfMemory,
     ];
 
     /// The kind with this discriminant, if any.

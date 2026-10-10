@@ -38,9 +38,19 @@ pub struct Image {
 
 impl Image {
     pub fn new(functions: &[LirFunction]) -> Image {
+        Image::compiled(functions, false)
+    }
+
+    /// The functions compiled in the metered tier.
+    pub fn metered(functions: &[LirFunction]) -> Image {
+        Image::compiled(functions, true)
+    }
+
+    fn compiled(functions: &[LirFunction], metered: bool) -> Image {
         let settings = CodegenSettings {
             target: target_for("x86_64-unknown-linux-gnu").unwrap(),
             opt: OptLevel::None,
+            metered,
         };
         let objects: Vec<CodeObject> = functions
             .iter()

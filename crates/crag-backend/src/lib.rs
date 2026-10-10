@@ -127,9 +127,8 @@ pub fn code<'db>(
     let lowered = lower_to_lir(db, program, owner, body, cell);
     let settings = CodegenSettings {
         target: host().clone(),
-        opt: match tier {
-            Tier::Baseline => OptLevel::None,
-        },
+        opt: OptLevel::None,
+        metered: tier == Tier::Metered,
     };
     Some(
         compile(&lowered.lir, &settings)

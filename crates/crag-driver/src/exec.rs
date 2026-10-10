@@ -118,6 +118,7 @@ pub fn stub_settings() -> Result<CodegenSettings, String> {
     Ok(CodegenSettings {
         target: target_for("x86_64-unknown-linux-gnu").map_err(|e| e.to_string())?,
         opt: OptLevel::None,
+        metered: false,
     })
 }
 
@@ -149,6 +150,8 @@ pub fn report(sources: &dyn Sources, functions: &HashMap<FuncId, Function>, trap
         TrapKind::NoMatch => "no arm of `case` matched",
         TrapKind::Error => "reached code with errors",
         TrapKind::Unsupported => "reached code the compiler does not support yet",
+        TrapKind::OutOfSteps => "ran out of steps",
+        TrapKind::OutOfMemory => "ran out of memory",
     };
     let first = trap.stack.first().map(|f| &functions[f]);
     let mut out = match (first, trap.position) {
