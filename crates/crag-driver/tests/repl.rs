@@ -63,8 +63,18 @@ fn expressions_run_and_show_their_values() {
     );
     assert_eq!(eval(&mut r, "half(8)"), "4\n");
     assert_eq!(eval(&mut r, "half(7)"), "Odd\n");
-    // Other values wait for value printing.
-    assert_eq!(eval(&mut r, "[1, 2]"), "<a value of type List[Int]>\n");
+    // Any value prints, from the shape of its type, in the image.
+    assert_eq!(eval(&mut r, "[1, 2]"), "[1, 2]\n");
+    assert_eq!(eval(&mut r, "type Point(x: Int, y: Int)"), "");
+    assert_eq!(
+        eval(&mut r, "[1: Point(x: 1, y: 2), 0: Point(x: 0, y: 0)]"),
+        "[0: Point(x: 0, y: 0), 1: Point(x: 1, y: 2)]\n"
+    );
+    assert_eq!(eval(&mut r, "{ n: Int -> n + 1 }"), "<function>\n");
+    // A long one is cut short.
+    let numbers: Vec<String> = (0..1000).map(|i| i.to_string()).collect();
+    let long = eval(&mut r, &format!("[{}]", numbers.join(", ")));
+    assert!(long.ends_with(", 99, … 900 more]\n"), "{long}");
 }
 
 #[test]

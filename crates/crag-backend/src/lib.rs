@@ -38,6 +38,7 @@ extern crate crag_db as salsa;
 
 mod layout;
 mod lower;
+mod shape;
 
 use std::sync::OnceLock;
 
@@ -54,6 +55,7 @@ pub use layout::{
     FieldSlot, Layout, element_layout, layout, record_layout, type_descriptor, type_index,
 };
 pub use lower::{Lowered, func_id, lower_to_lir};
+pub use shape::shapes;
 
 /// The code of an instance, ready for the loader.
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]

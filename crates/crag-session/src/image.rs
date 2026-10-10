@@ -41,10 +41,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-use crag_abi::{CodeObject, FuncId, RuntimeFn, SlotKey, TypeDescriptor};
+use crag_abi::{CodeObject, FuncId, RuntimeFn, Shapes, SlotKey, TypeDescriptor};
 use crag_loader::{CodeArena, SymbolTable, load, replace_group};
 use crag_runtime::{
-    CodeMap, Fiber, FiberConfig, FiberState, StopHandle, StopReason, Types, Worker,
+    CodeMap, Fiber, FiberConfig, FiberState, PrintLimits, StopHandle, StopReason, Types, Worker,
+    print_value, release_value,
 };
 
 use crate::host::ImageKind;
@@ -136,7 +137,11 @@ impl Image {
                 }
                 Err(why) => Message::Failed(why),
             },
-            Message::Run(func) => self.run(func),
+            Message::Run(func) => match self.run(func) {
+                Ok(words) => Message::Finished(words),
+                Err(reply) => reply,
+            },
+            Message::Show { func, shapes, root } => self.show(func, &shapes, root),
             other => Message::Failed(format!("an image does not take {other:?}")),
         })
     }
@@ -196,23 +201,58 @@ impl Image {
         Ok(())
     }
 
-    /// Runs a loaded function without parameters on a fiber of its own.
-    fn run(&mut self, func: FuncId) -> Message {
+    /// Runs a function as `run` does and shows its result, which it then
+    /// releases.
+    fn show(&mut self, func: FuncId, shapes: &Shapes, root: u32) -> Message {
+        let words = match self.run(func) {
+            Ok(words) => words,
+            Err(reply) => return reply,
+        };
+        let shape = &shapes.shapes[root as usize];
+        if shape.words() as usize != words.len() {
+            return Message::Failed(format!(
+                "a shape of {} words for a result of {}",
+                shape.words(),
+                words.len()
+            ));
+        }
+        let types = self.worker.types();
+        // SAFETY: the host describes the function's result, which the run
+        // left to the image.
+        let text = unsafe {
+            let text = print_value(&words, shapes, root, &types, PrintLimits::default());
+            release_value(self.worker.heap(), &types, &words, shapes, root);
+            text
+        };
+        Message::Shown(text)
+    }
+
+    /// Runs a loaded function without parameters on a fiber of its own:
+    /// its result words, or the answer that tells how it ended otherwise.
+    fn run(&mut self, func: FuncId) -> Result<Vec<u64>, Message> {
         let Some(&(entry, params, returns)) = self.functions.get(&func) else {
-            return Message::Failed(format!("function {} is not loaded", func.0));
+            return Err(Message::Failed(format!(
+                "function {} is not loaded",
+                func.0
+            )));
         };
         if params != 0 {
-            return Message::Failed(format!("function {} takes parameters", func.0));
+            return Err(Message::Failed(format!(
+                "function {} takes parameters",
+                func.0
+            )));
         }
         let Some(&stub) = self.stubs.get(&(0, returns)) else {
-            return Message::Failed(format!("no entry stub returns {returns} words"));
+            return Err(Message::Failed(format!(
+                "no entry stub returns {returns} words"
+            )));
         };
         // SAFETY: the host compiled the stub for the function's words, and
         // both stay loaded while the image exists, which outlives the fiber.
         let fiber = unsafe { Fiber::new(stub, entry, &[], FiberConfig::default()) };
         let mut fiber = match fiber {
             Ok(fiber) => fiber,
-            Err(e) => return Message::Failed(format!("cannot map a fiber's stack: {e}")),
+            Err(e) => return Err(Message::Failed(format!("cannot map a fiber's stack: {e}"))),
         };
         let handle = Box::new(fiber.stop_handle());
         RUNNING.store(
@@ -222,10 +262,10 @@ impl Image {
         let state = self.worker.resume(&mut fiber);
         RUNNING.store(std::ptr::null_mut(), Ordering::SeqCst);
         drop(handle);
-        match state {
+        Err(match state {
             FiberState::Paused => Message::Interrupted,
             FiberState::Finished => {
-                Message::Finished(fiber.results().expect("finished")[..returns as usize].to_vec())
+                return Ok(fiber.results().expect("finished")[..returns as usize].to_vec());
             }
             FiberState::Trapped => {
                 let trap = fiber.trap().expect("trapped");
@@ -236,7 +276,7 @@ impl Image {
                 }
             }
             state => Message::Failed(format!("the fiber stopped as {state:?}")),
-        }
+        })
     }
 }
 

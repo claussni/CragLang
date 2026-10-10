@@ -22,18 +22,17 @@
 //! sequence is its length as a `u32` and then its items, and an enum is a
 //! tag byte and then its fields. The image's first message is `Hello` with
 //! the version of the protocol it speaks, which the host checks before it
-//! sends anything. Messages that evaluate input and print values come with
-//! the components that use them (§11.6.2, §11.6.5).
+//! sends anything.
 
 use std::io::{self, Read, Write};
 
 use crag_abi::{
-    CodeObject, CountedField, ElementLayout, FuncId, Reloc, RelocKind, RelocTarget, RuntimeFn,
-    SlotKey, StackCheck, StackMap, TrapKind, TypeDescriptor,
+    CodeObject, CountedField, ElementLayout, FuncId, Number, Reloc, RelocKind, RelocTarget,
+    RuntimeFn, Shape, ShapeField, Shapes, SlotKey, StackCheck, StackMap, TrapKind, TypeDescriptor,
 };
 
 /// The version of the protocol, raised whenever a message changes.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -78,6 +77,15 @@ pub enum Message {
     Failed(String),
     /// From the image: SIGINT stopped the run at a safepoint.
     Interrupted,
+    /// From the host: runs a function as `Run` does, and shows its result,
+    /// of the shape `root` of `shapes`, then releases it (§11.6.5).
+    Show {
+        func: FuncId,
+        shapes: Shapes,
+        root: u32,
+    },
+    /// From the image: the result of a `Show`, as text.
+    Shown(String),
 }
 
 /// A function's code, shipped to an image.
@@ -112,6 +120,8 @@ const FINISHED: u8 = 7;
 const TRAPPED: u8 = 8;
 const FAILED: u8 = 9;
 const INTERRUPTED: u8 = 10;
+const SHOW: u8 = 11;
+const SHOWN: u8 = 12;
 
 impl Message {
     /// The body of the message's frame.
@@ -178,9 +188,19 @@ impl Message {
             }
             Message::Failed(why) => {
                 w.u8(FAILED);
-                w.seq(why.as_bytes(), |w, b| w.u8(*b));
+                w.text(why);
             }
             Message::Interrupted => w.u8(INTERRUPTED),
+            Message::Show { func, shapes, root } => {
+                w.u8(SHOW);
+                w.u32(func.0);
+                w.shapes(shapes);
+                w.u32(*root);
+            }
+            Message::Shown(text) => {
+                w.u8(SHOWN);
+                w.text(text);
+            }
         }
         w.0
     }
@@ -224,14 +244,16 @@ impl Message {
                 },
                 stack: r.seq(|r| Ok(FuncId(r.u32()?)))?,
             },
-            FAILED => {
-                let bytes = r.seq(Reader::u8)?;
-                Message::Failed(
-                    String::from_utf8(bytes)
-                        .map_err(|_| invalid("a reason that is not UTF-8".into()))?,
-                )
-            }
+            FAILED => Message::Failed(r.text()?),
             INTERRUPTED => Message::Interrupted,
+            SHOW => {
+                let (func, shapes, root) = (FuncId(r.u32()?), r.shapes()?, r.u32()?);
+                if root as usize >= shapes.shapes.len() {
+                    return Err(invalid(format!("the shape {root} of a shorter table")));
+                }
+                Message::Show { func, shapes, root }
+            }
+            SHOWN => Message::Shown(r.text()?),
             tag => return Err(invalid(format!("a message with the unknown tag {tag}"))),
         };
         match r.0.len() {
@@ -365,6 +387,83 @@ impl Writer {
             w.u32(m.return_offset);
             w.seq(&m.slots, |w, s| w.u32(*s));
         });
+    }
+
+    fn text(&mut self, text: &str) {
+        self.seq(text.as_bytes(), |w, b| w.u8(*b));
+    }
+
+    fn shapes(&mut self, shapes: &Shapes) {
+        self.seq(&shapes.shapes, |w, s| w.shape(s));
+        self.seq(&shapes.records, |w, &(index, shape)| {
+            w.u32(index);
+            w.u32(shape);
+        });
+    }
+
+    fn shape(&mut self, shape: &Shape) {
+        match shape {
+            Shape::Unit => self.u8(0),
+            Shape::Tag(name) => {
+                self.u8(1);
+                self.text(name);
+            }
+            Shape::Number(n) => {
+                self.u8(2);
+                match n {
+                    Number::Signed => self.u8(0),
+                    Number::Unsigned => self.u8(1),
+                    Number::Float => self.u8(2),
+                    Number::Fixed(digits) => {
+                        self.u8(3);
+                        self.u32(*digits);
+                    }
+                    Number::CodePoint => self.u8(4),
+                }
+            }
+            Shape::Union { members, words } => {
+                self.u8(3);
+                self.seq(members, |w, &(index, shape)| {
+                    w.u32(index);
+                    w.u32(shape);
+                });
+                self.u32(*words);
+            }
+            Shape::Record { name, fields } => {
+                self.u8(4);
+                match name {
+                    None => self.u8(0),
+                    Some(name) => {
+                        self.u8(1);
+                        self.text(name);
+                    }
+                }
+                self.seq(fields, |w, f| {
+                    w.text(&f.name);
+                    w.u32(f.offset);
+                    w.u32(f.shape);
+                });
+            }
+            Shape::List(element) => {
+                self.u8(5);
+                self.u32(*element);
+            }
+            Shape::Set(element) => {
+                self.u8(6);
+                self.u32(*element);
+            }
+            Shape::Map(key, value) => {
+                self.u8(7);
+                self.u32(*key);
+                self.u32(*value);
+            }
+            Shape::Function => self.u8(8),
+            Shape::Opaque { name, words } => {
+                self.u8(9);
+                self.text(name);
+                self.u32(*words);
+            }
+        }
     }
 
     fn descriptor(&mut self, d: &TypeDescriptor) {
@@ -510,6 +609,74 @@ impl Reader<'_> {
         })
     }
 
+    fn text(&mut self) -> io::Result<String> {
+        String::from_utf8(self.seq(Reader::u8)?)
+            .map_err(|_| invalid("text that is not UTF-8".into()))
+    }
+
+    fn shapes(&mut self) -> io::Result<Shapes> {
+        let shapes = Shapes {
+            shapes: self.seq(Reader::shape)?,
+            records: self.seq(|r| Ok((r.u32()?, r.u32()?)))?,
+        };
+        // Every shape a shape names is in the table.
+        let n = shapes.shapes.len() as u32;
+        let inside = |i: &u32| *i < n;
+        let named = shapes.shapes.iter().all(|s| match s {
+            Shape::Union { members, .. } => members.iter().map(|m| &m.1).all(inside),
+            Shape::Record { fields, .. } => fields.iter().map(|f| &f.shape).all(inside),
+            Shape::List(e) | Shape::Set(e) => inside(e),
+            Shape::Map(k, v) => inside(k) && inside(v),
+            _ => true,
+        });
+        if !named || !shapes.records.iter().map(|r| &r.1).all(inside) {
+            return Err(invalid("a shape that names no shape of its table".into()));
+        }
+        Ok(shapes)
+    }
+
+    fn shape(&mut self) -> io::Result<Shape> {
+        Ok(match self.u8()? {
+            0 => Shape::Unit,
+            1 => Shape::Tag(self.text()?),
+            2 => Shape::Number(match self.u8()? {
+                0 => Number::Signed,
+                1 => Number::Unsigned,
+                2 => Number::Float,
+                3 => Number::Fixed(self.u32()?),
+                4 => Number::CodePoint,
+                tag => return Err(invalid(format!("a number with the tag {tag}"))),
+            }),
+            3 => Shape::Union {
+                members: self.seq(|r| Ok((r.u32()?, r.u32()?)))?,
+                words: self.u32()?,
+            },
+            4 => Shape::Record {
+                name: match self.u8()? {
+                    0 => None,
+                    1 => Some(self.text()?),
+                    tag => return Err(invalid(format!("an option with the tag {tag}"))),
+                },
+                fields: self.seq(|r| {
+                    Ok(ShapeField {
+                        name: r.text()?,
+                        offset: r.u32()?,
+                        shape: r.u32()?,
+                    })
+                })?,
+            },
+            5 => Shape::List(self.u32()?),
+            6 => Shape::Set(self.u32()?),
+            7 => Shape::Map(self.u32()?, self.u32()?),
+            8 => Shape::Function,
+            9 => Shape::Opaque {
+                name: self.text()?,
+                words: self.u32()?,
+            },
+            tag => return Err(invalid(format!("a shape with the tag {tag}"))),
+        })
+    }
+
     fn descriptor(&mut self) -> io::Result<TypeDescriptor> {
         Ok(match self.u8()? {
             0 => TypeDescriptor::Record {
@@ -635,6 +802,54 @@ mod tests {
             },
             Message::Failed("function 3 is not loaded".into()),
             Message::Interrupted,
+            Message::Show {
+                func: FuncId(9),
+                shapes: Shapes {
+                    shapes: vec![
+                        Shape::Record {
+                            name: Some("Point".into()),
+                            fields: vec![
+                                ShapeField {
+                                    name: "x".into(),
+                                    offset: 16,
+                                    shape: 1,
+                                },
+                                ShapeField {
+                                    name: "next".into(),
+                                    offset: 24,
+                                    shape: 2,
+                                },
+                            ],
+                        },
+                        Shape::Number(Number::Fixed(2)),
+                        Shape::Union {
+                            members: vec![(7, 0), (8, 3)],
+                            words: 2,
+                        },
+                        Shape::Tag("Nil".into()),
+                        Shape::Record {
+                            name: None,
+                            fields: Vec::new(),
+                        },
+                        Shape::List(5),
+                        Shape::Set(6),
+                        Shape::Map(7, 8),
+                        Shape::Number(Number::Signed),
+                        Shape::Number(Number::Unsigned),
+                        Shape::Number(Number::Float),
+                        Shape::Number(Number::CodePoint),
+                        Shape::Unit,
+                        Shape::Function,
+                        Shape::Opaque {
+                            name: "Str".into(),
+                            words: 2,
+                        },
+                    ],
+                    records: vec![(7, 0)],
+                },
+                root: 2,
+            },
+            Message::Shown("Point(x: 1.50, next: Nil)".into()),
         ]
     }
 
@@ -783,5 +998,30 @@ mod tests {
         assert_eq!(broken(at, 200), io::ErrorKind::InvalidData);
         // A relocation target after the cell's tag.
         assert_eq!(broken(at - 1, 5), io::ErrorKind::InvalidData);
+        // A shape that names a shape the table lacks, as an element or as
+        // a record's.
+        for shapes in [
+            Shapes {
+                shapes: vec![Shape::List(1)],
+                records: Vec::new(),
+            },
+            Shapes {
+                shapes: vec![Shape::Unit],
+                records: vec![(3, 1)],
+            },
+            // The root, too.
+            Shapes {
+                shapes: Vec::new(),
+                records: Vec::new(),
+            },
+        ] {
+            let show = Message::Show {
+                func: FuncId(1),
+                shapes,
+                root: 0,
+            };
+            let err = Message::decode(&show.encode()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
     }
 }

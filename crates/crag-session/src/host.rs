@@ -41,7 +41,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use crag_abi::{FuncId, SlotKey, TypeDescriptor};
+use crag_abi::{FuncId, Shapes, SlotKey, TypeDescriptor};
 use crag_runtime::Trap;
 
 use crate::protocol::{
@@ -495,6 +495,38 @@ impl Session {
         }
     }
 
+    /// Runs a loaded function as `run` does, and has the image show its
+    /// result, of the shape `root` of `shapes`, and release it.
+    pub fn show(
+        &mut self,
+        func: FuncId,
+        shapes: &Shapes,
+        root: u32,
+    ) -> Result<RunResult, SessionError> {
+        let show = Message::Show {
+            func,
+            shapes: shapes.clone(),
+            root,
+        };
+        match self.request(&show)? {
+            Message::Shown(text) => Ok(RunResult::Shown(text)),
+            Message::Trapped {
+                kind,
+                position,
+                stack,
+            } => Ok(RunResult::Trapped(Trap {
+                kind,
+                position,
+                stack,
+            })),
+            Message::Interrupted => Ok(RunResult::Interrupted),
+            Message::Failed(why) => Err(SessionError::Refused(why)),
+            other => Err(SessionError::Refused(format!(
+                "the image answered {other:?} to Show"
+            ))),
+        }
+    }
+
     /// Kills the scratch image, for one that runs away, and starts a fresh
     /// one; how the old one ended.
     pub fn restart(&mut self) -> Result<ImageExit, SessionError> {
@@ -522,4 +554,6 @@ pub enum RunResult {
     Trapped(Trap),
     /// SIGINT stopped it.
     Interrupted,
+    /// The result as the image shows it.
+    Shown(String),
 }

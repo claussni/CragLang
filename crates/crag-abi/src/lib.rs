@@ -515,6 +515,96 @@ pub enum RelocTarget {
     Cell(SlotKey),
 }
 
+/// How a value of a type is printed (Implementation Plan §11.6.5): what
+/// its words are and what they point to. The host describes the type; the
+/// image walks the value. A type that contains itself refers back to its
+/// shape by index, so a shape is a table.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Shapes {
+    pub shapes: Vec<Shape>,
+    /// The shapes of the record types a box may have, by the type index
+    /// in its header: a value of a record type may be one of a subtype.
+    pub records: Vec<(u32, u32)>,
+}
+
+impl Shapes {
+    /// The shape of a record by the type index of its box, if known.
+    pub fn record(&self, index: u32) -> Option<u32> {
+        self.records.iter().find(|r| r.0 == index).map(|r| r.1)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Shape {
+    /// `()`: no words.
+    Unit,
+    /// A tag, by its name: no words.
+    Tag(String),
+    /// A word.
+    Number(Number),
+    /// A union: the type index of the member, then in a two-word union the
+    /// member's word. Each member by its type index.
+    Union {
+        members: Vec<(u32, u32)>,
+        words: u32,
+    },
+    /// A box of a record type, named or anonymous, whose fields are at
+    /// their offsets in it, in the order they are shown.
+    Record {
+        name: Option<String>,
+        fields: Vec<ShapeField>,
+    },
+    /// A box of a list or a set: the element's shape.
+    List(u32),
+    Set(u32),
+    /// A box of a map: the shapes of key and value.
+    Map(u32, u32),
+    /// A function value: two words.
+    Function,
+    /// What cannot be shown yet, by its type, and its words.
+    Opaque {
+        name: String,
+        words: u32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ShapeField {
+    pub name: String,
+    pub offset: u32,
+    pub shape: u32,
+}
+
+/// How a word holds a number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Number {
+    /// A signed integer, sign-extended.
+    Signed,
+    /// An unsigned integer, zero-extended.
+    Unsigned,
+    /// The bits of a `Float`.
+    Float,
+    /// A `Fixed` with this many digits after the point, scaled.
+    Fixed(u32),
+    CodePoint,
+}
+
+impl Shape {
+    /// The words of a value of the shape.
+    pub fn words(&self) -> u32 {
+        match self {
+            Shape::Unit | Shape::Tag(_) => 0,
+            Shape::Number(_)
+            | Shape::Record { .. }
+            | Shape::List(_)
+            | Shape::Set(_)
+            | Shape::Map(..) => 1,
+            Shape::Union { words, .. } | Shape::Opaque { words, .. } => *words,
+            Shape::Function => 2,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

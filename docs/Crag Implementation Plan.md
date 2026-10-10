@@ -913,7 +913,7 @@ The host process runs the compiler; user code runs in separate image processes, 
 
 An image is the `crag` binary itself, started as `crag __image <kind> <socket>`, so `crag` stays one binary (§20). The host binds a Unix socket in a fresh directory only its user can enter, starts the image with the socket's path, and accepts its connection. The image's first message is `Hello`, with the protocol version it speaks and its process id; the host checks both, so an image of another version, or a process that is not the one it started, fails the start. So does an image that exits before it connects, which is noticed at once, or one that does not connect within ten seconds.
 
-A frame is the length of its body as four little-endian bytes, then the body: a tag byte and the fields. A sequence is its length and then its items, and an enum a tag and then its fields. A frame longer than 1 GiB, an unknown tag, a sequence longer than what is left, a body cut short or one with bytes left over is corrupt. Besides `Hello`, `Ping` and `Pong`, which check that an image answers, and `Shutdown`, the messages load and run code (§11.6.3). Those that evaluate input and print values come with the components that use them (§11.6.2, §11.6.5), and pausing, reloading and the debugger's with theirs.
+A frame is the length of its body as four little-endian bytes, then the body: a tag byte and the fields. A sequence is its length and then its items, and an enum a tag and then its fields. A frame longer than 1 GiB, an unknown tag, a sequence longer than what is left, a body cut short or one with bytes left over is corrupt. Besides `Hello`, `Ping` and `Pong`, which check that an image answers, and `Shutdown`, the messages load and run code (§11.6.3) and show results (§11.6.5). Those for pausing, reloading and the debugger come with their components.
 
 A request is a message and its reply. When the stream breaks, the image has died or broken the protocol. A stream that ended belongs to an image that is exiting, which gets a second to do so. One that sent something corrupt is killed at once. The session then reaps the image, reports how it ended, such as "the scratch image (process 4711) was killed by signal 6 (SIGABRT)", and starts a fresh one of its kind. If that fails, the next request tries again. `restart` kills a runaway image and starts another. Dropping a session asks each image to shut down and kills one that does not. An image whose host goes away ends too, since its stream ends.
 
@@ -944,7 +944,7 @@ The editor reads lines until the parser finds the input complete: the first synt
 
 During a run the terminal is cooked, so Ctrl-C sends SIGINT to the host and the scratch image, which share the terminal's process group. The host ignores it. The image asks the running fiber to pause at its next safepoint, a function entry or a loop's back-edge, through the stack-limit sentinel (§11.3.4), and answers `Interrupted`. Its handler runs on the alternate signal stack, since a fiber's margin is small. The fiber is dropped; what its frames held is not released yet. A value it was computing stays empty, since a cell is filled only when the value is done.
 
-Until value printing (§11.6.5), the REPL shows numbers, code points and tags, and a union's member, from the result's words; any other value is shown as `<a value of type T>`. `()` shows nothing, and so does a definition.
+The image shows an expression's value (§11.6.5); `()` shows nothing, and so does a definition.
 
 Deviations from the first plan: the REPL type is `Repl`, since `Session` is the session manager's; errors come rendered, against the input; and `read_input` takes the completion as a function.
 
@@ -977,7 +977,7 @@ Result words that are references point into the image and mean nothing to the ho
 **Data structures**
 
 - `ShippedFunction` — a function's id, the signature of its slot, words of parameters and results, and code object; `Stub` — an entry stub and the words it was compiled for.
-- `Message::Load { types, stubs, functions, reset }`, `Loaded`, `Run(FuncId)`, `Finished(words)`, `Trapped { kind, position, stack }`, `Interrupted` and `Failed(reason)`.
+- `Message::Load { types, stubs, functions, reset }`, `Loaded`, `Run(FuncId)`, `Finished(words)`, `Trapped { kind, position, stack }`, `Interrupted` and `Failed(reason)`; `Show` and `Shown` (§11.6.5).
 - `Image` — in the image: the code arena, symbol table, loaded functions and stubs, descriptors, code map and worker.
 - `Scratch` — in the driver: a session and the names of the functions shipped, for reports.
 
@@ -1016,15 +1016,26 @@ The image loads every shipment with `replace_group`, and the host sends a functi
 
 #### 11.6.5 Value printing
 
-The REPL prints any value without generated code: the runtime walks the value guided by its type descriptor, the same metadata the codec and debugger use.
+The REPL prints any value without generated code: the image walks the value guided by the shape of its type. The host describes the result's type, and `Show` runs the function as `Run` does; the image prints the result and answers `Shown` with the text, then releases the value, so a value the REPL showed is freed. A value is shown as source writes it: `Point(x: 1, y: 2)`, `(a: 0.5, b: True)`, `[3, Empty, 5]`, `[1: 10, 2: 20]`, `[:]`, `12.05`, `'q'`. A function value is `<function>`, and a string, until code generation has strings, `<a value of type Str>`.
+
+A shape is a table, since a type may contain itself, as `Cons(head: Int, tail: Cons | Nil)` does: each entry is a tag, a number by how its word holds it, a union with its members by type index, a record with its fields at their offsets, a list, set or map with the shapes of its elements, a function value, or what cannot be shown yet. The shape of a type comes from the layout code generation gives it, so the two agree. A record's fields are shown in the order the type declares them, not in the layout's. A box of a record type may be one of a subtype, whose own fields the box holds, so the table also has the shapes of the static type's record subtypes, by type index, and the printer shows a box by the index in its header. The entries of a map or a set are shown in the order of their keys' words, which for numbers is their order; keys hold no references, so their words are their values.
+
+Limits keep a large value short: past a depth, a value is `…`; past a number of elements, a collection ends with `… 900 more`; past a number of characters, the text ends with `…`. A value is acyclic, being immutable and counted, so the walk ends.
+
+This is not the `TypeDescriptor` of the first plan: the runtime's descriptors keep only what releasing a box takes and are indexed by type in the image, while a shape is sent with each `Show` and names fields. Values of `Secret` types are to be hidden (Specification §17.2) once markers reach the type checker.
 
 **Data structures**
 
-- `TypeDescriptor` — per concrete type: kind, size, field names and offsets, union member tags, element type of collections.
+- `Shapes` — the table of `Shape`s and the record shapes by type index; `ShapeField` — a field's name, offset and shape; `Number` — signed, unsigned, `Float`, `Fixed` with its digits, or a code point.
+- `PrintLimits` — depth, elements of a collection, and characters.
+- `Message::Show { func, shapes, root }` and `Shown(text)`.
 
 **Functions**
 
-- `unsafe fn print_value(value: *const u8, ty: &TypeDescriptor, limits: PrintLimits) -> String` — recursive, with depth and length limits for large values.
+- `fn shapes(db: &dyn Db, program: Program, ty: Ty) -> (Shapes, u32)` — in the backend: the table and the type's own shape.
+- `unsafe fn print_value(words: &[u64], shapes: &Shapes, shape: u32, types: &Types, limits: PrintLimits) -> String` — in the runtime; recursive, with the limits. The descriptors find the elements of collections.
+- `unsafe fn release_value(heap, types, words, shapes, shape)` — gives up the references a value's words hold.
+- `Session::show` and `Scratch::show(project, root, ty)` — on the host.
 
 #### 11.6.6 Metered tier
 

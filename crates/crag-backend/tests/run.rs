@@ -30,7 +30,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 use crag_abi::{HEADER_SIZE, HEAP_OFFSET, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, TrapKind};
-use crag_backend::{code, type_index};
+use crag_backend::{code, shapes, type_index};
 use crag_codegen::{
     CodeObject, CodegenSettings, OptLevel, SlotKey, compile_entry_stub, target_for,
 };
@@ -39,8 +39,8 @@ use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, lower_body, owner
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{InstanceKey, Tier, collect_instances};
 use crag_runtime::{
-    CodeMap, Fiber, FiberConfig, FiberState, Heap, Trap, Types, Worker, alloc_box, list, map,
-    release_box,
+    CodeMap, Fiber, FiberConfig, FiberState, Heap, PrintLimits, Trap, Types, Worker, alloc_box,
+    list, map, print_value, release_box, release_value,
 };
 use crag_types::{Ty, TyKind, prelude_item, signature};
 
@@ -365,6 +365,39 @@ impl Module {
         match self.call(name, &args).as_slice() {
             [one] => *one as i64,
             words => panic!("{name} returned {words:?}"),
+        }
+    }
+
+    /// Calls a function without parameters and prints its result through
+    /// the shape of its type, then releases it.
+    fn shown(&mut self, name: &str) -> String {
+        let limits = PrintLimits {
+            items: 5,
+            ..PrintLimits::default()
+        };
+        self.shown_with(name, limits)
+    }
+
+    fn shown_with(&mut self, name: &str, limits: PrintLimits) -> String {
+        let words = self.call(name, &[]);
+        let (db, program) = (&self.db, self.program);
+        let module = program.modules(db)[1];
+        let owner = owners(db, module)
+            .into_iter()
+            .find(|o| matches!(o, Owner::Item(i) if i.name(db).text(db) == name))
+            .unwrap();
+        let ty = crag_mir::mir(db, program, InstanceKey::body(db, owner), Tier::Baseline)
+            .as_ref()
+            .unwrap()
+            .result;
+        let (shapes, root) = shapes(db, program, ty);
+        TYPES.set(&self.types);
+        // SAFETY: the words are the function's result, of type `ty`, which
+        // the call left to the test.
+        unsafe {
+            let text = print_value(&words, &shapes, root, &self.types, limits);
+            release_value(&mut self.heap, &self.types, &words, &shapes, root);
+            text
         }
     }
 
@@ -1016,6 +1049,84 @@ fn broken() -> Int { bad }
     }
     assert_eq!(m.run("read", &[]), Ok(vec![44]));
     assert_eq!(m.worker.heap().live_blocks(), 1);
+}
+
+#[test]
+fn values_print_by_the_shapes_of_their_types() {
+    let mut m = Module::new(
+        r#"type Point(x: Int, y: Int)
+type Point3(..Point, z: Int)
+type Pair(second: Int, first: Int)
+type Nil
+type Cons(head: Int, tail: Cons | Nil)
+
+fn point() -> Point { Point(x: 1, y: -2) }
+fn deeper() -> Point { Point3(x: 1, y: 2, z: 3) }
+fn pair() -> Pair { Pair(second: 2, first: 1) }
+fn anon() -> (b: Bool, a: Float) { (b: 1 < 2, a: 0.5) }
+fn chain() -> Cons | Nil { Cons(head: 1, tail: Cons(head: 2, tail: Nil)) }
+fn options() -> List[Option[Int]] { [3, Empty, 5] }
+fn points() -> List[Point] { [Point(x: 1, y: 2), Point3(x: 3, y: 4, z: 5)] }
+fn many() -> List[Int] { [1, 2, 3, 4, 5, 6, 7] }
+fn ages() -> Map[Int, Point] { [2: Point(x: 20, y: 0), 1: Point(x: 10, y: 0)] }
+fn none() -> Map[Int, Int] { [:] }
+fn set() -> Set[Int] { [3, 1, 2, 1] }
+fn cents() -> Fixed[2] { 12.05 }
+fn small() -> UInt8 { 255 }
+fn letter() -> CodePoint { 'q' }
+fn nothing() -> Option[Int] { Empty }
+fn adder() -> (Int) -> Int {
+  let p = point()
+  { n -> n + p.x }
+}
+"#,
+    );
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    let shown = |m: &mut Module, name: &str| m.shown(name);
+    assert_eq!(shown(&mut m, "point"), "Point(x: 1, y: -2)");
+    // A box shows its own type, a subtype's fields included.
+    assert_eq!(shown(&mut m, "deeper"), "Point3(x: 1, y: 2, z: 3)");
+    // Fields in the order they are declared, not laid out.
+    assert_eq!(shown(&mut m, "pair"), "Pair(second: 2, first: 1)");
+    assert_eq!(shown(&mut m, "anon"), "(a: 0.5, b: True)");
+    assert_eq!(
+        shown(&mut m, "chain"),
+        "Cons(head: 1, tail: Cons(head: 2, tail: Nil))"
+    );
+    assert_eq!(shown(&mut m, "options"), "[3, Empty, 5]");
+    assert_eq!(
+        shown(&mut m, "points"),
+        "[Point(x: 1, y: 2), Point3(x: 3, y: 4, z: 5)]"
+    );
+    assert_eq!(shown(&mut m, "many"), "[1, 2, 3, 4, 5, … 2 more]");
+    // Entries by their keys.
+    assert_eq!(
+        shown(&mut m, "ages"),
+        "[1: Point(x: 10, y: 0), 2: Point(x: 20, y: 0)]"
+    );
+    assert_eq!(shown(&mut m, "none"), "[:]");
+    assert_eq!(shown(&mut m, "set"), "[1, 2, 3]");
+    assert_eq!(shown(&mut m, "cents"), "12.05");
+    assert_eq!(shown(&mut m, "small"), "255");
+    assert_eq!(shown(&mut m, "letter"), "'q'");
+    assert_eq!(shown(&mut m, "nothing"), "Empty");
+    assert_eq!(shown(&mut m, "adder"), "<function>");
+    // Deep and long values are cut short.
+    let limits = PrintLimits {
+        depth: 1,
+        ..PrintLimits::default()
+    };
+    assert_eq!(
+        m.shown_with("chain", limits),
+        "Cons(head: 1, tail: Cons(head: …, tail: …))"
+    );
+    let limits = PrintLimits {
+        chars: 10,
+        ..PrintLimits::default()
+    };
+    assert_eq!(m.shown_with("many", limits), "[1, 2, 3, …]");
+    // Every value was released after it was shown.
+    assert_eq!(m.heap.live_blocks(), 0);
 }
 
 #[test]

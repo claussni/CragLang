@@ -29,13 +29,12 @@
 
 use std::collections::BTreeSet;
 
-use crag_backend::{Layout, layout, type_index};
 use crag_db::Setter;
 use crag_hir::{ItemKind, ModuleId, Owner, SourceFile, item_tree, module_scope};
 use crag_mir::{InstanceKey, Tier, mir};
 use crag_session::RunResult;
 use crag_syntax::{TokenKind, lex};
-use crag_types::{Builtin, Ty, TyKind};
+use crag_types::Ty;
 
 use crate::diagnostics::{check, render_at};
 use crate::exec::Sources;
@@ -398,12 +397,14 @@ impl Repl {
             .as_ref()
             .expect("the input's function has a body")
             .result;
-        let ran = self
-            .scratch
-            .execute(&self.project, key)
-            .map_err(|e| format!("error: {e}\n"))?;
-        Ok(match ran {
-            RunResult::Finished(words) => EvalOutput::Value(show(&self.project, ty, &words)),
+        // `()` shows nothing.
+        let ran = match ty == Ty::unit(db) {
+            true => self.scratch.execute(&self.project, key),
+            false => self.scratch.show(&self.project, key, ty),
+        };
+        Ok(match ran.map_err(|e| format!("error: {e}\n"))? {
+            RunResult::Finished(_) => EvalOutput::Value(None),
+            RunResult::Shown(text) => EvalOutput::Value(Some(text)),
             RunResult::Trapped(trap) => EvalOutput::Stopped(self.scratch.report(self, &trap)),
             RunResult::Interrupted => EvalOutput::Stopped("interrupted\n".into()),
         })
@@ -483,54 +484,5 @@ impl Sources for Repl {
         };
         let at = (position - layout.starts[i]).min(entry.text.len() as u32);
         (label, &entry.text, at)
-    }
-}
-
-/// A result as the REPL shows it until values print from their types'
-/// descriptors in the image (§11.6.5): numbers, code points and tags in
-/// full, other values by their type. None for `()`.
-fn show(project: &Project, ty: Ty, words: &[u64]) -> Option<String> {
-    let db = &project.db;
-    if ty == Ty::unit(db) {
-        return None;
-    }
-    let whole = || format!("<a value of type {}>", ty.display(db));
-    let word = words.first().copied().unwrap_or(0);
-    Some(match (layout(db, project.program, ty), ty.kind(db)) {
-        (Some(Layout::Imm(b)), _) => number(b, word),
-        (Some(Layout::Zero), TyKind::Named(..)) => ty.display(db),
-        (Some(Layout::Tag | Layout::Union), TyKind::Union(members)) => {
-            let Some(&member) = members.iter().find(|&&m| type_index(m) as u64 == word) else {
-                return Some(whole());
-            };
-            return show(project, member, &words[1..]).or(Some("()".into()));
-        }
-        _ => whole(),
-    })
-}
-
-/// A number as source writes it.
-fn number(builtin: Builtin, word: u64) -> String {
-    match builtin {
-        Builtin::Float => format!("{:?}", f64::from_bits(word)),
-        Builtin::UInt8 | Builtin::UInt16 | Builtin::UInt32 | Builtin::UInt64 => word.to_string(),
-        Builtin::Fixed(digits) => {
-            let n = word as i64;
-            let scale = 10i64.pow(digits);
-            let sign = if n < 0 { "-" } else { "" };
-            let n = n.unsigned_abs();
-            let scale = scale as u64;
-            format!(
-                "{sign}{}.{:0width$}",
-                n / scale,
-                n % scale,
-                width = digits as usize
-            )
-        }
-        Builtin::CodePoint => match char::from_u32(word as u32) {
-            Some(c) => format!("{c:?}"),
-            None => format!("<code point {word:#x}>"),
-        },
-        _ => (word as i64).to_string(),
     }
 }

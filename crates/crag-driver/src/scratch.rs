@@ -23,11 +23,12 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 
 use crag_abi::{FuncId, SlotKey};
-use crag_backend::func_id;
+use crag_backend::{func_id, shapes};
 use crag_codegen::{CodeObject, CodegenSettings, compile_entry_stub};
 use crag_mir::InstanceKey;
 use crag_runtime::Trap;
 use crag_session::{ImageCommand, RunResult, Session, ShippedFunction, Stub};
+use crag_types::Ty;
 
 use crate::exec::{Function, Sources, compile, report, stub_settings};
 use crate::project::Project;
@@ -123,6 +124,21 @@ impl Scratch {
         self.session.run(func_id(root)).map_err(|e| e.to_string())
     }
 
+    /// Ships a root without parameters and runs it in the image, which
+    /// shows its result, of type `ty`, and releases it.
+    pub fn show(
+        &mut self,
+        project: &Project,
+        root: InstanceKey,
+        ty: Ty,
+    ) -> Result<RunResult, String> {
+        self.ship(project, &[root])?;
+        let (shapes, shape) = shapes(&project.db, project.program, ty);
+        self.session
+            .show(func_id(root), &shapes, shape)
+            .map_err(|e| e.to_string())
+    }
+
     /// Ships a root without parameters and runs it in the image: its result
     /// words, or the report of the trap or interrupt that ended it.
     pub fn run(
@@ -134,6 +150,7 @@ impl Scratch {
             RunResult::Finished(words) => Ok(words),
             RunResult::Trapped(trap) => Err(self.report(project, &trap)),
             RunResult::Interrupted => Err("interrupted\n".into()),
+            RunResult::Shown(_) => unreachable!("a run shows nothing"),
         })
     }
 

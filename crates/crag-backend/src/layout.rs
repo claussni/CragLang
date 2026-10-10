@@ -168,7 +168,19 @@ pub fn record_layout<'db>(
 /// at run time: the record types of the program without type parameters
 /// that are subtypes of it, or `ty` alone.
 pub fn subtypes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Vec<i64> {
-    let mut out = vec![type_index(ty)];
+    let mut out: Vec<i64> = std::iter::once(ty)
+        .chain(record_subtypes(db, program, ty))
+        .map(type_index)
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// The record types of the program without type parameters that are
+/// subtypes of `ty`, other than `ty`; none when `ty` is not a named type
+/// without arguments.
+pub fn record_subtypes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Vec<Ty<'db>> {
+    let mut out = Vec::new();
     if !matches!(ty.kind(db), TyKind::Named(_, args) if args.is_empty()) {
         return out;
     }
@@ -183,11 +195,10 @@ pub fn subtypes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Vec<i64>
                 && matches!(type_def(db, program, id).kind, TypeDefKind::Record { .. })
                 && is_subtype(db, program, candidate, ty)
             {
-                out.push(type_index(candidate));
+                out.push(candidate);
             }
         }
     }
-    out.sort_unstable();
     out
 }
 

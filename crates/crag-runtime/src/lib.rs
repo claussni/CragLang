@@ -44,6 +44,7 @@ pub mod fiber;
 pub mod heap;
 pub mod list;
 pub mod map;
+pub mod print;
 pub mod rc;
 pub mod sentinel;
 pub mod side_stack;
@@ -55,6 +56,7 @@ pub mod unwind;
 
 pub use fiber::{Fiber, FiberConfig, FiberState, TaskContext, Worker};
 pub use heap::{Heap, alloc_box};
+pub use print::{PrintLimits, print_value, release_value};
 pub use rc::{Types, release_box};
 pub use sentinel::{StopHandle, StopReason, request_stop};
 pub use unwind::{CodeMap, Trap};

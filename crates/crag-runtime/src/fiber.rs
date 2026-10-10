@@ -311,6 +311,11 @@ impl Worker {
         self.types = types;
     }
 
+    /// The descriptors the worker's boxes are released by.
+    pub fn types(&self) -> Arc<Types> {
+        self.types.clone()
+    }
+
     /// Gives the worker the map of the image's code. A worker without it
     /// releases nothing a frame holds when a fiber traps.
     pub fn set_code_map(&mut self, code: Arc<CodeMap>) {
