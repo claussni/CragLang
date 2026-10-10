@@ -1431,7 +1431,7 @@ fn f(amount: Int) {
   let old = hits.swap(5)
   ref from = Account(balance: 100)
   let r = atomic {
-    if from.use { a -> a.balance } < amount { return InsufficientFunds() }
+    if from.use { a -> a.balance } < amount { return InsufficientFunds }
     from.update { a -> Account(balance: a.balance - amount) }
   }
   emit Placed(id: 1)

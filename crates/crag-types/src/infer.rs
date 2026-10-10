@@ -1072,7 +1072,8 @@ impl<'a, 'db> Infer<'a, 'db> {
     }
 
     /// A type named where a value is expected: a tag, whose type
-    /// arguments the context may give (§3.6.1).
+    /// arguments the context may give (§3.6.1), or a unit record, a record
+    /// type without fields, which has one value like a tag (§3.3).
     fn type_value(
         &mut self,
         id: ExprId,
@@ -1083,16 +1084,21 @@ impl<'a, 'db> Infer<'a, 'db> {
     ) -> Ty<'db> {
         let db = self.db;
         let header = type_header(db, self.program, item);
-        let is_tag = header.kind == HeaderKind::Nominal
-            && matches!(
-                crate::def::type_def(db, self.program, item).kind,
-                crate::def::TypeDefKind::Tag
-            );
-        if !is_tag {
+        let identity = type_identity(db, self.program, item);
+        let is_value = header.kind == HeaderKind::Nominal
+            && match crate::def::type_def(db, self.program, item).kind {
+                crate::def::TypeDefKind::Tag => true,
+                crate::def::TypeDefKind::Record { .. } => {
+                    let args = vec![self.err_ty(); header.params.len()];
+                    let ty = Ty::new(db, TyKind::Named(identity, args));
+                    fields_of(db, self.program, ty).is_some_and(|f| f.is_empty())
+                }
+                _ => false,
+            };
+        if !is_value {
             self.error(Site::Expr(id), ErrorKind::NotAValue { name });
             return self.err_ty();
         }
-        let identity = type_identity(db, self.program, item);
         if header.params.is_empty() || !args.is_empty() {
             if args.len() != header.params.len() {
                 let kind = ErrorKind::TypeArgCount {

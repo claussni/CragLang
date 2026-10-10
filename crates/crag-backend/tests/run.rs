@@ -974,3 +974,41 @@ fn flips(n: Int) -> Int {
     assert_eq!(m.heap.live_blocks(), 0);
     assert_eq!(m.int("flips", &[5]), -5);
 }
+
+#[test]
+fn unit_records_are_values() {
+    // A record type without fields has one value, written by its name
+    // like a tag's (§3.3).
+    let mut m = Module::new(
+        r#"type Overdrawn(..Error)
+type Done()
+
+fn withdraw(balance: Int, amount: Int) -> Int | Overdrawn {
+  if balance < amount { return Overdrawn }
+  balance - amount
+}
+
+fn left(balance: Int, amount: Int) -> Int {
+  case withdraw(balance, amount) {
+    Overdrawn -> -1
+    n: Int -> n
+  }
+}
+
+fn finish(n: Int) -> Int {
+  let d: Done | Int = if n < 0 { Done } else { n }
+  case d {
+    Done -> 0
+    k: Int -> k
+  }
+}
+"#,
+    );
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    assert_eq!(m.int("left", &[10, 3]), 7);
+    assert_eq!(m.int("left", &[1, 3]), -1);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("finish", &[-4]), 0);
+    assert_eq!(m.int("finish", &[4]), 4);
+    assert_eq!(m.heap.live_blocks(), 0);
+}

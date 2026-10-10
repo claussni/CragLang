@@ -244,6 +244,16 @@ let p = Point(x: 1, y: 2)
 
 Type identity is **name + fields**. Two independent declarations with the same name and the same fields denote the same type; indistinguishable types from different modules merge silently.
 
+A record type that has no fields, its parent's included, is a *unit record*. Like a tag, it has exactly one value, written by its name; `T()` builds the same value. Unlike a tag, it can spread a parent, which is how field-less error and signal types join their family (§8.1, §11.1).
+
+```
+type InsufficientFunds(..Error)
+fn withdraw(a: Account, amount: Int) -> Account | InsufficientFunds {
+  if a.balance < amount { return InsufficientFunds }
+  Account(..a, balance: a.balance - amount)
+}
+```
+
 ### 3.4 Anonymous records
 
 `(x: Int, y: Int)` is an anonymous record type, identified by its fields alone. Field order does not matter for identity. There are no positional tuples; `()` is the unit type.
@@ -3031,6 +3041,7 @@ case r {
 | Trap | A runtime or machine condition (e.g. overflow) that ends the code raising it and travels to the nearest trap handler | §8.3 |
 | Type mapping function | A function that transforms its argument’s type, e.g. `discard` | §8.4 |
 | UFCS | Uniform function call syntax: `x.f(a)` means `f(x, a)` | §6.3 |
+| Unit record | A record type without fields, which like a tag has a single value written by its name, e.g. `type Timeout(..Error)` | §3.3 |
 | Value condition | A `where` clause on a type that every value must satisfy | §3.10.1 |
 
 ## Appendix B Reserved words and standard markers

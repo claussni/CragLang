@@ -649,6 +649,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Some(Resolution::Value { value: Some(v), .. }) => {
                 self.assign(self.ty(expr), Rvalue::Global(*v))
             }
+            // A unit record is built like `T()` (§3.3).
+            Some(Resolution::Type(item))
+                if matches!(
+                    type_def(self.db, self.program, *item).kind,
+                    TypeDefKind::Record { .. }
+                ) =>
+            {
+                self.record_value(Some(expr), self.ty(expr), &[], &[])
+            }
             Some(Resolution::Type(_)) => Operand::Const(Constant::Tag(self.ty(expr))),
             _ => self.trap(TrapKind::Error, Some(expr)),
         }
