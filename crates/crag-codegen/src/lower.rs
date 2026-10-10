@@ -605,6 +605,28 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
                         b.def_var(vars[dst.0 as usize], v);
                     }
                 }
+                Inst::FuncAddr {
+                    dst,
+                    func,
+                    params,
+                    returns,
+                } => {
+                    let callee = imports.crag(&mut b, *func, *params, *returns);
+                    let v = b.ins().func_addr(I64, callee);
+                    b.def_var(vars[dst.0 as usize], v);
+                }
+                Inst::CallIndirect { callee, args, dsts } => {
+                    let sig =
+                        b.import_signature(crag_signature(args.len() as u32, dsts.len() as u32));
+                    let target = b.use_var(vars[callee.0 as usize]);
+                    let mut values = vec![ctx];
+                    values.extend(args.iter().map(|r| b.use_var(vars[r.0 as usize])));
+                    let call = b.ins().call_indirect(sig, target, &values);
+                    let results = b.inst_results(call).to_vec();
+                    for (dst, v) in dsts.iter().zip(results) {
+                        b.def_var(vars[dst.0 as usize], v);
+                    }
+                }
                 Inst::Context { dst } => b.def_var(vars[dst.0 as usize], ctx),
                 Inst::Load { dst, addr, offset } => {
                     let p = b.use_var(vars[addr.0 as usize]);
@@ -671,6 +693,14 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
                 values.extend(args.iter().map(|r| b.use_var(vars[r.0 as usize])));
                 side_pop(&mut b);
                 b.ins().return_call(callee, &values);
+            }
+            Term::TailCallIndirect { callee, args } => {
+                let sig = b.import_signature(crag_signature(args.len() as u32, lir.returns));
+                let target = b.use_var(vars[callee.0 as usize]);
+                let mut values = vec![ctx];
+                values.extend(args.iter().map(|r| b.use_var(vars[r.0 as usize])));
+                side_pop(&mut b);
+                b.ins().return_call_indirect(sig, target, &values);
             }
             Term::Trap { kind, position } => {
                 let conv = isa.default_call_conv();

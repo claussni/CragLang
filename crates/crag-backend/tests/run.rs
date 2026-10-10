@@ -29,13 +29,13 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 
-use crag_abi::{HEADER_SIZE, HEAP_OFFSET, RuntimeFn, TrapKind};
+use crag_abi::{HEADER_SIZE, HEAP_OFFSET, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, TrapKind};
 use crag_backend::{code, type_index};
 use crag_codegen::{CodeObject, CodegenSettings, FuncId, OptLevel, compile_entry_stub, target_for};
 use crag_db::RootDatabase;
 use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, lower_body, owners};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
-use crag_mir::{InstanceKey, Tier};
+use crag_mir::{Entry, InstanceKey, Tier};
 use crag_runtime::{
     CodeMap, Fiber, FiberConfig, FiberState, Heap, Trap, Types, Worker, alloc_box, list, map,
     release_box,
@@ -214,24 +214,44 @@ impl Module {
         let mut names = Vec::new();
         let mut unsupported = Vec::new();
         let mut types = Vec::new();
+        // The module's functions, then the code of the closures they make.
+        let mut pending = Vec::new();
         for owner in owners(&db, module) {
             let Owner::Item(item) = owner else { continue };
-            if *item.kind(&db) != ItemKind::Function {
+            if *item.kind(&db) == ItemKind::Function {
+                pending.push((Some(item), InstanceKey::body(&db, owner)));
+            }
+        }
+        pending.reverse();
+        let mut seen = Vec::new();
+        while let Some((item, key)) = pending.pop() {
+            if seen.contains(&key) {
                 continue;
             }
-            let key = InstanceKey::new(&db, owner, Vec::new());
+            seen.push(key);
             let compiled = code(&db, program, key, Tier::Baseline)
                 .as_ref()
                 .expect("a function with a body")
                 .as_ref()
                 .expect("Cranelift accepts it");
-            let name = item.name(&db).text(&db).clone();
+            let name = match key.owner(&db) {
+                Owner::Item(owner) => owner.name(&db).text(&db).clone(),
+                Owner::Test(_) => "test".into(),
+            };
             for what in &compiled.unsupported {
                 unsupported.push(format!("{name}: {what}"));
             }
-            names.push((name, compiled.params, compiled.returns));
+            // Each name with the index of its object.
+            if item.is_some() {
+                names.push((name, objects.len(), compiled.params, compiled.returns));
+            }
             types.extend(compiled.types.iter().cloned());
             objects.push((compiled.func, compiled.object.clone()));
+            for &callee in &compiled.calls {
+                if *callee.entry(&db) != Entry::Body {
+                    pending.push((None, callee));
+                }
+            }
         }
         let mut symbols = SymbolTable::new();
         for func in RuntimeFn::ALL {
@@ -263,16 +283,14 @@ impl Module {
         }
         let fiber_functions = names
             .iter()
-            .zip(&fiber_entries)
-            .map(|((name, ..), entry)| (name.clone(), entry.addr()))
+            .map(|(name, i, ..)| (name.clone(), fiber_entries[*i].addr()))
             .collect();
         let mut worker = Worker::new();
         worker.set_types(std::sync::Arc::new(Types::new(types.iter().cloned())));
         worker.set_code_map(std::sync::Arc::new(code_map));
         let functions = names
             .into_iter()
-            .zip(entries)
-            .map(|((name, params, returns), entry)| (name, (entry.addr(), params, returns)))
+            .map(|(name, i, params, returns)| (name, (entries[i].addr(), params, returns)))
             .collect();
         let settings = CodegenSettings {
             target: target_for("x86_64-unknown-linux-gnu").unwrap(),
@@ -300,7 +318,10 @@ impl Module {
         let stub = compile_entry_stub(params, returns, &self.settings).unwrap();
         let stub = load(&mut self.arena, &self.symbols, &stub).unwrap();
         // The stack limit, the side stack's pointer and end, then the heap.
+        let mut side = vec![0u64; 1 << 12];
         let mut ctx = [0u64; 8];
+        ctx[SIDE_PTR_OFFSET as usize / 8] = side.as_mut_ptr() as u64;
+        ctx[SIDE_END_OFFSET as usize / 8] = side.as_mut_ptr_range().end as u64;
         ctx[HEAP_OFFSET as usize / 8] = &raw mut *self.heap as u64;
         let mut results = [0u64; 2];
         TYPES.set(&self.types);
@@ -1011,4 +1032,126 @@ fn finish(n: Int) -> Int {
     assert_eq!(m.int("finish", &[-4]), 0);
     assert_eq!(m.int("finish", &[4]), 4);
     assert_eq!(m.heap.live_blocks(), 0);
+}
+
+#[test]
+fn closures_run() {
+    // A closure is its code and an environment of what it captures: on
+    // the side stack when it does not outlive its frame, on the heap when
+    // it escapes or is made in a loop (§11.5.9).
+    let mut m = Module::new(
+        r#"type Cell(n: Int)
+
+fn apply(f: (Int) -> Int, x: Int) -> Int {
+  f(x)
+}
+
+fn shifted(k: Int, x: Int) -> Int {
+  let c = Cell(n: k)
+  apply({ n -> n + c.n }, x)
+}
+
+fn reused(k: Int, x: Int) -> Int {
+  let c = Cell(n: k)
+  apply({ n -> Cell(n: n).n + c.n }, x)
+}
+
+fn adder(k: Int) -> (Int) -> Int {
+  let c = Cell(n: k)
+  { n -> n + c.n }
+}
+
+fn added(k: Int, x: Int) -> Int {
+  let f = adder(k)
+  f(x) + f(x)
+}
+
+fn sumTo(n: Int, step: Int) -> Int {
+  fn go(m: Int) -> Int {
+    if m < 1 { 0 } else { m + go(m - step) }
+  }
+  go(n)
+}
+
+fn neg(n: Int) -> Int {
+  0 - n
+}
+
+fn negated(x: Int) -> Int {
+  apply(neg, x)
+}
+
+fn both(f: (Int, Int) -> Int, x: Int) -> Int {
+  f(x, x)
+}
+
+fn doubled(x: Int) -> Int {
+  both(add, x)
+}
+
+fn nested(a: Int, x: Int) -> Int {
+  let c = Cell(n: a)
+  apply({ n -> apply({ m -> m + c.n }, n) * 2 }, x)
+}
+
+fn composed(x: Int) -> Int {
+  let fs = [adder(1), adder(10)]
+  var total = x
+  for f in fs {
+    total = f(total)
+  }
+  total
+}
+
+fn looped(n: Int) -> Int {
+  var total = 0
+  for i in 1..n {
+    let c = Cell(n: i)
+    total = apply({ m -> m + c.n }, total)
+  }
+  total
+}
+
+fn minus(a: Int, b: Int) -> Int {
+  a - b
+}
+
+fn partial(x: Int) -> Int {
+  apply(minus(_, 1), x)
+}
+
+fn forward(k: Int, x: Int) -> Int {
+  let f = adder(k)
+  f(x)
+}
+"#,
+    );
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    assert_eq!(m.int("shifted", &[5, 3]), 8);
+    assert_eq!(m.heap.live_blocks(), 0);
+    // The captured cell lives while the closure does, so the cell made
+    // inside it is another.
+    assert_eq!(m.int("reused", &[5, 3]), 8);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("added", &[5, 3]), 16);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("sumTo", &[10, 3]), 22);
+    assert_eq!(m.int("negated", &[4]), -4);
+    assert_eq!(m.int("doubled", &[21]), 42);
+    assert_eq!(m.int("nested", &[3, 4]), 14);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("composed", &[0]), 11);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("looped", &[4]), 10);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("partial", &[8]), 7);
+    assert_eq!(m.int("forward", &[2, 3]), 5);
+    assert_eq!(m.heap.live_blocks(), 0);
+    // A trap in a closure releases the environments the frames hold.
+    let trap = m.run("added", &[1, i64::MAX]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::Overflow);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+    let trap = m.run("shifted", &[1, i64::MAX]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::Overflow);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
 }

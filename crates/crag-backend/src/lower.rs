@@ -24,6 +24,11 @@
 //! or map is allocated inline too; the runtime grows it and finds its
 //! elements.
 //!
+//! A function value is the address of its code and its environment. The
+//! code takes the environment before the arguments, and a call goes
+//! through the address. An environment is a box on the heap, or on the
+//! side stack with a static count, so that counting it does nothing.
+//!
 //! What code generation does not handle yet, such as strings, ends its
 //! block with a trap and is listed.
 
@@ -31,7 +36,7 @@ use std::ops::Range;
 
 use crag_abi::{
     COUNT_OFFSET, HEAP_OFFSET, LEN_OFFSET, LIST_SIZE, MAP_SIZE, PAGE_FREE_OFFSET, PAGE_USED_OFFSET,
-    TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TypeDescriptor, size_class,
+    STATIC_COUNT, TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TypeDescriptor, size_class,
 };
 use crag_codegen::{
     BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, Cond, FuncId, Inst, LirFunction,
@@ -41,8 +46,8 @@ use crag_db::Db;
 use crag_db::plumbing::AsId;
 use crag_hir::{Owner, Program, hir_body, lower_body};
 use crag_mir::{
-    BinOp, BlockId, CmpOp, Constant, InstanceKey, Local, MirBody, Operand, Place, Rvalue,
-    Statement, Terminator, TrapKind,
+    BinOp, BlockId, ClosurePlacement, CmpOp, Constant, InstanceKey, Local, MirBody, Operand, Place,
+    Rvalue, Statement, Terminator, TrapKind,
 };
 use crag_types::{Builtin, Step, Ty, TyKind, prelude_item, signature};
 
@@ -97,12 +102,18 @@ pub fn lower_to_lir<'db>(
         true_index: named("True").map_or(-1, type_index),
         false_index: named("False").map_or(-1, type_index),
     };
-    for decl in &mir.locals {
+    for (i, decl) in mir.locals.iter().enumerate() {
         let layout = layout(db, program, decl.ty);
-        let words = layout.map_or(0, Layout::words);
+        let mut words = layout.map_or(0, Layout::words);
+        // An environment is passed as a word even when it holds nothing.
+        if i == 0 && mir.env {
+            words = words.max(1);
+        }
         let regs: Vec<VReg> = (0..words).map(|_| l.reg()).collect();
-        if layout == Some(Layout::Box) {
-            l.tracked.extend(&regs);
+        match layout {
+            Some(Layout::Box) => l.tracked.extend(&regs),
+            Some(Layout::Closure) => l.tracked.push(regs[1]),
+            _ => {}
         }
         l.locals.push(regs);
         l.layouts.push(layout);
@@ -335,7 +346,22 @@ impl<'a, 'db> Lower<'a, 'db> {
                 self.end(Term::Jump(done), Some(done));
                 Ok(())
             }
-            Some(Layout::Pair) => Err("strings, bytes and closures"),
+            // A function value without an environment has a null one.
+            Some(Layout::Closure) => {
+                let (call, done) = (self.new_block(), self.new_block());
+                self.end(
+                    Term::Branch {
+                        cond: regs[1],
+                        then: call,
+                        otherwise: done,
+                    },
+                    Some(call),
+                );
+                op(self, regs[1]);
+                self.end(Term::Jump(done), Some(done));
+                Ok(())
+            }
+            Some(Layout::Pair) => Err("strings and bytes"),
             _ => Ok(()),
         }
     }
@@ -643,7 +669,109 @@ impl<'a, 'db> Lower<'a, 'db> {
             }
             Rvalue::Concat(_) => Err("strings and bytes"),
             Rvalue::Global(_) => Err("module-level values"),
+            Rvalue::Closure {
+                code,
+                env,
+                captures,
+                placement,
+            } => {
+                let addr = self.code_addr(*code, ty)?;
+                if captures.is_empty() {
+                    return Ok(vec![addr, self.constant(0)]);
+                }
+                let (slots, size) =
+                    record_layout(self.db, self.program, *env).ok_or("captures of this type")?;
+                let mut values = Vec::new();
+                for (i, op) in captures.iter().enumerate() {
+                    let name = i.to_string();
+                    let slot = slots
+                        .iter()
+                        .find(|s| *s.name.text(self.db) == name)
+                        .ok_or("captures of this type")?;
+                    values.push((slot.offset, self.operand(op, slot.ty)?));
+                }
+                let index = type_index(*env);
+                let ptr = match placement {
+                    ClosurePlacement::Heap => {
+                        self.describe(*env)?;
+                        self.alloc(size, index)
+                    }
+                    ClosurePlacement::SideStack => {
+                        let ptr = self.reg();
+                        self.push(Inst::SidePush {
+                            dst: ptr,
+                            size,
+                            align: 8,
+                        });
+                        let count = self.constant(STATIC_COUNT as i64);
+                        self.push(Inst::Store {
+                            src: count,
+                            addr: ptr,
+                            offset: COUNT_OFFSET,
+                        });
+                        let index = self.constant(index);
+                        self.push(Inst::Store {
+                            src: index,
+                            addr: ptr,
+                            offset: TYPE_INDEX_OFFSET,
+                        });
+                        ptr
+                    }
+                };
+                for (offset, words) in values {
+                    for (k, src) in words.into_iter().enumerate() {
+                        self.push(Inst::Store {
+                            src,
+                            addr: ptr,
+                            offset: (offset + 8 * k as u32) as i32,
+                        });
+                    }
+                }
+                Ok(vec![addr, ptr])
+            }
+            Rvalue::FnValue { code, env } => {
+                let addr = self.code_addr(*code, ty)?;
+                let env = match env {
+                    Operand::Local(l) => self.locals[l.index()].clone(),
+                    Operand::Const(_) => vec![self.constant(0)],
+                };
+                Ok(vec![addr, word(&env)?])
+            }
         }
+    }
+
+    /// The address of a function value's code, of the function type `ty`,
+    /// which is loaded with this function.
+    fn code_addr(&mut self, code: InstanceKey<'db>, ty: Ty<'db>) -> Result<VReg, Unsupported> {
+        let (params, returns) = self.value_words(ty)?;
+        if !self.calls.contains(&code) {
+            self.calls.push(code);
+        }
+        let dst = self.reg();
+        self.push(Inst::FuncAddr {
+            dst,
+            func: func_id(code),
+            params,
+            returns,
+        });
+        Ok(dst)
+    }
+
+    /// The words of the parameters, the environment's included, and of the
+    /// result of a function value's code.
+    fn value_words(&self, ty: Ty<'db>) -> Result<(u32, u32), Unsupported> {
+        let TyKind::Fn { params, result, .. } = ty.kind(self.db) else {
+            return Err("values of this type");
+        };
+        let mut words = 1;
+        for &p in params {
+            words += self.layout_of(p)?.words() as u32;
+        }
+        let returns = self.layout_of(*result)?.words() as u32;
+        if returns > 2 {
+            return Err("types of parameters or results");
+        }
+        Ok((words, returns))
     }
 
     /// The words of the value at a place.
@@ -728,8 +856,8 @@ impl<'a, 'db> Lower<'a, 'db> {
                 {
                     "maps with keys of this type"
                 }
-                Some(_) => "collections holding strings, bytes or closures",
-                None => "records holding strings, bytes or closures",
+                Some(_) => "collections holding strings or bytes",
+                None => "records holding strings or bytes",
             });
         };
         self.types.push((index, descriptor));
@@ -875,8 +1003,32 @@ impl<'a, 'db> Lower<'a, 'db> {
             (Layout::Union, Layout::Imm(_) | Layout::Box) => vec![values[1]],
             (Layout::Union, Layout::Tag) => vec![values[0]],
             (Layout::Union | Layout::Tag, Layout::Zero) => Vec::new(),
+            // A function value fits where one of its type is expected,
+            // or one that is not Pure.
+            (Layout::Closure, Layout::Closure) if self.same_code(from, to) => values,
+            (Layout::Closure, Layout::Closure) => return Err("conversions of function values"),
             _ => return Err("this conversion"),
         })
+    }
+
+    /// Whether values of two function types call the same code: their
+    /// parameters and results are the same, if not whether they are Pure.
+    fn same_code(&self, from: Ty<'db>, to: Ty<'db>) -> bool {
+        match (from.kind(self.db), to.kind(self.db)) {
+            (
+                TyKind::Fn {
+                    params: a,
+                    result: r,
+                    ..
+                },
+                TyKind::Fn {
+                    params: b,
+                    result: q,
+                    ..
+                },
+            ) => a == b && r == q,
+            _ => false,
+        }
     }
 
     /// The member of the union `to` that a value of `from` is tagged
@@ -1060,6 +1212,28 @@ impl<'a, 'db> Lower<'a, 'db> {
                 };
                 self.end(term, None);
             }
+            Terminator::CallValue {
+                callee,
+                args,
+                dst,
+                target,
+                ..
+            } => {
+                let (code, args) = self.value_arguments(callee, args)?;
+                let dsts = self.locals[dst.index()].clone();
+                self.layouts[dst.index()].ok_or("values of this type")?;
+                self.push(Inst::CallIndirect {
+                    callee: code,
+                    args,
+                    dsts,
+                });
+                self.end(Term::Jump(block(*target)), None);
+            }
+            Terminator::TailCallValue { callee, args, .. } => {
+                let (code, args) = self.value_arguments(callee, args)?;
+                let term = Term::TailCallIndirect { callee: code, args };
+                self.end(term, None);
+            }
             Terminator::Return(op) => {
                 let values = self.operand(op, self.mir.result)?;
                 if values.len() != returns {
@@ -1108,6 +1282,29 @@ impl<'a, 'db> Lower<'a, 'db> {
             self.calls.push(func);
         }
         Ok(words)
+    }
+
+    /// The code address of a function value, and the words of a call's
+    /// arguments for it: the environment, then the arguments laid out for
+    /// the value's parameters.
+    fn value_arguments(
+        &mut self,
+        callee: &Operand<'db>,
+        args: &[Operand<'db>],
+    ) -> Result<(VReg, Vec<VReg>), Unsupported> {
+        let fn_ty = self.operand_ty(callee, Ty::error(self.db));
+        let TyKind::Fn { params, .. } = fn_ty.kind(self.db) else {
+            return Err("calls of values of this type");
+        };
+        let value = self.operand(callee, fn_ty)?;
+        let [code, env] = value[..] else {
+            return Err("calls of values of this type");
+        };
+        let mut words = vec![env];
+        for (arg, &param) in args.iter().zip(params) {
+            words.extend(self.operand(arg, param)?);
+        }
+        Ok((code, words))
     }
 
     /// Tests the runtime type of the value at a place, case by case.

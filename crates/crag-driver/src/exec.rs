@@ -24,7 +24,7 @@ use crag_backend::code;
 use crag_codegen::{CodeObject, CodegenSettings, OptLevel, compile_entry_stub, target_for};
 use crag_hir::{ModuleId, Owner};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
-use crag_mir::{InstanceKey, Tier};
+use crag_mir::{Entry, InstanceKey, Tier};
 use crag_runtime::{CodeMap, Fiber, FiberConfig, FiberState, Trap, Types, Worker};
 
 use crate::diagnostics::render_at;
@@ -74,7 +74,13 @@ impl Image {
             }
             seen.push(instance);
             let owner = *instance.owner(db);
-            let name = owner_name(project, owner);
+            let name = match instance.entry(db) {
+                Entry::Body => owner_name(project, owner),
+                Entry::Closure(_) => format!("a closure in {}", owner_name(project, owner)),
+                Entry::Function(_) => {
+                    format!("a function value in {}", owner_name(project, owner))
+                }
+            };
             let compiled = match code(db, program, instance, Tier::Baseline) {
                 Some(Ok(compiled)) => compiled,
                 Some(Err(e)) => return Err(format!("cannot compile {name}: {e}")),

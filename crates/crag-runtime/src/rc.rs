@@ -158,7 +158,8 @@ pub(crate) unsafe fn is_unique(ptr: *mut u8) -> bool {
     unsafe { count(ptr).load(Ordering::Acquire) == 1 }
 }
 
-/// Calls `f` with each box the counted fields at `base` hold.
+/// Calls `f` with each box the counted fields at `base` hold. A box field
+/// may be null: the environment of a function value without one.
 ///
 /// # Safety
 ///
@@ -168,7 +169,12 @@ pub(crate) unsafe fn boxes_in(base: *mut u8, fields: &[CountedField], mut f: imp
         // SAFETY: as the caller promises.
         unsafe {
             match field {
-                CountedField::Box(offset) => f(base.add(*offset as usize).cast::<*mut u8>().read()),
+                CountedField::Box(offset) => {
+                    let ptr = base.add(*offset as usize).cast::<*mut u8>().read();
+                    if !ptr.is_null() {
+                        f(ptr);
+                    }
+                }
                 CountedField::Union { offset, boxed } => {
                     let at = base.add(*offset as usize).cast::<u64>();
                     if boxed.binary_search(&(at.read() as u32)).is_ok() {

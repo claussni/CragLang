@@ -133,6 +133,21 @@ pub enum Inst {
         args: Vec<VReg>,
         dsts: Vec<VReg>,
     },
+    /// `dst` becomes the address of a function with `params` parameters
+    /// and `returns` results, for calls through a register.
+    FuncAddr {
+        dst: VReg,
+        func: FuncId,
+        params: u32,
+        returns: u32,
+    },
+    /// A call of the function whose address `callee` holds, with the Crag
+    /// calling convention; `dsts` receive the results, at most two.
+    CallIndirect {
+        callee: VReg,
+        args: Vec<VReg>,
+        dsts: Vec<VReg>,
+    },
     /// A call of a runtime function with the C calling convention. The task
     /// context goes first, before `args`; `dsts` receive the results, at
     /// most one.
@@ -193,6 +208,11 @@ pub enum Term {
     /// must return as many values as this function.
     TailCall {
         func: FuncId,
+        args: Vec<VReg>,
+    },
+    /// A tail call of the function whose address `callee` holds.
+    TailCallIndirect {
+        callee: VReg,
         args: Vec<VReg>,
     },
     /// Calls `rt_trap`, which does not return, with the source position
@@ -286,6 +306,19 @@ impl LirFunction {
                         }
                         args.iter().chain(dsts).try_for_each(reg)?;
                     }
+                    Inst::FuncAddr { dst, returns, .. } => {
+                        if *returns > 2 {
+                            return Err("a function with more than 2 results".into());
+                        }
+                        reg(dst)?;
+                    }
+                    Inst::CallIndirect { callee, args, dsts } => {
+                        if dsts.len() > 2 {
+                            return Err("a call with more than 2 results".into());
+                        }
+                        reg(callee)?;
+                        args.iter().chain(dsts).try_for_each(reg)?;
+                    }
                     Inst::Load { dst, addr, .. } => {
                         reg(dst)?;
                         reg(addr)?;
@@ -330,6 +363,10 @@ impl LirFunction {
                     values.iter().try_for_each(reg)?;
                 }
                 Term::TailCall { args, .. } => args.iter().try_for_each(reg)?,
+                Term::TailCallIndirect { callee, args } => {
+                    reg(callee)?;
+                    args.iter().try_for_each(reg)?;
+                }
                 Term::Trap { .. } => {}
             }
         }
@@ -349,7 +386,9 @@ impl LirFunction {
         self.blocks
             .iter()
             .filter_map(|b| match &b.term {
-                Term::TailCall { args, .. } => Some(args.len() as u32),
+                Term::TailCall { args, .. } | Term::TailCallIndirect { args, .. } => {
+                    Some(args.len() as u32)
+                }
                 _ => None,
             })
             .max()

@@ -61,6 +61,10 @@ pub struct Escapes {
     /// The level of each closure literal, `lazy` expression and local
     /// function body, by its expression.
     pub closures: Vec<(ExprId, EscapeLevel)>,
+    /// The bindings each of these captures, sorted: those it uses that it
+    /// does not declare, its inner frames' included, which closure
+    /// conversion puts into its environment (§11.5.9).
+    pub captures: Vec<(ExprId, Vec<BindingId>)>,
 }
 
 /// The summary of a function without a body: a C function may keep what
@@ -236,10 +240,28 @@ impl<'a, 'db> EscapeWalker<'a, 'db> {
             .map(|&f| (f, self.frame_level(f)))
             .collect();
         closures.sort();
+        let captures = closures
+            .iter()
+            .map(|&(frame, _)| {
+                let mut bindings: Vec<BindingId> = self
+                    .captures
+                    .get(&frame)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .collect();
+                bindings.sort();
+                (frame, bindings)
+            })
+            .collect();
         let mut seen = HashSet::new();
         errors.retain(|e| seen.insert((e.site, format!("{:?}", e.kind))));
         Walked {
-            escapes: Escapes { params, closures },
+            escapes: Escapes {
+                params,
+                closures,
+                captures,
+            },
             errors,
         }
     }

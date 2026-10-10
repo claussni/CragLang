@@ -323,7 +323,7 @@ pub enum TypeDescriptor {
 /// A field of a box that may hold a reference.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CountedField {
-    /// A box pointer at this offset.
+    /// A box pointer at this offset, or null.
     Box(u32),
     /// A union at this offset: its type index, then its payload, which is a
     /// box pointer when the index is one of `boxed`, sorted.

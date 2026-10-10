@@ -31,24 +31,55 @@ mod ir;
 mod liveness;
 
 use crag_db::Db;
-use crag_hir::{Owner, Program};
+use crag_hir::{ExprId, Owner, Program};
 use crag_types::Ty;
 
+pub use build::place;
 pub use checks::insert_overflow_checks;
 pub use ir::{
-    BinOp, Block, BlockId, CmpOp, Constant, Local, LocalDecl, MirBody, Operand, Place, Rvalue,
-    Statement, Terminator, TrapKind,
+    BinOp, Block, BlockId, ClosurePlacement, CmpOp, Constant, Local, LocalDecl, MirBody, Operand,
+    Place, Rvalue, Statement, Terminator, TrapKind,
 };
 pub use liveness::{Liveness, compute_liveness, insert_drops, insert_rc_ops};
 
-/// A function, test or module-level value with concrete type arguments:
-/// what code is generated for. Until monomorphization (§11.5.10) the
-/// arguments are empty.
+/// A function, test or module-level value with concrete type arguments,
+/// or the code of a closure in one: what code is generated for. Until
+/// monomorphization (§11.5.10) the arguments are empty.
 #[crag_db::interned(debug)]
 pub struct InstanceKey<'db> {
     pub owner: Owner<'db>,
     #[returns(ref)]
     pub args: Vec<Ty<'db>>,
+    pub entry: Entry,
+}
+
+impl<'db> InstanceKey<'db> {
+    /// The body of an owner itself.
+    pub fn body(db: &'db dyn Db, owner: Owner<'db>) -> InstanceKey<'db> {
+        InstanceKey::new(db, owner, Vec::new(), Entry::Body)
+    }
+}
+
+/// Which code of an owner an instance is (§11.5.9). Every entry but the
+/// body is called as a function value: its first parameter is the
+/// environment, a box or null.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
+pub enum Entry {
+    Body,
+    /// A closure literal or `lazy` expression, or the body of a local
+    /// function, by its expression.
+    Closure(ExprId),
+    /// A declared function used as a value, by the expression that names
+    /// it: it calls the function with its arguments, split by the members
+    /// of union parameters when the value is lifted (§11.5.5).
+    Function(ExprId),
+}
+
+impl Entry {
+    /// Whether the code takes an environment first.
+    pub fn takes_env(self) -> bool {
+        self != Entry::Body
+    }
 }
 
 /// How code is compiled (Compiler Architecture §5). The optimizing and
@@ -68,7 +99,7 @@ pub fn mir<'db>(
     tier: Tier,
 ) -> Option<MirBody<'db>> {
     let Tier::Baseline = tier;
-    let mut body = build::build(db, program, *instance.owner(db))?;
+    let mut body = build::build(db, program, *instance.owner(db), *instance.entry(db))?;
     insert_overflow_checks(&mut body);
     let live = compute_liveness(&body);
     insert_rc_ops(&mut body, &live);

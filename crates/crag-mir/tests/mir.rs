@@ -16,7 +16,7 @@
 
 use crag_db::RootDatabase;
 use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, owners};
-use crag_mir::{InstanceKey, Tier, mir};
+use crag_mir::{Entry, InstanceKey, Rvalue, Statement, Tier, mir};
 
 const PRELUDE: &str = r#"pub type Int
 pub type Int8
@@ -73,15 +73,52 @@ fn mir_of(text: &str) -> String {
         for error in &crag_hir::lower_body(&db, program, owner).errors {
             out += &format!("error: {error:?}\n");
         }
-        let key = InstanceKey::new(&db, owner, Vec::new());
-        if let Some(body) = mir(&db, program, key, Tier::Baseline) {
+        // The body, then the code of the closures it makes, each once.
+        let mut pending = vec![(name, InstanceKey::body(&db, owner))];
+        let mut seen = Vec::new();
+        while let Some((name, key)) = pending.pop() {
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            let Some(body) = mir(&db, program, key, Tier::Baseline) else {
+                continue;
+            };
             out += &format!("{name}\n{}", body.pretty(&db));
             for (_, what) in &body.unsupported {
                 out += &format!("unsupported: {what}\n");
             }
+            let mut codes = Vec::new();
+            for block in &body.blocks {
+                for statement in &block.statements {
+                    if let Statement::Assign(
+                        _,
+                        Rvalue::Closure { code, .. } | Rvalue::FnValue { code, .. },
+                    ) = statement
+                    {
+                        codes.push(*code);
+                    }
+                }
+            }
+            for code in codes.into_iter().rev() {
+                let label = match code.entry(&db) {
+                    Entry::Closure(e) | Entry::Function(e) => {
+                        format!("{}#{}", key_name(&db, code), e.index())
+                    }
+                    Entry::Body => key_name(&db, code),
+                };
+                pending.push((label, code));
+            }
         }
     }
     out
+}
+
+fn key_name(db: &RootDatabase, key: InstanceKey<'_>) -> String {
+    match key.owner(db) {
+        Owner::Item(item) => item.name(db).text(db).clone(),
+        Owner::Test(test) => format!("test {}", test.label(db)),
+    }
 }
 
 fn check(text: &str, expected: &str) {
@@ -609,9 +646,10 @@ bb3:
 #[test]
 fn what_cannot_run_traps() {
     check(
-        r#"fn closure(n: Int) -> Int {
-  let f = { x: Int -> x }
-  n
+        r#"fn reads(n: Int) -> Int {
+  var total = n
+  let f = { -> total }
+  f()
 }
 
 fn wrong() -> Int {
@@ -623,17 +661,245 @@ fn hole() -> Int {
 }
 "#,
         r#"error: expected Int, found Str
-closure
+reads
 param _0: Int (n)
+let _1: Int (total)
 bb0:
+  _1 = _0
   trap unsupported
-unsupported: closures
+unsupported: closures capturing a `var`
 wrong
 bb0:
   trap error
 hole
 bb0:
   trap hole
+"#,
+    );
+}
+
+/// A closure is a function value: the code of its body, which reads the
+/// captured values out of its environment, and the environment. One that
+/// does not outlive its frame borrows what it captures from the side
+/// stack, so `xs` lives until `apply` returns, and a tail call is then a
+/// plain call; an escaping one takes its captures to the heap. A local
+/// function calls itself through its own environment, and a declared
+/// function used as a value gets code that calls it.
+#[test]
+fn closures_capture_into_environments() {
+    check(
+        r#"fn apply(f: (Int) -> Int, x: Int) -> Int {
+  f(x)
+}
+
+fn shift(xs: Str, k: Int) -> Int {
+  apply({ n -> n + k + size(xs) }, 1)
+}
+
+fn twice(n: Int) -> Int {
+  fn go(m: Int) -> Int {
+    if m == 0 { 0 } else { go(m - 1) + n }
+  }
+  go(2)
+}
+
+fn named() -> Int {
+  apply(negate, 3)
+}
+
+type Cell(n: Int)
+
+fn adder(k: Int) -> (Int) -> Int {
+  let c = Cell(n: k)
+  { n -> n + c.n }
+}
+
+fn added(k: Int, x: Int) -> Int {
+  let f = adder(k)
+  f(x) + f(x)
+}
+
+fn negate(n: Int) -> Int {
+  0 - n
+}
+"#,
+        r#"apply
+param _0: (Int) -> Int (f)
+param _1: Int (x)
+bb0:
+  tail call value _0(_1)
+shift
+param _0: Str (xs)
+param _1: Int (k)
+let _2: (Int) -> Int is Pure
+let _3: (Int) -> Int
+let _4: Int
+bb0:
+  _2 = closure shift#11 side(_0, _1)
+  _3 = convert _2
+  _4 = call apply(_3, 1) -> bb1
+bb1:
+  release _0
+  return _4
+shift#11
+param _0: (0: Str, 1: Int)
+param _1: Int (n)
+let _2: Str (xs)
+let _3: Int (k)
+let _4: Int
+let _5: Int
+let _6: Int
+let _7: False | True
+let _8: False | True
+bb0:
+  _2 = _0.0
+  retain _2
+  _3 = _0.1
+  release _0
+  _7 = overflows Int.add(_1, _3)
+  branch _7 bb2 bb3
+bb1:
+  _8 = overflows Int.add(_4, _5)
+  branch _8 bb4 bb5
+bb2:
+  release _2
+  trap overflow
+bb3:
+  _4 = Int.add(_1, _3)
+  _5 = call size(_2) -> bb1
+bb4:
+  trap overflow
+bb5:
+  _6 = Int.add(_4, _5)
+  return _6
+twice
+param _0: Int (n)
+let _1: (Int) -> Int (go)
+let _2: (Int) -> Int
+let _3: Int
+bb0:
+  _2 = closure twice#17 side(_0)
+  _1 = _2
+  _3 = call value _1(2) -> bb1
+bb1:
+  return _3
+twice#17
+param _0: (0: Int)
+param _1: Int (m)
+let _2: Int (n)
+let _3: (Int) -> Int (go)
+let _4: False | True
+let _5: Int
+let _6: Int
+let _7: Int
+let _8: False | True
+let _9: False | True
+bb0:
+  _2 = _0.0
+  _3 = closure twice#17 with _0
+  _4 = Int.eq(_1, 0)
+  branch _4 bb1 bb2
+bb1:
+  release _3
+  return 0
+bb2:
+  _8 = overflows Int.sub(_1, 1)
+  branch _8 bb4 bb5
+bb3:
+  _9 = overflows Int.add(_6, _2)
+  branch _9 bb6 bb7
+bb4:
+  release _3
+  trap overflow
+bb5:
+  _5 = Int.sub(_1, 1)
+  _6 = call value _3(_5) -> bb3
+bb6:
+  trap overflow
+bb7:
+  _7 = Int.add(_6, _2)
+  return _7
+named
+let _0: (Int) -> Int is Pure
+let _1: (Int) -> Int
+bb0:
+  _0 = closure named#1 heap()
+  _1 = convert _0
+  tail call apply(_1, 3)
+named#1
+param _0: ()
+param _1: Int
+bb0:
+  tail call negate(_1)
+adder
+param _0: Int (k)
+let _1: Cell
+let _2: Cell (c)
+let _3: (Int) -> Int is Pure
+let _4: (Int) -> Int
+bb0:
+  _1 = Cell(n: _0)
+  _2 = _1
+  _3 = closure adder#9 heap(_2)
+  _4 = convert _3
+  return _4
+adder#9
+param _0: (0: Cell)
+param _1: Int (n)
+let _2: Cell (c)
+let _3: Int
+let _4: Int
+let _5: False | True
+bb0:
+  _2 = _0.0
+  retain _2
+  release _0
+  _3 = _2.n
+  release _2
+  _5 = overflows Int.add(_1, _3)
+  branch _5 bb1 bb2
+bb1:
+  trap overflow
+bb2:
+  _4 = Int.add(_1, _3)
+  return _4
+added
+param _0: Int (k)
+param _1: Int (x)
+let _2: (Int) -> Int
+let _3: (Int) -> Int (f)
+let _4: Int
+let _5: Int
+let _6: Int
+let _7: False | True
+bb0:
+  _2 = call adder(_0) -> bb1
+bb1:
+  _3 = _2
+  retain _3
+  _4 = call value _3(_1) -> bb2
+bb2:
+  _5 = call value _3(_1) -> bb3
+bb3:
+  _7 = overflows Int.add(_4, _5)
+  branch _7 bb4 bb5
+bb4:
+  trap overflow
+bb5:
+  _6 = Int.add(_4, _5)
+  return _6
+negate
+param _0: Int (n)
+let _1: Int
+let _2: False | True
+bb0:
+  _2 = overflows Int.sub(0, _0)
+  branch _2 bb1 bb2
+bb1:
+  trap overflow
+bb2:
+  _1 = Int.sub(0, _0)
+  return _1
 "#,
     );
 }

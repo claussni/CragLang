@@ -23,29 +23,43 @@
 //! until `insert_overflow_checks` makes it explicit. Where a value meets a
 //! type it fits but is not, such as a member passed for a union, a
 //! conversion is explicit too.
+//!
+//! A closure becomes a function value: the code of its body, an instance
+//! of its owner, and an environment record of what it captures (§11.5.9).
+//! The code takes the environment first and reads the captured values out
+//! of it. The environment of a closure that does not outlive its frame
+//! goes on the side stack and borrows what it captures; any other goes on
+//! the heap. A local function is a closure with a name, and a declared
+//! function used as a value gets code of its own that calls it.
 
 use std::collections::HashMap;
 
 use crag_db::Db;
 use crag_hir::{
-    Arm, BindingId, BindingKind, Body, Expr, ExprId, FieldArg, ItemId, ItemKind, Literal, Owner,
-    PRELUDE, Pat, PatId, Program, Resolution, Stmt, StrPart, hir_body, lower_body,
+    Arm, BindingId, BindingKind, Body, Expr, ExprId, FieldArg, ItemId, ItemKind, Literal, LocalFn,
+    Name, Owner, PRELUDE, Pat, PatId, Program, Resolution, Stmt, StrPart, hir_body, lower_body,
 };
 use crag_types::{
-    Builtin, Callee, DecisionTree, Dispatch, InferenceResult, ListLen, Position, Signature, Step,
-    Ty, TyKind, TypeDefKind, Value, body_types, decision_tree, declared_fields, fields_of,
-    literal_value, prelude_item, signature, type_def,
+    Builtin, Callee, DecisionTree, Dispatch, EscapeLevel, InferenceResult, ListLen, Position,
+    Signature, Step, Ty, TyKind, TypeDefKind, Value, body_types, decision_tree, declared_fields,
+    fields_of, literal_value, prelude_item, signature, type_def,
 };
 
-use crate::InstanceKey;
 use crate::ir::{
-    BinOp, Block, BlockId, CmpOp, Constant, Local, LocalDecl, MirBody, Operand, Place, Rvalue,
-    Statement, Terminator, TrapKind,
+    BinOp, Block, BlockId, ClosurePlacement, CmpOp, Constant, Local, LocalDecl, MirBody, Operand,
+    Place, Rvalue, Statement, Terminator, TrapKind,
 };
+use crate::{Entry, InstanceKey};
 
-/// The graph of a function, test or module-level value, before checks and
-/// reference counts are explicit. None for what has no body.
-pub fn build<'db>(db: &'db dyn Db, program: Program, owner: Owner<'db>) -> Option<MirBody<'db>> {
+/// The graph of a function, test or module-level value, or of the code of
+/// a closure in one, before checks and reference counts are explicit. None
+/// for what has no body.
+pub fn build<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    owner: Owner<'db>,
+    entry: Entry,
+) -> Option<MirBody<'db>> {
     if let Owner::Item(item) = owner
         && !matches!(*item.kind(db), ItemKind::Function | ItemKind::Value)
     {
@@ -55,15 +69,43 @@ pub fn build<'db>(db: &'db dyn Db, program: Program, owner: Owner<'db>) -> Optio
     let root = lowered.body.root?;
     let types = body_types(db, program, owner);
     let mut b = MirBuilder::new(db, program, owner, &lowered.body, types);
-    if lowered.errors.is_empty() && types.errors.is_empty() {
-        b.eval(root, Dest::Return);
-    } else {
-        b.terminate(Terminator::Trap {
-            kind: TrapKind::Error,
-            site: None,
-        });
+    let ok = lowered.errors.is_empty() && types.errors.is_empty();
+    let start = match entry {
+        Entry::Body => b.body_entry(root),
+        Entry::Closure(frame) => b.closure_entry(frame),
+        Entry::Function(expr) => b.function_entry(expr),
+    };
+    match start {
+        Some(start) if ok => start(&mut b),
+        _ => {
+            b.terminate(Terminator::Trap {
+                kind: TrapKind::Error,
+                site: None,
+            });
+        }
     }
     Some(b.finish())
+}
+
+/// What a builder does once its parameters are in place.
+type Start<'a, 'db> = Box<dyn FnOnce(&mut MirBuilder<'a, 'db>) + 'a>;
+
+/// Where a closure's environment goes: on the side stack when the closure
+/// does not outlive its frame (§11.5.8), unless it is made in a loop,
+/// which would push one per iteration; on the heap otherwise. Inlining a
+/// closure into a known callee, which needs no environment at all, comes
+/// with the optimizing tier.
+pub fn place(level: EscapeLevel, in_loop: bool) -> ClosurePlacement {
+    match level {
+        EscapeLevel::Local | EscapeLevel::Scoped if !in_loop => ClosurePlacement::SideStack,
+        _ => ClosurePlacement::Heap,
+    }
+}
+
+/// The name of the field of an environment that holds the `i`th captured
+/// value.
+fn capture_name<'db>(db: &'db dyn Db, i: usize) -> Name<'db> {
+    Name::new(db, format!("{i}"))
 }
 
 /// Whether values of a type are reference-counted: everything on the heap.
@@ -144,7 +186,17 @@ pub struct MirBuilder<'a, 'db> {
     bindings: HashMap<BindingId, Local>,
     unsupported: Vec<(ExprId, &'static str)>,
     params: usize,
+    /// Whether local 0 is an environment.
+    env: bool,
     result: Ty<'db>,
+    /// Whether the code is a test's, which gives no value.
+    test: bool,
+    /// The `for` loops around what is being built.
+    loops: u32,
+    /// Whether a closure's environment went on the side stack, which a
+    /// tail call would free: calls in tail position are then plain calls
+    /// until tail calls copy what they pass (§11.5.11).
+    side: bool,
     bool_ty: Ty<'db>,
     true_ty: Ty<'db>,
     false_ty: Ty<'db>,
@@ -178,17 +230,281 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             current: BlockId(0),
             bindings: HashMap::new(),
             unsupported: Vec::new(),
-            params: body.params.len(),
-            result: types.result.unwrap_or_else(|| Ty::unit(db)),
+            params: 0,
+            env: false,
+            result: Ty::unit(db),
+            test: false,
+            loops: 0,
+            side: false,
             bool_ty,
             true_ty,
             false_ty,
         };
-        for param in &body.params {
-            b.binding(param.binding);
-        }
         b.current = b.new_block();
         b
+    }
+
+    // Entries: each makes the parameters and says how the code goes on.
+
+    /// The body of the owner itself.
+    fn body_entry(&mut self, root: ExprId) -> Option<Start<'a, 'db>> {
+        let body = self.body;
+        for param in &body.params {
+            self.binding(param.binding);
+        }
+        self.params = body.params.len();
+        self.test = self.types.result.is_none();
+        self.result = self.types.result.unwrap_or_else(|| Ty::unit(self.db));
+        Some(Box::new(move |b| b.eval(root, Dest::Return)))
+    }
+
+    /// The code of a closure literal or a local function: the environment
+    /// and the parameters, then the captured values read out of it.
+    fn closure_entry(&mut self, frame: ExprId) -> Option<Start<'a, 'db>> {
+        let db = self.db;
+        let body = self.body;
+        let local_fn = local_fn_of(body, frame);
+        let own = local_fn.map(|(binding, _)| binding);
+        let ty = match local_fn {
+            Some((binding, _)) => self.types.binding(binding)?,
+            None => self.types.expr(frame)?,
+        };
+        let TyKind::Fn {
+            params: param_tys,
+            result,
+            ..
+        } = ty.kind(db)
+        else {
+            return None;
+        };
+        self.result = *result;
+        let (captures, env_ty) = self.environment(frame, own);
+        let env = self.temp(env_ty);
+        self.env = true;
+        // Parameters that are patterns are matched once all are in place.
+        let mut patterns = Vec::new();
+        let inner = match (local_fn, body.expr(frame)) {
+            (Some((_, function)), _) => {
+                for param in &function.params {
+                    self.binding(param.binding);
+                }
+                frame
+            }
+            (
+                None,
+                Expr::Closure {
+                    params,
+                    body: inner,
+                },
+            ) => {
+                for (param, &param_ty) in params.iter().zip(param_tys) {
+                    match body.pat(param.pat) {
+                        Pat::Bind { binding, sub: None } => {
+                            self.binding(*binding);
+                        }
+                        _ => patterns.push((param.pat, self.temp(param_ty), param_ty)),
+                    }
+                }
+                *inner
+            }
+            _ => return None,
+        };
+        self.params = self.locals.len();
+        for (i, &binding) in captures.iter().enumerate() {
+            let local = self.binding(binding);
+            let place = Place {
+                local: env,
+                path: vec![Step::Field(capture_name(db, i))],
+            };
+            self.push(Statement::Assign(local, Rvalue::Read(place)));
+        }
+        // A local function calls itself through its own environment.
+        if let Some(own) = own {
+            let local = self.binding(own);
+            let code = self.closure_code(frame);
+            let value = Rvalue::FnValue {
+                code,
+                env: Operand::Local(env),
+            };
+            self.push(Statement::Assign(local, value));
+        }
+        Some(Box::new(move |b| {
+            for (pat, local, ty) in patterns {
+                b.matched(pat, Operand::Local(local), ty, None);
+            }
+            b.eval(inner, Dest::Return)
+        }))
+    }
+
+    /// The code of a declared function used as a value at `expr`: an empty
+    /// environment and the parameters, then the call, split by the
+    /// members of union parameters when the value is lifted (§11.5.5).
+    fn function_entry(&mut self, expr: ExprId) -> Option<Start<'a, 'db>> {
+        let db = self.db;
+        let ty = self.types.expr(expr)?;
+        let TyKind::Fn { params, result, .. } = ty.kind(db) else {
+            return None;
+        };
+        let callee = self.types.callee(expr)?.clone();
+        self.result = *result;
+        self.temp(Ty::unit(db));
+        self.env = true;
+        let args: Vec<(Local, Ty<'db>)> = params.iter().map(|&t| (self.temp(t), t)).collect();
+        self.params = self.locals.len();
+        Some(Box::new(move |b| match callee {
+            Callee::Function(function) => b.forward(expr, function, &args),
+            Callee::Dispatch(dispatch) => {
+                let positional = vec![expr; args.len()];
+                let functions = match b.dispatch_functions(expr, &dispatch, &positional) {
+                    Ok(functions) => functions,
+                    Err(op) => {
+                        let result = b.result;
+                        return b.finish_dest(op, result, Dest::Return);
+                    }
+                };
+                let dst = b.temp(b.result);
+                let join = b.new_block();
+                b.dispatch_arms(
+                    expr,
+                    &dispatch,
+                    &functions,
+                    &args,
+                    &mut Vec::new(),
+                    dst,
+                    join,
+                );
+                b.switch_to(join);
+                let result = b.result;
+                b.finish_dest(Operand::Local(dst), result, Dest::Return);
+            }
+            _ => {
+                let op = b.unsupported(expr, "generic functions as values");
+                let result = b.result;
+                b.finish_dest(op, result, Dest::Return);
+            }
+        }))
+    }
+
+    /// Calls a declared function with the parameters of a value's code.
+    fn forward(&mut self, expr: ExprId, function: ItemId<'db>, args: &[(Local, Ty<'db>)]) {
+        let db = self.db;
+        let ops: Vec<Operand<'db>> = args.iter().map(|&(l, _)| Operand::Local(l)).collect();
+        let result = self.result;
+        if let Some(primitive) = self.primitive(function) {
+            let op = self.primitive_ops(expr, primitive, result, ops);
+            return self.finish_dest(op, result, Dest::Return);
+        }
+        if crag_hir::c_function(db, function).is_some() {
+            let op = self.unsupported(expr, "calls of C functions");
+            return self.finish_dest(op, result, Dest::Return);
+        }
+        let sig = signature(db, self.program, function);
+        if sig.type_params > 0 {
+            let op = self.unsupported(expr, "generic functions as values");
+            return self.finish_dest(op, result, Dest::Return);
+        }
+        if sig.params.len() != args.len() {
+            let op = self.unsupported(expr, "default arguments");
+            return self.finish_dest(op, result, Dest::Return);
+        }
+        let ops: Vec<Operand<'db>> = args
+            .iter()
+            .zip(&sig.params)
+            .map(|(&(l, ty), p)| self.coerce(Operand::Local(l), ty, p.ty))
+            .collect();
+        let func = InstanceKey::body(db, Owner::Item(function));
+        let ty = sig.result.unwrap_or_else(|| Ty::unit(db));
+        if ty == result {
+            self.terminate(Terminator::TailCall {
+                func,
+                args: ops,
+                site: expr,
+            });
+            return;
+        }
+        let dst = self.temp(ty);
+        let target = self.new_block();
+        self.terminate(Terminator::Call {
+            func,
+            args: ops,
+            dst,
+            target,
+            site: expr,
+        });
+        self.switch_to(target);
+        self.finish_dest(Operand::Local(dst), ty, Dest::Return);
+    }
+
+    /// The bindings a closure's environment holds, all it captures but a
+    /// local function's own name, and the environment's type.
+    fn environment(&self, frame: ExprId, own: Option<BindingId>) -> (Vec<BindingId>, Ty<'db>) {
+        let db = self.db;
+        let captures: Vec<BindingId> = self
+            .types
+            .escapes
+            .captures
+            .iter()
+            .find(|(f, _)| *f == frame)
+            .map(|(_, c)| c.iter().copied().filter(|&b| Some(b) != own).collect())
+            .unwrap_or_default();
+        let fields = captures
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| {
+                let ty = self.types.binding(b).unwrap_or_else(|| Ty::error(db));
+                (capture_name(db, i), ty)
+            })
+            .collect();
+        (captures, Ty::record(db, fields, false))
+    }
+
+    fn closure_code(&self, frame: ExprId) -> InstanceKey<'db> {
+        InstanceKey::new(self.db, self.owner, Vec::new(), Entry::Closure(frame))
+    }
+
+    /// A closure literal or a local function as a value: its code and its
+    /// environment, placed by its escape level.
+    fn closure_value(
+        &mut self,
+        frame: ExprId,
+        ty: Ty<'db>,
+        own: Option<BindingId>,
+    ) -> Operand<'db> {
+        let (captures, env) = self.environment(frame, own);
+        let mut ops = Vec::new();
+        for &binding in &captures {
+            match self.body.binding(binding).kind {
+                // A closure reads a `var` as it is when it runs, which
+                // needs the variable on the side stack.
+                BindingKind::Var => return self.unsupported(frame, "closures capturing a `var`"),
+                BindingKind::Ref | BindingKind::Ext => {
+                    return self.unsupported(frame, "`ref` and `ext` bindings");
+                }
+                _ => {}
+            }
+            ops.push(Operand::Local(self.binding(binding)));
+        }
+        let level = self
+            .types
+            .escapes
+            .closures
+            .iter()
+            .find(|(f, _)| *f == frame)
+            .map_or(EscapeLevel::Escaping, |(_, l)| *l);
+        let placement = place(level, self.loops > 0);
+        if placement == ClosurePlacement::SideStack && !ops.is_empty() {
+            self.side = true;
+        }
+        let code = self.closure_code(frame);
+        self.assign(
+            ty,
+            Rvalue::Closure {
+                code,
+                env,
+                captures: ops,
+                placement,
+            },
+        )
     }
 
     /// Prunes the blocks no path reaches and the locals no block uses, and
@@ -274,6 +590,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         }
         MirBody {
             params: self.params,
+            env: self.env,
             locals,
             blocks,
             result: self.result,
@@ -474,7 +791,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Dest::Value(local) => self.assign_to(local, op, ty),
             Dest::Discard => {}
             // A test gives no value.
-            Dest::Return if self.types.result.is_none() => {
+            Dest::Return if self.test => {
                 self.terminate(Terminator::Return(self.unit()));
             }
             Dest::Return => {
@@ -593,7 +910,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             }
             Expr::Grid(_) => self.unsupported(expr, "grids"),
             Expr::TypeArgs { .. } => self.unsupported(expr, "type arguments"),
-            Expr::Closure { .. } => self.unsupported(expr, "closures"),
+            Expr::Closure { .. } => self.closure_value(expr, ty, None),
             Expr::Pass => self.unsupported(expr, "`pass`"),
             Expr::Atomic(_) => self.unsupported(expr, "`atomic` blocks"),
             Expr::Lazy(_) => self.unsupported(expr, "`lazy`"),
@@ -630,9 +947,6 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         item: Option<&Resolution<'db>>,
     ) -> Operand<'db> {
         if let Some(binding) = local {
-            if self.body.binding(binding).kind == BindingKind::Fn {
-                return self.unsupported(expr, "local functions");
-            }
             // A narrowed binding is read as the member a test found
             // (§3.13.4).
             let local = self.binding(binding);
@@ -642,8 +956,16 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 false => Operand::Local(local),
             };
         }
+        // A function used as a value gets code that calls it.
         if self.is_call(expr) {
-            return self.unsupported(expr, "functions as values");
+            let code = InstanceKey::new(self.db, self.owner, Vec::new(), Entry::Function(expr));
+            let value = Rvalue::Closure {
+                code,
+                env: Ty::unit(self.db),
+                captures: Vec::new(),
+                placement: ClosurePlacement::Heap,
+            };
+            return self.assign(self.ty(expr), value);
         }
         match item {
             Some(Resolution::Value { value: Some(v), .. }) => {
@@ -790,8 +1112,69 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Some(Callee::Instance(_)) => self.unsupported(expr, "calls of generic functions"),
             Some(Callee::Slot(_)) => self.unsupported(expr, "calls through forms"),
             Some(Callee::Dispatch(dispatch)) => self.dispatch(expr, &dispatch, &positional, fields),
-            _ => self.unsupported(expr, "calls of function values"),
+            Some(Callee::Value) => self.call_value(expr, tail),
+            None => self.trap(TrapKind::Error, Some(expr)),
         }
+    }
+
+    /// A call of a function value: a closure, a local function, a
+    /// parameter or a field.
+    fn call_value(&mut self, expr: ExprId, tail: bool) -> Operand<'db> {
+        let db = self.db;
+        let body = self.body;
+        let (callee, fn_ty, args) = match body.expr(expr) {
+            Expr::Call { callee, args, .. } => {
+                let op = self.expr(*callee);
+                (op, self.ty(*callee), args)
+            }
+            Expr::MethodCall {
+                receiver,
+                name,
+                args,
+                ..
+            } => {
+                let local = self.place_of(*receiver);
+                let field = fields_of(db, self.program, self.ty(*receiver))
+                    .and_then(|fs| fs.into_iter().find(|(n, _)| n == name));
+                let Some((_, field_ty)) = field else {
+                    return self.trap(TrapKind::Error, Some(expr));
+                };
+                let place = Place {
+                    local,
+                    path: vec![Step::Field(*name)],
+                };
+                (self.assign(field_ty, Rvalue::Read(place)), field_ty, args)
+            }
+            _ => return self.trap(TrapKind::Error, Some(expr)),
+        };
+        let TyKind::Fn { params, result, .. } = fn_ty.kind(db) else {
+            return self.trap(TrapKind::Error, Some(expr));
+        };
+        let callee = self.typed(callee, fn_ty);
+        let mut ops = Vec::new();
+        for (&arg, &param) in args.iter().zip(params) {
+            let op = self.expr(arg);
+            ops.push(self.coerce(op, self.ty(arg), param));
+        }
+        if tail && *result == self.result && !self.side {
+            self.terminate(Terminator::TailCallValue {
+                callee,
+                args: ops,
+                site: expr,
+            });
+            return self.unit();
+        }
+        let dst = self.temp(*result);
+        let target = self.new_block();
+        self.terminate(Terminator::CallValue {
+            callee,
+            args: ops,
+            dst,
+            target,
+            site: expr,
+        });
+        self.switch_to(target);
+        Operand::Local(dst)
     }
 
     /// A lifted call (§4.6.1): the arguments are evaluated once, then a
@@ -804,28 +1187,13 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         positional: &[ExprId],
         fields: Option<&[FieldArg<'db>]>,
     ) -> Operand<'db> {
-        let db = self.db;
         if fields.is_some_and(|f| !f.is_empty()) {
             return self.unsupported(expr, "lifted calls with named arguments");
         }
-        let mut functions = Vec::new();
-        for arm in &dispatch.arms {
-            match arm.callee {
-                Callee::Function(f) => {
-                    let sig = signature(db, self.program, f);
-                    if sig.type_params > 0 {
-                        return self.unsupported(expr, "calls of generic functions");
-                    }
-                    if sig.params.len() != positional.len() {
-                        return self.unsupported(expr, "default arguments");
-                    }
-                    functions.push(f);
-                }
-                Callee::Instance(_) => return self.unsupported(expr, "calls of generic functions"),
-                Callee::Slot(_) => return self.unsupported(expr, "calls through forms"),
-                _ => return self.trap(TrapKind::Error, Some(expr)),
-            }
-        }
+        let functions = match self.dispatch_functions(expr, dispatch, positional) {
+            Ok(functions) => functions,
+            Err(op) => return op,
+        };
         let args: Vec<(Local, Ty<'db>)> = positional
             .iter()
             .map(|&arg| {
@@ -847,6 +1215,38 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         );
         self.switch_to(join);
         Operand::Local(dst)
+    }
+
+    /// The declared function of each arm of a dispatch, or what stops it
+    /// from being lowered.
+    fn dispatch_functions(
+        &mut self,
+        expr: ExprId,
+        dispatch: &Dispatch<'db>,
+        positional: &[ExprId],
+    ) -> Result<Vec<ItemId<'db>>, Operand<'db>> {
+        let db = self.db;
+        let mut functions = Vec::new();
+        for arm in &dispatch.arms {
+            match arm.callee {
+                Callee::Function(f) => {
+                    let sig = signature(db, self.program, f);
+                    if sig.type_params > 0 {
+                        return Err(self.unsupported(expr, "calls of generic functions"));
+                    }
+                    if sig.params.len() != positional.len() {
+                        return Err(self.unsupported(expr, "default arguments"));
+                    }
+                    functions.push(f);
+                }
+                Callee::Instance(_) => {
+                    return Err(self.unsupported(expr, "calls of generic functions"));
+                }
+                Callee::Slot(_) => return Err(self.unsupported(expr, "calls through forms")),
+                _ => return Err(self.trap(TrapKind::Error, Some(expr))),
+            }
+        }
+        Ok(functions)
     }
 
     /// The switch on the split argument at `indices.len()`, or the call
@@ -906,7 +1306,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let op = match self.primitive(function) {
             Some(primitive) => self.primitive_ops(expr, primitive, result, ops),
             None => {
-                let func = InstanceKey::new(self.db, Owner::Item(function), Vec::new());
+                let func = InstanceKey::body(self.db, Owner::Item(function));
                 let out = self.temp(result);
                 let target = self.new_block();
                 self.terminate(Terminator::Call {
@@ -948,9 +1348,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let Some(args) = self.arguments(sig, positional, fields) else {
             return self.unsupported(expr, "default arguments");
         };
-        let func = InstanceKey::new(db, Owner::Item(function), Vec::new());
+        let func = InstanceKey::body(db, Owner::Item(function));
         let ty = self.ty(expr);
-        if tail && ty == self.result {
+        if tail && ty == self.result && !self.side {
             self.terminate(Terminator::TailCall {
                 func,
                 args,
@@ -1383,7 +1783,11 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 pat,
                 iterable,
                 body,
-            } => self.for_loop(*pat, *iterable, *body),
+            } => {
+                self.loops += 1;
+                self.for_loop(*pat, *iterable, *body);
+                self.loops -= 1;
+            }
             Stmt::Return(Some(e)) => self.eval(*e, Dest::Return),
             Stmt::Return(None) => {
                 let unit = Ty::unit(self.db);
@@ -1395,10 +1799,21 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Stmt::On { handler, .. } => {
                 self.unsupported(*handler, "`on` handlers");
             }
-            Stmt::Fn { function, .. } => {
-                if let Some(e) = function.body {
-                    self.unsupported(e, "local functions");
+            Stmt::Fn { binding, function } => {
+                let Some(root) = function.body else {
+                    return;
+                };
+                if function.generic {
+                    self.unsupported(root, "generic local functions");
+                    return;
                 }
+                let ty = self
+                    .types
+                    .binding(*binding)
+                    .unwrap_or_else(|| Ty::error(self.db));
+                let local = self.binding(*binding);
+                let op = self.closure_value(root, ty, Some(*binding));
+                self.assign_to(local, op, ty);
             }
         }
     }
@@ -1923,6 +2338,19 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             }
         }
     }
+}
+
+/// The local function whose body is `root`, with its name's binding.
+fn local_fn_of<'a>(body: &'a Body<'_>, root: ExprId) -> Option<(BindingId, &'a LocalFn)> {
+    body.exprs.iter().find_map(|expr| match expr {
+        Expr::Block { stmts, .. } => stmts.iter().find_map(|stmt| match stmt {
+            Stmt::Fn { binding, function } if function.body == Some(root) => {
+                Some((*binding, function))
+            }
+            _ => None,
+        }),
+        _ => None,
+    })
 }
 
 fn int<'db>(n: i128) -> Operand<'db> {

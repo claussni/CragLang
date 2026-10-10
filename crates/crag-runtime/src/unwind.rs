@@ -167,8 +167,11 @@ unsafe fn unwind(worker: *mut Worker, mut ret: *const usize, mut fp: usize) -> V
             let sp = ret as usize + 8;
             stack.extend(code.function_at(ret.read()));
             for &offset in code.slots(ret.read()) {
+                // A function value's environment may be null.
                 let ptr = ((sp + offset as usize) as *const *mut u8).read();
-                drop_box(heap, types, ptr);
+                if !ptr.is_null() {
+                    drop_box(heap, types, ptr);
+                }
             }
             if fp == 0 {
                 return stack;

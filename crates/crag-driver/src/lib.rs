@@ -100,7 +100,7 @@ fn run(root: &Path, out: &mut dyn Write) -> Result<u8, String> {
     if !signature(db, program, item).params.is_empty() {
         return Err("`main` takes no parameters; arguments come from `args()`".into());
     }
-    let key = InstanceKey::new(db, Owner::Item(item), Vec::new());
+    let key = InstanceKey::body(db, Owner::Item(item));
     let result = mir(db, program, key, Tier::Baseline)
         .as_ref()
         .ok_or("`main` has no body")?
@@ -172,7 +172,7 @@ pub fn crag_test(root: &Path, filter: Option<&str>, out: &mut dyn Write) -> Test
             let Owner::Test(test) = owner else { continue };
             let label = test.label(db);
             if filter.is_none_or(|f| label.contains(f)) {
-                let key = InstanceKey::new(db, owner, Vec::new());
+                let key = InstanceKey::body(db, owner);
                 tests.push((format!("{} {label}", file.shown), key));
             }
         }

@@ -184,3 +184,33 @@ fn the_command_runs_the_project_in_the_current_directory() {
     let usage = Command::new(crag).arg("build").status().unwrap();
     assert_eq!(usage.code(), Some(2));
 }
+
+#[test]
+fn closures_run_and_trap_where_they_are_written() {
+    let app = r#"fn apply(f: (Int) -> Int, x: Int) -> Int {
+  f(x)
+}
+
+fn main() -> ExitCode {
+  let k = 4
+  ExitCode(code: apply({ n -> n * k }, 3))
+}
+
+test "overflows in a closure" {
+  let big = 4611686018427387904
+  let y = apply({ n -> n * big }, 2)
+}
+"#;
+    let root = project("closures", &[("package.crag", MANIFEST), ("app.crag", app)]);
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 12, "{}", text(out));
+    let mut out = Vec::new();
+    let report = crag_test(&root, None, &mut out);
+    let out = text(out);
+    assert_eq!(report.failed.len(), 1, "{out}");
+    // `apply` calls the closure in tail position, so its frame is gone.
+    assert_eq!(
+        report.failed[0].1,
+        "trap: arithmetic overflow\n  --> app.crag:12:24\n   |\n12 |   let y = apply({ n -> n * big }, 2)\n   |                        ^\n  in a closure in test \"overflows in a closure\"\n  in test \"overflows in a closure\"\n"
+    );
+}

@@ -18,8 +18,9 @@
 //!
 //! A value is zero, one or two words. Unit and tags take none; numbers and
 //! box pointers one. A union is its type index plus a payload word, or the
-//! index alone when every member is a tag, as for `Bool`. Strings, bytes
-//! and closures take two words.
+//! index alone when every member is a tag, as for `Bool`. Strings and
+//! bytes take two words, and so does a function value: the address of its
+//! code and its environment, a box or null (§11.5.9).
 
 use crag_abi::{CountedField, ElementLayout, HEADER_SIZE, TypeDescriptor};
 use crag_db::Db;
@@ -42,8 +43,11 @@ pub enum Layout {
     /// A union: the type index of the value's member, then its payload,
     /// which is zero for a tag.
     Union,
-    /// Two words of a string, bytes or a closure.
+    /// Two words of a string or bytes.
     Pair,
+    /// A function value: its code's address, then its environment, a box
+    /// or null.
+    Closure,
 }
 
 impl Layout {
@@ -51,7 +55,7 @@ impl Layout {
         match self {
             Layout::Zero => 0,
             Layout::Imm(_) | Layout::Box | Layout::Tag => 1,
-            Layout::Union | Layout::Pair => 2,
+            Layout::Union | Layout::Pair | Layout::Closure => 2,
         }
     }
 }
@@ -82,7 +86,7 @@ pub fn layout<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Lay
         TyKind::Record { open: true, .. } => return None,
         TyKind::Record { fields, .. } if fields.is_empty() => Layout::Zero,
         TyKind::Record { .. } => Layout::Box,
-        TyKind::Fn { .. } => Layout::Pair,
+        TyKind::Fn { .. } => Layout::Closure,
         TyKind::Union(members) => {
             let mut tags = true;
             for &m in members {
@@ -203,8 +207,8 @@ pub fn boxed_indices<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Opt
 }
 
 /// The words of a value of `ty` in a collection. None for what has no
-/// layout yet, and for strings, bytes and closures, whose references are
-/// not counted yet.
+/// layout yet, and for strings and bytes, whose references are not
+/// counted yet.
 pub fn element_layout<'db>(
     db: &'db dyn Db,
     program: Program,
@@ -222,6 +226,7 @@ pub fn element_layout<'db>(
             };
             (2, counted)
         }
+        Layout::Closure => (2, vec![CountedField::Box(8)]),
         Layout::Pair => return None,
     };
     Some(ElementLayout { words, counted })
@@ -243,8 +248,8 @@ pub fn equal_by_words<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bo
 /// The descriptor of a record or collection type: for a record the fields
 /// that hold references, which the runtime releases when it frees a box of
 /// the type, and for a collection the layouts of what it holds. None when
-/// a field or an element is a string, bytes or a closure, whose references
-/// are not counted yet, or a map's key is not equal by its words.
+/// a field or an element is a string or bytes, whose references are not
+/// counted yet, or a map's key is not equal by its words.
 pub fn type_descriptor<'db>(
     db: &'db dyn Db,
     program: Program,
@@ -284,6 +289,7 @@ pub fn type_descriptor<'db>(
                     });
                 }
             }
+            Layout::Closure => counted.push(CountedField::Box(slot.offset + 8)),
             Layout::Pair => return None,
             Layout::Zero | Layout::Imm(_) | Layout::Tag => {}
         }

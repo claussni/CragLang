@@ -543,7 +543,7 @@ The test splits the values of a column into constructors that each pattern cover
 
 MIR is the form code generation consumes: a control-flow graph per instance, with every operation explicit. `case` becomes a decision tree that tests each position at most once ([Compiling pattern matching to good decision trees](https://doi.org/10.1145/1411304.1411311)). Reference-count increments and decrements are inserted from a [liveness analysis](https://en.wikipedia.org/wiki/Live-variable_analysis): a value is released right after its last use. Overflow checks and drops become explicit operations. For `Float` a run of operations shares one check of the sticky overflow flag, and division checks for a zero divisor first (Specification §3.1.4).
 
-The builder evaluates each expression into an operand of the current block; `if`, `case`, `and`, `or` and `for` add blocks, and a `for` polls on its back-edge. A call in tail position whose result needs no conversion is a tail call. The operators of the prelude on numbers are operations rather than calls, and a negated literal is a constant, so `Int8.min` can be written. Where a value meets a type it fits but is not, such as a member passed for a union, an explicit conversion changes its representation. A body with type errors traps where it starts. What the builder does not lower yet, such as closures, local functions, default arguments and calls of generic functions, traps where it is reached and is listed in the body.
+The builder evaluates each expression into an operand of the current block; `if`, `case`, `and`, `or` and `for` add blocks, and a `for` polls on its back-edge. A call in tail position whose result needs no conversion is a tail call. The operators of the prelude on numbers are operations rather than calls, and a negated literal is a constant, so `Int8.min` can be written. Where a value meets a type it fits but is not, such as a member passed for a union, an explicit conversion changes its representation. A body with type errors traps where it starts. What the builder does not lower yet, such as `lazy`, default arguments and calls of generic functions, traps where it is reached and is listed in the body. Closures and local functions came with closure conversion (§11.5.9).
 
 Decision trees are built in `crag-types` from the pattern matrix of `case` checking, sharing its constructors. A node tests the first position the first row looks into. A position of several types is first switched on its runtime type, a finer type before the types it is part of; one of a single type is then tested against intervals, literals or list lengths, or, as a record, opened into its fields. A guarded leaf goes on to the rest of the tree when its guard fails. A `let` destructures with the tree of its one pattern, and a typed `let … else` tests the type first.
 
@@ -571,7 +571,7 @@ Code generation translates MIR into the facade's `LirFunction` and has Cranelift
 
 Each local becomes as many registers as its layout has words (Compiler Architecture §11). Numbers are words: narrow integers stay sign- or zero-extended to 64 bits, and a `Float` is a word holding its bits. A box is a pointer to a 16-byte header, the count and then the type index, followed by the fields: the parent's at their own offsets, then the type's own by name. A union is a type index and a payload word, or the index alone when every member is a tag, so a `Bool` is the index of `True` or `False`. The index is that of the member the value belongs to, which may be a parent of the value's own type; a conversion to a wider union retags the members it absorbs. A type index is the interned type's own index for now. A type test compares the index; a test for a record type finer than the static one reads the box's header and compares it with the indices of the program's record types that fit. Overflow tests use Cranelift's overflow flags for 64-bit types and a range check of the exact result for narrower ones.
 
-Boxes are allocated inline from the worker's heap (§11.4.11) and counted inline (§11.4.12); an empty list or map is allocated inline too, and the runtime grows it and finds its elements (§11.4.13). Checks trap through a call of a runtime function the unwinder provides (§11.4.14). The LIR gained what MIR needs: division, bit operations, shifts, unsigned and `Float` comparisons, `Float` arithmetic on the bits, overflow tests, selects, runtime calls and a trap terminator. What code generation does not handle yet, strings, bytes, closures, module-level values and calls of the prelude's builtins, ends its block with a trap and is listed with the code. Stack maps cover the registers holding boxes; line tables wait for MIR to carry positions, and code objects go to the artifact store with the persisted store (§11.9.5). The crate is `crag-backend`.
+Boxes are allocated inline from the worker's heap (§11.4.11) and counted inline (§11.4.12); an empty list or map is allocated inline too, and the runtime grows it and finds its elements (§11.4.13). Checks trap through a call of a runtime function the unwinder provides (§11.4.14). The LIR gained what MIR needs: division, bit operations, shifts, unsigned and `Float` comparisons, `Float` arithmetic on the bits, overflow tests, selects, runtime calls and a trap terminator. What code generation does not handle yet, strings, bytes, module-level values and calls of the prelude's builtins, ends its block with a trap and is listed with the code; function values came with closure conversion (§11.5.9). Stack maps cover the registers holding boxes; line tables wait for MIR to carry positions, and code objects go to the artifact store with the persisted store (§11.9.5). The crate is `crag-backend`.
 
 **Functions**
 
@@ -606,7 +606,7 @@ Crag frees memory by reference counting: every box has a count of references, an
 
 Generated code counts inline. A retain tests the count's sign and adds one atomically; a release tests the sign, subtracts one atomically, and calls `rt_release` when the count was one. For a union, both first test whether the index names a box. `rt_release` switches to the system stack and frees the box there, releasing its fields as the descriptor of its type lists them. A field whose count reaches zero goes on a list of boxes to free, linked through their dead count words, so freeing a long chain is a loop, needs no memory and cannot overflow a stack. The descriptors are data rather than generated drop glue: the runtime never calls back into Crag code (Compiler Architecture §2.1), and glue that runs Crag code at a drop comes with drop handlers and deferred teardown (Specification §13.5).
 
-Code generation describes each record and collection type it allocates or reads: the code of an instance lists the descriptors of those types, and the image indexes them by type index. A worker holds the image's descriptors. A record or collection holding strings, bytes or closures is not compiled yet, because their references are not counted.
+Code generation describes each record and collection type it allocates or reads: the code of an instance lists the descriptors of those types, and the image indexes them by type index. A worker holds the image's descriptors. A record or collection holding strings or bytes is not compiled yet, because their references are not counted. A function value's environment is counted like a box, and a null one is skipped (§11.5.9).
 
 **Data structures**
 
@@ -780,7 +780,7 @@ When no candidate accepts a call's arguments but one accepts each combination of
 
 An overloaded name used as a value whose expected function type has union parameters is lifted the same way, so `shapes.map(area)` works: a function name passed where the parameter's type chooses or instantiates it waits for that type, like a closure (§11.5.3).
 
-The call records a `Dispatch`. MIR evaluates the arguments once and switches on the tag of each split argument in turn; each arm converts the arguments to their members and calls its function, which may be a primitive operation, and the result is converted to the union. Arms that call instances or slots wait for monomorphization (§11.5.10), and lifted function values for closure conversion (§11.5.9).
+The call records a `Dispatch`. MIR evaluates the arguments once and switches on the tag of each split argument in turn; each arm converts the arguments to their members and calls its function, which may be a primitive operation, and the result is converted to the union. Arms that call instances or slots wait for monomorphization (§11.5.10). A lifted function value gets code of its own that dispatches so (§11.5.9).
 
 **Data structures**
 
@@ -838,7 +838,7 @@ Bindings-only values are the `ref` and `ext` cells, values of the types `Ref[T]`
 **Data structures**
 
 - `EscapeLevel` — Local, Scoped or Escaping, ordered.
-- `Escapes` — the levels of a body's parameters, its summary, and of its frames, which closure conversion places (§11.5.9).
+- `Escapes` — the levels of a body's parameters, its summary, and of its frames, with the bindings each frame captures, which closure conversion places and puts into environments (§11.5.9).
 - `BindingsOnly` — a ref, an `ext` cell, a closure or a `lazy` value, in the error that names it.
 
 **Functions**
@@ -848,17 +848,27 @@ Bindings-only values are the `ref` and `ext` cells, values of the types `Ref[T]`
 
 #### 11.5.9 Closure conversion
 
-A closure is code plus the values it captured. Conversion turns each closure into an environment record (the captured values) and a pointer to a function that takes the record as an extra argument. Where the record lives follows from the escape level: nowhere if the call is inlined, on the side stack if Local or Scoped, on the heap with a reference count if Escaping.
+A closure is code plus the values it captured. Conversion turns each closure into an environment record of the captured values and a function, its code, that takes the environment as its first argument. A function value is two words: the address of the code and the environment, a box or null when nothing is captured (Compiler Architecture §11). Calling one passes its environment, then the arguments, to its code, through the address.
+
+The code of a closure is an instance of the body that holds it, keyed by the closure's expression. It takes the environment and the closure's parameters, matching those written as patterns, and reads each captured value out of the environment into the binding's own local, so the body is built like any other. Escape analysis gives the bindings each closure captures, its inner closures' included, so a nested closure finds what it captures among its parent's locals. A local function is a closure with a name: its code binds that name to itself with the environment it was called with, so it calls itself without capturing itself and without a cycle of counts. A declared function used as a value, a primitive operation of the prelude included, gets code of its own at the expression that names it, which takes an empty environment and calls the function; a lifted value's code splits its arguments as a lifted call does (§11.5.5).
+
+Where the environment lives follows from the closure's escape level. A Local or Scoped closure's environment goes on the side stack, where it is freed when its frame returns; its header has the static count, so counting it does nothing, and it borrows what it captures, which liveness keeps alive as long as the closure and every copy of it are. An Escaping closure's environment is a box on the heap that holds a reference to each captured value and is released like any box, so a closure stored in a record or a list is counted with it. A closure made inside a loop also goes on the heap, because the side stack would grow by one environment per iteration until the function returns. A trap releases the environments the frames hold; the unwinder skips null ones and the static count those on the side stack.
+
+Until tail calls copy side-stack closures into the callee's frame (§11.5.11), a call in tail position is a plain call in a function that has put an environment on the side stack, since the tail call would free it. A closure that captures a `var` is not lowered yet: it must read the variable as it is when the closure runs, so the variable has to move to the side stack (Compiler Architecture §8). Inlining a closure into a known callee, which needs no environment at all, comes with the MIR optimizer (§11.10.1). A function value that converts to a function type with other parameter or result types, which needs code that converts the values, is not compiled yet; one that is Pure fits a function type that is not, as it is.
 
 **Data structures**
 
-- `ClosureEnv` — a generated record type per closure literal.
-- `ClosurePlacement` — Inline, SideStack or Heap.
+- `Entry` — which code of an owner an instance is: its body, a closure's code by the closure's expression, or a declared function's code as a value by the expression that names it. Every entry but the body takes an environment first.
+- `ClosurePlacement` — SideStack or Heap.
+- `Rvalue::Closure` — a function value: its code, its environment's type, a record whose fields are named by position, and the captured values; `Rvalue::FnValue` — one of its code with an environment it has, which is how a local function names itself.
+- `Terminator::CallValue` and `Terminator::TailCallValue` — calls of a function value.
+- `Liveness::holds` — the locals each local borrows through the side-stack closures it may hold.
+- `Layout::Closure` — the two words of a function value; `Inst::FuncAddr`, `Inst::CallIndirect` and `Term::TailCallIndirect` in the LIR.
 
 **Functions**
 
-- `fn convert_closure(b: &mut MirBuilder, closure: ExprId, placement: ClosurePlacement) -> (TypeId, InstanceKey)` — returns the environment type and the code function.
-- `fn place(level: EscapeLevel, callee_known: bool) -> ClosurePlacement`.
+- `fn place(level: EscapeLevel, in_loop: bool) -> ClosurePlacement`.
+- `MirBuilder::closure_value(frame, ty, own)` — the closure's environment and value where it is made; `MirBuilder::closure_entry(frame)` and `MirBuilder::function_entry(expr)` — the parameters and start of a closure's code and of a function's code as a value.
 
 #### 11.5.10 Monomorphization
 
@@ -881,7 +891,7 @@ A call in tail position must not grow the stack (§5.6.3). Before the jump, the 
 
 **Functions**
 
-- `fn lower_tail_call(b: &mut MirBuilder, call: ExprId)` — releases, copies side-stack arguments, pops the side-stack mark, emits Cranelift's `return_call`.
+- `fn lower_tail_call(b: &mut MirBuilder, call: ExprId)` — releases, copies side-stack arguments, pops the side-stack mark, emits Cranelift's `return_call`. Until it does, a function that puts a closure's environment on the side stack makes no tail calls (§11.5.9).
 
 ### 11.6 M3 components
 

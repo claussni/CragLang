@@ -25,7 +25,7 @@ use crag_db::Db;
 use crag_hir::{BindingId, ExprId, ItemId, Name, Owner};
 use crag_types::{Builtin, Step, Ty, TyKind};
 
-use crate::InstanceKey;
+use crate::{Entry, InstanceKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, crag_db::SalsaValue)]
 pub struct Local(pub u32);
@@ -51,6 +51,9 @@ impl BlockId {
 pub struct MirBody<'db> {
     /// Locals `0..params` hold the parameters on entry.
     pub params: usize,
+    /// Whether the code is called as a function value, so that local 0 is
+    /// its environment: one word, a box or null (§11.5.9).
+    pub env: bool,
     pub locals: Vec<LocalDecl<'db>>,
     pub blocks: Vec<Block<'db>>,
     pub result: Ty<'db>,
@@ -200,6 +203,33 @@ pub enum Rvalue<'db> {
     },
     /// The value of a module-level `let`.
     Global(ItemId<'db>),
+    /// A function value: the code, and an environment of type `env`, a
+    /// record of the captured values in its order, or null when there are
+    /// none (§11.5.9). On the side stack the environment borrows the
+    /// captured locals, which stay live while the value does; on the heap
+    /// it takes their references.
+    Closure {
+        code: InstanceKey<'db>,
+        env: Ty<'db>,
+        captures: Vec<Operand<'db>>,
+        placement: ClosurePlacement,
+    },
+    /// A function value of the code with an environment it already has:
+    /// how a local function names itself.
+    FnValue {
+        code: InstanceKey<'db>,
+        env: Operand<'db>,
+    },
+}
+
+/// Where a closure's environment lives, by its escape level (§11.5.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
+pub enum ClosurePlacement {
+    /// In the frame's part of the side stack, uncounted, for a closure
+    /// that does not outlive the frame.
+    SideStack,
+    /// In a counted box.
+    Heap,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -260,6 +290,20 @@ pub enum Terminator<'db> {
         args: Vec<Operand<'db>>,
         site: ExprId,
     },
+    /// A call of a function value, which goes with its environment, before
+    /// the arguments, to its code.
+    CallValue {
+        callee: Operand<'db>,
+        args: Vec<Operand<'db>>,
+        dst: Local,
+        target: BlockId,
+        site: ExprId,
+    },
+    TailCallValue {
+        callee: Operand<'db>,
+        args: Vec<Operand<'db>>,
+        site: ExprId,
+    },
     Return(Operand<'db>),
     Trap {
         kind: TrapKind,
@@ -277,10 +321,11 @@ impl<'db> Terminator<'db> {
             Terminator::Switch {
                 cases, otherwise, ..
             } => cases.iter().map(|(_, b)| *b).chain([*otherwise]).collect(),
-            Terminator::Call { target, .. } => vec![*target],
-            Terminator::TailCall { .. } | Terminator::Return(_) | Terminator::Trap { .. } => {
-                Vec::new()
-            }
+            Terminator::Call { target, .. } | Terminator::CallValue { target, .. } => vec![*target],
+            Terminator::TailCall { .. }
+            | Terminator::TailCallValue { .. }
+            | Terminator::Return(_)
+            | Terminator::Trap { .. } => Vec::new(),
         }
     }
 
@@ -297,10 +342,11 @@ impl<'db> Terminator<'db> {
                 .map(|(_, b)| b)
                 .chain([otherwise])
                 .collect(),
-            Terminator::Call { target, .. } => vec![target],
-            Terminator::TailCall { .. } | Terminator::Return(_) | Terminator::Trap { .. } => {
-                Vec::new()
-            }
+            Terminator::Call { target, .. } | Terminator::CallValue { target, .. } => vec![target],
+            Terminator::TailCall { .. }
+            | Terminator::TailCallValue { .. }
+            | Terminator::Return(_)
+            | Terminator::Trap { .. } => Vec::new(),
         }
     }
 }
@@ -319,7 +365,9 @@ impl<'db> Rvalue<'db> {
     pub fn locals_mut(&mut self) -> Vec<&mut Local> {
         let mut out = Vec::new();
         match self {
-            Rvalue::Use(o) | Rvalue::Convert(o) => out.extend(o.locals_mut()),
+            Rvalue::Use(o) | Rvalue::Convert(o) | Rvalue::FnValue { env: o, .. } => {
+                out.extend(o.locals_mut())
+            }
             Rvalue::Read(p) | Rvalue::Len(p) | Rvalue::Slice { list: p, .. } => {
                 out.push(&mut p.local)
             }
@@ -345,6 +393,9 @@ impl<'db> Rvalue<'db> {
             Rvalue::Index { list: p, index: o } | Rvalue::MapGet { map: p, key: o } => {
                 out.push(&mut p.local);
                 out.extend(o.locals_mut());
+            }
+            Rvalue::Closure { captures, .. } => {
+                out.extend(captures.iter_mut().filter_map(Operand::locals_mut))
             }
             Rvalue::Global(_) => {}
         }
@@ -383,6 +434,19 @@ impl<'db> Terminator<'db> {
             }
             Terminator::TailCall { args, .. } => {
                 args.iter_mut().filter_map(Operand::locals_mut).collect()
+            }
+            Terminator::CallValue {
+                callee, args, dst, ..
+            } => {
+                let mut out: Vec<&mut Local> = callee.locals_mut().into_iter().collect();
+                out.extend(args.iter_mut().filter_map(Operand::locals_mut));
+                out.push(dst);
+                out
+            }
+            Terminator::TailCallValue { callee, args, .. } => {
+                let mut out: Vec<&mut Local> = callee.locals_mut().into_iter().collect();
+                out.extend(args.iter_mut().filter_map(Operand::locals_mut));
+                out
             }
             Terminator::Jump(_) | Terminator::Trap { .. } => Vec::new(),
         }
@@ -502,6 +566,25 @@ fn rvalue_text<'db>(db: &'db dyn Db, rvalue: &Rvalue<'db>) -> String {
             format!("slice {}[{front}..-{back}]", place(list))
         }
         Rvalue::Global(item) => format!("value {}", item.name(db).text(db)),
+        Rvalue::Closure {
+            code,
+            captures,
+            placement,
+            ..
+        } => {
+            let place = match placement {
+                ClosurePlacement::SideStack => "side",
+                ClosurePlacement::Heap => "heap",
+            };
+            format!(
+                "closure {} {place}({})",
+                func_name(db, *code),
+                ops(captures)
+            )
+        }
+        Rvalue::FnValue { code, env } => {
+            format!("closure {} with {}", func_name(db, *code), op(env))
+        }
     }
 }
 
@@ -545,6 +628,22 @@ fn terminator_text<'db>(db: &'db dyn Db, terminator: &Terminator<'db>) -> String
         Terminator::TailCall { func, args, .. } => {
             format!("tail call {}({})", func_name(db, *func), ops(args))
         }
+        Terminator::CallValue {
+            callee,
+            args,
+            dst,
+            target,
+            ..
+        } => format!(
+            "_{} = call value {}({}) -> bb{}",
+            dst.0,
+            op(callee),
+            ops(args),
+            target.0
+        ),
+        Terminator::TailCallValue { callee, args, .. } => {
+            format!("tail call value {}({})", op(callee), ops(args))
+        }
         Terminator::Return(o) => format!("return {}", op(o)),
         Terminator::Trap { kind, .. } => {
             let kind = match kind {
@@ -562,9 +661,13 @@ fn terminator_text<'db>(db: &'db dyn Db, terminator: &Terminator<'db>) -> String
 }
 
 fn func_name<'db>(db: &'db dyn Db, func: InstanceKey<'db>) -> String {
-    match func.owner(db) {
+    let owner = match func.owner(db) {
         Owner::Item(item) => item.name(db).text(db).clone(),
         Owner::Test(test) => format!("test {}", test.label(db)),
+    };
+    match *func.entry(db) {
+        Entry::Body => owner,
+        Entry::Closure(e) | Entry::Function(e) => format!("{owner}#{}", e.index()),
     }
 }
 
