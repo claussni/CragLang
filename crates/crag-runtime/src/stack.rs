@@ -243,7 +243,13 @@ unsafe extern "C" fn morestack_slow(ctx: *const TaskContext, needed: usize, sp: 
         let mut sp = sp;
         let check_sp = sp + SAVE_BYTES;
         if check_sp.wrapping_sub(needed) < fiber.limit || check_sp < needed {
+            let before = fiber.stack.size();
             sp = grow_stack(fiber, needed, sp);
+            // A metered fiber's stack is charged to its memory budget.
+            if fiber.metering.is_some() {
+                let heap = &mut *ctx.heap.load(Ordering::Relaxed);
+                heap.charge(fiber.stack.size().saturating_sub(before));
+            }
         }
         finish_check(ctx, fiber.limit);
 

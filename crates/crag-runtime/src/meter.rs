@@ -23,7 +23,13 @@
 //! regularly. A fiber that is not metered starts with fuel that never runs
 //! out.
 //!
-//! The memory budget is charged by the heap (see `heap`). When it is used
+//! At each refill the runtime also asks the fiber's poll, if it has one,
+//! whether to stop, and traps with `Cancelled` if so: the host's poll asks
+//! whether an edit cancelled the evaluation (Implementation Plan §11.6.7).
+//! The poll is Rust, run on the system stack, and must not unwind.
+//!
+//! The memory budget is charged by the heap (see `heap`), and so is the
+//! growth of a metered fiber's stack, since a recursion holds memory there. When it is used
 //! up, the heap empties the fuel, so the trap comes at the next step: there
 //! the frame is at a safepoint whose stack map lists what it holds, which a
 //! runtime function in the middle of its work is not.
@@ -52,13 +58,16 @@ pub struct Meter {
     pub memory: usize,
 }
 
+/// Asked at each refill whether the fiber is to stop.
+pub type Poll = Box<dyn FnMut() -> bool>;
+
 /// A meter as the fiber uses it up.
-#[derive(Debug)]
 pub(crate) struct Metering {
     /// Steps not yet in the fuel.
     pub(crate) steps: u64,
     /// Bytes left, or none once the budget was exceeded.
     pub(crate) memory: Option<usize>,
+    pub(crate) poll: Option<Poll>,
 }
 
 impl Metering {
@@ -66,6 +75,7 @@ impl Metering {
         Metering {
             steps: meter.steps,
             memory: Some(meter.memory),
+            poll: None,
         }
     }
 }
@@ -134,6 +144,9 @@ unsafe extern "C" fn refuel_slow(ctx: *const TaskContext) -> u64 {
         }
         if metering.steps == 0 {
             return TrapKind::OutOfSteps as u64 + 1;
+        }
+        if metering.poll.as_mut().is_some_and(|poll| poll()) {
+            return TrapKind::Cancelled as u64 + 1;
         }
         let portion = metering.steps.min(REFUEL);
         metering.steps -= portion;

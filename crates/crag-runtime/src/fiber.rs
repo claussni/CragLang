@@ -263,6 +263,22 @@ impl Fiber {
         self.metering = Some(metering);
     }
 
+    /// Gives a metered fiber a poll, asked at each refill of its fuel: when
+    /// it answers true, the fiber traps with `Cancelled`. Called after
+    /// `set_meter`.
+    ///
+    /// # Safety
+    ///
+    /// What the poll borrows outlives the fiber's runs; the poll does not
+    /// unwind.
+    pub unsafe fn set_poll<'a>(&mut self, poll: Box<dyn FnMut() -> bool + 'a>) {
+        let metering = self.metering.as_mut().expect("the fiber is metered");
+        // SAFETY: the caller promises that the borrows outlive every use.
+        metering.poll = Some(unsafe {
+            std::mem::transmute::<Box<dyn FnMut() -> bool + 'a>, crate::meter::Poll>(poll)
+        });
+    }
+
     /// The steps the fiber may still take, if it is metered.
     pub fn steps_left(&self) -> Option<u64> {
         let metering = self.metering.as_ref()?;

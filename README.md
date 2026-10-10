@@ -23,6 +23,7 @@ Compiler, host and runtime for the Crag language, written in Rust.
 | `crates/crag-backend` | Code generation from MIR (M1) |
 | `crates/crag-driver` | The `crag` command: `run` and `test`, diagnostics (M1) |
 | `crates/crag-session` | Session manager: image processes, their protocol and supervision (M3) |
+| `crates/crag-eval` | Compile-time evaluation of constants in the metered tier (M3) |
 | `std` | The standard library: the prelude `std.core` (M1) |
 
 ## Build

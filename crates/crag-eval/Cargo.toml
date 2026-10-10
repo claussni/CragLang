@@ -1,6 +1,6 @@
 [package]
-name = "crag-driver"
-description = "The crag command: run and test a project, with diagnostics"
+name = "crag-eval"
+description = "Compile-time evaluation: pure code run in the compiler under a meter"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,21 +10,17 @@ license.workspace = true
 [lints]
 workspace = true
 
-[[bin]]
-name = "crag"
-path = "src/main.rs"
-
 [dependencies]
+blake3 = "1.8.7"
 crag-abi = { path = "../crag-abi" }
 crag-backend = { path = "../crag-backend" }
 crag-codegen = { path = "../crag-codegen" }
 crag-db = { path = "../crag-db" }
-crag-eval = { path = "../crag-eval" }
 crag-hir = { path = "../crag-hir" }
 crag-loader = { path = "../crag-loader" }
 crag-mir = { path = "../crag-mir" }
 crag-runtime = { path = "../crag-runtime" }
-crag-session = { path = "../crag-session" }
-crag-syntax = { path = "../crag-syntax" }
 crag-types = { path = "../crag-types" }
-libc = "0.2.190"
+
+[dev-dependencies]
+blake3 = "1.8.7"

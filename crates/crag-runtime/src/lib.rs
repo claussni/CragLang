@@ -41,6 +41,7 @@ compile_error!("the runtime's context switch is written for x86-64 Unix only");
 #[macro_use]
 mod system;
 
+pub mod codec;
 pub mod fiber;
 pub mod heap;
 pub mod list;
@@ -56,6 +57,7 @@ pub mod stress;
 mod testing;
 pub mod unwind;
 
+pub use codec::{NotSolid, encode_value};
 pub use fiber::{Fiber, FiberConfig, FiberState, TaskContext, Worker};
 pub use heap::{Heap, alloc_box};
 pub use meter::Meter;

@@ -122,6 +122,12 @@ fn errors_are_shown_against_the_input_and_change_nothing() {
         "error: `broken` is not defined\n --> input:1:1\n  |\n1 | broken()\n  | ^^^^^^\n"
     );
     assert!(eval(&mut r, "fn ) {").starts_with("error: "));
+    // A constant is computed when it is defined, and one that fails is an
+    // error.
+    assert_eq!(
+        eval(&mut r, "let half: Int = double(1) / 0"),
+        "error: `half` cannot be computed at compile time: it traps with division by zero\n --> input:1:1\n  |\n1 | let half: Int = double(1) / 0\n  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+    );
     assert_eq!(eval(&mut r, "double(21)"), "42\n");
 }
 

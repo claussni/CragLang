@@ -1061,28 +1061,41 @@ This differs from the first plan's `charge_allocation(ctx, size) -> Result<(), O
 
 #### 11.6.7 Compile-time evaluation
 
-Constants, conditions with known inputs, `embed` handlers and type functions are evaluated while compiling (§18.3–18.4). The host compiles the needed `is Pure` code in the metered tier and runs it in its own process, which is safe because pure code does no I/O and the step limit bounds it. Each result is a Solid value, hashed and cached as a query result.
+Constants, conditions with known inputs, `embed` handlers and type functions are evaluated while compiling (§18.3–18.4). The host compiles the needed `is Pure` code in the metered tier and runs it in its own process, which is safe because pure code does no I/O and the meter bounds its steps and its memory. Each result is a Solid value, hashed and cached as a query result. The crate is `crag-eval`.
+
+Built so far are constants: a module-level value whose body has no effects. The type checker walks the effects of values as it does those of functions; a value that calls what does I/O, directly or through what it calls, is no constant. `const_eval` collects the instances the value reaches, compiles them metered, loads them into a code arena of its own with a fresh worker, and runs the value on a fiber under the meter: 100 million steps and 256 MiB. The stack of a metered fiber counts against its memory, since a recursion holds memory there. The result is encoded with the Solid codec (§11.6.8), hashed with BLAKE3 and released. The value's cell, and the cells of the values it read, hold references of their own, which are released too, so the worker's heap ends empty and is unmapped.
+
+An evaluation that traps, or runs out of steps or memory, is a compile error at the value's declaration, such as ``error: `ratio` cannot be computed at compile time: it traps with division by zero in down``. That holds for every constant, read or not, and the REPL reports it when the value is defined. An evaluation that reaches code with errors, or what code generation does not support yet, or that gives what has no encoding, such as a function value, is no error: the value is not a constant and is computed when the program runs, as before (§11.6.2). The result is not yet used by the code that reads the value; that is the codec's other half (§11.6.8).
+
+At each refill of the fuel the runtime asks the fiber's poll, and the host's poll asks whether an edit has cancelled the query. A cancelled evaluation traps with `Cancelled`, and once the fiber has stopped the query unwinds as cancelled queries do: Salsa cancels by unwinding, which must not cross the frames of generated code, so the poll catches it and the query raises it again in Rust.
+
+Conditions with known inputs wait for conditions in the checker, type functions for `Type` values (and strings, which their examples need), and `embed` for §11.6.9.
 
 **Data structures**
 
-- `ConstValue` — a Solid value in serialized form, plus its hash.
-- `EvalSite` — where evaluation was requested: a constant, a type position, an `embed`.
+- `ConstValue` — the bytes of a Solid value, plus their hash.
+- `EvalSite` — where evaluation was requested: so far a module-level value; type positions and `embed` sites are to come.
+- `EvalError` — `Trap { kind, position, stack }`, a compile error, or `NotConstant(why)`, which is not.
+- `Meter` with the poll: `Fiber::set_poll`, asked at each refill; `TrapKind::Cancelled`.
 
 **Functions**
 
-- `fn const_eval(db: &dyn Db, site: EvalSite) -> Result<ConstValue, EvalError>` — the query: collect instances, compile metered, run under the step limit, serialize the result.
-- `fn type_function(db: &dyn Db, call: TypeCallId) -> Result<TypeId, EvalError>` — evaluation in a type position, returning a compile-time `Type` value.
-- `fn poll_cancel(db: &dyn Db) -> Result<(), Cancelled>` — called with each fuel refill so an edit can cancel a long evaluation.
+- `fn const_eval(db: &dyn Db, program: Program, site: EvalSite) -> Result<ConstValue, EvalError>` — the query: collect instances, compile metered, run under the meter, encode the result.
+- `fn eval_errors(db, program, module) -> Vec<(ItemId, EvalError)>` — the failed constants of a module, which the driver reports with the other diagnostics.
+- The poll — `catch_cancelled(|| check_cancelled(db)).is_err()`, called at each refill so an edit can cancel a long evaluation.
+- `fn type_function(db: &dyn Db, call: TypeCallId) -> Result<TypeId, EvalError>` — evaluation in a type position, returning a compile-time `Type` value; not built yet.
 
 #### 11.6.8 Solid value codec
 
 Compile-time results must be stored, hashed and embedded into code objects, and later the transport sends values between processes. The codec turns Solid values (immutable, with no refs or handles) into bytes and back, deterministically, so equal values give equal bytes and equal hashes.
 
+The encoder came first, with compile-time evaluation (§11.6.7). It walks a value by the shape of its type (§11.6.5), not by the runtime's `TypeDescriptor`, which keeps only what releasing a box takes. Numbers are their word, eight bytes little-endian; a union is the member's place among its shape's members, four bytes, then the member; a record is the index of the shape of the box's own type, which may be a subtype's, then its fields in the shape's order; a list is its length, eight bytes, then its elements; a map or a set is its length, then its entries in the order of their keys' bytes. Tags and `()` take no bytes. A function value and what a shape cannot show have no encoding.
+
 **Functions**
 
-- `unsafe fn encode(value: *const u8, ty: &TypeDescriptor, out: &mut Vec<u8>)` — canonical: sorted map keys, fixed integer widths.
-- `fn decode(bytes: &[u8], ty: &TypeDescriptor, heap: &mut Heap) -> Result<Value, DecodeError>`.
-- `fn embed_constant(code: &mut CodeObject, value: &ConstValue) -> DataOffset` — places the bytes in the code object's static data.
+- `unsafe fn encode_value(words: &[u64], shapes: &Shapes, shape: u32, types: &Types) -> Result<Vec<u8>, NotSolid>` — in the runtime; canonical: sorted map keys, fixed integer widths.
+- `fn decode(bytes: &[u8], shapes: &Shapes, shape: u32, heap: &mut Heap) -> Result<Vec<u64>, DecodeError>` — not built yet.
+- `fn embed_constant(code: &mut CodeObject, value: &ConstValue) -> DataOffset` — places the bytes in the code object's static data; not built yet.
 
 #### 11.6.9 embed handlers
 

@@ -33,7 +33,7 @@ use crag_abi::{
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.

@@ -1075,12 +1075,30 @@ fn churn(n: Int) -> Int {
   t
 }
 
+type End
+type Node(value: Int, next: Node | End)
+
+fn chain(k: Int) -> Int {
+  var n: Node | End = End
+  for i in 1..k {
+    n = Node(value: i, next: n)
+  }
+  case n {
+    Node(value:) -> value
+    End -> 0
+  }
+}
+
 fn waves(k: Int) -> Int {
   var t = 0
   for i in 1..k {
-    t = t + start(5000)
+    t = t + chain(5000)
   }
   t
+}
+
+fn depth(n: Int) -> Int {
+  if n == 0 { 0 } else { depth(n - 1) + 1 }
 }
 "#;
     let mut m = Module::metered(text);
@@ -1109,43 +1127,53 @@ fn waves(k: Int) -> Int {
         Ok(vec![2000])
     );
 
-    // Each frame holds a point: a hundred thousand of them do not fit 32
-    // KiB, and the trap releases them. A fresh heap has no free blocks, so
-    // every point is charged.
-    let mut m = Module::metered(text);
+    // A chain holds its nodes of 40 bytes, made in a loop, so only the
+    // heap grows. The loop's range is a box of 32 bytes, whose refill
+    // carves 4 KiB; a refill of nodes carves 102 of them, 4080 bytes, and
+    // seven fit what is left of 32 KiB: the 715th node goes beyond it. The
+    // trap comes at the next step, the loop's back-edge, which a chain of
+    // 715 never reaches.
     let budget = |memory| Meter {
         steps: u64::MAX,
         memory,
     };
-    let (trap, _) = m.run_metered("start", &[100_000], budget(32 << 10));
-    let trap = trap.unwrap_err();
-    assert_eq!(trap.kind, TrapKind::OutOfMemory);
-    // The budget holds 1024 points of 32 bytes. The frame that made the
-    // next one called `hold` once more, whose entry trapped.
-    assert_eq!(trap.stack.len(), 1025);
-    assert_eq!(m.worker.heap().live_blocks(), 0);
+    let fresh = |k| {
+        let mut m = Module::metered(text);
+        let result = m.run_metered("chain", &[k], budget(32 << 10)).0;
+        assert_eq!(m.worker.heap().live_blocks(), 0);
+        result
+    };
+    assert_eq!(fresh(714), Ok(vec![714]));
+    assert_eq!(fresh(715), Ok(vec![715]));
+    let trap = fresh(716).unwrap_err();
+    assert_eq!((trap.kind, trap.stack.len()), (TrapKind::OutOfMemory, 1));
     // A point made and dropped each turn reuses its block.
+    let mut m = Module::metered(text);
     assert_eq!(
         m.run_metered("churn", &[100_000], budget(32 << 10)).0,
         Ok(vec![0])
     );
-    assert_eq!(
-        m.run_metered("start", &[1000], budget(32 << 10)).0,
-        Ok(vec![2000])
-    );
-    // Each wave holds 5000 points, three pages, and gives them back when it
-    // is done: what pages that empty give back is charged again.
+    // Each wave holds 5000 nodes, more than three pages, and gives them
+    // back when it is done: what pages that empty give back is charged
+    // again.
     assert_eq!(
         m.run_metered("waves", &[10], budget(256 << 10)).0,
-        Ok(vec![100_000])
+        Ok(vec![50_000])
+    );
+    // The stack is memory too: the frames of a deep recursion do not fit.
+    let trap = m.run_metered("depth", &[100_000], budget(64 << 10)).0;
+    assert_eq!(trap.unwrap_err().kind, TrapKind::OutOfMemory);
+    assert_eq!(
+        m.run_metered("depth", &[100], budget(64 << 10)).0,
+        Ok(vec![100])
     );
     // A fiber stopped and resumed keeps what is left of its budget, so the
-    // trap comes as before however often it is resumed.
+    // trap comes however often it is resumed.
     let mut m = Module::metered(text);
     let trap = m
-        .run_paused("start", &[100_000], budget(32 << 10))
+        .run_paused("chain", &[100_000], budget(32 << 10))
         .unwrap_err();
-    assert_eq!((trap.kind, trap.stack.len()), (TrapKind::OutOfMemory, 1025));
+    assert_eq!(trap.kind, TrapKind::OutOfMemory);
     assert_eq!(
         m.run_paused("spin", &[100_000], ample(1000))
             .unwrap_err()

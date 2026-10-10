@@ -139,10 +139,9 @@ impl Sources for Project {
     }
 }
 
-/// A trap as the user sees it: what went wrong, where, and the functions
-/// it happened in.
-pub fn report(sources: &dyn Sources, functions: &HashMap<FuncId, Function>, trap: &Trap) -> String {
-    let what = match trap.kind {
+/// What a trap of the kind tells the user.
+pub fn trap_message(kind: TrapKind) -> &'static str {
+    match kind {
         TrapKind::Overflow => "arithmetic overflow",
         TrapKind::DivideByZero => "division by zero",
         TrapKind::Index => "index out of range",
@@ -152,7 +151,14 @@ pub fn report(sources: &dyn Sources, functions: &HashMap<FuncId, Function>, trap
         TrapKind::Unsupported => "reached code the compiler does not support yet",
         TrapKind::OutOfSteps => "ran out of steps",
         TrapKind::OutOfMemory => "ran out of memory",
-    };
+        TrapKind::Cancelled => "was cancelled",
+    }
+}
+
+/// A trap as the user sees it: what went wrong, where, and the functions
+/// it happened in.
+pub fn report(sources: &dyn Sources, functions: &HashMap<FuncId, Function>, trap: &Trap) -> String {
+    let what = trap_message(trap.kind);
     let first = trap.stack.first().map(|f| &functions[f]);
     let mut out = match (first, trap.position) {
         (Some(f), Some(position)) => {

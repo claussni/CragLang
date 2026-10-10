@@ -219,8 +219,9 @@ pub enum RuntimeFn {
     /// Called by metered code when its fuel went negative. It has the
     /// convention of `rt_morestack`: every register preserved, no result.
     /// The runtime refills the fuel and returns, or, when the task's steps
-    /// or its memory budget are used up, traps with `OutOfSteps` or
-    /// `OutOfMemory` as `rt_trap` would at this call, releasing what the
+    /// or its memory budget are used up, or the fiber's poll asks it to
+    /// stop, traps with `OutOfSteps`, `OutOfMemory` or `Cancelled` as
+    /// `rt_trap` would at this call, releasing what the
     /// frames hold as the call's stack map lists it.
     Refuel = 10,
 }
@@ -284,10 +285,13 @@ pub enum TrapKind {
     OutOfSteps = 7,
     /// Metered code used up its memory budget.
     OutOfMemory = 8,
+    /// The runtime's poll at a refill asked metered code to stop, as the
+    /// host does when an edit cancels a compile-time evaluation.
+    Cancelled = 9,
 }
 
 impl TrapKind {
-    pub const ALL: [TrapKind; 9] = [
+    pub const ALL: [TrapKind; 10] = [
         TrapKind::Overflow,
         TrapKind::DivideByZero,
         TrapKind::Index,
@@ -297,6 +301,7 @@ impl TrapKind {
         TrapKind::Unsupported,
         TrapKind::OutOfSteps,
         TrapKind::OutOfMemory,
+        TrapKind::Cancelled,
     ];
 
     /// The kind with this discriminant, if any.

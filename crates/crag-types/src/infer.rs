@@ -117,9 +117,13 @@ pub fn infer_in_group<'db>(
             None
         }
     };
-    // Effects matter for what runs: functions and tests (§3.14).
+    // Effects matter for what runs: functions, tests, and module-level
+    // values, which compile-time evaluation runs only without them (§3.14,
+    // §18.4).
     let effects = match owner {
-        Owner::Item(item) if *item.kind(db) != ItemKind::Function => EffectSet::NONE,
+        Owner::Item(item) if !matches!(*item.kind(db), ItemKind::Function | ItemKind::Value) => {
+            EffectSet::NONE
+        }
         _ => {
             let effects_of = |f: ItemId<'db>| cx.effects_of(f);
             let walker = Walker::new(

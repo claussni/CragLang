@@ -167,6 +167,29 @@ fn a_trap_in_main_is_reported_with_its_stack() {
 }
 
 #[test]
+fn a_constant_that_fails_at_compile_time_is_an_error() {
+    let root = project(
+        "constant",
+        &[
+            ("package.crag", MANIFEST),
+            (
+                "app.crag",
+                "fn down(n: Int) -> Int {\n  if n == 0 { 1 / n } else { down(n - 1) }\n}\n\nlet ratio = down(3)\n\nfn main() {\n  let r = ratio\n}\n",
+            ),
+        ],
+    );
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 1);
+    let out = text(out);
+    assert!(
+        out.starts_with(
+            "error: `ratio` cannot be computed at compile time: it traps with division by zero in down\n --> app.crag:5:1\n  |\n5 | let ratio = down(3)\n  | ^^^^^^^^^^^^^^^^^^^\n"
+        ),
+        "{out}"
+    );
+}
+
+#[test]
 fn the_command_runs_the_project_in_the_current_directory() {
     let root = demo("command");
     let crag = env!("CARGO_BIN_EXE_crag");

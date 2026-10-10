@@ -20,6 +20,7 @@
 use std::ops::Range;
 
 use crag_db::Db;
+use crag_eval::EvalError;
 use crag_hir::{
     ImportCycle, LowerError, ModuleId, NameError, Origin, PathError, Previous, Redeclaration,
     check_shadowing, import_graph, lower_body, module_scope, owners, parse,
@@ -75,6 +76,22 @@ pub fn check(project: &Project) -> Vec<Diagnostic> {
             let range = error.site.range(map).unwrap_or(0..0);
             out.push(at(range, error.kind.message(db)));
         }
+        // Constants are evaluated at compile time (Specification §18.4),
+        // and an evaluation that fails is an error at the value.
+        for (item, error) in crag_eval::eval_errors(db, program, module) {
+            let EvalError::Trap { kind, stack, .. } = error else {
+                continue;
+            };
+            let name = item.name(db).text(db);
+            let mut message = format!(
+                "`{name}` cannot be computed at compile time: it {}",
+                trap_verb(kind)
+            );
+            if let Some(inner) = stack.first().filter(|f| *f != name) {
+                message += &format!(" in {inner}");
+            }
+            out.push(at(decl_range(db, module, item_decl(db, item)), message));
+        }
     }
     for cycle in &import_graph(db, program).cycles {
         out.push(import_cycle(db, cycle));
@@ -90,6 +107,15 @@ pub fn check(project: &Project) -> Vec<Diagnostic> {
     let order = |m: ModuleId| project.files.iter().position(|f| f.module == m);
     out.sort_by_key(|d| (order(d.module), d.range.start));
     out
+}
+
+/// What a trap in a compile-time evaluation did, after "it".
+fn trap_verb(kind: crag_abi::TrapKind) -> String {
+    use crag_abi::TrapKind::*;
+    match kind {
+        OutOfSteps | OutOfMemory => crate::exec::trap_message(kind).to_string(),
+        kind => format!("traps with {}", crate::exec::trap_message(kind)),
+    }
 }
 
 /// The range of a module's declaration by its index.

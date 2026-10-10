@@ -129,6 +129,7 @@ dependencies = [
  "crag-backend",
  "crag-codegen",
  "crag-db",
+ "crag-eval",
  "crag-hir",
  "crag-loader",
  "crag-mir",
@@ -137,6 +138,22 @@ dependencies = [
  "crag-syntax",
  "crag-types",
  "libc",
+]
+
+[[package]]
+name = "crag-eval"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "crag-abi",
+ "crag-backend",
+ "crag-codegen",
+ "crag-db",
+ "crag-hir",
+ "crag-loader",
+ "crag-mir",
+ "crag-runtime",
+ "crag-types",
 ]
 
 [[package]]

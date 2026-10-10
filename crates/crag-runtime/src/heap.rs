@@ -276,7 +276,7 @@ impl Heap {
         matches!(self.meter, Some(HeapMeter { left: None, .. }))
     }
 
-    fn charge(&mut self, bytes: usize) {
+    pub(crate) fn charge(&mut self, bytes: usize) {
         let Some(meter) = &mut self.meter else { return };
         match meter.left {
             Some(left) if bytes <= left => meter.left = Some(left - bytes),
