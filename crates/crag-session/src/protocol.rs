@@ -29,11 +29,11 @@ use std::io::{self, Read, Write};
 
 use crag_abi::{
     CodeObject, CountedField, ElementLayout, FuncId, Reloc, RelocKind, RelocTarget, RuntimeFn,
-    StackCheck, StackMap, TrapKind, TypeDescriptor,
+    SlotKey, StackCheck, StackMap, TrapKind, TypeDescriptor,
 };
 
 /// The version of the protocol, raised whenever a message changes.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -79,6 +79,8 @@ pub enum Message {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShippedFunction {
     pub id: FuncId,
+    /// The signature of the slot it fills (§11.6.4).
+    pub signature: u32,
     /// Words of parameters and results.
     pub params: u32,
     pub returns: u32,
@@ -296,6 +298,7 @@ impl Writer {
 
     fn function(&mut self, f: &ShippedFunction) {
         self.u32(f.id.0);
+        self.u32(f.signature);
         self.u32(f.params);
         self.u32(f.returns);
         self.object(&f.object);
@@ -321,6 +324,11 @@ impl Writer {
                 RelocTarget::Local(offset) => {
                     w.u8(2);
                     w.u32(offset);
+                }
+                RelocTarget::Slot(key) => {
+                    w.u8(3);
+                    w.u32(key.func.0);
+                    w.u32(key.signature);
                 }
             }
             w.u64(r.addend as u64);
@@ -420,6 +428,7 @@ impl Reader<'_> {
     fn function(&mut self) -> io::Result<ShippedFunction> {
         Ok(ShippedFunction {
             id: FuncId(self.u32()?),
+            signature: self.u32()?,
             params: self.u32()?,
             returns: self.u32()?,
             object: self.object()?,
@@ -446,6 +455,10 @@ impl Reader<'_> {
                         })?)
                     }
                     2 => RelocTarget::Local(r.u32()?),
+                    3 => RelocTarget::Slot(SlotKey {
+                        func: FuncId(r.u32()?),
+                        signature: r.u32()?,
+                    }),
                     tag => return Err(invalid(format!("a relocation target with the tag {tag}"))),
                 };
                 Ok(Reloc {
@@ -565,12 +578,14 @@ mod tests {
                 functions: vec![
                     ShippedFunction {
                         id: FuncId(9),
+                        signature: 7,
                         params: 1,
                         returns: 1,
                         object: object(StackCheck::Margin),
                     },
                     ShippedFunction {
                         id: FuncId(10),
+                        signature: 7,
                         params: 0,
                         returns: 0,
                         object: object(StackCheck::Sized { needed: 4096 }),
@@ -617,6 +632,15 @@ mod tests {
                     kind: RelocKind::Abs64,
                     target: RelocTarget::Local(1),
                     addend: i64::MAX,
+                },
+                Reloc {
+                    offset: 2,
+                    kind: RelocKind::Abs64,
+                    target: RelocTarget::Slot(SlotKey {
+                        func: FuncId(9),
+                        signature: u32::MAX,
+                    }),
+                    addend: 0,
                 },
             ],
             footprint: 48,
@@ -686,6 +710,7 @@ mod tests {
         load.extend(
             ShippedFunction {
                 id: FuncId(1),
+                signature: 7,
                 params: 0,
                 returns: 0,
                 object: CodeObject {
@@ -700,13 +725,20 @@ mod tests {
             }
             .encode(),
         );
-        // The runtime function's index, after the function's id, words,
-        // code, alignment, entry, relocation count, offset and kinds.
-        let at = 13 + 12 + 4 + 10 + 8 + 4 + 4 + 2;
+        // The runtime function's index, after the function's id, signature,
+        // words, code, alignment, entry, relocation count, offset and kinds.
+        let at = 13 + 16 + 4 + 10 + 8 + 4 + 4 + 2;
+        assert_eq!(load[at - 1], 1);
         assert_eq!(load[at], RuntimeFn::Trap as u8);
-        load[at] = 200;
-        let mut frame = (load.len() as u32).to_le_bytes().to_vec();
-        frame.extend(load);
-        assert_eq!(invalid(&frame), io::ErrorKind::InvalidData);
+        let broken = |at: usize, byte: u8| {
+            let mut load = load.clone();
+            load[at] = byte;
+            let mut frame = (load.len() as u32).to_le_bytes().to_vec();
+            frame.extend(load);
+            invalid(&frame)
+        };
+        assert_eq!(broken(at, 200), io::ErrorKind::InvalidData);
+        // A relocation target after the slot's tag.
+        assert_eq!(broken(at - 1, 4), io::ErrorKind::InvalidData);
     }
 }

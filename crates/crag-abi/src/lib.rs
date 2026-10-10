@@ -410,6 +410,17 @@ pub const PAGE_USED_OFFSET: i32 = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FuncId(pub u32);
 
+/// A slot of the slot table that development images call through
+/// (Implementation Plan §11.6.4): a function with one signature. The host
+/// numbers signatures; code compiled against one signature only reaches
+/// code of that signature, so a definition that changes its signature
+/// gets a new slot and the callers of the old one keep the old code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SlotKey {
+    pub func: FuncId,
+    pub signature: u32,
+}
+
 /// The machine code of one function plus what the loader needs to place it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeObject {
@@ -484,6 +495,8 @@ pub enum RelocTarget {
     Runtime(RuntimeFn),
     /// An offset into this code object's own `code`.
     Local(u32),
+    /// The slot of a function, which holds its entry point.
+    Slot(SlotKey),
 }
 
 #[cfg(test)]

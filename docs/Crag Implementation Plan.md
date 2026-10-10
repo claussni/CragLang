@@ -126,7 +126,7 @@ The REPL and compile-time evaluation share the metered tier: both run code the h
 - **Session manager.** Starts and supervises the scratch image, speaks a length-prefixed message protocol over a local socket, and restarts the image after a crash.
 - **REPL.** A line editor, multi-line input completed when the parser reports a complete form, `:rebind`, and session definitions treated as non-pub module functions.
 - **Code shipping.** The host compiles instances; the scratch image loads the code objects and resolves relocations.
-- **Slot tables.** One indirection slot per function, swapped atomically when a definition changes.
+- **Slot tables.** One indirection slot per function and signature, swapped atomically when a definition changes.
 - **Value printing.** Results printed from type descriptors, so any value prints without generated code.
 - **Metered tier.** Fuel decremented at prologues and loop back-edges, and a per-task memory budget checked by the allocator's slow path.
 - **Compile-time evaluation.** `const_eval(site)` queries compile `is Pure` MIR in the host, run it under the step limit (§18.4), and store results as hashed Solid values, also in type positions for type functions.
@@ -353,12 +353,12 @@ Protection applies to whole pages, so each load fills a region of fresh pages wh
 **Data structures**
 
 - `CodeArena` — one reserved address range, so all code stays within reach of relative branches, with pages committed on demand and a free list of returned page runs, so retired code can be reused later.
-- `SymbolTable` — runtime functions and loaded functions to addresses.
+- `SymbolTable` — runtime functions and loaded functions to addresses, and the slot table (§11.6.4).
 
 **Functions**
 
 - `fn load(arena: &mut CodeArena, symbols: &SymbolTable, code: &CodeObject) -> Result<CodeAddr, LoadError>` — allocate, copy, relocate, protect. For code nothing refers to by number, such as an entry stub.
-- `fn load_group(arena: &mut CodeArena, symbols: &mut SymbolTable, group: &[(FuncId, &CodeObject)]) -> Result<Vec<CodeAddr>, LoadError>` — loads functions into one region and enters them in the symbol table. They may refer to each other, to themselves and to functions already loaded. Either all are loaded or none.
+- `fn load_group(arena: &mut CodeArena, symbols: &mut SymbolTable, group: &[(SlotKey, &CodeObject)]) -> Result<Vec<CodeAddr>, LoadError>` — loads functions into one region, enters them in the symbol table and fills their slots. They may refer to each other, to themselves and to functions already loaded. Either all are loaded or none. `replace_group` does the same for functions that may be loaded already (§11.6.4).
 - `unsafe fn unload(arena: &mut CodeArena, symbols: &mut SymbolTable, entry: CodeAddr) -> Result<(), LoadError>` — removes one code object once no frame uses it; the pages return to the free list with the region's last object (used from M5).
 
 #### 11.3.7 Salsa facade
@@ -509,7 +509,7 @@ Builtin types are declarations of the prelude with a builtin's name and number o
 
 **Data structures**
 
-- `Ty` — interned type terms: builtins, named types by their identity, anonymous records, functions, unions, type parameters, and an error type that fits everything, so that one error is reported once.
+- `Ty` — interned type terms, never collected, since a type's index names a signature in slot keys (§11.6.4): builtins, named types by their identity, anonymous records, functions, unions, type parameters, and an error type that fits everything, so that one error is reported once.
 - `TypeDef` and `Signature` — a type declaration's fields, parent or alias target, and a function's parameter and result types, lowered from the HIR.
 - `InferenceResult` — a type for every expression, pattern, binding and written type, the callee of every call, the success type, the holes with their types, and the errors, each at a node of the body. The body's source map gives their ranges.
 
@@ -882,7 +882,7 @@ Unrolling `fields` loops and making `typeInfo` constants come with compile-time 
 
 **Data structures**
 
-- `InstanceKey` — owner, type arguments, slot fillings, and the entry (§11.5.9); interned. `InstanceKey::of` makes the key of a concrete `Instance`.
+- `InstanceKey` — owner, type arguments, slot fillings, and the entry (§11.5.9); interned and never collected, since its index is the function's id (§11.6.4). `InstanceKey::of` makes the key of a concrete `Instance`.
 - The worklist of `collect_instances` — instances still to visit, plus a set of those already seen.
 
 **Functions**
@@ -951,13 +951,13 @@ The REPL reads input, compiles it and shows the result. Each input becomes a def
 
 The host compiles; the image only loads, so it links no code generator. To run something in the scratch image, the host compiles what the roots reach, as `crag run` does, and sends the image what it lacks in one `Load`: the code objects with their relocations and their words of parameters and results, the descriptors of the types they use, and the entry stubs to run them with, which the host compiles too. The image loads the functions together with the M0 loader, so they may call each other and what it has already, adds the descriptors to its worker's and the stack maps to its code map, and answers `Loaded`, or `Failed` with the reason and without loading them. `Run` then calls a loaded function without parameters on a fiber of its own; the image answers `Finished` with its result words or `Trapped` with the trap's kind, position and stack, which the host reports against the source as `crag run` does. A trap ends only the run; a crash ends the image, and the session starts another (§11.6.1).
 
-The host remembers what each image has: functions by their id and the hash of their code, stubs by their words, and descriptors by type index. A shipment sends only what is missing, so the second root to call a function does not send it again, and a fresh image after a crash gets everything anew. A function that comes again with other code, as a changed definition would, is refused until slot tables can swap it (§11.6.4).
+The host remembers what each image has: functions by their id and the hash of their code, stubs by their words, and descriptors by type index. A shipment sends only what is missing, so the second root to call a function does not send it again, and a fresh image after a crash gets everything anew. A function that comes again with other code, as a changed definition does, is sent again and replaces the old code (§11.6.4).
 
 Result words that are references point into the image and mean nothing to the host; value printing reads values in the image (§11.6.5). A run that does not end blocks the request until `restart` kills the image; interrupting it at a safepoint comes with the REPL (§11.6.2).
 
 **Data structures**
 
-- `ShippedFunction` — a function's id, words of parameters and results, and code object; `Stub` — an entry stub and the words it was compiled for.
+- `ShippedFunction` — a function's id, the signature of its slot, words of parameters and results, and code object; `Stub` — an entry stub and the words it was compiled for.
 - `Message::Load { types, stubs, functions }`, `Loaded`, `Run(FuncId)`, `Finished(words)`, `Trapped { kind, position, stack }` and `Failed(reason)`.
 - `Image` — in the image: the code arena, symbol table, loaded functions and stubs, descriptors, code map and worker.
 - `Scratch` — in the driver: a session and the names of the functions shipped, for reports.
@@ -971,17 +971,29 @@ Result words that are references point into the image and mean nothing to the ho
 
 #### 11.6.4 Slot tables
 
-In development images, calls between functions go through a table of function pointers, one slot per function. Replacing a definition writes a new pointer into its slot, and every later call reaches the new code; frames already running finish on the old code.
+In development images, calls between functions go through a table of function pointers. Replacing a definition writes a new pointer into its slot, and every later call reaches the new code; frames already running finish on the old code. Baseline code makes every Crag call this way, including tail calls; a function value's code address is read from the slot when the value is made. Release builds will call directly: the LIR names each call's target as `Direct` or `Slot`, and only the backend decides.
+
+A slot belongs to a function and a signature, not to the function alone. The slot key is the function's id and the index of its MIR's function type: its parameters, the environment included, and its result. Code compiled against a signature therefore only ever calls code of that signature. When a definition changes its signature, it fills a new slot. The callers compiled anew call that slot; old code still calls the old one, which keeps the old code. The signature is a query of its own, so a caller depends on its callee's signature, not on its body: a changed body leaves its callers' code as it was, and only the function itself is shipped again.
+
+The ids must stay valid for the session. Salsa reuses the index of an interned value that no query has read for a few revisions, so a function's id could later name another instance and a signature another type. `InstanceKey` and `Ty` are therefore never collected (`revisions = usize::MAX`).
+
+The loader keeps the table with the symbol table. It assigns a slot index when it first sees a key, in place of the host, since the key already carries everything the host decides. A `Slot` relocation is patched with the slot's address. It resolves only to a filled slot or to a member of the group being loaded, so no code can call an empty slot. The table grows in chunks of 512 slots that never move, so the patched addresses stay valid. A group's slots are filled after its code is executable, with a release store. The call loads the entry from the slot each time and calls it. `replace_group` loads functions that may be loaded already: the new entries take their place in the symbol table and their slots. The old code stays loaded and in the image's code map, since frames may still run it; nothing unloads it yet. Unloading empties the slots that hold the entry.
+
+The image loads every shipment with `replace_group`, and the host sends a function whose code changed. In the scratch tests, editing the body of `two` sends only `two`, and `answer`, which calls it, gets the new result. Changing `two`'s signature sends `two` and `answer`, while `twice`, still loaded with its old code, calls the old `two`. Editing a closure's body sends only the closure: the function that makes it is unchanged and reads the new code from the slot. A changed type descriptor is still refused; migrating values to a changed type comes with hot reload (§11.8.5).
 
 **Data structures**
 
-- `SlotTable` — an array of code addresses, indexed by slot number.
-- `SlotIndex` — assigned per function and signature by the host, stable for the session.
+- `SlotKey` — a function's id and a signature index, in the ABI; `RelocTarget::Slot(SlotKey)`.
+- `SlotTable` — chunks of code addresses, indexed by `SlotIndex`, with the index of each key.
+- `SlotIndex` — assigned by the loader per slot key, stable for the table's life.
+- `CallTarget` — in the LIR: `Direct(FuncId)` or `Slot(SlotKey)`.
 
 **Functions**
 
 - `fn slot_set(table: &SlotTable, index: SlotIndex, addr: CodeAddr)` — an atomic store.
-- Generated call sequence — load the slot, call through it.
+- `fn replace_group(arena, symbols, group) -> Result<Vec<CodeAddr>, LoadError>` — loads functions over loaded ones.
+- `fn slot_key(db, program, instance) -> SlotKey` — in the backend, from the tracked `slot_signature`.
+- Generated call sequence — the slot's address as an absolute constant, a load of the entry, an indirect call or tail call.
 
 #### 11.6.5 Value printing
 

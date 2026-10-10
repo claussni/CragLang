@@ -95,7 +95,7 @@ fn boxes_fn() -> LirFunction {
                         b: r(5),
                     },
                     Inst::Call {
-                        func: FuncId(0),
+                        func: FuncId(0).into(),
                         args: vec![r(6)],
                         dsts: vec![r(7)],
                     },

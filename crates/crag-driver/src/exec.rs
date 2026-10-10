@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crag_abi::{FuncId, RuntimeFn, TrapKind, TypeDescriptor};
+use crag_abi::{FuncId, RuntimeFn, SlotKey, TrapKind, TypeDescriptor};
 use crag_backend::code;
 use crag_codegen::{CodeObject, CodegenSettings, OptLevel, compile_entry_stub, target_for};
 use crag_hir::{ModuleId, Owner};
@@ -54,7 +54,8 @@ pub struct Function {
 
 /// The code of what some roots reach.
 pub struct Compiled<'a> {
-    pub objects: Vec<(FuncId, &'a CodeObject)>,
+    /// Each function's code and the slot it fills.
+    pub objects: Vec<(SlotKey, &'a CodeObject)>,
     /// The descriptors of the types the code uses, by index.
     pub types: Vec<(u32, TypeDescriptor)>,
     pub functions: HashMap<FuncId, Function>,
@@ -85,7 +86,7 @@ pub fn compile<'a>(
             Some(Err(e)) => return Err(format!("cannot compile {name}: {e}")),
             None => return Err(format!("{name} has no body to compile")),
         };
-        compiled.objects.push((code.func, &code.object));
+        compiled.objects.push((code.slot, &code.object));
         for t in &code.types {
             if !compiled.types.contains(t) {
                 compiled.types.push(t.clone());
@@ -176,9 +177,9 @@ impl Image {
             .map_err(|e| format!("cannot load the code: {e:?}"))?;
         let mut map = CodeMap::new();
         let mut addrs = HashMap::new();
-        for (&(func, object), entry) in objects.iter().zip(&entries) {
-            map.add(func, entry.addr(), object);
-            addrs.insert(func, entry.addr());
+        for (&(slot, object), entry) in objects.iter().zip(&entries) {
+            map.add(slot.func, entry.addr(), object);
+            addrs.insert(slot.func, entry.addr());
         }
         let mut worker = Worker::new();
         worker.set_types(Arc::new(Types::new(types)));

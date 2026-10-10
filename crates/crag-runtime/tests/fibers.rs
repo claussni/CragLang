@@ -92,7 +92,7 @@ fn sum_squares_fn(self_id: u32) -> LirFunction {
                         b: r(3),
                     },
                     Inst::Call {
-                        func: FuncId(self_id),
+                        func: FuncId(self_id).into(),
                         args: vec![r(4)],
                         dsts: vec![r(5)],
                     },
@@ -170,7 +170,7 @@ fn countdown_fn(self_id: u32) -> LirFunction {
                     },
                 ],
                 term: Term::TailCall {
-                    func: FuncId(self_id),
+                    func: FuncId(self_id).into(),
                     args: vec![r(0), r(1)],
                 },
             },
@@ -254,7 +254,7 @@ fn wide_fn(live: u32, add: u32) -> LirFunction {
             value: i64::from(i),
         });
         insts.push(Inst::Call {
-            func: FuncId(add),
+            func: FuncId(add).into(),
             args: vec![r(0), r(tmp)],
             dsts: vec![r(1 + i)],
         });

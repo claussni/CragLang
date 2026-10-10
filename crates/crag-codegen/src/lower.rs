@@ -25,20 +25,22 @@ use crag_abi::{
 use cranelift_codegen::binemit::Reloc as ClifReloc;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::immediates::Imm64;
 use cranelift_codegen::ir::types::{F64, I64};
 use cranelift_codegen::ir::{
-    AbiParam, AtomicRmwOp, ExtFuncData, ExternalName, FuncRef, Function, InstBuilder, MemFlagsData,
-    Signature, TrapCode, UserExternalName, UserFuncName, Value,
+    AbiParam, AtomicRmwOp, ExtFuncData, ExternalName, FuncRef, Function, GlobalValue,
+    GlobalValueData, InstBuilder, MemFlagsData, Signature, TrapCode, UserExternalName,
+    UserFuncName, Value,
 };
 use cranelift_codegen::isa::{self, CallConv, OwnedTargetIsa, TargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::{Context, FinalizedRelocTarget};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
-use crate::lir::{BinOp, Cond, Inst, LirFunction, OverflowOp, Term};
+use crate::lir::{BinOp, CallTarget, Cond, Inst, LirFunction, OverflowOp, Term};
 use crate::{
     CodeObject, CodegenError, CodegenSettings, FuncId, OptLevel, Reloc, RelocKind, RelocTarget,
-    StackCheck, StackMap,
+    SlotKey, StackCheck, StackMap,
 };
 
 /// Namespaces of the external names the lowering declares. A relocation's
@@ -46,6 +48,9 @@ use crate::{
 const NS_FUNCTION: u32 = 0;
 const NS_RUNTIME: u32 = 1;
 const NS_LOCAL: u32 = 2;
+/// A slot, by its place in `Imports::slots`, since a slot key does not fit
+/// a name's index.
+const NS_SLOT: u32 = 3;
 
 /// A machine the facade can generate code for.
 #[derive(Clone)]
@@ -116,7 +121,8 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
     lir.validate().map_err(CodegenError::InvalidLir)?;
     let isa = settings.target.isa(settings.opt);
 
-    let body = run_backend(isa, build_body(lir, isa))?;
+    let (func, slots) = build_body(lir, isa);
+    let body = run_backend(isa, func, &slots)?;
     let footprint = body.footprint(isa, tail_args_growth(lir));
     if footprint <= FRAME_BUDGET {
         return Ok(CodeObject {
@@ -134,7 +140,7 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
     // that checks for the whole footprint and then tail-calls the body. The
     // body keeps its own margin check: by then it always fits, and it still
     // serves as a stop point.
-    let wrapper = run_backend(isa, build_wrapper(lir, isa, footprint))?;
+    let wrapper = run_backend(isa, build_wrapper(lir, isa, footprint), &[])?;
     let wrapper_footprint = wrapper.footprint(isa, 0);
     if wrapper_footprint > FRAME_BUDGET {
         return Err(CodegenError::FrameTooLarge {
@@ -230,7 +236,7 @@ pub fn compile_entry_stub(
     b.seal_all_blocks();
     b.finalize(isa.frontend_config());
 
-    let stub = run_backend(isa, func)?;
+    let stub = run_backend(isa, func, &[])?;
     let footprint = stub.footprint(isa, 0);
     Ok(CodeObject {
         code: stub.code,
@@ -264,10 +270,21 @@ fn tail_args_growth(lir: &LirFunction) -> u32 {
     }
 }
 
-/// Imported functions of the function being built, declared once each.
+/// Imported functions and slots of the function being built, declared
+/// once each.
 #[derive(Default)]
 struct Imports {
     functions: HashMap<(u32, u32, u32, u32), FuncRef>,
+    /// The slots, in the order of their names' indices.
+    slots: Vec<SlotKey>,
+    slot_values: HashMap<SlotKey, GlobalValue>,
+}
+
+/// How a call reaches its callee.
+enum Reached {
+    Direct(FuncRef),
+    /// The entry loaded from a slot.
+    Loaded(Value),
 }
 
 impl Imports {
@@ -307,6 +324,46 @@ impl Imports {
         returns: u32,
     ) -> FuncRef {
         self.get(b, (NS_FUNCTION, func.0), crag_signature(params, returns))
+    }
+
+    /// The callee of a call: the function, or the entry its slot holds,
+    /// loaded at the current position.
+    fn target(
+        &mut self,
+        b: &mut FunctionBuilder,
+        target: CallTarget,
+        params: u32,
+        returns: u32,
+    ) -> Reached {
+        let key = match target {
+            CallTarget::Direct(func) => {
+                return Reached::Direct(self.crag(b, func, params, returns));
+            }
+            CallTarget::Slot(key) => key,
+        };
+        let slot = match self.slot_values.get(&key) {
+            Some(&slot) => slot,
+            None => {
+                let index = self.slots.len() as u32;
+                self.slots.push(key);
+                let name = b.func.declare_imported_user_function(UserExternalName {
+                    namespace: NS_SLOT,
+                    index,
+                });
+                let slot = b.create_global_value(GlobalValueData::Symbol {
+                    name: ExternalName::user(name),
+                    offset: Imm64::new(0),
+                    colocated: false,
+                    tls: false,
+                });
+                self.slot_values.insert(key, slot);
+                slot
+            }
+        };
+        let addr = b.ins().symbol_value(I64, slot);
+        // Loaded at every call, never kept: the image replaces the entry
+        // between calls.
+        Reached::Loaded(b.ins().load(I64, MemFlagsData::trusted(), addr, 0))
     }
 
     /// `rt_morestack` preserves every register, so the call on the cold path
@@ -427,7 +484,8 @@ fn emit_side_push(
     start
 }
 
-fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
+/// The body and the slots it calls through.
+fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> (Function, Vec<SlotKey>) {
     let sig = crag_signature(lir.params, lir.returns);
     let mut func = Function::with_name_signature(UserFuncName::default(), sig);
     let mut fb_ctx = FunctionBuilderContext::new();
@@ -596,10 +654,17 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
                     b.def_var(vars[dst.0 as usize], v);
                 }
                 Inst::Call { func, args, dsts } => {
-                    let callee = imports.crag(&mut b, *func, args.len() as u32, dsts.len() as u32);
+                    let (params, returns) = (args.len() as u32, dsts.len() as u32);
+                    let callee = imports.target(&mut b, *func, params, returns);
                     let mut values = vec![ctx];
                     values.extend(args.iter().map(|r| b.use_var(vars[r.0 as usize])));
-                    let call = b.ins().call(callee, &values);
+                    let call = match callee {
+                        Reached::Direct(callee) => b.ins().call(callee, &values),
+                        Reached::Loaded(entry) => {
+                            let sig = b.import_signature(crag_signature(params, returns));
+                            b.ins().call_indirect(sig, entry, &values)
+                        }
+                    };
                     let results = b.inst_results(call).to_vec();
                     for (dst, v) in dsts.iter().zip(results) {
                         b.def_var(vars[dst.0 as usize], v);
@@ -611,8 +676,10 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
                     params,
                     returns,
                 } => {
-                    let callee = imports.crag(&mut b, *func, *params, *returns);
-                    let v = b.ins().func_addr(I64, callee);
+                    let v = match imports.target(&mut b, *func, *params, *returns) {
+                        Reached::Direct(callee) => b.ins().func_addr(I64, callee),
+                        Reached::Loaded(entry) => entry,
+                    };
                     b.def_var(vars[dst.0 as usize], v);
                 }
                 Inst::CallIndirect { callee, args, dsts } => {
@@ -688,11 +755,18 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
                 b.ins().return_(&values);
             }
             Term::TailCall { func, args } => {
-                let callee = imports.crag(&mut b, *func, args.len() as u32, lir.returns);
+                let params = args.len() as u32;
+                let callee = imports.target(&mut b, *func, params, lir.returns);
                 let mut values = vec![ctx];
                 values.extend(args.iter().map(|r| b.use_var(vars[r.0 as usize])));
                 side_pop(&mut b);
-                b.ins().return_call(callee, &values);
+                match callee {
+                    Reached::Direct(callee) => b.ins().return_call(callee, &values),
+                    Reached::Loaded(entry) => {
+                        let sig = b.import_signature(crag_signature(params, lir.returns));
+                        b.ins().return_call_indirect(sig, entry, &values)
+                    }
+                };
             }
             Term::TailCallIndirect { callee, args } => {
                 let sig = b.import_signature(crag_signature(args.len() as u32, lir.returns));
@@ -717,7 +791,7 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa) -> Function {
 
     b.seal_all_blocks();
     b.finalize(isa.frontend_config());
-    func
+    (func, imports.slots)
 }
 
 /// The wrapper for a function whose frame exceeds the budget: the sized
@@ -768,7 +842,11 @@ impl Compiled {
     }
 }
 
-fn run_backend(isa: &dyn TargetIsa, func: Function) -> Result<Compiled, CodegenError> {
+fn run_backend(
+    isa: &dyn TargetIsa,
+    func: Function,
+    slots: &[SlotKey],
+) -> Result<Compiled, CodegenError> {
     let mut ctx = Context::for_function(func);
     ctx.compile(isa, &mut ControlPlane::default())
         .map_err(|e| CodegenError::Backend(format!("{:?}", e.inner)))?;
@@ -792,6 +870,7 @@ fn run_backend(isa: &dyn TargetIsa, func: Function) -> Result<Compiled, CodegenE
                 RelocTarget::Runtime(RuntimeFn::from_index(name.index).ok_or_else(unsupported)?)
             }
             NS_LOCAL => RelocTarget::Local(name.index),
+            NS_SLOT => RelocTarget::Slot(*slots.get(name.index as usize).ok_or_else(unsupported)?),
             _ => return Err(unsupported()),
         };
         relocs.push(Reloc {

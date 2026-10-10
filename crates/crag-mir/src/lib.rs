@@ -51,7 +51,10 @@ pub use liveness::{Liveness, compute_liveness, insert_drops, insert_rc_ops};
 /// one: what code is generated for. A generic function has code only per
 /// instance (§11.5.10): with concrete type arguments, and the functions
 /// that fill its slots, each an instance as concrete.
-#[crag_db::interned(debug)]
+///
+/// Its index is the function's id in images and must not name another
+/// instance later in the session, so it is never collected.
+#[crag_db::interned(debug, revisions = usize::MAX)]
 pub struct InstanceKey<'db> {
     pub owner: Owner<'db>,
     #[returns(ref)]

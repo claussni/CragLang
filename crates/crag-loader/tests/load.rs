@@ -18,10 +18,20 @@
 //! without the code generator.
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
-use crag_abi::{CodeObject, FuncId, Reloc, RelocKind, RelocTarget, RuntimeFn, StackCheck};
-use crag_loader::{CodeAddr, CodeArena, LoadError, SymbolTable, load, load_group, unload};
+use crag_abi::{CodeObject, FuncId, Reloc, RelocKind, RelocTarget, RuntimeFn, SlotKey, StackCheck};
+use crag_loader::{
+    CodeAddr, CodeArena, LoadError, SymbolTable, load, load_group, replace_group, slot_set, unload,
+};
 
 const PAGE: usize = 4096;
+
+/// The slot of a function with the first signature.
+fn key(func: u32) -> SlotKey {
+    SlotKey {
+        func: FuncId(func),
+        signature: 0,
+    }
+}
 
 fn object(code: Vec<u8>, relocs: Vec<Reloc>) -> CodeObject {
     CodeObject {
@@ -55,6 +65,22 @@ fn jump(target: RelocTarget, addend: i64) -> CodeObject {
             kind: RelocKind::Abs64,
             target,
             addend,
+        }],
+    )
+}
+
+/// `movabs rax, <slot>; jmp [rax]`: a call through a slot.
+fn through(slot: SlotKey) -> CodeObject {
+    let mut code = vec![0x48, 0xb8];
+    code.extend([0u8; 8]);
+    code.extend([0xff, 0x20]);
+    object(
+        code,
+        vec![Reloc {
+            offset: 2,
+            kind: RelocKind::Abs64,
+            target: RelocTarget::Slot(slot),
+            addend: 0,
         }],
     )
 }
@@ -112,7 +138,7 @@ fn relocations_resolve_every_kind_of_target() {
     let mut symbols = SymbolTable::new();
     symbols.define_runtime(RuntimeFn::Morestack, seven as *const () as usize);
 
-    load_group(&mut arena, &mut symbols, &[(FuncId(0), &constant(42))]).unwrap();
+    load_group(&mut arena, &mut symbols, &[(key(0), &constant(42))]).unwrap();
 
     // 1 jumps forward to 2 in the same group; 2 jumps to 0, loaded earlier;
     // 3 jumps to itself plus an addend, which skips the jump.
@@ -125,9 +151,9 @@ fn relocations_resolve_every_kind_of_target() {
         &mut arena,
         &mut symbols,
         &[
-            (FuncId(1), &to_member),
-            (FuncId(2), &to_earlier),
-            (FuncId(3), &to_self),
+            (key(1), &to_member),
+            (key(2), &to_earlier),
+            (key(3), &to_self),
         ],
     )
     .unwrap();
@@ -163,12 +189,7 @@ fn failed_load_changes_nothing() {
     let next = arena_probe(&mut arena, &symbols);
 
     let fails = |arena: &mut CodeArena, symbols: &mut SymbolTable, obj: &CodeObject| {
-        let err = load_group(
-            arena,
-            symbols,
-            &[(FuncId(5), &constant(1)), (FuncId(6), obj)],
-        )
-        .unwrap_err();
+        let err = load_group(arena, symbols, &[(key(5), &constant(1)), (key(6), obj)]).unwrap_err();
         assert_eq!(arena.bytes_in_use(), 0);
         assert_eq!(symbols.function(FuncId(5)), None);
         err
@@ -225,17 +246,13 @@ fn duplicate_functions_are_rejected() {
     let mut arena = CodeArena::new(16 * PAGE).unwrap();
     let mut symbols = SymbolTable::new();
     let one = constant(1);
-    load_group(&mut arena, &mut symbols, &[(FuncId(0), &one)]).unwrap();
-    let again = load_group(&mut arena, &mut symbols, &[(FuncId(0), &one)]);
+    load_group(&mut arena, &mut symbols, &[(key(0), &one)]).unwrap();
+    let again = load_group(&mut arena, &mut symbols, &[(key(0), &one)]);
     assert!(matches!(
         again,
         Err(LoadError::DuplicateFunction(FuncId(0)))
     ));
-    let twice = load_group(
-        &mut arena,
-        &mut symbols,
-        &[(FuncId(1), &one), (FuncId(1), &one)],
-    );
+    let twice = load_group(&mut arena, &mut symbols, &[(key(1), &one), (key(1), &one)]);
     assert!(matches!(
         twice,
         Err(LoadError::DuplicateFunction(FuncId(1)))
@@ -250,7 +267,7 @@ fn unload_frees_a_region_with_its_last_object() {
     let entries = load_group(
         &mut arena,
         &mut symbols,
-        &[(FuncId(0), &constant(1)), (FuncId(1), &constant(2))],
+        &[(key(0), &constant(1)), (key(1), &constant(2))],
     )
     .unwrap();
 
@@ -271,7 +288,7 @@ fn unload_frees_a_region_with_its_last_object() {
     }
 
     // The pages and the function number can be used again.
-    let reloaded = load_group(&mut arena, &mut symbols, &[(FuncId(0), &constant(3))]).unwrap();
+    let reloaded = load_group(&mut arena, &mut symbols, &[(key(0), &constant(3))]).unwrap();
     assert_eq!(reloaded[0], entries[0]);
     assert_eq!(call(reloaded[0]), 3);
 }
@@ -312,7 +329,7 @@ fn no_page_is_writable_and_executable() {
     let mut arena = CodeArena::new(16 * PAGE).unwrap();
     let mut symbols = SymbolTable::new();
     let first = load(&mut arena, &symbols, &constant(1)).unwrap();
-    let second = load_group(&mut arena, &mut symbols, &[(FuncId(0), &constant(2))]).unwrap()[0];
+    let second = load_group(&mut arena, &mut symbols, &[(key(0), &constant(2))]).unwrap()[0];
     // SAFETY: the code is not running and is not called again.
     unsafe { unload(&mut arena, &mut symbols, first).unwrap() };
     let third = load(&mut arena, &symbols, &constant(3)).unwrap();
@@ -325,4 +342,124 @@ fn no_page_is_writable_and_executable() {
         .lines()
         .filter(|l| l.split_whitespace().nth(1).unwrap().starts_with("rwx"));
     assert_eq!(both.count(), 0);
+}
+
+#[test]
+fn calls_through_a_slot_reach_the_replacement() {
+    let mut arena = CodeArena::new(16 * PAGE).unwrap();
+    let mut symbols = SymbolTable::new();
+    let old = load_group(&mut arena, &mut symbols, &[(key(0), &constant(1))]).unwrap()[0];
+    let caller = load(&mut arena, &symbols, &through(key(0))).unwrap();
+    assert_eq!(call(caller), 1);
+
+    // Only `replace_group` takes a function that is loaded.
+    let again = load_group(&mut arena, &mut symbols, &[(key(0), &constant(2))]);
+    assert!(matches!(
+        again,
+        Err(LoadError::DuplicateFunction(FuncId(0)))
+    ));
+    let new = replace_group(&mut arena, &mut symbols, &[(key(0), &constant(2))]).unwrap()[0];
+    assert_ne!(new, old);
+    assert_eq!(call(caller), 2);
+    assert_eq!(symbols.function(FuncId(0)), Some(new));
+    assert_eq!(symbols.slots().get(key(0)), Some(new));
+    // The old code stays loaded for the frames that still run it.
+    assert_eq!(call(old), 1);
+    assert_eq!(protection(old.addr()), "r-xp");
+
+    // A group still takes each function once.
+    let twice = replace_group(
+        &mut arena,
+        &mut symbols,
+        &[(key(0), &constant(3)), (key(0), &constant(4))],
+    );
+    assert!(matches!(
+        twice,
+        Err(LoadError::DuplicateFunction(FuncId(0)))
+    ));
+    assert_eq!(call(caller), 2);
+
+    // `slot_set` is all a replacement takes.
+    let slot = symbols.slots().index(key(0)).unwrap();
+    slot_set(symbols.slots(), slot, old);
+    assert_eq!(call(caller), 1);
+}
+
+#[test]
+fn a_slot_is_for_one_signature() {
+    let mut arena = CodeArena::new(16 * PAGE).unwrap();
+    let mut symbols = SymbolTable::new();
+    let other = SlotKey {
+        func: FuncId(0),
+        signature: 1,
+    };
+    load_group(&mut arena, &mut symbols, &[(key(0), &constant(1))]).unwrap();
+    let unresolved = load(&mut arena, &symbols, &through(other));
+    assert!(matches!(unresolved, Err(LoadError::UnresolvedSlot(k)) if k == other));
+
+    // The function with its new signature fills a slot of its own; code
+    // compiled for the old one keeps calling the old code.
+    let old_caller = load(&mut arena, &symbols, &through(key(0))).unwrap();
+    replace_group(&mut arena, &mut symbols, &[(other, &constant(2))]).unwrap();
+    let new_caller = load(&mut arena, &symbols, &through(other)).unwrap();
+    assert_eq!(call(old_caller), 1);
+    assert_eq!(call(new_caller), 2);
+}
+
+#[test]
+fn members_of_a_group_call_each_other_through_their_slots() {
+    let mut arena = CodeArena::new(16 * PAGE).unwrap();
+    let mut symbols = SymbolTable::new();
+    let entries = load_group(
+        &mut arena,
+        &mut symbols,
+        &[(key(1), &through(key(2))), (key(2), &constant(5))],
+    )
+    .unwrap();
+    assert_eq!(call(entries[0]), 5);
+
+    // A failed load leaves the slots it made empty, and nothing resolves
+    // to them.
+    let failed = load_group(
+        &mut arena,
+        &mut symbols,
+        &[(key(3), &jump(RelocTarget::Function(FuncId(9)), 0))],
+    );
+    assert!(failed.is_err());
+    assert_eq!(symbols.slots().get(key(3)), None);
+    let unresolved = load(&mut arena, &symbols, &through(key(3)));
+    assert!(matches!(unresolved, Err(LoadError::UnresolvedSlot(_))));
+
+    // Unloading empties the slot.
+    // SAFETY: nothing runs or calls the code afterwards.
+    unsafe { unload(&mut arena, &mut symbols, entries[1]).unwrap() };
+    assert_eq!(symbols.slots().get(key(2)), None);
+    assert!(symbols.slots().index(key(2)).is_some());
+}
+
+#[test]
+fn the_slot_table_grows_without_moving_slots() {
+    let mut arena = CodeArena::new(64 * PAGE).unwrap();
+    let mut symbols = SymbolTable::new();
+    load_group(&mut arena, &mut symbols, &[(key(0), &constant(1))]).unwrap();
+    let first = symbols
+        .slots()
+        .address(symbols.slots().index(key(0)).unwrap());
+    let caller = load(&mut arena, &symbols, &through(key(0))).unwrap();
+    let many: Vec<_> = (1..2000).map(|_| constant(0)).collect();
+    let group: Vec<_> = many
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (key(i as u32 + 1), c))
+        .collect();
+    load_group(&mut arena, &mut symbols, &group).unwrap();
+    let last = symbols.slots().index(key(1999)).unwrap();
+    assert_ne!(symbols.slots().address(last), first);
+    assert_eq!(
+        symbols
+            .slots()
+            .address(symbols.slots().index(key(0)).unwrap()),
+        first
+    );
+    assert_eq!(call(caller), 1);
 }

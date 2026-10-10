@@ -24,7 +24,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crag_db::RootDatabase;
+use crag_db::{RootDatabase, Setter};
 use crag_hir::{ModuleId, PRELUDE, Program, SourceFile};
 
 /// The prelude, bundled with the tool (Specification §19.4).
@@ -130,6 +130,12 @@ impl Project {
 
     pub fn source(&self, module: ModuleId) -> &str {
         module.file(&self.db).text(&self.db)
+    }
+
+    /// Replaces the text of a module, as an edit of its file does.
+    pub fn set_source(&mut self, module: ModuleId, text: String) {
+        let file = module.file(&self.db);
+        file.set_text(&mut self.db).to(text);
     }
 }
 

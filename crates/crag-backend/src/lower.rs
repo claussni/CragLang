@@ -39,8 +39,8 @@ use crag_abi::{
     STATIC_COUNT, TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TypeDescriptor, size_class,
 };
 use crag_codegen::{
-    BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, Cond, FuncId, Inst, LirFunction,
-    OverflowOp, RuntimeFn, Term, VReg,
+    BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, CallTarget, Cond, FuncId, Inst,
+    LirFunction, OverflowOp, RuntimeFn, Term, VReg,
 };
 use crag_db::Db;
 use crag_db::plumbing::AsId;
@@ -55,6 +55,7 @@ use crate::layout::{
     Layout, boxed_indices, equal_by_words, layout, record_layout, subtypes, type_descriptor,
     type_index,
 };
+use crate::slot_key;
 
 /// The LIR of a body, with what it could not lower.
 pub struct Lowered<'db> {
@@ -740,6 +741,11 @@ impl<'a, 'db> Lower<'a, 'db> {
         }
     }
 
+    /// Where a call of an instance goes: through its slot.
+    fn slot(&self, callee: InstanceKey<'db>) -> CallTarget {
+        CallTarget::Slot(slot_key(self.db, self.program, callee))
+    }
+
     /// The address of a function value's code, of the function type `ty`,
     /// which is loaded with this function.
     fn code_addr(&mut self, code: InstanceKey<'db>, ty: Ty<'db>) -> Result<VReg, Unsupported> {
@@ -750,7 +756,7 @@ impl<'a, 'db> Lower<'a, 'db> {
         let dst = self.reg();
         self.push(Inst::FuncAddr {
             dst,
-            func: func_id(code),
+            func: self.slot(code),
             params,
             returns,
         });
@@ -1198,7 +1204,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let dsts = self.locals[dst.index()].clone();
                 self.layouts[dst.index()].ok_or("values of this type")?;
                 self.push(Inst::Call {
-                    func: func_id(*func),
+                    func: self.slot(*func),
                     args,
                     dsts,
                 });
@@ -1207,7 +1213,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             Terminator::TailCall { func, args, .. } => {
                 let args = self.arguments(*func, args)?;
                 let term = Term::TailCall {
-                    func: func_id(*func),
+                    func: self.slot(*func),
                     args,
                 };
                 self.end(term, None);

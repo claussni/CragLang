@@ -31,7 +31,9 @@ use std::collections::HashMap;
 
 use crag_abi::{HEADER_SIZE, HEAP_OFFSET, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, TrapKind};
 use crag_backend::{code, type_index};
-use crag_codegen::{CodeObject, CodegenSettings, FuncId, OptLevel, compile_entry_stub, target_for};
+use crag_codegen::{
+    CodeObject, CodegenSettings, OptLevel, SlotKey, compile_entry_stub, target_for,
+};
 use crag_db::RootDatabase;
 use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, lower_body, owners};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
@@ -210,7 +212,7 @@ impl Module {
                 .map(|(_, e)| e.kind.message(&db))
                 .collect::<Vec<_>>()
         );
-        let mut objects: Vec<(FuncId, CodeObject)> = Vec::new();
+        let mut objects: Vec<(SlotKey, CodeObject)> = Vec::new();
         let mut names = Vec::new();
         let mut unsupported = Vec::new();
         let mut types = Vec::new();
@@ -247,7 +249,7 @@ impl Module {
                 names.push((name, objects.len(), compiled.params, compiled.returns));
             }
             types.extend(compiled.types.iter().cloned());
-            objects.push((compiled.func, compiled.object.clone()));
+            objects.push((compiled.slot, compiled.object.clone()));
         }
         let mut symbols = SymbolTable::new();
         for func in RuntimeFn::ALL {
@@ -265,7 +267,7 @@ impl Module {
             symbols.define_runtime(func, addr);
         }
         let mut arena = CodeArena::new(1 << 20).unwrap();
-        let group: Vec<(FuncId, &CodeObject)> = objects.iter().map(|(f, o)| (*f, o)).collect();
+        let group: Vec<(SlotKey, &CodeObject)> = objects.iter().map(|(f, o)| (*f, o)).collect();
         let entries = load_group(&mut arena, &mut symbols, &group).unwrap();
         let mut fiber_arena = CodeArena::new(1 << 20).unwrap();
         let mut fiber_symbols = SymbolTable::new();
@@ -275,7 +277,7 @@ impl Module {
         let fiber_entries = load_group(&mut fiber_arena, &mut fiber_symbols, &group).unwrap();
         let mut code_map = CodeMap::new();
         for ((func, object), entry) in group.iter().zip(&fiber_entries) {
-            code_map.add(*func, entry.addr(), object);
+            code_map.add(func.func, entry.addr(), object);
         }
         let fiber_functions = names
             .iter()

@@ -14,7 +14,8 @@
 // You should have received a copy of the GNU General Public License along with
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
-use crag_db::RootDatabase;
+use crag_db::plumbing::AsId;
+use crag_db::{RootDatabase, Setter};
 use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, owners};
 use crag_mir::{Entry, InstanceKey, Tier, collect_instances, mir};
 
@@ -1251,4 +1252,47 @@ bb4:
   branch _4 bb1 bb2
 "#,
     );
+}
+
+#[test]
+fn instance_and_type_ids_are_never_reused() {
+    // A function's id in images is its instance key's index, and a slot's
+    // signature a type's index, so neither may come back as another one
+    // when old values go unread for revisions. Both are interned inside
+    // queries, where salsa would otherwise reuse stale ones.
+    let mut db = RootDatabase::new();
+    let core = ModuleId::new(
+        &db,
+        "std.core".to_string(),
+        SourceFile::new(&db, PRELUDE.to_string()),
+    );
+    let file = SourceFile::new(&db, String::new());
+    let module = ModuleId::new(&db, "app".to_string(), file);
+    let program = Program::new(&db, vec![core, module]);
+    let mut instances = std::collections::HashSet::new();
+    let mut types = std::collections::HashSet::new();
+    for i in 0..20 {
+        file.set_text(&mut db).to(format!(
+            "type T{i}(n: Int)\n\nfn g{i}(t: T{i}) -> Int {{\n  t.n\n}}\n\n\
+             fn f{i}() -> Int {{\n  g{i}(T{i}(n: {i}))\n}}\n"
+        ));
+        let items = &crag_hir::item_tree(&db, module).items;
+        let item = |name: &str| {
+            let item = items
+                .iter()
+                .map(|i| i.id)
+                .find(|id| id.name(&db).text(&db) == name);
+            item.unwrap()
+        };
+        let root = InstanceKey::body(&db, Owner::Item(item(&format!("f{i}"))));
+        let reached = collect_instances(&db, program, &[root], Tier::Baseline);
+        let callees: Vec<_> = reached.iter().filter(|&&k| k != root).collect();
+        assert_eq!(callees.len(), 1, "revision {i}");
+        assert!(instances.insert(callees[0].as_id().index()), "revision {i}");
+        let sig = crag_types::signature(&db, program, item(&format!("g{i}")));
+        assert!(
+            types.insert(sig.params[0].ty.as_id().index()),
+            "revision {i}"
+        );
+    }
 }

@@ -20,11 +20,28 @@
 //! in SSA form: any block may assign any register, and the facade builds SSA.
 //! Every register holds one machine word.
 
-use crag_abi::{FuncId, RuntimeFn, TrapKind};
+use crag_abi::{FuncId, RuntimeFn, SlotKey, TrapKind};
 
 /// A virtual register. Registers `0..params` hold the parameters on entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct VReg(pub u32);
+
+/// Where a call of another Crag function goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallTarget {
+    /// Straight to the function's entry, which the loader patches in.
+    Direct(FuncId),
+    /// To the entry the function's slot holds when the call is made, so
+    /// that replacing the function reaches the call (Implementation Plan
+    /// §11.6.4).
+    Slot(SlotKey),
+}
+
+impl From<FuncId> for CallTarget {
+    fn from(func: FuncId) -> CallTarget {
+        CallTarget::Direct(func)
+    }
+}
 
 /// Index into `LirFunction::blocks`. Block 0 is where execution starts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -129,15 +146,16 @@ pub enum Inst {
     },
     /// A normal call. `dsts` receive the results, at most two.
     Call {
-        func: FuncId,
+        func: CallTarget,
         args: Vec<VReg>,
         dsts: Vec<VReg>,
     },
     /// `dst` becomes the address of a function with `params` parameters
-    /// and `returns` results, for calls through a register.
+    /// and `returns` results, for calls through a register: through a
+    /// slot, the entry the slot holds now.
     FuncAddr {
         dst: VReg,
-        func: FuncId,
+        func: CallTarget,
         params: u32,
         returns: u32,
     },
@@ -207,7 +225,7 @@ pub enum Term {
     /// A guaranteed tail call: the callee replaces this frame. The callee
     /// must return as many values as this function.
     TailCall {
-        func: FuncId,
+        func: CallTarget,
         args: Vec<VReg>,
     },
     /// A tail call of the function whose address `callee` holds.

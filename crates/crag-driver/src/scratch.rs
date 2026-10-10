@@ -58,10 +58,11 @@ impl Scratch {
         let functions: Vec<ShippedFunction> = compiled
             .objects
             .iter()
-            .map(|&(id, object)| {
-                let f = &compiled.functions[&id];
+            .map(|&(slot, object)| {
+                let f = &compiled.functions[&slot.func];
                 ShippedFunction {
-                    id,
+                    id: slot.func,
+                    signature: slot.signature,
                     params: f.params,
                     returns: f.returns,
                     object: object.clone(),

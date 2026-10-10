@@ -19,10 +19,11 @@
 use std::fs;
 use std::path::PathBuf;
 
+use crag_backend::func_id;
 use crag_driver::{Project, Scratch};
 use crag_hir::{ItemKind, Owner, item_tree};
 use crag_mir::InstanceKey;
-use crag_session::ImageCommand;
+use crag_session::{ImageCommand, RunResult};
 
 const APP: &str = r#"type Point(x: Int, y: Int)
 
@@ -61,6 +62,14 @@ fn down(n: Int) -> Int {
 
 fn boom() -> Int {
   down(3)
+}
+
+fn apply(f: (Int) -> Int, x: Int) -> Int {
+  f(x)
+}
+
+fn bump() -> Int {
+  apply({ n -> n + 1 }, 1)
 }
 "#;
 
@@ -142,17 +151,46 @@ fn a_fresh_image_gets_the_code_again() {
 }
 
 #[test]
-fn changed_code_is_not_shipped_over_the_old() {
-    let p = project("old", APP);
+fn a_changed_definition_replaces_the_old_code() {
+    let mut p = project("change", APP);
     let mut s = scratch();
-    assert_eq!(s.run(&p, function(&p, "two")).unwrap(), Ok(vec![2]));
-    // The same function in another database is another function, but its
-    // id may be the same: that stands in for a definition that changed.
-    let q = project("new", &APP.replace("  2\n", "  3\n"));
-    let error = s.run(&q, function(&q, "two")).unwrap_err();
-    assert!(
-        error.ends_with("changed, and the image cannot replace its code yet"),
-        "{error}"
-    );
-    assert_eq!(s.run(&p, function(&p, "two")).unwrap(), Ok(vec![2]));
+    assert_eq!(s.run(&p, function(&p, "answer")).unwrap(), Ok(vec![42]));
+    let module = p.module("demo.app").unwrap();
+
+    // `answer` calls `two` through its slot, so only `two` is sent again.
+    p.set_source(module, APP.replace("  2\n", "  3\n"));
+    assert_eq!(s.ship(&p, &[function(&p, "answer")]).unwrap(), 1);
+    assert_eq!(s.run(&p, function(&p, "answer")).unwrap(), Ok(vec![43]));
+    assert_eq!(s.run(&p, function(&p, "two")).unwrap(), Ok(vec![3]));
+    assert_eq!(s.run(&p, function(&p, "twice")).unwrap(), Ok(vec![46]));
+
+    // A new signature is a new slot, which the callers compiled anew call.
+    let app = APP
+        .replace(
+            "fn two() -> Int {\n  2\n}",
+            "fn two(k: Int) -> Int {\n  k\n}",
+        )
+        .replace("40 + two()", "40 + two(5)");
+    p.set_source(module, app);
+    assert_eq!(s.ship(&p, &[function(&p, "answer")]).unwrap(), 2);
+    assert_eq!(s.run(&p, function(&p, "answer")).unwrap(), Ok(vec![45]));
+    // `twice`, run as the image has it, still calls the old `two`, which
+    // its code was compiled against, and the new `answer`.
+    let twice = func_id(function(&p, "twice"));
+    match s.session().run(twice).unwrap() {
+        RunResult::Finished(words) => assert_eq!(words, vec![48]),
+        RunResult::Trapped(trap) => panic!("{trap:?}"),
+    }
+
+    // A closure's code is reached through its slot too: `bump`, which
+    // makes the closure, has the code it had and is not sent again.
+    assert_eq!(s.run(&p, function(&p, "bump")).unwrap(), Ok(vec![2]));
+    p.set_source(module, APP.replace("n + 1", "n + 5"));
+    assert_eq!(s.ship(&p, &[function(&p, "bump")]).unwrap(), 1);
+    assert_eq!(s.run(&p, function(&p, "bump")).unwrap(), Ok(vec![6]));
+
+    // Back to the first text: the image gets the first code again.
+    p.set_source(module, APP.into());
+    assert_eq!(s.ship(&p, &[function(&p, "answer")]).unwrap(), 2);
+    assert_eq!(s.run(&p, function(&p, "answer")).unwrap(), Ok(vec![42]));
 }

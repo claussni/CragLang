@@ -22,6 +22,11 @@
 //! their types join the worker's, and their stack maps join the code map
 //! that unwinding reads. A function is run on a fiber of its own through
 //! the stub for its words.
+//!
+//! A function shipped again replaces the code it had (§11.6.4): the new
+//! code fills its slot, so every later call reaches it, while frames
+//! still running the old code finish there. The old code stays loaded and
+//! in the code map.
 
 use std::collections::HashMap;
 use std::io;
@@ -29,8 +34,8 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
 
-use crag_abi::{CodeObject, FuncId, RuntimeFn, TypeDescriptor};
-use crag_loader::{CodeArena, SymbolTable, load, load_group};
+use crag_abi::{CodeObject, FuncId, RuntimeFn, SlotKey, TypeDescriptor};
+use crag_loader::{CodeArena, SymbolTable, load, replace_group};
 use crag_runtime::{CodeMap, Fiber, FiberConfig, FiberState, Types, Worker};
 
 use crate::host::ImageKind;
@@ -45,7 +50,7 @@ const ARENA: usize = 1 << 30;
 pub struct Image {
     arena: CodeArena,
     symbols: SymbolTable,
-    /// Each function's entry and words of parameters and results.
+    /// Each function's latest entry and words of parameters and results.
     functions: HashMap<FuncId, (usize, u32, u32)>,
     /// Each entry stub's entry, by words of parameters and results.
     stubs: HashMap<(u32, u32), usize>,
@@ -113,9 +118,17 @@ impl Image {
                 self.stubs.insert(shape, entry.addr());
             }
         }
-        let group: Vec<(FuncId, &CodeObject)> =
-            functions.iter().map(|f| (f.id, &f.object)).collect();
-        let entries = load_group(&mut self.arena, &mut self.symbols, &group)
+        let group: Vec<(SlotKey, &CodeObject)> = functions
+            .iter()
+            .map(|f| {
+                let slot = SlotKey {
+                    func: f.id,
+                    signature: f.signature,
+                };
+                (slot, &f.object)
+            })
+            .collect();
+        let entries = replace_group(&mut self.arena, &mut self.symbols, &group)
             .map_err(|e| format!("cannot load the code: {e}"))?;
         for (f, entry) in functions.into_iter().zip(entries) {
             self.functions

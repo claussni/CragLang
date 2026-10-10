@@ -25,6 +25,7 @@ use crag_session::{Image, Message, ShippedFunction};
 fn function(id: u32, params: u32, relocs: Vec<Reloc>) -> ShippedFunction {
     ShippedFunction {
         id: FuncId(id),
+        signature: params,
         params,
         returns: 1,
         object: CodeObject {
@@ -96,12 +97,17 @@ fn an_image_refuses_what_it_cannot_do() {
         image.answer(Message::Run(FuncId(6))),
         Some(Message::Failed("no entry stub returns 1 words".into()))
     );
-    // Loaded already, and a type index with another descriptor.
+    // Twice in one shipment, and a type index with another descriptor.
+    let twice = vec![function(5, 0, Vec::new()), function(5, 0, Vec::new())];
     assert_eq!(
-        image.answer(load(Vec::new(), vec![function(5, 1, Vec::new())])),
+        image.answer(load(Vec::new(), twice)),
         Some(Message::Failed(
-            "cannot load the code: function 5 is already loaded".into()
+            "cannot load the code: function 5 is already loaded or comes twice".into()
         ))
+    );
+    assert_eq!(
+        image.answer(Message::Run(FuncId(5))),
+        Some(Message::Failed("function 5 takes parameters".into()))
     );
     assert_eq!(
         image.answer(load(
@@ -119,5 +125,14 @@ fn an_image_refuses_what_it_cannot_do() {
     assert_eq!(
         image.answer(Message::Loaded),
         Some(Message::Failed("an image does not take Loaded".into()))
+    );
+    // Shipped again, a function replaces its code.
+    assert_eq!(
+        image.answer(load(Vec::new(), vec![function(5, 0, Vec::new())])),
+        Some(Message::Loaded)
+    );
+    assert_eq!(
+        image.answer(Message::Run(FuncId(5))),
+        Some(Message::Failed("no entry stub returns 1 words".into()))
     );
 }

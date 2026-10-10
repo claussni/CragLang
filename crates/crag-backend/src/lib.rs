@@ -23,6 +23,12 @@
 //! are read through calls of the runtime, and checks trap through a call of
 //! the runtime. Every call is a safepoint whose stack map lists
 //! the boxes the frame holds.
+//!
+//! Baseline code calls other Crag functions through their slots
+//! (Implementation Plan §11.6.4), so that an image can replace a function
+//! without reloading its callers. A slot is the function's id and its
+//! signature: the index of the function type its MIR has, parameters and
+//! result, which stays the same while the signature does.
 
 extern crate crag_db as salsa;
 
@@ -31,12 +37,14 @@ mod lower;
 
 use std::sync::OnceLock;
 
-use crag_abi::TypeDescriptor;
+use crag_abi::{SlotKey, TypeDescriptor};
 
 use crag_codegen::{CodeObject, CodegenSettings, OptLevel, Target, compile, target_for};
 use crag_db::Db;
+use crag_db::plumbing::AsId;
 use crag_hir::Program;
 use crag_mir::{InstanceKey, Tier, mir};
+use crag_types::{Ty, TyKind};
 
 pub use layout::{
     FieldSlot, Layout, element_layout, layout, record_layout, type_descriptor, type_index,
@@ -47,8 +55,10 @@ pub use lower::{Lowered, func_id, lower_to_lir};
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
 pub struct Code<'db> {
     pub object: CodeObject,
-    /// The function the object is loaded as, which calls name.
+    /// The function the object is loaded as, and the slot it fills, which
+    /// calls name.
     pub func: crag_codegen::FuncId,
+    pub slot: SlotKey,
     /// Words of parameters and results, for the entry stub.
     pub params: u32,
     pub returns: u32,
@@ -65,6 +75,33 @@ pub struct Code<'db> {
 fn host() -> &'static Target {
     static HOST: OnceLock<Target> = OnceLock::new();
     HOST.get_or_init(|| target_for("x86_64-unknown-linux-gnu").expect("the host is supported"))
+}
+
+/// The slot of an instance: its function id and its signature.
+pub fn slot_key<'db>(db: &'db dyn Db, program: Program, instance: InstanceKey<'db>) -> SlotKey {
+    SlotKey {
+        func: func_id(instance),
+        signature: *slot_signature(db, program, instance),
+    }
+}
+
+/// The signature part of an instance's slot: the index of the function
+/// type of its MIR, or zero for what has none. A query of its own, so that
+/// callers depend on the signature and not on the body.
+#[crag_db::tracked]
+fn slot_signature<'db>(db: &'db dyn Db, program: Program, instance: InstanceKey<'db>) -> u32 {
+    let Some(body) = mir(db, program, instance, Tier::Baseline) else {
+        return 0;
+    };
+    let ty = Ty::new(
+        db,
+        TyKind::Fn {
+            params: body.locals[..body.params].iter().map(|l| l.ty).collect(),
+            result: body.result,
+            pure: false,
+        },
+    );
+    ty.as_id().index()
 }
 
 /// The code object of an instance; none for what has no MIR, and an error
@@ -89,6 +126,7 @@ pub fn code<'db>(
             .map(|object| Code {
                 object,
                 func: func_id(instance),
+                slot: slot_key(db, program, instance),
                 params: lowered.lir.params,
                 returns: lowered.lir.returns,
                 calls: lowered.calls,

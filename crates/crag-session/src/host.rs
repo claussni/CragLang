@@ -345,9 +345,6 @@ pub enum SessionError {
     Io(io::Error),
     /// The image could not do what it was asked, and why; it runs on.
     Refused(String),
-    /// A function the image has loaded was shipped with other code, which
-    /// only slot tables can swap in (§11.6.4).
-    Changed(FuncId),
 }
 
 impl fmt::Display for SessionError {
@@ -356,11 +353,6 @@ impl fmt::Display for SessionError {
             SessionError::Exited(exit) => write!(f, "{exit}; a fresh one has started"),
             SessionError::Io(e) => write!(f, "the image cannot be started: {e}"),
             SessionError::Refused(why) => write!(f, "the image refused: {why}"),
-            SessionError::Changed(func) => write!(
-                f,
-                "function {} changed, and the image cannot replace its code yet",
-                func.0
-            ),
         }
     }
 }
@@ -418,7 +410,8 @@ impl Session {
     /// Ships code to the scratch image: the functions, stubs and type
     /// descriptors it lacks, loaded together. Returns how many functions
     /// were sent. A function that comes again with the code it has is not
-    /// sent; one that comes with other code is refused.
+    /// sent; one that comes with other code is, and replaces the old code
+    /// in the image.
     pub fn ship(
         &mut self,
         types: &[(u32, TypeDescriptor)],
@@ -430,14 +423,15 @@ impl Session {
         let mut new_functions = Vec::new();
         for f in functions {
             let hash = blake3::hash(&f.encode());
-            match image.functions.get(&f.id).or(hashes.get(&f.id)) {
-                Some(known) if *known == hash => continue,
-                Some(_) => return Err(SessionError::Changed(f.id)),
-                None => {
-                    hashes.insert(f.id, hash);
-                    new_functions.push(f.clone());
-                }
+            let known = image.functions.get(&f.id).or(hashes.get(&f.id));
+            if known == Some(&hash) {
+                continue;
             }
+            // New, or changed: the image replaces the code it has. A
+            // function that comes twice with different code is sent twice,
+            // and the image refuses the shipment.
+            hashes.insert(f.id, hash);
+            new_functions.push(f.clone());
         }
         let mut shapes = HashSet::new();
         let new_stubs: Vec<Stub> = stubs

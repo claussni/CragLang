@@ -30,13 +30,25 @@
 //!
 //! A region's pages return to the free list when its last code object is
 //! unloaded.
+//!
+//! # Slots
+//!
+//! Development images call through a slot table (Implementation Plan
+//! §11.6.4): a call loads the callee's entry from its slot and calls that,
+//! so a function can be replaced by loading new code and storing its entry
+//! in the slot. Every later call reaches the new code, while frames already
+//! running finish on the old. A slot belongs to a function with one
+//! signature, as a [`SlotKey`] names it; loading a function fills its slot.
+//! The table grows in chunks that never move, so a slot's address, which
+//! the code is patched with, stays valid as long as the table lives.
 
 #![cfg(unix)]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crag_abi::{CodeObject, FuncId, RelocKind, RelocTarget, RuntimeFn};
+use crag_abi::{CodeObject, FuncId, RelocKind, RelocTarget, RuntimeFn, SlotKey};
 
 /// The address of a loaded code object's entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -52,12 +64,70 @@ impl CodeAddr {
     }
 }
 
-/// What relocations resolve against: the runtime functions and the loaded
-/// Crag functions.
+/// Slots per chunk of the slot table: a page of them.
+const SLOT_CHUNK: usize = 512;
+
+/// A slot's place in the slot table, assigned when its key is first loaded
+/// and kept for the table's life.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SlotIndex(u32);
+
+/// The entry points that calls through slots load, one per function and
+/// signature. An empty slot holds zero.
+#[derive(Default)]
+pub struct SlotTable {
+    chunks: Vec<Box<[AtomicUsize; SLOT_CHUNK]>>,
+    index: HashMap<SlotKey, SlotIndex>,
+}
+
+impl SlotTable {
+    /// The slot of a key, if it has one.
+    pub fn index(&self, key: SlotKey) -> Option<SlotIndex> {
+        self.index.get(&key).copied()
+    }
+
+    /// The slot of a key, made when it has none.
+    fn assign(&mut self, key: SlotKey) -> SlotIndex {
+        let next = SlotIndex(self.index.len() as u32);
+        let index = *self.index.entry(key).or_insert(next);
+        if index == next && next.0 as usize == self.chunks.len() * SLOT_CHUNK {
+            self.chunks
+                .push(Box::new([const { AtomicUsize::new(0) }; SLOT_CHUNK]));
+        }
+        index
+    }
+
+    fn cell(&self, index: SlotIndex) -> &AtomicUsize {
+        let i = index.0 as usize;
+        &self.chunks[i / SLOT_CHUNK][i % SLOT_CHUNK]
+    }
+
+    /// The address of a slot, which calls load the entry point from.
+    pub fn address(&self, index: SlotIndex) -> usize {
+        self.cell(index).as_ptr() as usize
+    }
+
+    /// The entry point a key's slot holds now; none when it has no slot or
+    /// the slot is empty.
+    pub fn get(&self, key: SlotKey) -> Option<CodeAddr> {
+        let entry = self.cell(self.index(key)?).load(Ordering::Acquire);
+        (entry != 0).then_some(CodeAddr(entry))
+    }
+}
+
+/// Stores an entry point in a slot. The store is atomic, so a call on
+/// another thread loads either the old entry or the new one.
+pub fn slot_set(table: &SlotTable, index: SlotIndex, addr: CodeAddr) {
+    table.cell(index).store(addr.0, Ordering::Release);
+}
+
+/// What relocations resolve against: the runtime functions, the loaded
+/// Crag functions and their slots.
 #[derive(Default)]
 pub struct SymbolTable {
     runtime: [Option<usize>; RuntimeFn::ALL.len()],
     functions: HashMap<FuncId, CodeAddr>,
+    slots: SlotTable,
 }
 
 impl SymbolTable {
@@ -75,9 +145,13 @@ impl SymbolTable {
         self.runtime[func as usize]
     }
 
-    /// The entry point of a loaded function.
+    /// The entry point of a loaded function: its latest code.
     pub fn function(&self, func: FuncId) -> Option<CodeAddr> {
         self.functions.get(&func).copied()
+    }
+
+    pub fn slots(&self) -> &SlotTable {
+        &self.slots
     }
 }
 
@@ -91,6 +165,9 @@ pub enum LoadError {
     UnresolvedFunction(FuncId),
     /// A relocation names a runtime function with no address.
     UnresolvedRuntime(RuntimeFn),
+    /// A relocation names the slot of a function with a signature that is
+    /// neither loaded nor in the group.
+    UnresolvedSlot(SlotKey),
     /// The function is already loaded, or appears twice in the group.
     DuplicateFunction(FuncId),
     /// The code object contradicts itself: an entry point, relocation or
@@ -109,7 +186,14 @@ impl std::fmt::Display for LoadError {
             LoadError::UnresolvedRuntime(func) => {
                 write!(f, "runtime function {} has no address", func.symbol())
             }
-            LoadError::DuplicateFunction(id) => write!(f, "function {} is already loaded", id.0),
+            LoadError::UnresolvedSlot(key) => write!(
+                f,
+                "function {} with signature {} is not loaded",
+                key.func.0, key.signature
+            ),
+            LoadError::DuplicateFunction(id) => {
+                write!(f, "function {} is already loaded or comes twice", id.0)
+            }
             LoadError::Malformed(why) => write!(f, "malformed code object: {why}"),
             LoadError::NotLoaded(addr) => write!(f, "no code is loaded at {:#x}", addr.0),
         }
@@ -281,24 +365,54 @@ pub fn load(
     Ok(place(arena, symbols, &[(None, code)])?[0])
 }
 
-/// Loads functions together into one region and enters them in the symbol
-/// table. Their relocations may name each other, themselves and functions
-/// already loaded. Either all are loaded or none.
+/// Loads functions together into one region, enters them in the symbol
+/// table and fills their slots. Their relocations may name each other,
+/// themselves and functions already loaded. Either all are loaded or none.
 pub fn load_group(
     arena: &mut CodeArena,
     symbols: &mut SymbolTable,
-    group: &[(FuncId, &CodeObject)],
+    group: &[(SlotKey, &CodeObject)],
+) -> Result<Vec<CodeAddr>, LoadError> {
+    enter(arena, symbols, group, false)
+}
+
+/// Loads functions as `load_group` does, except that some may be loaded
+/// already: their new code takes their place in the symbol table and their
+/// slots, so later calls through the slots reach it. The old code stays
+/// loaded, since frames may still run it; it is not unloaded yet.
+pub fn replace_group(
+    arena: &mut CodeArena,
+    symbols: &mut SymbolTable,
+    group: &[(SlotKey, &CodeObject)],
+) -> Result<Vec<CodeAddr>, LoadError> {
+    enter(arena, symbols, group, true)
+}
+
+fn enter(
+    arena: &mut CodeArena,
+    symbols: &mut SymbolTable,
+    group: &[(SlotKey, &CodeObject)],
+    replace: bool,
 ) -> Result<Vec<CodeAddr>, LoadError> {
     let mut seen = HashSet::new();
-    for &(id, _) in group {
-        if symbols.functions.contains_key(&id) || !seen.insert(id) {
-            return Err(LoadError::DuplicateFunction(id));
+    for &(key, _) in group {
+        let loaded = !replace && symbols.functions.contains_key(&key.func);
+        if loaded || !seen.insert(key.func) {
+            return Err(LoadError::DuplicateFunction(key.func));
         }
     }
-    let items: Vec<_> = group.iter().map(|&(id, code)| (Some(id), code)).collect();
+    // The members' slots must exist before their callers are patched with
+    // the slots' addresses. If the load fails, they stay empty.
+    let slots: Vec<SlotIndex> = group
+        .iter()
+        .map(|&(key, _)| symbols.slots.assign(key))
+        .collect();
+    let items: Vec<_> = group.iter().map(|&(key, code)| (Some(key), code)).collect();
     let entries = place(arena, symbols, &items)?;
-    for (&(id, _), &entry) in group.iter().zip(&entries) {
-        symbols.functions.insert(id, entry);
+    // The code is executable now, so it may be published.
+    for ((&(key, _), &entry), &slot) in group.iter().zip(&entries).zip(&slots) {
+        symbols.functions.insert(key.func, entry);
+        slot_set(&symbols.slots, slot, entry);
     }
     Ok(entries)
 }
@@ -307,7 +421,7 @@ pub fn load_group(
 fn place(
     arena: &mut CodeArena,
     symbols: &SymbolTable,
-    items: &[(Option<FuncId>, &CodeObject)],
+    items: &[(Option<SlotKey>, &CodeObject)],
 ) -> Result<Vec<CodeAddr>, LoadError> {
     // Lay the objects out one after another.
     let mut offsets = Vec::with_capacity(items.len());
@@ -345,12 +459,23 @@ fn place(
                 }
                 let target = match reloc.target {
                     RelocTarget::Function(id) => {
-                        match items.iter().position(|&(member, _)| member == Some(id)) {
+                        let member = items
+                            .iter()
+                            .position(|&(member, _)| member.is_some_and(|key| key.func == id));
+                        match member {
                             Some(member) => entry_of(member),
                             None => symbols
                                 .function(id)
                                 .ok_or(LoadError::UnresolvedFunction(id))?
                                 .addr(),
+                        }
+                    }
+                    RelocTarget::Slot(key) => {
+                        let member = items.iter().any(|&(member, _)| member == Some(key));
+                        let slots = &symbols.slots;
+                        match slots.index(key) {
+                            Some(slot) if member || slots.get(key).is_some() => slots.address(slot),
+                            _ => return Err(LoadError::UnresolvedSlot(key)),
                         }
                     }
                     RelocTarget::Runtime(func) => symbols
@@ -440,6 +565,11 @@ pub unsafe fn unload(
         .remove(&entry.0)
         .ok_or(LoadError::NotLoaded(entry))?;
     symbols.functions.retain(|_, addr| *addr != entry);
+    for &slot in symbols.slots.index.values() {
+        let cell = symbols.slots.cell(slot);
+        // Nothing may call the code any more, so its slots empty.
+        let _ = cell.compare_exchange(entry.0, 0, Ordering::AcqRel, Ordering::Relaxed);
+    }
     let region = arena
         .regions
         .get_mut(&start)

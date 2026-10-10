@@ -21,7 +21,10 @@ use crag_db::Db;
 use crag_db::plumbing::AsId;
 use crag_hir::{ItemId, Name};
 
-#[crag_db::interned(debug)]
+/// A type. Its index stands for a signature in slot keys (Implementation
+/// Plan §11.6.4) and must not name another type later in the session, so
+/// it is never collected.
+#[crag_db::interned(debug, revisions = usize::MAX)]
 pub struct Ty<'db> {
     #[returns(ref)]
     pub kind: TyKind<'db>,

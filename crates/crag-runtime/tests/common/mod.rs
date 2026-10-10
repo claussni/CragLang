@@ -18,7 +18,7 @@
 //! fibers that call them.
 #![allow(dead_code)]
 
-use crag_abi::{FuncId, RuntimeFn};
+use crag_abi::{FuncId, RuntimeFn, SlotKey};
 use crag_codegen::{
     CodeObject, CodegenSettings, LirFunction, OptLevel, VReg, compile, compile_entry_stub,
     target_for,
@@ -51,11 +51,17 @@ impl Image {
         for func in RuntimeFn::ALL {
             symbols.define_runtime(func, crag_runtime::runtime_fn_addr(func));
         }
-        let group: Vec<_> = (0..).map(FuncId).zip(&objects).collect();
+        let group: Vec<_> = (0..)
+            .map(|i| SlotKey {
+                func: FuncId(i),
+                signature: 0,
+            })
+            .zip(&objects)
+            .collect();
         let entries = load_group(&mut arena, &mut symbols, &group).unwrap();
         let mut code = CodeMap::new();
         for ((func, object), entry) in group.iter().zip(&entries) {
-            code.add(*func, entry.addr(), object);
+            code.add(func.func, entry.addr(), object);
         }
         Image {
             code,

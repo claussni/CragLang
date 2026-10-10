@@ -22,7 +22,7 @@
 //! runtime's test.
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
-use crag_abi::{FRAME_BUDGET, RuntimeFn, STACK_LIMIT_SENTINEL};
+use crag_abi::{FRAME_BUDGET, RuntimeFn, STACK_LIMIT_SENTINEL, SlotKey};
 use crag_codegen::{
     BinOp, Block, BlockId, CodeObject, CodegenError, CodegenSettings, Cond, FuncId, Inst,
     LirFunction, OptLevel, RelocTarget, StackCheck, Term, VReg, compile, compile_entry_stub,
@@ -139,7 +139,13 @@ fn load(objects: &[&CodeObject]) -> Image {
     let mut arena = CodeArena::new(1 << 20).unwrap();
     let mut symbols = SymbolTable::new();
     symbols.define_runtime(RuntimeFn::Morestack, morestack_stub as *const () as usize);
-    let group: Vec<_> = (0..).map(FuncId).zip(objects.iter().copied()).collect();
+    let group: Vec<_> = (0..)
+        .map(|i| SlotKey {
+            func: FuncId(i),
+            signature: 0,
+        })
+        .zip(objects.iter().copied())
+        .collect();
     let entries = load_group(&mut arena, &mut symbols, &group).unwrap();
     Image {
         entries: entries.iter().map(|e| e.addr()).collect(),
@@ -312,7 +318,7 @@ fn countdown_fn(self_id: u32) -> LirFunction {
                     },
                 ],
                 term: Term::TailCall {
-                    func: FuncId(self_id),
+                    func: FuncId(self_id).into(),
                     args: vec![r(0), r(1)],
                 },
             },
@@ -334,13 +340,13 @@ fn wide_fn(live: u32, callee: u32) -> LirFunction {
             value: i64::from(i),
         });
         insts.push(Inst::Call {
-            func: FuncId(callee),
+            func: FuncId(callee).into(),
             args: vec![r(0), r(tmp)],
             dsts: vec![r(1 + i)],
         });
     }
     insts.push(Inst::Call {
-        func: FuncId(callee),
+        func: FuncId(callee).into(),
         args: vec![r(0), r(0)],
         dsts: vec![r(acc)],
     });
@@ -530,7 +536,7 @@ fn tail_call_with_more_arguments_counts_toward_the_footprint() {
         blocks: vec![Block {
             insts: vec![],
             term: Term::TailCall {
-                func: FuncId(1),
+                func: FuncId(1).into(),
                 args: vec![r(0); 12],
             },
         }],
@@ -577,7 +583,7 @@ fn tracked_fn(add: u32) -> LirFunction {
         blocks: vec![Block {
             insts: vec![
                 Inst::Call {
-                    func: FuncId(add),
+                    func: FuncId(add).into(),
                     args: vec![r(0), r(1)],
                     dsts: vec![r(2)],
                 },

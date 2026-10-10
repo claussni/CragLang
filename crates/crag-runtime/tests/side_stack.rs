@@ -87,7 +87,7 @@ fn pass_pair_fn(sum_pair: u32) -> LirFunction {
                     offset: 8,
                 },
                 Inst::Call {
-                    func: FuncId(sum_pair),
+                    func: FuncId(sum_pair).into(),
                     args: vec![r(1)],
                     dsts: vec![r(3)],
                 },
@@ -153,7 +153,7 @@ fn sum_through_slots_fn(self_id: u32) -> LirFunction {
                         b: r(4),
                     },
                     Inst::Call {
-                        func: FuncId(self_id),
+                        func: FuncId(self_id).into(),
                         args: vec![r(4)],
                         dsts: vec![r(5)],
                     },
@@ -216,7 +216,7 @@ fn call_in_loop_fn(callee: u32) -> LirFunction {
             Block {
                 insts: vec![
                     Inst::Call {
-                        func: FuncId(callee),
+                        func: FuncId(callee).into(),
                         args: vec![r(0)],
                         dsts: vec![r(5)],
                     },
