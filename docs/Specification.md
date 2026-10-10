@@ -790,7 +790,7 @@ fn sum(xs: List[Int], i: Int, acc: Int) -> Int {
 ```
 
 1. The caller's bindings are released before the jump, so `Immediate` handlers of its values run before the callee starts.
-2. A stack-allocated closure passed in a tail call is copied into the callee's frame.
+2. A stack-allocated closure that a tail call passes, or calls, is moved out of the caller's frame first, so the callee can use it.
 3. A foreign call in tail position is an ordinary call.
 
 #### 5.6.4 Local functions

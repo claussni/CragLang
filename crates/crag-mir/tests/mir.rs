@@ -131,6 +131,187 @@ fn check(text: &str, expected: &str) {
     }
 }
 
+/// A tail call pops the caller's part of the side stack, so a closure it
+/// passes or calls goes on the heap, with the side-stack closures that one
+/// captures; one it does not take along stays on the side stack.
+#[test]
+fn tail_calls_take_closures_to_the_heap() {
+    check(
+        r#"fn apply(f: (Int) -> Int, x: Int) -> Int {
+  f(x)
+}
+
+fn passed(k: Int) -> Int {
+  apply({ n -> n + k }, 1)
+}
+
+fn kept(k: Int) -> Int {
+  let r = apply({ n -> n + k }, 1)
+  apply(negate, r)
+}
+
+fn called(k: Int) -> Int {
+  fn go(m: Int) -> Int {
+    m + k
+  }
+  go(1)
+}
+
+fn nested(k: Int) -> Int {
+  let f: (Int) -> Int = { n -> n + k }
+  apply({ n -> f(n) }, 2)
+}
+
+fn negate(n: Int) -> Int {
+  0 - n
+}
+"#,
+        r#"apply
+param _0: (Int) -> Int (f)
+param _1: Int (x)
+bb0:
+  tail call value _0(_1)
+passed
+param _0: Int (k)
+let _1: (Int) -> Int is Pure
+let _2: (Int) -> Int
+bb0:
+  _1 = closure passed#6 heap(_0)
+  _2 = convert _1
+  tail call apply(_2, 1)
+passed#6
+param _0: (0: Int)
+param _1: Int (n)
+let _2: Int (k)
+let _3: Int
+let _4: False | True
+bb0:
+  _2 = _0.0
+  release _0
+  _4 = overflows Int.add(_1, _2)
+  branch _4 bb1 bb2
+bb1:
+  trap overflow
+bb2:
+  _3 = Int.add(_1, _2)
+  return _3
+kept
+param _0: Int (k)
+let _1: (Int) -> Int is Pure
+let _2: (Int) -> Int
+let _3: Int
+let _4: Int (r)
+let _5: (Int) -> Int is Pure
+let _6: (Int) -> Int
+bb0:
+  _1 = closure kept#6 side(_0)
+  _2 = convert _1
+  _3 = call apply(_2, 1) -> bb1
+bb1:
+  _4 = _3
+  _5 = closure kept#10 heap()
+  _6 = convert _5
+  tail call apply(_6, _4)
+kept#6
+param _0: (0: Int)
+param _1: Int (n)
+let _2: Int (k)
+let _3: Int
+let _4: False | True
+bb0:
+  _2 = _0.0
+  release _0
+  _4 = overflows Int.add(_1, _2)
+  branch _4 bb1 bb2
+bb1:
+  trap overflow
+bb2:
+  _3 = Int.add(_1, _2)
+  return _3
+kept#10
+param _0: ()
+param _1: Int
+bb0:
+  tail call negate(_1)
+called
+param _0: Int (k)
+let _1: (Int) -> Int (go)
+let _2: (Int) -> Int
+bb0:
+  _2 = closure called#4 heap(_0)
+  _1 = _2
+  tail call value _1(1)
+called#4
+param _0: (0: Int)
+param _1: Int (m)
+let _2: Int (k)
+let _3: (Int) -> Int (go)
+let _4: Int
+let _5: False | True
+bb0:
+  _2 = _0.0
+  _3 = closure called#4 with _0
+  release _3
+  _5 = overflows Int.add(_1, _2)
+  branch _5 bb1 bb2
+bb1:
+  trap overflow
+bb2:
+  _4 = Int.add(_1, _2)
+  return _4
+nested
+param _0: Int (k)
+let _1: (Int) -> Int is Pure
+let _2: (Int) -> Int (f)
+let _3: (Int) -> Int is Pure
+let _4: (Int) -> Int
+bb0:
+  _1 = closure nested#5 heap(_0)
+  _2 = convert _1
+  _3 = closure nested#11 heap(_2)
+  _4 = convert _3
+  tail call apply(_4, 2)
+nested#5
+param _0: (0: Int)
+param _1: Int (n)
+let _2: Int (k)
+let _3: Int
+let _4: False | True
+bb0:
+  _2 = _0.0
+  release _0
+  _4 = overflows Int.add(_1, _2)
+  branch _4 bb1 bb2
+bb1:
+  trap overflow
+bb2:
+  _3 = Int.add(_1, _2)
+  return _3
+nested#11
+param _0: (0: (Int) -> Int)
+param _1: Int (n)
+let _2: (Int) -> Int (f)
+bb0:
+  _2 = _0.0
+  retain _2
+  release _0
+  tail call value _2(_1)
+negate
+param _0: Int (n)
+let _1: Int
+let _2: False | True
+bb0:
+  _2 = overflows Int.sub(0, _0)
+  branch _2 bb1 bb2
+bb1:
+  trap overflow
+bb2:
+  _1 = Int.sub(0, _0)
+  return _1
+"#,
+    );
+}
+
 /// Integer operations test for overflow before they run, division for a
 /// zero divisor first; a run of `Float` operations shares one test, after
 /// it. A negated literal is a constant.
@@ -684,8 +865,8 @@ bb0:
 /// A closure is a function value: the code of its body, which reads the
 /// captured values out of its environment, and the environment. One that
 /// does not outlive its frame borrows what it captures from the side
-/// stack, so `xs` lives until `apply` returns, and a tail call is then a
-/// plain call; an escaping one takes its captures to the heap. A local
+/// stack, so `xs` lives until `apply` returns; an escaping one takes its
+/// captures to the heap. A local
 /// function calls itself through its own environment, and a declared
 /// function used as a value gets code that calls it.
 #[test]
@@ -696,14 +877,16 @@ fn closures_capture_into_environments() {
 }
 
 fn shift(xs: Str, k: Int) -> Int {
-  apply({ n -> n + k + size(xs) }, 1)
+  let r = apply({ n -> n + k + size(xs) }, 1)
+  r
 }
 
 fn twice(n: Int) -> Int {
   fn go(m: Int) -> Int {
     if m == 0 { 0 } else { go(m - 1) + n }
   }
-  go(2)
+  let r = go(2)
+  r
 }
 
 fn named() -> Int {
@@ -737,13 +920,15 @@ param _1: Int (k)
 let _2: (Int) -> Int is Pure
 let _3: (Int) -> Int
 let _4: Int
+let _5: Int (r)
 bb0:
   _2 = closure shift#11 side(_0, _1)
   _3 = convert _2
   _4 = call apply(_3, 1) -> bb1
 bb1:
   release _0
-  return _4
+  _5 = _4
+  return _5
 shift#11
 param _0: (0: Str, 1: Int)
 param _1: Int (n)
@@ -780,12 +965,14 @@ param _0: Int (n)
 let _1: (Int) -> Int (go)
 let _2: (Int) -> Int
 let _3: Int
+let _4: Int (r)
 bb0:
   _2 = closure twice#17 side(_0)
   _1 = _2
   _3 = call value _1(2) -> bb1
 bb1:
-  return _3
+  _4 = _3
+  return _4
 twice#17
 param _0: (0: Int)
 param _1: Int (m)

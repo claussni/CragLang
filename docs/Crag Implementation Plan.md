@@ -111,7 +111,7 @@ The type system fills the space between the M1 front end and the MIR builder, fo
 - **Escape analysis.** The Local, Scoped and Escaping lattice, parameter summaries in the component fixpoint, bindings-only checks and stream-end capture counts.
 - **Closure conversion.** Environment records plus code pointers, placed inline, on the side stack or on the heap by escape level.
 - **Monomorphization.** A worklist from the roots; instance keys of function, type arguments and slot fillings; `fields` unrolling, `typeInfo`, and `Immediate` and `Solid` per instance.
-- **Tail calls.** Values released before the jump, and side-stack closures copied into the callee's frame (§5.6.3).
+- **Tail calls.** Values released before the jump, and side-stack closures that the call takes along moved to the heap (§5.6.3).
 
 **Exit:** the specification's examples for Chapters 3 to 8 compile and run.
 
@@ -312,7 +312,7 @@ Some stack values must have an address that other code holds: a closure that doe
 **Functions**
 
 - Push (generated code) — `p = align_up(ctx.side_ptr, align); if p + size <= ctx.side_end { ctx.side_ptr = p + size } else { rt_side_grow(ctx, size, align); retry }`.
-- Mark and pop (generated code) — a function that pushes saves both fields on entry and stores them back before it returns or tail-calls, which frees everything it pushed, whichever chunk it ended up in. An address on the side stack must therefore not be returned or passed to a tail call.
+- Mark and pop (generated code) — a function that pushes saves both fields on entry and stores them back before it returns or tail-calls, which frees everything it pushed, whichever chunk it ended up in. An address on the side stack must therefore not be returned or passed to a tail call (§11.5.11).
 - `rt_side_grow(ctx: *const TaskContext, size: usize, align: usize)` — an assembly routine that preserves every register and runs on the system stack. It points the two fields at the next chunk with enough room, reusing or allocating one, and returns nothing; the generated code repeats the push.
 
 #### 11.3.4 Sentinel
@@ -854,7 +854,7 @@ The code of a closure is an instance of the body that holds it, keyed by the clo
 
 Where the environment lives follows from the closure's escape level. A Local or Scoped closure's environment goes on the side stack, where it is freed when its frame returns; its header has the static count, so counting it does nothing, and it borrows what it captures, which liveness keeps alive as long as the closure and every copy of it are. An Escaping closure's environment is a box on the heap that holds a reference to each captured value and is released like any box, so a closure stored in a record or a list is counted with it. A closure made inside a loop also goes on the heap, because the side stack would grow by one environment per iteration until the function returns. A trap releases the environments the frames hold; the unwinder skips null ones and the static count those on the side stack.
 
-Until tail calls copy side-stack closures into the callee's frame (§11.5.11), a call in tail position is a plain call in a function that has put an environment on the side stack, since the tail call would free it. A closure that captures a `var` is not lowered yet: it must read the variable as it is when the closure runs, so the variable has to move to the side stack (Compiler Architecture §8). Inlining a closure into a known callee, which needs no environment at all, comes with the MIR optimizer (§11.10.1). A function value that converts to a function type with other parameter or result types, which needs code that converts the values, is not compiled yet; one that is Pure fits a function type that is not, as it is.
+A closure that a tail call takes along goes on the heap instead (§11.5.11). A closure that captures a `var` is not lowered yet: it must read the variable as it is when the closure runs, so the variable has to move to the side stack (Compiler Architecture §8). Inlining a closure into a known callee, which needs no environment at all, comes with the MIR optimizer (§11.10.1). A function value that converts to a function type with other parameter or result types, which needs code that converts the values, is not compiled yet; one that is Pure fits a function type that is not, as it is.
 
 **Data structures**
 
@@ -893,11 +893,15 @@ Unrolling `fields` loops and making `typeInfo` constants come with compile-time 
 
 #### 11.5.11 Tail calls
 
-A call in tail position must not grow the stack (§5.6.3). Before the jump, the caller releases the values it still owns, and closures it placed on its side stack that it passes to the callee are copied into the callee's side-stack frame, because the caller's side-stack frame is popped.
+A call in tail position must not grow the stack (§5.6.3). The MIR builder makes a call in tail position whose result needs no conversion a tail call, which Cranelift's `return_call` and `return_call_indirect` compile to a jump. Before the jump the caller releases the values it still owns, as at a return, and stores back its side-stack mark, which frees what it pushed.
+
+So a closure whose environment is on the caller's side stack cannot go along, neither as an argument nor as the function value called. Copying the environment into the callee's part of the side stack would not do: the callee takes its mark after the copy and so never frees it, a tail-recursive loop would grow the side stack by one environment per round, and the locals the environment borrows die with the caller. A pass after the builder therefore puts every such closure on the heap, where its environment holds its own references and is released like any box. It follows which side-stack closures each local may hold, through copies and conversions, from every tail call's arguments and callee, and also moves the side-stack closures that a closure it moves captures, since a heap environment outlives the frame. A closure that the tail call does not take along stays on the side stack and is freed by the jump.
+
+A local function called in tail position, `go(n)` at the end of its declaring function, therefore costs one allocation; calls of it from its own code use the environment it was called with and allocate nothing. Inlining a closure into a known callee removes the environment altogether (§11.10.1).
 
 **Functions**
 
-- `fn lower_tail_call(b: &mut MirBuilder, call: ExprId)` — releases, copies side-stack arguments, pops the side-stack mark, emits Cranelift's `return_call`. Until it does, a function that puts a closure's environment on the side stack makes no tail calls (§11.5.9).
+- `fn place_tail_closures(body: &mut MirBody)` — puts on the heap the side-stack closures that tail calls pass or call, and those they capture; it runs before the checks of arithmetic and the reference counts, which then count the moved environments like any other.
 
 ### 11.6 M3 components
 

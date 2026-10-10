@@ -1153,6 +1153,82 @@ fn forward(k: Int, x: Int) -> Int {
 }
 
 #[test]
+fn tail_calls_take_closures_along() {
+    // A tail call pops the caller's side stack, so a closure it passes or
+    // calls is on the heap; one it does not take along stays behind and
+    // is popped (§11.5.11). None of these loops grows a stack.
+    let mut m = Module::new(
+        r#"type Cell(n: Int)
+
+fn apply(f: (Int) -> Int, x: Int) -> Int {
+  f(x)
+}
+
+fn over(f: (Int) -> Int, x: Int) -> Int {
+  let r = apply({ m -> m + 0 * x }, x)
+  f(r)
+}
+
+fn passed(k: Int, x: Int) -> Int {
+  let c = Cell(n: k)
+  over({ n -> n + c.n }, x)
+}
+
+fn wrapped(k: Int, x: Int) -> Int {
+  let c = Cell(n: k)
+  let f: (Int) -> Int = { n -> n + c.n }
+  over({ n -> f(n) * 2 }, x)
+}
+
+fn rounds(k: Int, n: Int, acc: Int) -> Int {
+  let c = Cell(n: k)
+  if n == 0 { acc } else { relay({ m -> m + c.n }, k, n - 1, acc) }
+}
+
+fn relay(f: (Int) -> Int, k: Int, n: Int, acc: Int) -> Int {
+  rounds(k, n, f(acc))
+}
+
+fn countdown(n: Int, k: Int) -> Int {
+  fn go(m: Int) -> Int {
+    let r = apply({ x -> x + 0 * m }, m)
+    if r == 0 { k } else { go(r - 1) }
+  }
+  go(n)
+}
+
+fn kept(k: Int, n: Int) -> Int {
+  let c = Cell(n: k)
+  let r = apply({ m -> m + c.n }, 0)
+  if n == 0 { r } else { kept(k, n - 1) }
+}
+"#,
+    );
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    // The callee's own side-stack closure lies where the caller's was.
+    assert_eq!(m.int("passed", &[5, 3]), 8);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("wrapped", &[3, 4]), 14);
+    assert_eq!(m.heap.live_blocks(), 0);
+    // Deep enough to overflow the thread's stack without tail calls.
+    assert_eq!(m.int("rounds", &[2, 1_000_000, 0]), 2_000_000);
+    assert_eq!(m.heap.live_blocks(), 0);
+    // `go` calls itself with the environment it was called with, after
+    // its own closure has gone on the side stack.
+    assert_eq!(m.int("countdown", &[1_000_000, 7]), 7);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("kept", &[4, 1_000_000]), 4);
+    assert_eq!(m.heap.live_blocks(), 0);
+    // A trap in the callee releases the environment it was passed.
+    let trap = m.run("passed", &[1, i64::MAX]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::Overflow);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+    let trap = m.run("rounds", &[i64::MAX, 3, 1]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::Overflow);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+}
+
+#[test]
 fn generic_functions_run_per_instance() {
     // A generic function is compiled once per type arguments and slot
     // fillings it is called with (§11.5.10).

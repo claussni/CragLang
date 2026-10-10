@@ -19,9 +19,11 @@
 //!
 //! `mir` builds an instance's graph from its HIR and its types, with
 //! `case` lowered through a decision tree. Passes then make the rest
-//! explicit: the checks of arithmetic, which trap on overflow and on a zero
-//! divisor (§3.1.1, §3.1.4), and the reference counts, which follow from a
-//! liveness analysis so that a value is released right after its last use.
+//! explicit: closures that a tail call takes along go on the heap, since
+//! the call pops the side stack (§5.6.3); the checks of arithmetic, which
+//! trap on overflow and on a zero divisor (§3.1.1, §3.1.4); and the
+//! reference counts, which follow from a liveness analysis so that a value
+//! is released right after its last use.
 
 extern crate crag_db as salsa;
 
@@ -29,6 +31,7 @@ mod build;
 mod checks;
 mod ir;
 mod liveness;
+mod tail;
 
 use std::collections::HashSet;
 
@@ -136,6 +139,7 @@ pub fn mir<'db>(
 ) -> Option<MirBody<'db>> {
     let Tier::Baseline = tier;
     let mut body = build::build(db, program, instance)?;
+    tail::place_tail_closures(&mut body);
     insert_overflow_checks(&mut body);
     let live = compute_liveness(&body);
     insert_rc_ops(&mut body, &live);

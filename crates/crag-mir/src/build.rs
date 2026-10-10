@@ -229,10 +229,6 @@ pub struct MirBuilder<'a, 'db> {
     test: bool,
     /// The `for` loops around what is being built.
     loops: u32,
-    /// Whether a closure's environment went on the side stack, which a
-    /// tail call would free: calls in tail position are then plain calls
-    /// until tail calls copy what they pass (§11.5.11).
-    side: bool,
     bool_ty: Ty<'db>,
     true_ty: Ty<'db>,
     false_ty: Ty<'db>,
@@ -290,7 +286,6 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             result: Ty::unit(db),
             test: false,
             loops: 0,
-            side: false,
             bool_ty,
             true_ty,
             false_ty,
@@ -660,9 +655,6 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             .find(|(f, _)| *f == frame)
             .map_or(EscapeLevel::Escaping, |(_, l)| *l);
         let placement = place(level, self.loops > 0);
-        if placement == ClosurePlacement::SideStack && !ops.is_empty() {
-            self.side = true;
-        }
         let code = self.closure_code(frame);
         self.assign(
             ty,
@@ -1328,7 +1320,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             let op = self.expr(arg);
             ops.push(self.coerce(op, self.ty(arg), param));
         }
-        if tail && *result == self.result && !self.side {
+        if tail && *result == self.result {
             self.terminate(Terminator::TailCallValue {
                 callee,
                 args: ops,
@@ -1510,7 +1502,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             return self.unsupported(expr, "default arguments");
         };
         let ty = self.ty(expr);
-        if tail && ty == self.result && !self.side {
+        if tail && ty == self.result {
             self.terminate(Terminator::TailCall {
                 func,
                 args,
