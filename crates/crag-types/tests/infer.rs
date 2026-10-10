@@ -1661,3 +1661,27 @@ fn fine(xs: List[Int]) -> List[Int] {
         ]
     );
 }
+
+#[test]
+fn closures_are_typed_after_the_other_arguments() {
+    // A literal fixes `T` before the closure, whose parameter then has it,
+    // with or without an expected type.
+    let text = "fn again[T](f: (T) -> T, x: T) -> T { f(f(x)) }
+fn id(x: Int) -> Int { x }
+fn a() -> Int { again({ n -> n + 1 }, 0) }
+fn b() -> Int { 1 + again({ n -> n + 1 }, 0) }
+fn c() -> Int { id(again({ n -> n + 1 }, 0)) }
+fn d() -> Int { let v = again({ n -> n + 1 }, 0)
+  v }";
+    assert_eq!(
+        ok(text),
+        [
+            "f: (T) -> T, x: T, -> T",
+            "x: Int, -> Int",
+            "n: Int, -> Int",
+            "n: Int, -> Int",
+            "n: Int, -> Int",
+            "n: Int, v: Int, -> Int",
+        ]
+    );
+}

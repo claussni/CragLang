@@ -191,9 +191,13 @@ fn closures_run_and_trap_where_they_are_written() {
   f(x)
 }
 
+fn again[T](f: (T) -> T, x: T) -> T {
+  f(f(x))
+}
+
 fn main() -> ExitCode {
   let k = 4
-  ExitCode(code: apply({ n -> n * k }, 3))
+  ExitCode(code: apply({ n -> n * k }, 3) + again({ n -> n + 1 }, 0))
 }
 
 test "overflows in a closure" {
@@ -203,7 +207,7 @@ test "overflows in a closure" {
 "#;
     let root = project("closures", &[("package.crag", MANIFEST), ("app.crag", app)]);
     let mut out = Vec::new();
-    assert_eq!(crag_run(&root, &mut out), 12, "{}", text(out));
+    assert_eq!(crag_run(&root, &mut out), 14, "{}", text(out));
     let mut out = Vec::new();
     let report = crag_test(&root, None, &mut out);
     let out = text(out);
@@ -211,6 +215,6 @@ test "overflows in a closure" {
     // `apply` calls the closure in tail position, so its frame is gone.
     assert_eq!(
         report.failed[0].1,
-        "trap: arithmetic overflow\n  --> app.crag:12:24\n   |\n12 |   let y = apply({ n -> n * big }, 2)\n   |                        ^\n  in a closure in test \"overflows in a closure\"\n  in test \"overflows in a closure\"\n"
+        "trap: arithmetic overflow\n  --> app.crag:16:24\n   |\n16 |   let y = apply({ n -> n * big }, 2)\n   |                        ^\n  in a closure in test \"overflows in a closure\"\n  in test \"overflows in a closure\"\n"
     );
 }

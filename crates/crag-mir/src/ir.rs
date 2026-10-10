@@ -454,6 +454,36 @@ impl<'db> Terminator<'db> {
 }
 
 impl<'db> MirBody<'db> {
+    /// The instances the body needs code of: those it calls, and the code
+    /// of the function values it makes, in the order they occur.
+    pub fn callees(&self) -> Vec<InstanceKey<'db>> {
+        let mut out = Vec::new();
+        for block in &self.blocks {
+            for statement in &block.statements {
+                if let Statement::Assign(
+                    _,
+                    Rvalue::Closure { code, .. } | Rvalue::FnValue { code, .. },
+                ) = statement
+                {
+                    out.push(*code);
+                }
+            }
+            if let Terminator::Call { func, .. } | Terminator::TailCall { func, .. } =
+                &block.terminator
+            {
+                out.push(*func);
+            }
+        }
+        let mut seen = Vec::new();
+        out.retain(|k| {
+            !seen.contains(k) && {
+                seen.push(*k);
+                true
+            }
+        });
+        out
+    }
+
     /// The body as text, one statement per line, for tests and debugging.
     pub fn pretty(&self, db: &'db dyn Db) -> String {
         let mut out = String::new();
@@ -661,10 +691,14 @@ fn terminator_text<'db>(db: &'db dyn Db, terminator: &Terminator<'db>) -> String
 }
 
 fn func_name<'db>(db: &'db dyn Db, func: InstanceKey<'db>) -> String {
-    let owner = match func.owner(db) {
+    let mut owner = match func.owner(db) {
         Owner::Item(item) => item.name(db).text(db).clone(),
         Owner::Test(test) => format!("test {}", test.label(db)),
     };
+    if !func.args(db).is_empty() {
+        let args: Vec<String> = func.args(db).iter().map(|t| t.display(db)).collect();
+        owner += &format!("[{}]", args.join(", "));
+    }
     match *func.entry(db) {
         Entry::Body => owner,
         Entry::Closure(e) | Entry::Function(e) => format!("{owner}#{}", e.index()),

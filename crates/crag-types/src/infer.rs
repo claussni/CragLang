@@ -2354,12 +2354,32 @@ impl<'a, 'db> Infer<'a, 'db> {
                 }
             }
         }
-        // The arguments that take their type from the context, in order:
-        // a closure gets the parameter types known so far and gives its
-        // result.
-        if let Some(Plan::Params(given)) = &plan {
-            for (i, g) in given.iter().enumerate() {
-                let Some(g) = *g else { continue };
+        // The arguments that take their type from the context, in order,
+        // closures and function names last: a closure gets the parameter
+        // types known so far, which a literal argument may give, and gives
+        // its result.
+        let order = plan.as_ref().map_or(Vec::new(), |plan| match plan {
+            Plan::Params(given) => {
+                let late = |g: &Option<usize>| {
+                    let arg = g.and_then(|g| match g < positional.len() {
+                        true => Some(&positional[g]),
+                        false => named.get(g - positional.len()).map(|(_, a)| a),
+                    });
+                    matches!(arg, Some(Arg::Pending(e))
+                        if matches!(self.body.expr(*e), Expr::Closure { .. } | Expr::Name { .. }))
+                };
+                let (early, late): (Vec<_>, Vec<_>) = given
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .partition(|(_, g)| !late(g));
+                early.into_iter().chain(late).collect()
+            }
+            _ => Vec::new(),
+        });
+        if let Some(Plan::Params(_)) = &plan {
+            for (i, g) in order {
+                let Some(g) = g else { continue };
                 let param = candidate.params[i].ty;
                 let unknown = |j: u32| args.get(j as usize).is_some_and(Option::is_none);
                 if !mentions(db, param, function, &unknown) {

@@ -30,9 +30,11 @@ mod checks;
 mod ir;
 mod liveness;
 
+use std::collections::HashSet;
+
 use crag_db::Db;
 use crag_hir::{ExprId, Owner, Program};
-use crag_types::Ty;
+use crag_types::{Filling, Instance, Ty};
 
 pub use build::place;
 pub use checks::insert_overflow_checks;
@@ -42,21 +44,55 @@ pub use ir::{
 };
 pub use liveness::{Liveness, compute_liveness, insert_drops, insert_rc_ops};
 
-/// A function, test or module-level value with concrete type arguments,
-/// or the code of a closure in one: what code is generated for. Until
-/// monomorphization (§11.5.10) the arguments are empty.
+/// A function, test or module-level value, or the code of a closure in
+/// one: what code is generated for. A generic function has code only per
+/// instance (§11.5.10): with concrete type arguments, and the functions
+/// that fill its slots, each an instance as concrete.
 #[crag_db::interned(debug)]
 pub struct InstanceKey<'db> {
     pub owner: Owner<'db>,
     #[returns(ref)]
     pub args: Vec<Ty<'db>>,
+    #[returns(ref)]
+    pub fillings: Vec<Instance<'db>>,
     pub entry: Entry,
 }
 
 impl<'db> InstanceKey<'db> {
-    /// The body of an owner itself.
+    /// The body of an owner that is not generic.
     pub fn body(db: &'db dyn Db, owner: Owner<'db>) -> InstanceKey<'db> {
-        InstanceKey::new(db, owner, Vec::new(), Entry::Body)
+        InstanceKey::new(db, owner, Vec::new(), Vec::new(), Entry::Body)
+    }
+
+    /// The body of a concrete instance of a function: its type arguments,
+    /// and slot fillings that name no slot.
+    pub fn of(db: &'db dyn Db, instance: &Instance<'db>) -> InstanceKey<'db> {
+        let fillings: Vec<Instance<'db>> = instance
+            .fillings
+            .iter()
+            .filter_map(|f| match f {
+                Filling::Function(i) => Some(i.clone()),
+                Filling::Slot(_) => None,
+            })
+            .collect();
+        InstanceKey::new(
+            db,
+            Owner::Item(instance.function),
+            instance.args.clone(),
+            fillings,
+            Entry::Body,
+        )
+    }
+
+    /// Another entry of the same instance.
+    pub fn with_entry(self, db: &'db dyn Db, entry: Entry) -> InstanceKey<'db> {
+        InstanceKey::new(
+            db,
+            *self.owner(db),
+            self.args(db).clone(),
+            self.fillings(db).clone(),
+            entry,
+        )
     }
 }
 
@@ -99,10 +135,36 @@ pub fn mir<'db>(
     tier: Tier,
 ) -> Option<MirBody<'db>> {
     let Tier::Baseline = tier;
-    let mut body = build::build(db, program, *instance.owner(db), *instance.entry(db))?;
+    let mut body = build::build(db, program, instance)?;
     insert_overflow_checks(&mut body);
     let live = compute_liveness(&body);
     insert_rc_ops(&mut body, &live);
     insert_drops(&mut body, &live);
     Some(body)
+}
+
+/// The instances the roots reach (§11.5.10): the roots, those with MIR
+/// that they call or whose code they make as values, and so on, each
+/// once, in the order a depth-first walk reaches them. A generic function is reached only as
+/// instances, with the type arguments and slot fillings of each call.
+pub fn collect_instances<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    roots: &[InstanceKey<'db>],
+    tier: Tier,
+) -> Vec<InstanceKey<'db>> {
+    let mut seen: HashSet<InstanceKey<'db>> = HashSet::new();
+    let mut out = Vec::new();
+    let mut pending: Vec<InstanceKey<'db>> = roots.iter().rev().copied().collect();
+    while let Some(instance) = pending.pop() {
+        if !seen.insert(instance) {
+            continue;
+        }
+        let Some(body) = mir(db, program, instance, tier) else {
+            continue;
+        };
+        out.push(instance);
+        pending.extend(body.callees().into_iter().rev());
+    }
+    out
 }

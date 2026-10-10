@@ -543,7 +543,7 @@ The test splits the values of a column into constructors that each pattern cover
 
 MIR is the form code generation consumes: a control-flow graph per instance, with every operation explicit. `case` becomes a decision tree that tests each position at most once ([Compiling pattern matching to good decision trees](https://doi.org/10.1145/1411304.1411311)). Reference-count increments and decrements are inserted from a [liveness analysis](https://en.wikipedia.org/wiki/Live-variable_analysis): a value is released right after its last use. Overflow checks and drops become explicit operations. For `Float` a run of operations shares one check of the sticky overflow flag, and division checks for a zero divisor first (Specification §3.1.4).
 
-The builder evaluates each expression into an operand of the current block; `if`, `case`, `and`, `or` and `for` add blocks, and a `for` polls on its back-edge. A call in tail position whose result needs no conversion is a tail call. The operators of the prelude on numbers are operations rather than calls, and a negated literal is a constant, so `Int8.min` can be written. Where a value meets a type it fits but is not, such as a member passed for a union, an explicit conversion changes its representation. A body with type errors traps where it starts. What the builder does not lower yet, such as `lazy`, default arguments and calls of generic functions, traps where it is reached and is listed in the body. Closures and local functions came with closure conversion (§11.5.9).
+The builder evaluates each expression into an operand of the current block; `if`, `case`, `and`, `or` and `for` add blocks, and a `for` polls on its back-edge. A call in tail position whose result needs no conversion is a tail call. The operators of the prelude on numbers are operations rather than calls, and a negated literal is a constant, so `Int8.min` can be written. Where a value meets a type it fits but is not, such as a member passed for a union, an explicit conversion changes its representation. A body with type errors traps where it starts. What the builder does not lower yet, such as `lazy` and default arguments, traps where it is reached and is listed in the body. Closures and local functions came with closure conversion (§11.5.9), calls of generic functions and slots with monomorphization (§11.5.10).
 
 Decision trees are built in `crag-types` from the pattern matrix of `case` checking, sharing its constructors. A node tests the first position the first row looks into. A position of several types is first switched on its runtime type, a finer type before the types it is part of; one of a single type is then tested against intervals, literals or list lengths, or, as a record, opened into its fields. A guarded leaf goes on to the rest of the tree when its guard fails. A `let` destructures with the tree of its one pattern, and a typed `let … else` tests the type first.
 
@@ -555,7 +555,7 @@ A counted local, one of a type whose values live on the heap, owns one reference
 - `Local` — a typed local, not in SSA form; `Place` — a local or a path of steps into it: a field, an element, or the value as a member of its union.
 - `Rvalue` — a use, a read of a place, a conversion, arithmetic with or without its check, the flags checks compute, comparisons, record, list and map construction, and the list and map operations patterns and loops need.
 - `DecisionTree` — tests of a position's type, interval, literal or length, guards, and leaves naming the arm with the positions of its bindings.
-- `InstanceKey` — the owner of a body and its type arguments, empty until monomorphization (§11.5.10); `Tier` — the baseline tier only, for now.
+- `InstanceKey` — the owner of a body and its type arguments, empty until monomorphization (§11.5.10), which added the slot fillings; `Tier` — the baseline tier only, for now.
 
 **Functions**
 
@@ -734,7 +734,7 @@ The graph is that of the functions each body names, in calls, as values and as t
 
 A generic function is checked once against its bounds, not once per use. Inside it, a type parameter is opaque: one bounded by a named type fits that type and has its fields, and one bounded by a form can be passed to the form's functions. A form used as a parameter type stands for a type parameter of its own after the written ones (§4.3). The forms of a function's bounds, with the forms they require in their `where` clause or stand for, give the function its slots: each of their functions with the bound's type arguments, in a fixed order. HIR adds the slots' names to the names a generic body sees, and a call in the body may resolve to a slot like to a function. A union of forms holds when one of them does; which one is known only per type argument, so it gives no slots (§4.7).
 
-A call of a generic function infers the type arguments: first from the arguments that have their own type, then from the expected type, then from the arguments that take their type from the context, a closure getting the parameter types known so far and giving its result. Type arguments written in brackets replace the inference. Each type argument must fit its named bound, and each slot must be filled by a function visible where the call is written that accepts the slot's parameters and gives its result. In a generic caller a slot may be filled by one of the caller's own slots, and a generic function may fill a slot with type arguments inferred from the slot's parameters, to a fixed depth. The most specific filling wins, by the ranking of §11.5.4. The call records the instance, the function with its type arguments and slot fillings, which monomorphization compiles (§11.5.10); until then MIR reports calls of instances and slots as not supported. Generic functions may be used as values when the expected type or type arguments in brackets fix them.
+A call of a generic function infers the type arguments: first from the arguments that have their own type, then from the expected type, then from the arguments that take their type from the context, closures and function names after the others, so that a literal argument fixes a type parameter before a closure gets the parameter types known so far and gives its result. Type arguments written in brackets replace the inference. Each type argument must fit its named bound, and each slot must be filled by a function visible where the call is written that accepts the slot's parameters and gives its result. In a generic caller a slot may be filled by one of the caller's own slots, and a generic function may fill a slot with type arguments inferred from the slot's parameters, to a fixed depth. The most specific filling wins, by the ranking of §11.5.4. The call records the instance, the function with its type arguments and slot fillings, which monomorphization compiles (§11.5.10). Generic functions may be used as values when the expected type or type arguments in brackets fix them.
 
 `Oks[X]` and `Errs[X]` are builtin type functions over error unions (§8.1). Applied to a type without type parameters they become the members that are not errors, or those that are; applied to a type parameter they stay until substitution. With them the prelude declares the type mapping functions `discard`, `check` and `expect` and their prefixes `~`, `?` and `!!` as generic functions without bodies (§8.4). Inference checks their two rules: `check` and `expect` need a value with errors, and `check` a value whose successes do not contain `Empty`.
 
@@ -780,7 +780,7 @@ When no candidate accepts a call's arguments but one accepts each combination of
 
 An overloaded name used as a value whose expected function type has union parameters is lifted the same way, so `shapes.map(area)` works: a function name passed where the parameter's type chooses or instantiates it waits for that type, like a closure (§11.5.3).
 
-The call records a `Dispatch`. MIR evaluates the arguments once and switches on the tag of each split argument in turn; each arm converts the arguments to their members and calls its function, which may be a primitive operation, and the result is converted to the union. Arms that call instances or slots wait for monomorphization (§11.5.10). A lifted function value gets code of its own that dispatches so (§11.5.9).
+The call records a `Dispatch`. MIR evaluates the arguments once and switches on the tag of each split argument in turn; each arm converts the arguments to their members and calls its function, which may be a primitive operation, and the result is converted to the union. An arm may call an instance or a slot, which monomorphization compiles (§11.5.10). A lifted function value gets code of its own that dispatches so (§11.5.9).
 
 **Data structures**
 
@@ -872,18 +872,24 @@ Until tail calls copy side-stack closures into the callee's frame (§11.5.11), a
 
 #### 11.5.10 Monomorphization
 
-Each generic function is compiled separately for each set of type arguments and slot fillings it is used with. A worklist starts from the roots (`main`, tests, REPL input), and every instance reached adds the instances it calls. At this point `fields` loops are unrolled per concrete record, `typeInfo` becomes a constant, and properties such as `Immediate` and `Solid` are decided per instance.
+Each generic function is compiled separately for each set of type arguments and slot fillings it is used with. A generic function has no code of its own; its instances do. A worklist starts from the roots (`main`, tests, REPL input), and every instance reached adds the instances it calls and the code of the closures and function values it makes, each once.
+
+An instance is keyed by its function, its type arguments and its slot fillings, each filling an instance as concrete. MIR is built for the instance from the generic body and its types: every type the builder reads, of an expression, a binding, a pattern or a written type, has the type arguments in place of the type parameters, so the graph holds only concrete types. Decision trees are built from the concrete pattern types, so a `case` in an instance splits the members its subject has there. A call of a generic function names its instance with the caller's type arguments in place; a slot filling that names one of the caller's slots becomes the caller's own filling. A call of a slot calls the function that fills it, an operation of the prelude when that is one. Closures in an instance are instances of their own code with the same type arguments and fillings, and an instance or a slot used as a value gets code that calls it. Code generation lays out an instance's parameters with its type arguments in place.
+
+A function that calls itself with ever larger type arguments, such as `nest(Pair[T, T](first: x, second: x), n - 1)`, would have instances without end. An instance whose type arguments nest more than sixteen levels deep is not compiled; the call that reaches it traps as not supported.
+
+Unrolling `fields` loops and making `typeInfo` constants come with compile-time reflection (§11.6.7), and `Immediate` per instance with dispose handlers and deferred teardown (§11.7.12), which decide it from the concrete types; `Solid` is decided where signals and compile-time evaluation need it (§11.6.8, §11.7.10).
 
 **Data structures**
 
-- `InstanceKey` — function, type arguments, slot fillings; interned.
-- `Worklist` — instances still to visit, plus a set of those already seen.
+- `InstanceKey` — owner, type arguments, slot fillings, and the entry (§11.5.9); interned. `InstanceKey::of` makes the key of a concrete `Instance`.
+- The worklist of `collect_instances` — instances still to visit, plus a set of those already seen.
 
 **Functions**
 
-- `fn collect_instances(db: &dyn Db, roots: &[InstanceKey]) -> Vec<InstanceKey>`.
-- `fn substitute_body(db: &dyn Db, thir: &Thir, key: InstanceKey) -> Thir` — replaces type parameters and slots.
-- `fn is_immediate(db: &dyn Db, ty: TypeId) -> bool` and `fn is_solid(db: &dyn Db, ty: TypeId) -> bool` — per concrete type.
+- `fn collect_instances(db: &dyn Db, program: Program, roots: &[InstanceKey], tier: Tier) -> Vec<InstanceKey>` — the instances with MIR the roots reach, in the order a depth-first walk reaches them; `MirBody::callees` — what one body reaches.
+- `MirBuilder::subst`, `MirBuilder::concrete` and `MirBuilder::callee_instance` — a type, an instance and a call's callee with the instance's type arguments and fillings in place; `MirBuilder::instance_signature` — the signature of a concrete instance.
+- `fn decision_tree_with(db, program, owner, pats, subject, arms) -> Option<DecisionTree>` — a decision tree over the patterns typed as in an instance.
 
 #### 11.5.11 Tail calls
 

@@ -1276,7 +1276,12 @@ impl<'a, 'db> Lower<'a, 'db> {
         let sig = signature(db, self.program, item);
         let mut words = Vec::new();
         for (arg, param) in args.iter().zip(&sig.params) {
-            words.extend(self.operand(arg, param.ty)?);
+            // An instance's parameters have its type arguments in place.
+            let ty = match func.args(db).is_empty() {
+                true => param.ty,
+                false => crag_types::subst(db, self.program, param.ty, item, func.args(db)),
+            };
+            words.extend(self.operand(arg, ty)?);
         }
         if !self.calls.contains(&func) {
             self.calls.push(func);

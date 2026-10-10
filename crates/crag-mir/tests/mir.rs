@@ -16,7 +16,7 @@
 
 use crag_db::RootDatabase;
 use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, owners};
-use crag_mir::{Entry, InstanceKey, Rvalue, Statement, Tier, mir};
+use crag_mir::{Entry, InstanceKey, Tier, collect_instances, mir};
 
 const PRELUDE: &str = r#"pub type Int
 pub type Int8
@@ -61,6 +61,7 @@ fn mir_of(text: &str) -> String {
     );
     let program = Program::new(&db, vec![core, module]);
     let mut out = String::new();
+    let mut printed = std::collections::HashSet::new();
     for (_, error) in crag_types::module_type_errors(&db, program, module) {
         out += &format!("error: {}\n", error.kind.message(&db));
     }
@@ -73,52 +74,54 @@ fn mir_of(text: &str) -> String {
         for error in &crag_hir::lower_body(&db, program, owner).errors {
             out += &format!("error: {error:?}\n");
         }
-        // The body, then the code of the closures it makes, each once.
-        let mut pending = vec![(name, InstanceKey::body(&db, owner))];
-        let mut seen = Vec::new();
-        while let Some((name, key)) = pending.pop() {
-            if seen.contains(&key) {
+        // The body, then the instances and closure code it reaches that
+        // are not bodies of the module's functions, each once.
+        for key in collect_instances(
+            &db,
+            program,
+            &[InstanceKey::body(&db, owner)],
+            Tier::Baseline,
+        ) {
+            let own = key.args(&db).is_empty() && *key.entry(&db) == Entry::Body;
+            if (own && *key.owner(&db) != owner) || !printed.insert(key) {
                 continue;
             }
-            seen.push(key);
-            let Some(body) = mir(&db, program, key, Tier::Baseline) else {
-                continue;
+            let label = match own {
+                true => name.clone(),
+                false => key_name(&db, key),
             };
-            out += &format!("{name}\n{}", body.pretty(&db));
+            let body = mir(&db, program, key, Tier::Baseline).as_ref().unwrap();
+            out += &format!("{label}\n{}", body.pretty(&db));
             for (_, what) in &body.unsupported {
                 out += &format!("unsupported: {what}\n");
-            }
-            let mut codes = Vec::new();
-            for block in &body.blocks {
-                for statement in &block.statements {
-                    if let Statement::Assign(
-                        _,
-                        Rvalue::Closure { code, .. } | Rvalue::FnValue { code, .. },
-                    ) = statement
-                    {
-                        codes.push(*code);
-                    }
-                }
-            }
-            for code in codes.into_iter().rev() {
-                let label = match code.entry(&db) {
-                    Entry::Closure(e) | Entry::Function(e) => {
-                        format!("{}#{}", key_name(&db, code), e.index())
-                    }
-                    Entry::Body => key_name(&db, code),
-                };
-                pending.push((label, code));
             }
         }
     }
     out
 }
 
+/// An instance as `name[args] {fillings}#expr`.
 fn key_name(db: &RootDatabase, key: InstanceKey<'_>) -> String {
-    match key.owner(db) {
+    let mut name = match key.owner(db) {
         Owner::Item(item) => item.name(db).text(db).clone(),
         Owner::Test(test) => format!("test {}", test.label(db)),
+    };
+    if !key.args(db).is_empty() {
+        let args: Vec<String> = key.args(db).iter().map(|t| t.display(db)).collect();
+        name += &format!("[{}]", args.join(", "));
     }
+    if !key.fillings(db).is_empty() {
+        let fillings: Vec<String> = key
+            .fillings(db)
+            .iter()
+            .map(|f| f.function.name(db).text(db).clone())
+            .collect();
+        name += &format!(" {{{}}}", fillings.join(", "));
+    }
+    if let Entry::Closure(e) | Entry::Function(e) = key.entry(db) {
+        name += &format!("#{}", e.index());
+    }
+    name
 }
 
 fn check(text: &str, expected: &str) {
@@ -900,6 +903,165 @@ bb1:
 bb2:
   _1 = Int.sub(0, _0)
   return _1
+"#,
+    );
+}
+
+/// A generic function has code per instance: its type arguments replace
+/// the type parameters in every type, and a call of a slot calls the
+/// function that fills it, here through the caller's own slot.
+#[test]
+fn generic_functions_have_code_per_instance() {
+    check(
+        r#"form Sized[T] {
+  measure(x: T) -> Int
+}
+
+fn measure(s: Str) -> Int {
+  size(s)
+}
+
+fn first[T](xs: List[T]) -> T {
+  xs[0]
+}
+
+fn larger[T: Sized](a: T, b: T) -> T {
+  if measure(a) < measure(b) { b } else { a }
+}
+
+fn twice[T: Sized](a: T) -> Int {
+  measure(larger(a, a)) * 2
+}
+
+fn use(xs: List[Str]) -> Int {
+  size(first(xs)) + first([1, 2]) + twice("ab")
+}
+"#,
+        r#"measure
+param _0: Str (s)
+bb0:
+  tail call size(_0)
+use
+param _0: List[Str] (xs)
+let _1: Str
+let _2: Int
+let _3: List[Int]
+let _4: Int
+let _5: Int
+let _6: Int
+let _7: Int
+let _8: False | True
+let _9: False | True
+bb0:
+  _1 = call first[Str](_0) -> bb1
+bb1:
+  _2 = call size(_1) -> bb2
+bb2:
+  _3 = [1, 2]
+  _4 = call first[Int](_3) -> bb3
+bb3:
+  _8 = overflows Int.add(_2, _4)
+  branch _8 bb5 bb6
+bb4:
+  _9 = overflows Int.add(_5, _6)
+  branch _9 bb7 bb8
+bb5:
+  trap overflow
+bb6:
+  _5 = Int.add(_2, _4)
+  _6 = call twice[Str]("ab") -> bb4
+bb7:
+  trap overflow
+bb8:
+  _7 = Int.add(_5, _6)
+  return _7
+first[Str]
+param _0: List[Str] (xs)
+let _1: Int
+let _2: False | True
+let _3: False | True
+let _4: Str
+bb0:
+  _1 = len _0
+  _2 = Int.lt(0, 0)
+  branch _2 bb1 bb2
+bb1:
+  release _0
+  trap index
+bb2:
+  _3 = Int.ge(0, _1)
+  branch _3 bb3 bb4
+bb3:
+  release _0
+  trap index
+bb4:
+  _4 = _0[0]
+  retain _4
+  release _0
+  return _4
+first[Int]
+param _0: List[Int] (xs)
+let _1: Int
+let _2: False | True
+let _3: False | True
+let _4: Int
+bb0:
+  _1 = len _0
+  _2 = Int.lt(0, 0)
+  branch _2 bb1 bb2
+bb1:
+  release _0
+  trap index
+bb2:
+  _3 = Int.ge(0, _1)
+  branch _3 bb3 bb4
+bb3:
+  release _0
+  trap index
+bb4:
+  _4 = _0[0]
+  release _0
+  return _4
+twice[Str] {measure}
+param _0: Str (a)
+let _1: Str
+let _2: Int
+let _3: Int
+let _4: False | True
+bb0:
+  retain _0
+  _1 = call larger[Str](_0, _0) -> bb1
+bb1:
+  _2 = call measure(_1) -> bb2
+bb2:
+  _4 = overflows Int.mul(_2, 2)
+  branch _4 bb3 bb4
+bb3:
+  trap overflow
+bb4:
+  _3 = Int.mul(_2, 2)
+  return _3
+larger[Str] {measure}
+param _0: Str (a)
+param _1: Str (b)
+let _2: Int
+let _3: Int
+let _4: False | True
+bb0:
+  retain _0
+  _2 = call measure(_0) -> bb3
+bb1:
+  release _0
+  return _1
+bb2:
+  release _1
+  return _0
+bb3:
+  retain _1
+  _3 = call measure(_1) -> bb4
+bb4:
+  _4 = Int.lt(_2, _3)
+  branch _4 bb1 bb2
 "#,
     );
 }

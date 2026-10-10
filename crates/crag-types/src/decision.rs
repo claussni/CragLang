@@ -121,8 +121,22 @@ pub fn decision_tree<'db>(
     subject: Ty<'db>,
     arms: &[(PatId, bool)],
 ) -> Option<DecisionTree<'db>> {
-    let body = hir_body(db, program, owner);
     let pats = &body_types(db, program, owner).pats;
+    decision_tree_with(db, program, owner, pats, subject, arms)
+}
+
+/// The decision tree with the patterns of the body typed by `pats`, one
+/// type per pattern: those of an instance of a generic function, whose
+/// type parameters are replaced (§11.5.10).
+pub fn decision_tree_with<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    owner: Owner<'db>,
+    pats: &[Option<Ty<'db>>],
+    subject: Ty<'db>,
+    arms: &[(PatId, bool)],
+) -> Option<DecisionTree<'db>> {
+    let body = hir_body(db, program, owner);
     let checker = Checker::new(db, program);
     let mut rows = Vec::new();
     for (arm, &(pat, _)) in arms.iter().enumerate() {

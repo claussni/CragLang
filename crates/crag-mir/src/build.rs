@@ -40,9 +40,10 @@ use crag_hir::{
     Name, Owner, PRELUDE, Pat, PatId, Program, Resolution, Stmt, StrPart, hir_body, lower_body,
 };
 use crag_types::{
-    Builtin, Callee, DecisionTree, Dispatch, EscapeLevel, InferenceResult, ListLen, Position,
-    Signature, Step, Ty, TyKind, TypeDefKind, Value, body_types, decision_tree, declared_fields,
-    fields_of, literal_value, prelude_item, signature, type_def,
+    Builtin, Callee, DecisionTree, Dispatch, EscapeLevel, Filling, InferenceResult, Instance,
+    ListLen, Position, SigParam, Signature, Step, Ty, TyKind, TypeDefKind, Value, body_types,
+    decision_tree_with, declared_fields, fields_of, literal_value, prelude_item, result_type,
+    signature, subst, type_def,
 };
 
 use crate::ir::{
@@ -51,24 +52,32 @@ use crate::ir::{
 };
 use crate::{Entry, InstanceKey};
 
-/// The graph of a function, test or module-level value, or of the code of
-/// a closure in one, before checks and reference counts are explicit. None
-/// for what has no body.
+/// The graph of an instance: a function, test or module-level value, or
+/// the code of a closure in one, before checks and reference counts are
+/// explicit. In an instance of a generic function every type has the
+/// instance's type arguments in place of the type parameters, and a call
+/// of a slot calls the function that fills it (§11.5.10). None for what
+/// has no body, and for a generic function without type arguments.
 pub fn build<'db>(
     db: &'db dyn Db,
     program: Program,
-    owner: Owner<'db>,
-    entry: Entry,
+    instance: InstanceKey<'db>,
 ) -> Option<MirBody<'db>> {
-    if let Owner::Item(item) = owner
-        && !matches!(*item.kind(db), ItemKind::Function | ItemKind::Value)
-    {
-        return None;
+    let (owner, entry) = (*instance.owner(db), *instance.entry(db));
+    if let Owner::Item(item) = owner {
+        if !matches!(*item.kind(db), ItemKind::Function | ItemKind::Value) {
+            return None;
+        }
+        if *item.kind(db) == ItemKind::Function
+            && signature(db, program, item).type_params != instance.args(db).len()
+        {
+            return None;
+        }
     }
     let lowered = lower_body(db, program, owner);
     let root = lowered.body.root?;
     let types = body_types(db, program, owner);
-    let mut b = MirBuilder::new(db, program, owner, &lowered.body, types);
+    let mut b = MirBuilder::new(db, program, instance, &lowered.body, types);
     let ok = lowered.errors.is_empty() && types.errors.is_empty();
     let start = match entry {
         Entry::Body => b.body_entry(root),
@@ -100,6 +109,25 @@ pub fn place(level: EscapeLevel, in_loop: bool) -> ClosurePlacement {
         EscapeLevel::Local | EscapeLevel::Scoped if !in_loop => ClosurePlacement::SideStack,
         _ => ClosurePlacement::Heap,
     }
+}
+
+/// How deeply the type arguments of an instance may nest: a function that
+/// calls itself with ever larger type arguments would otherwise have
+/// instances without end.
+const INSTANCE_DEPTH: usize = 16;
+
+/// How deeply a type nests.
+fn depth(db: &dyn Db, ty: Ty<'_>) -> usize {
+    let deepest = |tys: &mut dyn Iterator<Item = Ty<'_>>| tys.map(|t| depth(db, t)).max();
+    1 + match ty.kind(db) {
+        TyKind::Builtin(_, args) | TyKind::Named(_, args) | TyKind::Union(args) => {
+            deepest(&mut args.iter().copied())
+        }
+        TyKind::Record { fields, .. } => deepest(&mut fields.iter().map(|&(_, t)| t)),
+        TyKind::Fn { params, result, .. } => deepest(&mut params.iter().copied().chain([*result])),
+        TyKind::Error | TyKind::Param(..) => None,
+    }
+    .unwrap_or(0)
 }
 
 /// The name of the field of an environment that holds the `i`th captured
@@ -178,6 +206,14 @@ pub struct MirBuilder<'a, 'db> {
     db: &'db dyn Db,
     program: Program,
     owner: Owner<'db>,
+    instance: InstanceKey<'db>,
+    /// The generic function whose type parameters the instance's type
+    /// arguments replace, and those arguments.
+    generic: Option<(ItemId<'db>, Vec<Ty<'db>>)>,
+    /// The functions that fill the instance's slots, in their order.
+    fillings: Vec<Instance<'db>>,
+    /// The type of each pattern, with the type arguments in place.
+    pats: Vec<Option<Ty<'db>>>,
     body: &'a Body<'db>,
     types: &'a InferenceResult<'db>,
     locals: Vec<LocalDecl<'db>>,
@@ -206,10 +242,25 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     fn new(
         db: &'db dyn Db,
         program: Program,
-        owner: Owner<'db>,
+        instance: InstanceKey<'db>,
         body: &'a Body<'db>,
         types: &'a InferenceResult<'db>,
     ) -> Self {
+        let owner = *instance.owner(db);
+        let generic = match owner {
+            Owner::Item(item) if !instance.args(db).is_empty() => {
+                Some((item, instance.args(db).clone()))
+            }
+            _ => None,
+        };
+        let pats = match &generic {
+            Some((item, args)) => types
+                .pats
+                .iter()
+                .map(|t| t.map(|t| subst(db, program, t, *item, args)))
+                .collect(),
+            None => types.pats.clone(),
+        };
         let named = |name: &str| match prelude_item(db, program, name) {
             Some(item) => Ty::new(db, TyKind::Named(item, Vec::new())),
             None => Ty::error(db),
@@ -223,6 +274,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             db,
             program,
             owner,
+            instance,
+            generic,
+            fillings: instance.fillings(db).clone(),
+            pats,
             body,
             types,
             locals: Vec::new(),
@@ -254,7 +309,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         }
         self.params = body.params.len();
         self.test = self.types.result.is_none();
-        self.result = self.types.result.unwrap_or_else(|| Ty::unit(self.db));
+        self.result = match self.types.result {
+            Some(result) => self.subst(result),
+            None => Ty::unit(self.db),
+        };
         Some(Box::new(move |b| b.eval(root, Dest::Return)))
     }
 
@@ -266,8 +324,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let local_fn = local_fn_of(body, frame);
         let own = local_fn.map(|(binding, _)| binding);
         let ty = match local_fn {
-            Some((binding, _)) => self.types.binding(binding)?,
-            None => self.types.expr(frame)?,
+            Some((binding, _)) => self.binding_ty(binding)?,
+            None => self.expr_ty(frame)?,
         };
         let TyKind::Fn {
             params: param_tys,
@@ -341,19 +399,20 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     /// members of union parameters when the value is lifted (§11.5.5).
     fn function_entry(&mut self, expr: ExprId) -> Option<Start<'a, 'db>> {
         let db = self.db;
-        let ty = self.types.expr(expr)?;
+        let ty = self.expr_ty(expr)?;
         let TyKind::Fn { params, result, .. } = ty.kind(db) else {
             return None;
         };
         let callee = self.types.callee(expr)?.clone();
+        let instance = self.callee_instance(&callee);
         self.result = *result;
         self.temp(Ty::unit(db));
         self.env = true;
         let args: Vec<(Local, Ty<'db>)> = params.iter().map(|&t| (self.temp(t), t)).collect();
         self.params = self.locals.len();
-        Some(Box::new(move |b| match callee {
-            Callee::Function(function) => b.forward(expr, function, &args),
-            Callee::Dispatch(dispatch) => {
+        Some(Box::new(move |b| match (callee, instance) {
+            (_, Some(instance)) => b.forward(expr, &instance, &args),
+            (Callee::Dispatch(dispatch), _) => {
                 let positional = vec![expr; args.len()];
                 let functions = match b.dispatch_functions(expr, &dispatch, &positional) {
                     Ok(functions) => functions,
@@ -378,31 +437,26 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 b.finish_dest(Operand::Local(dst), result, Dest::Return);
             }
             _ => {
-                let op = b.unsupported(expr, "generic functions as values");
+                let op = b.trap(TrapKind::Error, Some(expr));
                 let result = b.result;
                 b.finish_dest(op, result, Dest::Return);
             }
         }))
     }
 
-    /// Calls a declared function with the parameters of a value's code.
-    fn forward(&mut self, expr: ExprId, function: ItemId<'db>, args: &[(Local, Ty<'db>)]) {
+    /// Calls a function with the parameters of a value's code.
+    fn forward(&mut self, expr: ExprId, instance: &Instance<'db>, args: &[(Local, Ty<'db>)]) {
         let db = self.db;
         let ops: Vec<Operand<'db>> = args.iter().map(|&(l, _)| Operand::Local(l)).collect();
         let result = self.result;
-        if let Some(primitive) = self.primitive(function) {
+        if let Some(primitive) = self.primitive_of(instance) {
             let op = self.primitive_ops(expr, primitive, result, ops);
             return self.finish_dest(op, result, Dest::Return);
         }
-        if crag_hir::c_function(db, function).is_some() {
-            let op = self.unsupported(expr, "calls of C functions");
-            return self.finish_dest(op, result, Dest::Return);
-        }
-        let sig = signature(db, self.program, function);
-        if sig.type_params > 0 {
-            let op = self.unsupported(expr, "generic functions as values");
-            return self.finish_dest(op, result, Dest::Return);
-        }
+        let Some(func) = self.callable(expr, instance) else {
+            return self.finish_dest(self.unit(), result, Dest::Return);
+        };
+        let sig = self.instance_signature(instance);
         if sig.params.len() != args.len() {
             let op = self.unsupported(expr, "default arguments");
             return self.finish_dest(op, result, Dest::Return);
@@ -412,7 +466,6 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             .zip(&sig.params)
             .map(|(&(l, ty), p)| self.coerce(Operand::Local(l), ty, p.ty))
             .collect();
-        let func = InstanceKey::body(db, Owner::Item(function));
         let ty = sig.result.unwrap_or_else(|| Ty::unit(db));
         if ty == result {
             self.terminate(Terminator::TailCall {
@@ -451,7 +504,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             .iter()
             .enumerate()
             .map(|(i, &b)| {
-                let ty = self.types.binding(b).unwrap_or_else(|| Ty::error(db));
+                let ty = self.binding_ty(b).unwrap_or_else(|| Ty::error(db));
                 (capture_name(db, i), ty)
             })
             .collect();
@@ -459,7 +512,122 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     }
 
     fn closure_code(&self, frame: ExprId) -> InstanceKey<'db> {
-        InstanceKey::new(self.db, self.owner, Vec::new(), Entry::Closure(frame))
+        self.instance.with_entry(self.db, Entry::Closure(frame))
+    }
+
+    // Instances.
+
+    /// A type with the instance's type arguments in place.
+    fn subst(&self, ty: Ty<'db>) -> Ty<'db> {
+        match &self.generic {
+            Some((item, args)) => subst(self.db, self.program, ty, *item, args),
+            None => ty,
+        }
+    }
+
+    fn expr_ty(&self, expr: ExprId) -> Option<Ty<'db>> {
+        self.types.expr(expr).map(|t| self.subst(t))
+    }
+
+    fn binding_ty(&self, binding: BindingId) -> Option<Ty<'db>> {
+        self.types.binding(binding).map(|t| self.subst(t))
+    }
+
+    /// The type a type written in the body stands for.
+    fn type_ref(&self, ty: crag_hir::TypeRefId) -> Option<Ty<'db>> {
+        let ty = self.types.types.get(ty.index()).copied().flatten()?;
+        Some(self.subst(ty))
+    }
+
+    /// An instance a call in the body names, with the instance's type
+    /// arguments in place and its slots replaced by their fillings: one
+    /// that names no slot.
+    fn concrete(&self, instance: &Instance<'db>) -> Option<Instance<'db>> {
+        let fillings = instance
+            .fillings
+            .iter()
+            .map(|f| match f {
+                Filling::Function(i) => self.concrete(i).map(Filling::Function),
+                Filling::Slot(k) => self
+                    .fillings
+                    .get(*k as usize)
+                    .cloned()
+                    .map(Filling::Function),
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Instance {
+            function: instance.function,
+            args: instance.args.iter().map(|&t| self.subst(t)).collect(),
+            fillings,
+        })
+    }
+
+    /// The function a callee calls, as a concrete instance: a declared
+    /// function, an instance of a generic one, or what fills a slot.
+    fn callee_instance(&self, callee: &Callee<'db>) -> Option<Instance<'db>> {
+        match callee {
+            Callee::Function(function) => Some(Instance {
+                function: *function,
+                args: Vec::new(),
+                fillings: Vec::new(),
+            }),
+            Callee::Instance(instance) => self.concrete(instance),
+            Callee::Slot(slot) => self.fillings.get(*slot as usize).cloned(),
+            _ => None,
+        }
+    }
+
+    /// The signature of a concrete instance, its type arguments in place,
+    /// with the result inference gives when none is written.
+    fn instance_signature(&self, instance: &Instance<'db>) -> Signature<'db> {
+        let (db, program) = (self.db, self.program);
+        let sig = signature(db, program, instance.function);
+        let ty = |t: Ty<'db>| match instance.args.is_empty() {
+            true => t,
+            false => subst(db, program, t, instance.function, &instance.args),
+        };
+        Signature {
+            type_params: 0,
+            params: sig
+                .params
+                .iter()
+                .map(|p| SigParam {
+                    ty: ty(p.ty),
+                    ..p.clone()
+                })
+                .collect(),
+            result: sig
+                .result
+                .or_else(|| result_type(db, program, instance.function))
+                .map(ty),
+        }
+    }
+
+    /// The operation a concrete instance stands for, if it is one.
+    fn primitive_of(&self, instance: &Instance<'db>) -> Option<Primitive> {
+        match instance.args.is_empty() {
+            true => self.primitive(instance.function),
+            false => None,
+        }
+    }
+
+    /// The code a call of a concrete instance goes to, or none when it
+    /// cannot be called yet, which is recorded at the call.
+    fn callable(&mut self, expr: ExprId, instance: &Instance<'db>) -> Option<InstanceKey<'db>> {
+        let db = self.db;
+        if crag_hir::c_function(db, instance.function).is_some() {
+            self.unsupported(expr, "calls of C functions");
+            return None;
+        }
+        if signature(db, self.program, instance.function).type_params != instance.args.len() {
+            self.trap(TrapKind::Error, Some(expr));
+            return None;
+        }
+        if instance.args.iter().any(|&t| depth(db, t) > INSTANCE_DEPTH) {
+            self.unsupported(expr, "instances whose type arguments nest this deeply");
+            return None;
+        }
+        Some(InstanceKey::of(db, instance))
     }
 
     /// A closure literal or a local function as a value: its code and its
@@ -644,8 +812,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             return local;
         }
         let ty = self
-            .types
-            .binding(binding)
+            .binding_ty(binding)
             .unwrap_or_else(|| Ty::error(self.db));
         let local = self.local(ty, Some(binding));
         self.bindings.insert(binding, local);
@@ -708,7 +875,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     }
 
     fn ty(&self, expr: ExprId) -> Ty<'db> {
-        self.types.expr(expr).unwrap_or_else(|| Ty::error(self.db))
+        self.expr_ty(expr).unwrap_or_else(|| Ty::error(self.db))
     }
 
     fn int(&self) -> Ty<'db> {
@@ -958,7 +1125,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         }
         // A function used as a value gets code that calls it.
         if self.is_call(expr) {
-            let code = InstanceKey::new(self.db, self.owner, Vec::new(), Entry::Function(expr));
+            let code = self.instance.with_entry(self.db, Entry::Function(expr));
             let value = Rvalue::Closure {
                 code,
                 env: Ty::unit(self.db),
@@ -1055,7 +1222,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             }
             Expr::Not(a) => self.branch_on(*a, otherwise, then),
             Expr::Is { expr, ty } => {
-                let target = self.types.types.get(ty.index()).copied().flatten();
+                let target = self.type_ref(*ty);
                 let Some(target) = target else {
                     self.trap(TrapKind::Error, Some(cond));
                     return;
@@ -1104,13 +1271,18 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             };
         let positional: Vec<ExprId> = receiver.into_iter().chain(args.iter().copied()).collect();
         match self.types.callee(expr).cloned() {
-            Some(Callee::Function(function)) => {
-                self.call_function(expr, function, &positional, fields, tail)
+            Some(callee @ (Callee::Function(_) | Callee::Instance(_) | Callee::Slot(_))) => {
+                match self.callee_instance(&callee) {
+                    Some(instance) => {
+                        self.call_function(expr, &instance, &positional, fields, tail)
+                    }
+                    None => self.trap(TrapKind::Error, Some(expr)),
+                }
             }
-            Some(Callee::Construct(ty)) => self.construct(expr, ty, &positional, fields),
-            // Instances are compiled with monomorphization (§11.5.10).
-            Some(Callee::Instance(_)) => self.unsupported(expr, "calls of generic functions"),
-            Some(Callee::Slot(_)) => self.unsupported(expr, "calls through forms"),
+            Some(Callee::Construct(ty)) => {
+                let ty = self.subst(ty);
+                self.construct(expr, ty, &positional, fields)
+            }
             Some(Callee::Dispatch(dispatch)) => self.dispatch(expr, &dispatch, &positional, fields),
             Some(Callee::Value) => self.call_value(expr, tail),
             None => self.trap(TrapKind::Error, Some(expr)),
@@ -1217,34 +1389,23 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         Operand::Local(dst)
     }
 
-    /// The declared function of each arm of a dispatch, or what stops it
-    /// from being lowered.
+    /// The concrete instance each arm of a dispatch calls, or what stops
+    /// it from being lowered.
     fn dispatch_functions(
         &mut self,
         expr: ExprId,
         dispatch: &Dispatch<'db>,
         positional: &[ExprId],
-    ) -> Result<Vec<ItemId<'db>>, Operand<'db>> {
-        let db = self.db;
+    ) -> Result<Vec<Instance<'db>>, Operand<'db>> {
         let mut functions = Vec::new();
         for arm in &dispatch.arms {
-            match arm.callee {
-                Callee::Function(f) => {
-                    let sig = signature(db, self.program, f);
-                    if sig.type_params > 0 {
-                        return Err(self.unsupported(expr, "calls of generic functions"));
-                    }
-                    if sig.params.len() != positional.len() {
-                        return Err(self.unsupported(expr, "default arguments"));
-                    }
-                    functions.push(f);
-                }
-                Callee::Instance(_) => {
-                    return Err(self.unsupported(expr, "calls of generic functions"));
-                }
-                Callee::Slot(_) => return Err(self.unsupported(expr, "calls through forms")),
-                _ => return Err(self.trap(TrapKind::Error, Some(expr))),
+            let Some(instance) = self.callee_instance(&arm.callee) else {
+                return Err(self.trap(TrapKind::Error, Some(expr)));
+            };
+            if self.instance_signature(&instance).params.len() != positional.len() {
+                return Err(self.unsupported(expr, "default arguments"));
             }
+            functions.push(instance);
         }
         Ok(functions)
     }
@@ -1256,7 +1417,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         &mut self,
         expr: ExprId,
         dispatch: &Dispatch<'db>,
-        functions: &[ItemId<'db>],
+        functions: &[Instance<'db>],
         args: &[(Local, Ty<'db>)],
         indices: &mut Vec<usize>,
         dst: Local,
@@ -1264,16 +1425,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     ) {
         let level = indices.len();
         if level < dispatch.args.len() {
-            let members = &dispatch.members[level];
+            let members: Vec<Ty<'db>> = dispatch.members[level]
+                .iter()
+                .map(|&m| self.subst(m))
+                .collect();
             let blocks: Vec<BlockId> = members.iter().map(|_| self.new_block()).collect();
             let fail = self.new_block();
             self.terminate(Terminator::Switch {
                 place: Place::local(args[dispatch.args[level]].0),
-                cases: members
-                    .iter()
-                    .copied()
-                    .zip(blocks.iter().copied())
-                    .collect(),
+                cases: members.into_iter().zip(blocks.iter().copied()).collect(),
                 otherwise: fail,
             });
             self.switch_to(fail);
@@ -1290,23 +1450,26 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             .iter()
             .zip(&dispatch.members)
             .fold(0, |n, (&i, members)| n * members.len() + i);
-        let (function, result) = (functions[index], dispatch.arms[index].result);
-        let params = &signature(self.db, self.program, function).params;
+        let function = &functions[index];
+        let result = self.subst(dispatch.arms[index].result);
+        let params = self.instance_signature(function).params;
         let mut ops = Vec::new();
-        for (k, (&(local, ty), param)) in args.iter().zip(params).enumerate() {
+        for (k, (&(local, ty), param)) in args.iter().zip(&params).enumerate() {
             let (op, from) = match dispatch.args.iter().position(|&a| a == k) {
                 Some(level) => {
-                    let member = dispatch.members[level][indices[level]];
+                    let member = self.subst(dispatch.members[level][indices[level]]);
                     (self.coerce(Operand::Local(local), ty, member), member)
                 }
                 None => (Operand::Local(local), ty),
             };
             ops.push(self.coerce(op, from, param.ty));
         }
-        let op = match self.primitive(function) {
+        let op = match self.primitive_of(function) {
             Some(primitive) => self.primitive_ops(expr, primitive, result, ops),
             None => {
-                let func = InstanceKey::body(self.db, Owner::Item(function));
+                let Some(func) = self.callable(expr, function) else {
+                    return;
+                };
                 let out = self.temp(result);
                 let target = self.new_block();
                 self.terminate(Terminator::Call {
@@ -1324,31 +1487,28 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         self.terminate(Terminator::Jump(join));
     }
 
+    /// A call of a concrete instance: a declared function, an instance of
+    /// a generic one, or what fills a slot.
     fn call_function(
         &mut self,
         expr: ExprId,
-        function: ItemId<'db>,
+        instance: &Instance<'db>,
         positional: &[ExprId],
         fields: Option<&[FieldArg<'db>]>,
         tail: bool,
     ) -> Operand<'db> {
-        let db = self.db;
         if fields.is_none()
-            && let Some(primitive) = self.primitive(function)
+            && let Some(primitive) = self.primitive_of(instance)
         {
             return self.primitive_call(expr, primitive, positional);
         }
-        if crag_hir::c_function(db, function).is_some() {
-            return self.unsupported(expr, "calls of C functions");
-        }
-        let sig = signature(db, self.program, function);
-        if sig.type_params > 0 {
-            return self.unsupported(expr, "calls of generic functions");
-        }
-        let Some(args) = self.arguments(sig, positional, fields) else {
+        let Some(func) = self.callable(expr, instance) else {
+            return self.unit();
+        };
+        let sig = self.instance_signature(instance);
+        let Some(args) = self.arguments(&sig, positional, fields) else {
             return self.unsupported(expr, "default arguments");
         };
-        let func = InstanceKey::body(db, Owner::Item(function));
         let ty = self.ty(expr);
         if tail && ty == self.result && !self.side {
             self.terminate(Terminator::TailCall {
@@ -1755,7 +1915,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 value,
                 otherwise,
             } => {
-                let test = ty.map(|t| self.types.types.get(t.index()).copied().flatten());
+                let test = ty.map(|t| self.type_ref(t));
                 let op = self.expr(*value);
                 match test {
                     Some(None) => {
@@ -1831,8 +1991,14 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             _ => {}
         }
         let subject = self.materialize(op, ty);
-        let Some(tree) = decision_tree(self.db, self.program, self.owner, ty, &[(pat, false)])
-        else {
+        let Some(tree) = decision_tree_with(
+            self.db,
+            self.program,
+            self.owner,
+            &self.pats,
+            ty,
+            &[(pat, false)],
+        ) else {
             self.trap(TrapKind::Error, None);
             return;
         };
@@ -2025,7 +2191,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let local = self.place_of(subject);
         let ty = self.ty(subject);
         let spec: Vec<(PatId, bool)> = arms.iter().map(|a| (a.pat, a.guard.is_some())).collect();
-        let Some(tree) = decision_tree(self.db, self.program, self.owner, ty, &spec) else {
+        let Some(tree) =
+            decision_tree_with(self.db, self.program, self.owner, &self.pats, ty, &spec)
+        else {
             self.trap(TrapKind::Error, Some(expr));
             return;
         };

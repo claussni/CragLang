@@ -35,12 +35,12 @@ use crag_codegen::{CodeObject, CodegenSettings, FuncId, OptLevel, compile_entry_
 use crag_db::RootDatabase;
 use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, lower_body, owners};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
-use crag_mir::{Entry, InstanceKey, Tier};
+use crag_mir::{InstanceKey, Tier, collect_instances};
 use crag_runtime::{
     CodeMap, Fiber, FiberConfig, FiberState, Heap, Trap, Types, Worker, alloc_box, list, map,
     release_box,
 };
-use crag_types::{Ty, TyKind, prelude_item};
+use crag_types::{Ty, TyKind, prelude_item, signature};
 
 const PRELUDE: &str = r#"pub type Int
 pub type Int8
@@ -214,21 +214,18 @@ impl Module {
         let mut names = Vec::new();
         let mut unsupported = Vec::new();
         let mut types = Vec::new();
-        // The module's functions, then the code of the closures they make.
-        let mut pending = Vec::new();
+        // The module's functions that are not generic, then the instances
+        // and closure code they reach.
+        let mut roots = Vec::new();
         for owner in owners(&db, module) {
             let Owner::Item(item) = owner else { continue };
-            if *item.kind(&db) == ItemKind::Function {
-                pending.push((Some(item), InstanceKey::body(&db, owner)));
+            if *item.kind(&db) == ItemKind::Function
+                && signature(&db, program, item).type_params == 0
+            {
+                roots.push(InstanceKey::body(&db, owner));
             }
         }
-        pending.reverse();
-        let mut seen = Vec::new();
-        while let Some((item, key)) = pending.pop() {
-            if seen.contains(&key) {
-                continue;
-            }
-            seen.push(key);
+        for key in collect_instances(&db, program, &roots, Tier::Baseline) {
             let compiled = code(&db, program, key, Tier::Baseline)
                 .as_ref()
                 .expect("a function with a body")
@@ -238,20 +235,19 @@ impl Module {
                 Owner::Item(owner) => owner.name(&db).text(&db).clone(),
                 Owner::Test(_) => "test".into(),
             };
-            for what in &compiled.unsupported {
+            let body = crag_mir::mir(&db, program, key, Tier::Baseline);
+            let built = body
+                .iter()
+                .flat_map(|b| b.unsupported.iter().map(|(_, w)| w));
+            for what in built.chain(&compiled.unsupported) {
                 unsupported.push(format!("{name}: {what}"));
             }
-            // Each name with the index of its object.
-            if item.is_some() {
+            // Each root by its name, with the index of its object.
+            if roots.contains(&key) {
                 names.push((name, objects.len(), compiled.params, compiled.returns));
             }
             types.extend(compiled.types.iter().cloned());
             objects.push((compiled.func, compiled.object.clone()));
-            for &callee in &compiled.calls {
-                if *callee.entry(&db) != Entry::Body {
-                    pending.push((None, callee));
-                }
-            }
         }
         let mut symbols = SymbolTable::new();
         for func in RuntimeFn::ALL {
@@ -1153,5 +1149,133 @@ fn forward(k: Int, x: Int) -> Int {
     assert_eq!(m.worker.heap().live_blocks(), 0);
     let trap = m.run("shifted", &[1, i64::MAX]).unwrap_err();
     assert_eq!(trap.kind, TrapKind::Overflow);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+}
+
+#[test]
+fn generic_functions_run_per_instance() {
+    // A generic function is compiled once per type arguments and slot
+    // fillings it is called with (§11.5.10).
+    let mut m = Module::new(
+        r#"type Shape(pos: Int)
+type Circle(..Shape, r: Int)
+type Point(x: Int, y: Int)
+type Pair[A, B](first: A, second: B)
+
+form Sizable[U] {
+  size(u: U) -> Int
+}
+
+fn size(p: Point) -> Int {
+  p.x * p.y
+}
+
+fn size(n: Int) -> Int {
+  n
+}
+
+fn identity[T](x: T) -> T {
+  x
+}
+
+fn biggest[T: Sizable](a: T, b: T) -> T {
+  if size(a) < size(b) { b } else { a }
+}
+
+fn twice[A: Sizable](a: A) -> Int {
+  size(biggest(a, a)) * 2
+}
+
+fn pos[S: Shape](s: S) -> Int {
+  s.pos
+}
+
+fn apply[A, B](a: A, f: (A) -> B) -> B {
+  f(a)
+}
+
+fn swap[A, B](p: Pair[A, B]) -> Pair[B, A] {
+  Pair[B, A](first: p.second, second: p.first)
+}
+
+fn orZero[T: Sizable](o: Option[T]) -> Int {
+  case o {
+    Empty -> 0
+    v: T -> size(v)
+  }
+}
+
+fn nest[T](x: T, n: Int) -> Int {
+  if n == 0 { 0 } else { nest(Pair[T, T](first: x, second: x), n - 1) + 1 }
+}
+
+fn same(x: Int) -> Int {
+  identity(x) + identity(Point(x: x, y: 1)).x
+}
+
+fn larger(x: Int) -> Int {
+  biggest(Point(x: x, y: 2), Point(x: 3, y: 3)).y
+}
+
+fn doubled(x: Int) -> Int {
+  twice(Point(x: x, y: 1)) + twice(x)
+}
+
+fn circle(x: Int) -> Int {
+  pos(Circle(pos: x, r: 1))
+}
+
+fn tripled(x: Int) -> Int {
+  apply(x, { n -> n * 3 })
+}
+
+fn swapped(x: Int) -> Int {
+  let p = swap(Pair[Int, Point](first: x, second: Point(x: 1, y: 2)))
+  p.first.y + p.second
+}
+
+fn optional(x: Int) -> Int {
+  let o: Option[Point] = if 0 < x { Point(x: x, y: 2) } else { Empty }
+  orZero[Point](o)
+}
+
+fn nested(n: Int) -> Int {
+  nest(1, n)
+}
+
+fn kept[T](x: T) -> T {
+  let f = { y: T -> y }
+  f(x)
+}
+
+fn closed(x: Int) -> Int {
+  kept(x) + kept(Point(x: x, y: 1)).y
+}
+"#,
+    );
+    // Each call of `nest` adds a level of `Pair`, so its instances stop
+    // at a depth, where the call traps.
+    assert_eq!(
+        m.unsupported,
+        ["nest: instances whose type arguments nest this deeply"]
+    );
+    assert_eq!(m.int("same", &[4]), 8);
+    assert_eq!(m.int("larger", &[2]), 3);
+    assert_eq!(m.int("larger", &[5]), 2);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("doubled", &[5]), 20);
+    assert_eq!(m.int("circle", &[7]), 7);
+    assert_eq!(m.int("tripled", &[7]), 21);
+    assert_eq!(m.int("swapped", &[5]), 7);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("optional", &[3]), 6);
+    assert_eq!(m.int("optional", &[-3]), 0);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("closed", &[4]), 5);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("nested", &[3]), 3);
+    assert_eq!(m.heap.live_blocks(), 0);
+    let trap = m.run("nested", &[40]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::Unsupported);
     assert_eq!(m.worker.heap().live_blocks(), 0);
 }

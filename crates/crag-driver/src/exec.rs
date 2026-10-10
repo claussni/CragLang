@@ -24,7 +24,7 @@ use crag_backend::code;
 use crag_codegen::{CodeObject, CodegenSettings, OptLevel, compile_entry_stub, target_for};
 use crag_hir::{ModuleId, Owner};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
-use crag_mir::{Entry, InstanceKey, Tier};
+use crag_mir::{Entry, InstanceKey, Tier, collect_instances};
 use crag_runtime::{CodeMap, Fiber, FiberConfig, FiberState, Trap, Types, Worker};
 
 use crate::diagnostics::render_at;
@@ -63,16 +63,10 @@ impl Image {
     /// with the runtime's functions.
     pub fn build(project: &Project, roots: &[InstanceKey]) -> Result<Image, String> {
         let (db, program) = (&project.db, project.program);
-        let mut pending: Vec<InstanceKey> = roots.to_vec();
-        let mut seen: Vec<InstanceKey> = Vec::new();
         let mut objects: Vec<(FuncId, &CodeObject)> = Vec::new();
         let mut types = Vec::new();
         let mut functions = HashMap::new();
-        while let Some(instance) = pending.pop() {
-            if seen.contains(&instance) {
-                continue;
-            }
-            seen.push(instance);
+        for instance in collect_instances(db, program, roots, Tier::Baseline) {
             let owner = *instance.owner(db);
             let name = match instance.entry(db) {
                 Entry::Body => owner_name(project, owner),
@@ -88,7 +82,6 @@ impl Image {
             };
             objects.push((compiled.func, &compiled.object));
             types.extend(compiled.types.iter().cloned());
-            pending.extend(compiled.calls.iter().copied());
             functions.insert(
                 compiled.func,
                 Function {
