@@ -121,9 +121,26 @@ pub fn stub_settings() -> Result<CodegenSettings, String> {
     })
 }
 
+/// Where reports show a module's source.
+pub trait Sources {
+    /// The label of the text a position of the module is in, the text, and
+    /// the position in it.
+    fn locate(&self, module: ModuleId, position: u32) -> (String, &str, u32);
+}
+
+impl Sources for Project {
+    fn locate(&self, module: ModuleId, position: u32) -> (String, &str, u32) {
+        (
+            self.file(module).shown.clone(),
+            self.source(module),
+            position,
+        )
+    }
+}
+
 /// A trap as the user sees it: what went wrong, where, and the functions
 /// it happened in.
-pub fn report(project: &Project, functions: &HashMap<FuncId, Function>, trap: &Trap) -> String {
+pub fn report(sources: &dyn Sources, functions: &HashMap<FuncId, Function>, trap: &Trap) -> String {
     let what = match trap.kind {
         TrapKind::Overflow => "arithmetic overflow",
         TrapKind::DivideByZero => "division by zero",
@@ -136,9 +153,8 @@ pub fn report(project: &Project, functions: &HashMap<FuncId, Function>, trap: &T
     let first = trap.stack.first().map(|f| &functions[f]);
     let mut out = match (first, trap.position) {
         (Some(f), Some(position)) => {
-            let file = &project.file(f.module).shown;
-            let source = project.source(f.module);
-            render_at("trap", what, file, source, position..position)
+            let (file, source, position) = sources.locate(f.module, position);
+            render_at("trap", what, &file, source, position..position)
         }
         _ => format!("trap: {what}\n"),
     };
@@ -161,6 +177,7 @@ pub fn report(project: &Project, functions: &HashMap<FuncId, Function>, trap: &T
 pub fn owner_name(project: &Project, owner: Owner) -> String {
     let db = &project.db;
     match owner {
+        Owner::Item(item) if item.name(db).text(db) == crate::repl::INPUT => "the input".into(),
         Owner::Item(item) => item.name(db).text(db).clone(),
         Owner::Test(test) => format!("test {}", test.label(db)),
     }

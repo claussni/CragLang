@@ -44,6 +44,11 @@ directory with a `package.crag` naming the package and its `main` module:
     /path/to/target/debug/crag run
     /path/to/target/debug/crag test [filter]
 
+Without arguments, `crag` opens the REPL, in the project of the current
+directory if there is one. `:help` lists its commands.
+
+    /path/to/target/debug/crag
+
 ## Use of Claude Code
 
 Crag is designed and implemented with the help of

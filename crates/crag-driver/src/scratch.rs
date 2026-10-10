@@ -26,9 +26,10 @@ use crag_abi::{FuncId, SlotKey};
 use crag_backend::func_id;
 use crag_codegen::{CodeObject, CodegenSettings, compile_entry_stub};
 use crag_mir::InstanceKey;
+use crag_runtime::Trap;
 use crag_session::{ImageCommand, RunResult, Session, ShippedFunction, Stub};
 
-use crate::exec::{Function, compile, report, stub_settings};
+use crate::exec::{Function, Sources, compile, report, stub_settings};
 use crate::project::Project;
 
 /// A session with its scratch image, and what the host knows of the code
@@ -115,18 +116,30 @@ impl Scratch {
         Ok(sent)
     }
 
+    /// Ships a root without parameters and runs it in the image: how the
+    /// run ended.
+    pub fn execute(&mut self, project: &Project, root: InstanceKey) -> Result<RunResult, String> {
+        self.ship(project, &[root])?;
+        self.session.run(func_id(root)).map_err(|e| e.to_string())
+    }
+
     /// Ships a root without parameters and runs it in the image: its result
-    /// words, or the report of the trap that ended it.
+    /// words, or the report of the trap or interrupt that ended it.
     pub fn run(
         &mut self,
         project: &Project,
         root: InstanceKey,
     ) -> Result<Result<Vec<u64>, String>, String> {
-        self.ship(project, &[root])?;
-        match self.session.run(func_id(root)).map_err(|e| e.to_string())? {
-            RunResult::Finished(words) => Ok(Ok(words)),
-            RunResult::Trapped(trap) => Ok(Err(report(project, &self.functions, &trap))),
-        }
+        Ok(match self.execute(project, root)? {
+            RunResult::Finished(words) => Ok(words),
+            RunResult::Trapped(trap) => Err(self.report(project, &trap)),
+            RunResult::Interrupted => Err("interrupted\n".into()),
+        })
+    }
+
+    /// A trap in shipped code as the user sees it.
+    pub fn report(&self, sources: &dyn Sources, trap: &Trap) -> String {
+        report(sources, &self.functions, trap)
     }
 }
 

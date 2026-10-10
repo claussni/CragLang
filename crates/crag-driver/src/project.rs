@@ -69,16 +69,8 @@ impl Project {
         let mut paths = Vec::new();
         collect(root, &mut paths).map_err(|e| format!("cannot read {}: {e}", root.display()))?;
         paths.sort();
-        let db = RootDatabase::new();
-        let core = ModuleId::new(
-            &db,
-            PRELUDE.to_string(),
-            SourceFile::new(&db, CORE.to_string()),
-        );
-        let mut files = vec![ModuleFile {
-            module: core,
-            shown: format!("{PRELUDE} (bundled)"),
-        }];
+        let mut project = Project::bare();
+        let (db, files) = (&project.db, &mut project.files);
         for path in paths {
             let relative = path.strip_prefix(root).unwrap_or(&path);
             if relative == Path::new("package.crag") {
@@ -92,20 +84,52 @@ impl Project {
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect();
             let name = format!("{package}.{}", segments.join("."));
-            let module = ModuleId::new(&db, name, SourceFile::new(&db, text));
+            let module = ModuleId::new(db, name, SourceFile::new(db, text));
             files.push(ModuleFile {
                 module,
                 shown: relative.display().to_string(),
             });
         }
-        let program = Program::new(&db, files.iter().map(|f| f.module).collect());
-        Ok(Project {
+        let modules = project.files.iter().map(|f| f.module).collect();
+        project.program.set_modules(&mut project.db).to(modules);
+        project.package = package;
+        project.main = main;
+        Ok(project)
+    }
+
+    /// A program of the prelude alone, as the REPL has outside a project.
+    pub fn bare() -> Project {
+        let db = RootDatabase::new();
+        let core = ModuleId::new(
+            &db,
+            PRELUDE.to_string(),
+            SourceFile::new(&db, CORE.to_string()),
+        );
+        let files = vec![ModuleFile {
+            module: core,
+            shown: format!("{PRELUDE} (bundled)"),
+        }];
+        let program = Program::new(&db, vec![core]);
+        Project {
             db,
             program,
-            package,
-            main,
+            package: String::new(),
+            main: None,
             files,
-        })
+        }
+    }
+
+    /// Adds a module that no file holds, such as the REPL's session, shown
+    /// as `shown`.
+    pub fn add_module(&mut self, path: &str, shown: &str, text: String) -> ModuleId {
+        let module = ModuleId::new(&self.db, path.to_string(), SourceFile::new(&self.db, text));
+        self.files.push(ModuleFile {
+            module,
+            shown: shown.to_string(),
+        });
+        let modules = self.files.iter().map(|f| f.module).collect();
+        self.program.set_modules(&mut self.db).to(modules);
+        module
     }
 
     /// The modules of the project itself, without the prelude.

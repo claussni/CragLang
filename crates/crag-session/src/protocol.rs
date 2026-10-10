@@ -33,7 +33,7 @@ use crag_abi::{
 };
 
 /// The version of the protocol, raised whenever a message changes.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -76,6 +76,8 @@ pub enum Message {
     /// From the image: it could not do what the host asked, and why; it
     /// is as it was before.
     Failed(String),
+    /// From the image: SIGINT stopped the run at a safepoint.
+    Interrupted,
 }
 
 /// A function's code, shipped to an image.
@@ -109,6 +111,7 @@ const RUN: u8 = 6;
 const FINISHED: u8 = 7;
 const TRAPPED: u8 = 8;
 const FAILED: u8 = 9;
+const INTERRUPTED: u8 = 10;
 
 impl Message {
     /// The body of the message's frame.
@@ -177,6 +180,7 @@ impl Message {
                 w.u8(FAILED);
                 w.seq(why.as_bytes(), |w, b| w.u8(*b));
             }
+            Message::Interrupted => w.u8(INTERRUPTED),
         }
         w.0
     }
@@ -227,6 +231,7 @@ impl Message {
                         .map_err(|_| invalid("a reason that is not UTF-8".into()))?,
                 )
             }
+            INTERRUPTED => Message::Interrupted,
             tag => return Err(invalid(format!("a message with the unknown tag {tag}"))),
         };
         match r.0.len() {
@@ -629,6 +634,7 @@ mod tests {
                 stack: Vec::new(),
             },
             Message::Failed("function 3 is not loaded".into()),
+            Message::Interrupted,
         ]
     }
 

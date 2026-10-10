@@ -18,6 +18,9 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crag_backend::func_id;
 use crag_driver::{Project, Scratch};
@@ -80,6 +83,18 @@ fn cornered() -> Int {
 
 fn theCorner() -> Point {
   corner
+}
+
+fn spin() -> Int {
+  spin()
+}
+
+fn loops() -> Int {
+  var t = 0
+  for i in 0..4000000000000 {
+    t = t + 1
+  }
+  t
 }
 "#;
 
@@ -189,7 +204,7 @@ fn a_changed_definition_replaces_the_old_code() {
     let twice = func_id(function(&p, "twice"));
     match s.session().run(twice).unwrap() {
         RunResult::Finished(words) => assert_eq!(words, vec![48]),
-        RunResult::Trapped(trap) => panic!("{trap:?}"),
+        other => panic!("{other:?}"),
     }
 
     // A closure's code is reached through its slot too: `bump`, which
@@ -237,4 +252,41 @@ fn a_value_is_computed_again_once_its_code_changed() {
     // So does a change of its own code.
     p.set_source(module, APP.replace("x: 40, y: two()", "x: 50, y: two()"));
     assert_eq!(s.run(&p, function(&p, "cornered")).unwrap(), Ok(vec![52]));
+}
+
+#[test]
+fn sigint_stops_a_run_at_a_safepoint_and_the_image_runs_on() {
+    let p = project("interrupt", APP);
+    let mut s = scratch();
+    // A loop of tail calls stops at a function entry, a `for` loop at its
+    // back-edge.
+    for name in ["spin", "loops"] {
+        s.ship(&p, &[function(&p, name)]).unwrap();
+        let pid = s.session().scratch().pid() as libc::pid_t;
+        let done = Arc::new(AtomicBool::new(false));
+        // Until the run ends: a signal before it starts finds nothing to
+        // stop. An image that does not stop is killed after a while, which
+        // fails the test.
+        let interrupter = std::thread::spawn({
+            let done = done.clone();
+            move || {
+                for _ in 0..200 {
+                    if done.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                    // SAFETY: sends a signal to the image this test started.
+                    unsafe { libc::kill(pid, libc::SIGINT) };
+                }
+                // SAFETY: as above.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        });
+        let ran = s.run(&p, function(&p, name)).unwrap();
+        done.store(true, Ordering::SeqCst);
+        interrupter.join().unwrap();
+        assert_eq!(ran, Err("interrupted\n".into()), "{name}");
+        assert_eq!(s.session().scratch().pid() as libc::pid_t, pid);
+    }
+    assert_eq!(s.run(&p, function(&p, "answer")).unwrap(), Ok(vec![42]));
 }

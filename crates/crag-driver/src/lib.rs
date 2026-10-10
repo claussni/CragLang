@@ -22,7 +22,9 @@
 
 pub mod diagnostics;
 pub mod exec;
+pub mod line;
 pub mod project;
+pub mod repl;
 pub mod scratch;
 
 use std::io::Write;
@@ -36,6 +38,7 @@ use crag_types::{Ty, TyKind, prelude_item, signature};
 pub use diagnostics::{Diagnostic, check, render_diagnostic};
 pub use exec::Image;
 pub use project::Project;
+pub use repl::{EvalOutput, Repl};
 pub use scratch::Scratch;
 
 /// The exit status of a run that trapped (Specification §19.7.1).
@@ -139,6 +142,47 @@ fn run(root: &Path, out: &mut dyn Write) -> Result<u8, String> {
             Ok(EXIT_TRAP)
         }
     }
+}
+
+/// `crag` without arguments: the REPL, in the project at `root` if there is
+/// one, until the input ends or `:quit`. The terminal's Ctrl-C reaches the
+/// scratch image, which stops the run; the host ignores it.
+pub fn crag_repl(root: &Path) -> u8 {
+    let project = if root.join("package.crag").exists() {
+        match checked(root, &mut std::io::stdout()) {
+            Some(project) => project,
+            None => return 1,
+        }
+    } else {
+        Project::bare()
+    };
+    // SAFETY: ignoring a signal changes no state but its disposition.
+    unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+    let command = match crag_session::ImageCommand::current() {
+        Ok(command) => command,
+        Err(e) => {
+            println!("error: cannot find the crag binary: {e}");
+            return 1;
+        }
+    };
+    let scratch = match Scratch::start(command) {
+        Ok(scratch) => scratch,
+        Err(e) => {
+            println!("error: cannot start the scratch image: {e}");
+            return 1;
+        }
+    };
+    let mut repl = Repl::new(project, scratch);
+    let mut editor = line::LineEditor::new();
+    while let Some(input) = line::read_input(&mut editor, &|prefix| repl.completions(prefix)) {
+        match repl.eval_input(&input) {
+            Ok(EvalOutput::Quit) => break,
+            Ok(output) => print!("{}", output.render()),
+            Err(errors) => print!("{errors}"),
+        }
+        let _ = std::io::stdout().flush();
+    }
+    0
 }
 
 /// What `crag test` found.

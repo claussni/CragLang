@@ -27,16 +27,25 @@
 //! code fills its slot, so every later call reaches it, while frames
 //! still running the old code finish there. The old code stays loaded and
 //! in the code map.
+//!
+//! SIGINT interrupts a run (§11.6.2): the image asks the running fiber to
+//! pause at its next safepoint, a function entry or a loop's back-edge, and
+//! answers `Interrupted`. The fiber is dropped; what its frames held is
+//! not released yet. The terminal sends SIGINT to the image together with
+//! the host, which ignores it while the REPL runs.
 
 use std::collections::HashMap;
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crag_abi::{CodeObject, FuncId, RuntimeFn, SlotKey, TypeDescriptor};
 use crag_loader::{CodeArena, SymbolTable, load, replace_group};
-use crag_runtime::{CodeMap, Fiber, FiberConfig, FiberState, Types, Worker};
+use crag_runtime::{
+    CodeMap, Fiber, FiberConfig, FiberState, StopHandle, StopReason, Types, Worker,
+};
 
 use crate::host::ImageKind;
 use crate::protocol::{
@@ -45,6 +54,37 @@ use crate::protocol::{
 
 /// The address range reserved for an image's code.
 const ARENA: usize = 1 << 30;
+
+/// The stop handle of the fiber running now, for the SIGINT handler; null
+/// between runs. The image has one thread, so the handler never runs while
+/// the handle is replaced.
+static RUNNING: AtomicPtr<StopHandle> = AtomicPtr::new(std::ptr::null_mut());
+
+extern "C" fn on_interrupt(_signal: libc::c_int) {
+    let handle = RUNNING.load(Ordering::SeqCst);
+    if !handle.is_null() {
+        // SAFETY: the handle lives while it is published; requesting a stop
+        // only stores atomically, which a signal handler may do.
+        unsafe { (*handle).request_stop(StopReason::Pause) };
+    }
+}
+
+/// Has SIGINT pause the running fiber. The handler runs on the alternate
+/// signal stack the standard library sets up, not on the fiber's, whose
+/// margin is small.
+fn handle_interrupts() -> io::Result<()> {
+    // SAFETY: installs a handler that only does what a handler may.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_interrupt as *const () as usize;
+        action.sa_flags = libc::SA_ONSTACK | libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        if libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
 
 /// The code an image has loaded and the worker that runs it.
 pub struct Image {
@@ -174,7 +214,16 @@ impl Image {
             Ok(fiber) => fiber,
             Err(e) => return Message::Failed(format!("cannot map a fiber's stack: {e}")),
         };
-        match self.worker.resume(&mut fiber) {
+        let handle = Box::new(fiber.stop_handle());
+        RUNNING.store(
+            &*handle as *const StopHandle as *mut StopHandle,
+            Ordering::SeqCst,
+        );
+        let state = self.worker.resume(&mut fiber);
+        RUNNING.store(std::ptr::null_mut(), Ordering::SeqCst);
+        drop(handle);
+        match state {
+            FiberState::Paused => Message::Interrupted,
             FiberState::Finished => {
                 Message::Finished(fiber.results().expect("finished")[..returns as usize].to_vec())
             }
@@ -195,6 +244,7 @@ impl Image {
 /// until the host says `Shutdown` or goes away.
 pub fn serve(kind: ImageKind, socket: &Path) -> io::Result<()> {
     let ImageKind::Scratch = kind;
+    handle_interrupts()?;
     let mut image = Image::new()?;
     let mut stream = UnixStream::connect(socket)?;
     write_message(

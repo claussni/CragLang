@@ -26,6 +26,4 @@ crag-runtime = { path = "../crag-runtime" }
 crag-session = { path = "../crag-session" }
 crag-syntax = { path = "../crag-syntax" }
 crag-types = { path = "../crag-types" }
-
-[dev-dependencies]
 libc = "0.2.190"

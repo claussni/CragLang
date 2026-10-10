@@ -936,18 +936,33 @@ A SIGSEGV that a test sends to an image from outside does not kill it: the stand
 
 #### 11.6.2 REPL
 
-The REPL reads input, compiles it and shows the result. Each input becomes a definition in a session module, treated like a non-pub module function, so the same queries that serve files serve the REPL; `:rebind` replaces a definition and invalidates what depends on it.
+The REPL reads input, compiles it and shows the result. `crag` without arguments opens it, in the project of the current directory if there is one, whose modules it can import, and with the prelude alone otherwise. The session's definitions are one module, `repl`, whose text is theirs, one after another, so the queries that serve files serve the REPL, and a definition is a non-pub module function like any other. An input that starts with a declaration's keyword adds its declarations, a `let` among them as a module-level value (§11.4.10). Any other input is an expression. It becomes the body of a function of the REPL's own, `__input`, for as long as it is compiled and run in the scratch image. Its result type is inferred, as for any non-pub function. That function's id stays the same from input to input, so each input's code replaces the last one's (§11.6.4).
+
+A name of the session is defined once; defining it again is an error that points to `:rebind` (Specification §17.3). `:rebind` replaces the definitions of the names it declares, the queries recheck what depends on them, and the next run ships what changed. The values the new code computes differently are computed again (§11.6.3). The report names the dependents: the session's definitions that name a rebound name or a dependent's. A name is matched by its text, since no local binding may shadow a name of the module; a field after `.` and a label before `:` do not count. An input with errors changes nothing: the session goes back to its definitions before it, and the errors are shown against the input, or against the definition they are in, by its first name. A trap is shown the same way, with the input's function as "the input".
+
+The editor reads lines until the parser finds the input complete: the first syntax error, if any, is inside the input, not at its end. An empty line ends an input as it is, so an input with a missing bracket can be finished. On a terminal, the editor switches it to raw mode while it reads a line and back between lines, and draws the line again after each key. It knows the keys of most shells: arrows, Home and End, Ctrl-A, -E, -K, -U and -W, Up and Down for the history of the session, and Tab, which completes a name from the session's scope, the prelude's and imported names included, and from the keywords. Ctrl-C drops the input, and Ctrl-D on an empty line ends the session. Off a terminal, such as on a pipe, it reads plain lines and shows no prompt. Completion after `p.` of what takes `p`'s type (Specification §17.2) is still to come.
+
+During a run the terminal is cooked, so Ctrl-C sends SIGINT to the host and the scratch image, which share the terminal's process group. The host ignores it. The image asks the running fiber to pause at its next safepoint, a function entry or a loop's back-edge, through the stack-limit sentinel (§11.3.4), and answers `Interrupted`. Its handler runs on the alternate signal stack, since a fiber's margin is small. The fiber is dropped; what its frames held is not released yet. A value it was computing stays empty, since a cell is filled only when the value is done.
+
+Until value printing (§11.6.5), the REPL shows numbers, code points and tags, and a union's member, from the result's words; any other value is shown as `<a value of type T>`. `()` shows nothing, and so does a definition.
+
+Deviations from the first plan: the REPL type is `Repl`, since `Session` is the session manager's; errors come rendered, against the input; and `read_input` takes the completion as a function.
 
 **Data structures**
 
-- `SessionModule` — an in-memory module holding the session's definitions as query inputs.
-- `LineEditor` — history, editing keys, completion via the language queries.
+- `Repl` — the project, the session's module, the scratch image (§11.6.3), and the input being run.
+- `SessionModule` — the session's definitions, each with its text and the names it declares, laid out as the text of the `repl` module.
+- `LineEditor` — the history and the terminal's settings; `Line` — a line being edited, with its cursor and its place in the history; `Key` — a key, decoded from what the terminal sends.
+- `EvalOutput` — nothing, a rebind with its dependents, a value as shown, the report of a trap or an interrupt, a command's text, or the end.
 
 **Functions**
 
-- `fn read_input(editor: &mut LineEditor) -> Option<String>` — keeps reading lines until the parser reports a complete form; `None` at end of input.
-- `fn eval_input(session: &mut Session, text: &str) -> Result<EvalOutput, Vec<Diagnostic>>` — adds a definition or expression to the session module, compiles the new instances, ships them, asks the scratch image to run them.
-- `fn rebind(session: &mut Session, name: &str, text: &str) -> Result<(), Vec<Diagnostic>>` and `fn run_command(session: &mut Session, command: &str)` — for `:` commands.
+- `fn read_input(editor: &mut LineEditor, complete: &dyn Fn(&str) -> Vec<String>) -> Option<String>` — keeps reading lines until the input is complete; `None` at end of input.
+- `fn is_complete(text: &str) -> bool` and `fn is_definition(text: &str) -> bool` — from the parser and the lexer, on the input alone.
+- `Repl::eval_input(&mut self, text: &str) -> Result<EvalOutput, String>` — adds a definition, or runs an expression: compiles what it reaches, ships it and asks the scratch image to run it.
+- `Repl::rebind(&mut self, text: &str) -> Result<EvalOutput, String>` and `Repl::run_command(&mut self, command: &str)` — for `:rebind`, `:help` and `:quit`.
+- `Repl::completions(&self, prefix: &str) -> Vec<String>` — the names of the session's scope and the keywords that start with a prefix.
+- `fn decode(bytes: &[u8]) -> Option<(Key, usize)>` and `Line::key(&mut self, key, history, complete) -> Outcome` — the editor's keys and what they do, apart from the terminal.
 
 #### 11.6.3 Code shipping
 
@@ -957,12 +972,12 @@ The host remembers what each image has: functions by their id and the hash of th
 
 The image keeps the values of module-level `let`s in their cells between runs (§11.4.10). The host remembers, for each value, a hash of the code it is computed with: its own and that of every function it reaches. When the hash changes, the `Load` names the value's cell and the image empties it after loading, so the next read computes the value with the new code. Code the value does not run leaves it as it is. Every run ships its root first, and the root reaches every value the run may read, so no run reads a value computed with other code. The value an emptied cell held is not released yet.
 
-Result words that are references point into the image and mean nothing to the host; value printing reads values in the image (§11.6.5). A run that does not end blocks the request until `restart` kills the image; interrupting it at a safepoint comes with the REPL (§11.6.2).
+Result words that are references point into the image and mean nothing to the host; value printing reads values in the image (§11.6.5). SIGINT stops a run at its next safepoint, and the image answers `Interrupted` (§11.6.2); `restart` kills an image that does not answer.
 
 **Data structures**
 
 - `ShippedFunction` — a function's id, the signature of its slot, words of parameters and results, and code object; `Stub` — an entry stub and the words it was compiled for.
-- `Message::Load { types, stubs, functions, reset }`, `Loaded`, `Run(FuncId)`, `Finished(words)`, `Trapped { kind, position, stack }` and `Failed(reason)`.
+- `Message::Load { types, stubs, functions, reset }`, `Loaded`, `Run(FuncId)`, `Finished(words)`, `Trapped { kind, position, stack }`, `Interrupted` and `Failed(reason)`.
 - `Image` — in the image: the code arena, symbol table, loaded functions and stubs, descriptors, code map and worker.
 - `Scratch` — in the driver: a session and the names of the functions shipped, for reports.
 

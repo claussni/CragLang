@@ -478,6 +478,7 @@ impl Session {
     pub fn run(&mut self, func: FuncId) -> Result<RunResult, SessionError> {
         match self.request(&Message::Run(func))? {
             Message::Finished(words) => Ok(RunResult::Finished(words)),
+            Message::Interrupted => Ok(RunResult::Interrupted),
             Message::Trapped {
                 kind,
                 position,
@@ -519,4 +520,6 @@ pub enum RunResult {
     /// The result words. Words that are references point into the image.
     Finished(Vec<u64>),
     Trapped(Trap),
+    /// SIGINT stopped it.
+    Interrupted,
 }
