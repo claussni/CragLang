@@ -438,8 +438,8 @@ let b = a
     assert_eq!(
         errors(text),
         [
-            "`pong(n)`: `pong` is recursive, so it must state its success type",
-            "`ping(n)`: `ping` is recursive, so it must state its success type",
+            "`pong(n)`: this call makes `ping` and `pong` recursive, so `ping` and `pong` must \
+             state their success types",
             "`\"x\"`: expected Int, found Str",
             "`3`: Int cannot be iterated",
             "`{ 0 }`: the `else` of a `let … else` must leave",
@@ -1371,6 +1371,37 @@ fn f(k: Circle | Square, q: Square | Point, s: Circle | Rect) {
             "`area(q)`: no function `area` takes (Point | Square)",
             "`scale(s, 2)`: lifted calls whose arguments typed by the context differ by member \
              are not supported yet",
+        ]
+    );
+}
+
+#[test]
+fn recursive_groups_are_reported_once() {
+    // §3.13.1: every member of a recursive group states its success type,
+    // even where one written type would break the cycle; one diagnostic
+    // names the members missing one, at the call that links them, and
+    // calls of them report nothing more.
+    let text = "fn depth(n: Int) { if n == 0 { 0 } else { depth(n - 1) + 1 } }
+fn even(n: Int) -> Bool { if n == 0 { True } else { odd(n - 1) } }
+fn odd(n: Int) { even(n - 1) }
+fn size(x: Int) -> Int { 1 }
+fn size(x: Str) { measure(x) }
+fn measure(x: Str) { size(1) }
+fn a(n: Int) { b(n) }
+fn b(n: Int) { c(n) }
+fn c(n: Int) { a(n) }
+fn user(n: Int) -> Int { depth(n) }";
+    assert_eq!(
+        errors(text),
+        [
+            "`depth(n - 1)`: this call makes `depth` recursive, so `depth` must state its success \
+             type",
+            "`even(n - 1)`: this call makes `even` and `odd` recursive, so `odd` must state its \
+             success type",
+            "`measure(x)`: this call makes `size` and `measure` recursive, so `size` and \
+             `measure` must state their success types",
+            "`b(n)`: this call makes `a`, `b` and `c` recursive, so `a`, `b` and `c` must state \
+             their success types",
         ]
     );
 }

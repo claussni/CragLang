@@ -46,7 +46,7 @@ use crate::def::{
     HeaderKind, TypeLowerer, alias_target, prelude_item, signature, type_header, value_type,
 };
 use crate::generic::{CallSite, Slot, bind, instantiate, mentions, slots, type_param_names};
-use crate::group::{error_type, result_type};
+use crate::group::{error_type, group_of, result_type};
 use crate::overload::{Ranked, most_specific};
 use crate::relate::{declared_fields, fields_of, is_subtype, join, normalize};
 use crate::result::{Callee, Dispatch, DispatchArm, ErrorKind, InferenceResult, Site, TypeError};
@@ -812,11 +812,19 @@ impl<'a, 'db> Infer<'a, 'db> {
         Ty::new(db, TyKind::Fn { params, result })
     }
 
+    /// A call of a function whose success type is unknown. One of a
+    /// recursive group is reported once for the group (§11.5.6).
+    fn missing_success(&mut self, id: ExprId, function: ItemId<'db>) {
+        if !group_of(self.db, self.program, function).recursive {
+            self.error(Site::Expr(id), ErrorKind::RecursiveSuccess { function });
+        }
+    }
+
     fn success(&mut self, id: ExprId, function: ItemId<'db>) -> Ty<'db> {
         match self.result_of(function) {
             Some(ty) => ty,
             None => {
-                self.error(Site::Expr(id), ErrorKind::RecursiveSuccess { function });
+                self.missing_success(id, function);
                 self.err_ty()
             }
         }
@@ -898,7 +906,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                     CandidateKind::Generic => {
                         let function = candidate.function;
                         if self.result_of(function).is_none() {
-                            self.error(Site::Expr(id), ErrorKind::RecursiveSuccess { function });
+                            self.missing_success(id, function);
                             return self.err_ty();
                         }
                         match instantiate(db, program, function, args, self.call_site()) {
@@ -2259,7 +2267,7 @@ impl<'a, 'db> Infer<'a, 'db> {
         let result = match result {
             Some(result) => crate::relate::subst(db, program, result, function, &args),
             None => {
-                self.error(Site::Expr(id), ErrorKind::RecursiveSuccess { function });
+                self.missing_success(id, function);
                 self.err_ty()
             }
         };

@@ -226,6 +226,12 @@ pub enum ErrorKind<'db> {
     RecursiveSuccess {
         function: ItemId<'db>,
     },
+    /// A recursive group with members that state no success type, at the
+    /// call that links them (§3.13.1).
+    RecursiveGroup {
+        members: Vec<ItemId<'db>>,
+        missing: Vec<ItemId<'db>>,
+    },
     /// A module-level value whose type depends on itself.
     ValueCycle {
         value: ItemId<'db>,
@@ -364,6 +370,26 @@ impl<'db> ErrorKind<'db> {
                 "`{}` is recursive, so it must state its success type",
                 item(function)
             ),
+            ErrorKind::RecursiveGroup { members, missing } => {
+                let list = |items: &[ItemId<'db>]| {
+                    let names: Vec<String> =
+                        items.iter().map(|i| format!("`{}`", item(i))).collect();
+                    match names.split_last() {
+                        Some((last, [])) => last.clone(),
+                        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+                        None => String::new(),
+                    }
+                };
+                let (verb, what) = match missing.len() {
+                    1 => ("its", "success type"),
+                    _ => ("their", "success types"),
+                };
+                format!(
+                    "this call makes {} recursive, so {} must state {verb} {what}",
+                    list(members),
+                    list(missing)
+                )
+            }
             ErrorKind::ValueCycle { value } => {
                 format!("the value `{}` depends on itself", item(value))
             }

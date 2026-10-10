@@ -52,7 +52,8 @@ pub use generic::{
     instantiate, param_bound, slots, type_param_names,
 };
 pub use group::{
-    Group, callees, error_members, error_type, group_errors, group_of, result_type, success_members,
+    Group, callees, error_members, error_type, group_errors, group_of, recursion_errors,
+    result_type, success_members,
 };
 pub use infer::constant as literal_value;
 pub use overload::{Ranked, Specificity, compare_param, most_specific, overload_errors};
@@ -80,6 +81,7 @@ pub fn module_type_errors<'db>(
 ) -> Vec<(Owner<'db>, TypeError<'db>)> {
     let mut errors: Vec<(Owner<'db>, TypeError<'db>)> = overload_errors(db, program, module)
         .iter()
+        .chain(recursion_errors(db, program, module))
         .map(|(item, e)| (Owner::Item(*item), e.clone()))
         .collect();
     for owner in owners(db, module) {

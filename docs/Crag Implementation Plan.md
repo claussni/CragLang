@@ -796,11 +796,14 @@ The call records a `Dispatch`. MIR evaluates the arguments once and switches on 
 
 #### 11.5.6 Recursive-group diagnostic
 
-Recursive functions must state their success type, including functions linked through overloads the return-type filter compares (§3.13.1). The compiler detects this when the query system reports a cycle in success-type inference, and turns the cycle into a diagnostic naming every member missing a type.
+Recursive functions must state their success type, including functions linked through overloads the return-type filter compares (§3.13.1). Each member of a recursive group states it, even where one written type would break the cycle. The groups are those of error inference (§11.5.2): the strongly connected components of the functions each body names, every overload included, so a group never depends on inference. Each group with members missing a success type gets one diagnostic, in the first of them: it names the group and the members missing one, at the first call in that member's body that links it to the group. Calls of those members give the error type without an error of their own; a call that meets a cycle outside a recursive group, through a module-level value, still reports the function.
+
+A name that is a local binding, such as a parameter called `f`, names no function, so it adds no edge to the graph.
 
 **Functions**
 
-- `fn on_cycle(db: &dyn Db, participants: &[FunctionId]) -> Diagnostic` — the facade's cycle handler for success-type queries.
+- `fn recursion_errors(db: &dyn Db, program: Program, module: ModuleId) -> &Vec<(ItemId, TypeError)>` — the diagnostic of each group whose first member missing a success type is in the module.
+- `fn linking_call(body, members) -> Option<ExprId>` — the first call of a member in a body, or its first use as a value.
 
 #### 11.5.7 Effects
 

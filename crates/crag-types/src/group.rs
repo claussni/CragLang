@@ -30,11 +30,15 @@
 
 use crag_db::Db;
 use crag_db::plumbing::AsId;
-use crag_hir::{Expr, ItemId, ItemKind, Owner, Program, Resolution, hir_body, type_identity};
+use crag_hir::{
+    Body, Expr, ExprId, ItemId, ItemKind, ModuleId, Owner, Program, Resolution, hir_body,
+    item_tree, type_identity,
+};
 
 use crate::def::{prelude_item, signature, success_type};
 use crate::infer::infer_in_group;
 use crate::relate::{is_subtype, join, normalize};
+use crate::result::{ErrorKind, Site, TypeError};
 use crate::ty::{Ty, TyKind};
 
 /// The functions a function's body names: in calls, as values and as the
@@ -46,6 +50,7 @@ pub fn callees<'db>(db: &'db dyn Db, program: Program, function: ItemId<'db>) ->
     for expr in &body.exprs {
         let functions = match expr {
             Expr::Name {
+                local: None,
                 item: Some(Resolution::Value { functions, .. }),
                 ..
             }
@@ -143,6 +148,87 @@ pub fn group_of<'db>(db: &'db dyn Db, program: Program, function: ItemId<'db>) -
         }
     }
     unreachable!("the root closes its component")
+}
+
+/// The diagnostic of each recursive group whose first member without a
+/// written success type is in `module` (§3.13.1). It names the group and
+/// every member missing a success type, at a call in that member which
+/// links it to the group.
+#[crag_db::tracked(returns(ref))]
+pub fn recursion_errors<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    module: ModuleId,
+) -> Vec<(ItemId<'db>, TypeError<'db>)> {
+    let mut errors = Vec::new();
+    for item in &item_tree(db, module).items {
+        let function = item.id;
+        if *function.kind(db) != ItemKind::Function {
+            continue;
+        }
+        let group = group_of(db, program, function);
+        if !group.recursive {
+            continue;
+        }
+        let missing: Vec<ItemId<'db>> = group
+            .members
+            .iter()
+            .copied()
+            .filter(|&m| signature(db, program, m).result.is_none())
+            .collect();
+        if missing.first() != Some(&function) {
+            continue;
+        }
+        let body = hir_body(db, program, Owner::Item(function));
+        let Some(call) = linking_call(body, &group.members) else {
+            continue;
+        };
+        let kind = ErrorKind::RecursiveGroup {
+            members: group.members.clone(),
+            missing,
+        };
+        errors.push((
+            function,
+            TypeError {
+                site: Site::Expr(call),
+                kind,
+            },
+        ));
+    }
+    errors
+}
+
+/// The first call in a body of one of `members`, or the first use of one
+/// as a value.
+fn linking_call<'db>(body: &Body<'db>, members: &[ItemId<'db>]) -> Option<ExprId> {
+    let names = |expr: &Expr<'db>| match expr {
+        Expr::Name {
+            local: None,
+            item: Some(Resolution::Value { functions, .. }),
+            ..
+        }
+        | Expr::MethodCall { functions, .. }
+        | Expr::TypedCall { functions, .. }
+        | Expr::Field { functions, .. } => functions.iter().any(|f| members.contains(f)),
+        _ => false,
+    };
+    let callees: Vec<ExprId> = body
+        .exprs
+        .iter()
+        .filter_map(|e| match e {
+            Expr::Call { callee, .. } => Some(*callee),
+            _ => None,
+        })
+        .collect();
+    body.exprs.iter().enumerate().find_map(|(i, expr)| {
+        let id = ExprId(i as u32);
+        let linked = match expr {
+            Expr::Call { callee, .. } => names(body.expr(*callee)),
+            Expr::Name { .. } => names(expr) && !callees.contains(&id),
+            _ => names(expr),
+        };
+        linked.then_some(id)
+    })
 }
 
 /// The errors of each member of the group whose first member is `root`,
