@@ -1685,3 +1685,13 @@ fn d() -> Int { let v = again({ n -> n + 1 }, 0)
         ]
     );
 }
+
+#[test]
+fn constructions_in_a_list_fit_an_overload() {
+    // `sum` is the prelude's too, so the list is matched against both
+    // before either is chosen; a construction has no positional argument.
+    let text = "type Point(x: Int, y: Int)
+fn sum(ps: List[Point]) -> Int { 0 }
+fn total() -> Int { sum([Point(x: 1, y: 2), Point(x: 3, y: 4)]) }";
+    assert_eq!(ok(text), ["ps: List[Point], -> Int", "-> Int"]);
+}

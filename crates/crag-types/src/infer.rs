@@ -1383,7 +1383,10 @@ impl<'a, 'db> Infer<'a, 'db> {
                     _ => false,
                 })
             }
-            Expr::Call { args, .. } => self.could_fit(args[0], param),
+            // A negated literal; any other call is typed on its own.
+            Expr::Call { callee, args, .. } if args.len() == 1 && self.is_negation(*callee) => {
+                self.could_fit(args[0], param)
+            }
             Expr::Hole => true,
             Expr::Closure { params, .. } => {
                 any(&|k| matches!(k, TyKind::Fn { params: p, .. } if p.len() == params.len()))

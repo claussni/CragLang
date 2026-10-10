@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crag_abi::{FuncId, RuntimeFn, TrapKind};
+use crag_abi::{FuncId, RuntimeFn, TrapKind, TypeDescriptor};
 use crag_backend::code;
 use crag_codegen::{CodeObject, CodegenSettings, OptLevel, compile_entry_stub, target_for};
 use crag_hir::{ModuleId, Owner};
@@ -35,18 +35,117 @@ pub struct Image {
     arena: CodeArena,
     symbols: SymbolTable,
     settings: CodegenSettings,
-    /// Each function's entry, words of parameters and results, name and
-    /// module.
     functions: HashMap<FuncId, Function>,
+    /// Each function's entry.
+    entries: HashMap<FuncId, usize>,
     worker: Worker,
 }
 
-struct Function {
-    entry: usize,
-    params: u32,
-    returns: u32,
-    name: String,
-    module: ModuleId,
+/// A compiled function as runs and reports need it.
+#[derive(Clone, Debug)]
+pub struct Function {
+    /// Words of parameters and results.
+    pub params: u32,
+    pub returns: u32,
+    /// The name reports give it, and where its code is written.
+    pub name: String,
+    pub module: ModuleId,
+}
+
+/// The code of what some roots reach.
+pub struct Compiled<'a> {
+    pub objects: Vec<(FuncId, &'a CodeObject)>,
+    /// The descriptors of the types the code uses, by index.
+    pub types: Vec<(u32, TypeDescriptor)>,
+    pub functions: HashMap<FuncId, Function>,
+}
+
+/// Compiles the instances and everything they call.
+pub fn compile<'a>(
+    project: &'a Project,
+    roots: &[InstanceKey<'a>],
+) -> Result<Compiled<'a>, String> {
+    let (db, program) = (&project.db, project.program);
+    let mut compiled = Compiled {
+        objects: Vec::new(),
+        types: Vec::new(),
+        functions: HashMap::new(),
+    };
+    for instance in collect_instances(db, program, roots, Tier::Baseline) {
+        let owner = *instance.owner(db);
+        let name = match instance.entry(db) {
+            Entry::Body => owner_name(project, owner),
+            Entry::Closure(_) => format!("a closure in {}", owner_name(project, owner)),
+            Entry::Function(_) => {
+                format!("a function value in {}", owner_name(project, owner))
+            }
+        };
+        let code = match code(db, program, instance, Tier::Baseline) {
+            Some(Ok(code)) => code,
+            Some(Err(e)) => return Err(format!("cannot compile {name}: {e}")),
+            None => return Err(format!("{name} has no body to compile")),
+        };
+        compiled.objects.push((code.func, &code.object));
+        for t in &code.types {
+            if !compiled.types.contains(t) {
+                compiled.types.push(t.clone());
+            }
+        }
+        compiled.functions.insert(
+            code.func,
+            Function {
+                params: code.params,
+                returns: code.returns,
+                name,
+                module: owner.module(db),
+            },
+        );
+    }
+    Ok(compiled)
+}
+
+/// The settings entry stubs are compiled with: the host's target.
+pub fn stub_settings() -> Result<CodegenSettings, String> {
+    Ok(CodegenSettings {
+        target: target_for("x86_64-unknown-linux-gnu").map_err(|e| e.to_string())?,
+        opt: OptLevel::None,
+    })
+}
+
+/// A trap as the user sees it: what went wrong, where, and the functions
+/// it happened in.
+pub fn report(project: &Project, functions: &HashMap<FuncId, Function>, trap: &Trap) -> String {
+    let what = match trap.kind {
+        TrapKind::Overflow => "arithmetic overflow",
+        TrapKind::DivideByZero => "division by zero",
+        TrapKind::Index => "index out of range",
+        TrapKind::Hole => "reached `???`",
+        TrapKind::NoMatch => "no arm of `case` matched",
+        TrapKind::Error => "reached code with errors",
+        TrapKind::Unsupported => "reached code the compiler does not support yet",
+    };
+    let first = trap.stack.first().map(|f| &functions[f]);
+    let mut out = match (first, trap.position) {
+        (Some(f), Some(position)) => {
+            let file = &project.file(f.module).shown;
+            let source = project.source(f.module);
+            render_at("trap", what, file, source, position..position)
+        }
+        _ => format!("trap: {what}\n"),
+    };
+    // Runs of one function, as recursion makes them, are told once.
+    let mut k = 0;
+    while k < trap.stack.len() {
+        let func = trap.stack[k];
+        let run = trap.stack[k..].iter().take_while(|&&f| f == func).count();
+        let name = &functions[&func].name;
+        out += &match run {
+            1 => format!("  in {name}\n"),
+            n => format!("  in {name}, {n} frames\n"),
+        };
+        k += run;
+    }
+    out
 }
 
 /// The name of a body for reports: a function's, or a test's label.
@@ -62,37 +161,11 @@ impl Image {
     /// Compiles the instances and everything they call, and loads them
     /// with the runtime's functions.
     pub fn build(project: &Project, roots: &[InstanceKey]) -> Result<Image, String> {
-        let (db, program) = (&project.db, project.program);
-        let mut objects: Vec<(FuncId, &CodeObject)> = Vec::new();
-        let mut types = Vec::new();
-        let mut functions = HashMap::new();
-        for instance in collect_instances(db, program, roots, Tier::Baseline) {
-            let owner = *instance.owner(db);
-            let name = match instance.entry(db) {
-                Entry::Body => owner_name(project, owner),
-                Entry::Closure(_) => format!("a closure in {}", owner_name(project, owner)),
-                Entry::Function(_) => {
-                    format!("a function value in {}", owner_name(project, owner))
-                }
-            };
-            let compiled = match code(db, program, instance, Tier::Baseline) {
-                Some(Ok(compiled)) => compiled,
-                Some(Err(e)) => return Err(format!("cannot compile {name}: {e}")),
-                None => return Err(format!("{name} has no body to compile")),
-            };
-            objects.push((compiled.func, &compiled.object));
-            types.extend(compiled.types.iter().cloned());
-            functions.insert(
-                compiled.func,
-                Function {
-                    entry: 0,
-                    params: compiled.params,
-                    returns: compiled.returns,
-                    name,
-                    module: owner.module(db),
-                },
-            );
-        }
+        let Compiled {
+            objects,
+            types,
+            functions,
+        } = compile(project, roots)?;
         let io = |e: std::io::Error| format!("cannot map memory for code: {e}");
         let mut arena = CodeArena::new(64 << 20).map_err(io)?;
         let mut symbols = SymbolTable::new();
@@ -102,22 +175,20 @@ impl Image {
         let entries = load_group(&mut arena, &mut symbols, &objects)
             .map_err(|e| format!("cannot load the code: {e:?}"))?;
         let mut map = CodeMap::new();
+        let mut addrs = HashMap::new();
         for (&(func, object), entry) in objects.iter().zip(&entries) {
             map.add(func, entry.addr(), object);
-            functions.get_mut(&func).expect("compiled").entry = entry.addr();
+            addrs.insert(func, entry.addr());
         }
         let mut worker = Worker::new();
         worker.set_types(Arc::new(Types::new(types)));
         worker.set_code_map(Arc::new(map));
-        let settings = CodegenSettings {
-            target: target_for("x86_64-unknown-linux-gnu").map_err(|e| e.to_string())?,
-            opt: OptLevel::None,
-        };
         Ok(Image {
             arena,
             symbols,
-            settings,
+            settings: stub_settings()?,
             functions,
+            entries: addrs,
             worker,
         })
     }
@@ -132,7 +203,8 @@ impl Image {
         let stub = load(&mut self.arena, &self.symbols, &stub).expect("the stub loads");
         // SAFETY: the stub was compiled for the function's words, and both
         // stay loaded while the image exists, which outlives the fiber.
-        let mut fiber = unsafe { Fiber::new(stub.addr(), f.entry, &[], FiberConfig::default()) }
+        let entry = self.entries[&func];
+        let mut fiber = unsafe { Fiber::new(stub.addr(), entry, &[], FiberConfig::default()) }
             .expect("a fiber's stack can be mapped");
         match self.worker.resume(&mut fiber) {
             FiberState::Finished => {
@@ -143,40 +215,9 @@ impl Image {
         }
     }
 
-    /// A trap as the user sees it: what went wrong, where, and the
-    /// functions it happened in.
+    /// A trap as the user sees it.
     pub fn report(&self, project: &Project, trap: &Trap) -> String {
-        let what = match trap.kind {
-            TrapKind::Overflow => "arithmetic overflow",
-            TrapKind::DivideByZero => "division by zero",
-            TrapKind::Index => "index out of range",
-            TrapKind::Hole => "reached `???`",
-            TrapKind::NoMatch => "no arm of `case` matched",
-            TrapKind::Error => "reached code with errors",
-            TrapKind::Unsupported => "reached code the compiler does not support yet",
-        };
-        let first = trap.stack.first().map(|f| &self.functions[f]);
-        let mut out = match (first, trap.position) {
-            (Some(f), Some(position)) => {
-                let file = &project.file(f.module).shown;
-                let source = project.source(f.module);
-                render_at("trap", what, file, source, position..position)
-            }
-            _ => format!("trap: {what}\n"),
-        };
-        // Runs of one function, as recursion makes them, are told once.
-        let mut k = 0;
-        while k < trap.stack.len() {
-            let func = trap.stack[k];
-            let run = trap.stack[k..].iter().take_while(|&&f| f == func).count();
-            let name = &self.functions[&func].name;
-            out += &match run {
-                1 => format!("  in {name}\n"),
-                n => format!("  in {name}, {n} frames\n"),
-            };
-            k += run;
-        }
-        out
+        report(project, &self.functions, trap)
     }
 
     /// The heap the image's fibers allocate from.

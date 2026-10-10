@@ -17,11 +17,13 @@
 //! The driver (Implementation Plan §11.4.15): the `crag` command's `run`
 //! and `test`. It loads a project into the database, prints the
 //! diagnostics of every module, compiles what the entry points reach, and
-//! runs them on fibers.
+//! runs them on fibers. `Scratch` runs code in the scratch image instead
+//! (§11.6.3).
 
 pub mod diagnostics;
 pub mod exec;
 pub mod project;
+pub mod scratch;
 
 use std::io::Write;
 use std::path::Path;
@@ -34,6 +36,7 @@ use crag_types::{Ty, TyKind, prelude_item, signature};
 pub use diagnostics::{Diagnostic, check, render_diagnostic};
 pub use exec::Image;
 pub use project::Project;
+pub use scratch::Scratch;
 
 /// The exit status of a run that trapped (Specification §19.7.1).
 pub const EXIT_TRAP: u8 = 70;

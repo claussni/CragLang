@@ -23,7 +23,13 @@
 //! connect in time, fails the start. A broken stream means the image died
 //! or misbehaved: the session reaps it, tells how it ended and starts
 //! another of its kind.
+//!
+//! The host remembers what each image has loaded (§11.6.3): functions by
+//! id and the hash of their code, entry stubs by their words, and type
+//! descriptors by index. A shipment sends only what the image lacks, so a
+//! fresh image after a crash gets everything again.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
@@ -35,7 +41,12 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::protocol::{Message, PROTOCOL_VERSION, read_message, write_message};
+use crag_abi::{FuncId, TypeDescriptor};
+use crag_runtime::Trap;
+
+use crate::protocol::{
+    Message, PROTOCOL_VERSION, ShippedFunction, Stub, read_message, write_message,
+};
 
 /// How long an image may take to connect and say `Hello`.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -101,6 +112,11 @@ pub struct ImageHandle {
     child: Child,
     stream: UnixStream,
     state: ImageState,
+    /// What the image has loaded: functions with the hash of their code,
+    /// stubs by their words, and type indices.
+    functions: HashMap<FuncId, blake3::Hash>,
+    stubs: HashSet<(u32, u32)>,
+    types: HashSet<u32>,
 }
 
 impl ImageHandle {
@@ -114,6 +130,11 @@ impl ImageHandle {
 
     pub fn state(&self) -> ImageState {
         self.state
+    }
+
+    /// Whether the image has loaded the function.
+    pub fn has(&self, func: FuncId) -> bool {
+        self.functions.contains_key(&func)
     }
 
     /// Waits for the image to exit, killing it if it does not within
@@ -190,6 +211,9 @@ pub fn spawn_image(command: &ImageCommand, kind: ImageKind) -> io::Result<ImageH
             child,
             stream,
             state: ImageState::Running,
+            functions: HashMap::new(),
+            stubs: HashSet::new(),
+            types: HashSet::new(),
         }),
         Err(e) => {
             let _ = child.kill();
@@ -319,6 +343,11 @@ pub enum SessionError {
     Exited(ImageExit),
     /// The image died or misbehaved, and no fresh one could be started.
     Io(io::Error),
+    /// The image could not do what it was asked, and why; it runs on.
+    Refused(String),
+    /// A function the image has loaded was shipped with other code, which
+    /// only slot tables can swap in (§11.6.4).
+    Changed(FuncId),
 }
 
 impl fmt::Display for SessionError {
@@ -326,6 +355,12 @@ impl fmt::Display for SessionError {
         match self {
             SessionError::Exited(exit) => write!(f, "{exit}; a fresh one has started"),
             SessionError::Io(e) => write!(f, "the image cannot be started: {e}"),
+            SessionError::Refused(why) => write!(f, "the image refused: {why}"),
+            SessionError::Changed(func) => write!(
+                f,
+                "function {} changed, and the image cannot replace its code yet",
+                func.0
+            ),
         }
     }
 }
@@ -380,6 +415,89 @@ impl Session {
         Err(SessionError::Exited(self.on_image_exit(status)?))
     }
 
+    /// Ships code to the scratch image: the functions, stubs and type
+    /// descriptors it lacks, loaded together. Returns how many functions
+    /// were sent. A function that comes again with the code it has is not
+    /// sent; one that comes with other code is refused.
+    pub fn ship(
+        &mut self,
+        types: &[(u32, TypeDescriptor)],
+        stubs: &[Stub],
+        functions: &[ShippedFunction],
+    ) -> Result<usize, SessionError> {
+        let image = &self.scratch;
+        let mut hashes = HashMap::new();
+        let mut new_functions = Vec::new();
+        for f in functions {
+            let hash = blake3::hash(&f.encode());
+            match image.functions.get(&f.id).or(hashes.get(&f.id)) {
+                Some(known) if *known == hash => continue,
+                Some(_) => return Err(SessionError::Changed(f.id)),
+                None => {
+                    hashes.insert(f.id, hash);
+                    new_functions.push(f.clone());
+                }
+            }
+        }
+        let mut shapes = HashSet::new();
+        let new_stubs: Vec<Stub> = stubs
+            .iter()
+            .filter(|s| {
+                let shape = (s.params, s.returns);
+                !image.stubs.contains(&shape) && shapes.insert(shape)
+            })
+            .cloned()
+            .collect();
+        let mut indices = HashSet::new();
+        let new_types: Vec<(u32, TypeDescriptor)> = types
+            .iter()
+            .filter(|(index, _)| !image.types.contains(index) && indices.insert(*index))
+            .cloned()
+            .collect();
+        let sent = new_functions.len();
+        if sent == 0 && new_stubs.is_empty() && new_types.is_empty() {
+            return Ok(0);
+        }
+        let load = Message::Load {
+            types: new_types,
+            stubs: new_stubs,
+            functions: new_functions,
+        };
+        match self.request(&load)? {
+            Message::Loaded => {
+                let image = &mut self.scratch;
+                image.functions.extend(hashes);
+                image.stubs.extend(shapes);
+                image.types.extend(indices);
+                Ok(sent)
+            }
+            Message::Failed(why) => Err(SessionError::Refused(why)),
+            other => Err(SessionError::Refused(format!(
+                "the image answered {other:?} to Load"
+            ))),
+        }
+    }
+
+    /// Runs a loaded function without parameters in the scratch image.
+    pub fn run(&mut self, func: FuncId) -> Result<RunResult, SessionError> {
+        match self.request(&Message::Run(func))? {
+            Message::Finished(words) => Ok(RunResult::Finished(words)),
+            Message::Trapped {
+                kind,
+                position,
+                stack,
+            } => Ok(RunResult::Trapped(Trap {
+                kind,
+                position,
+                stack,
+            })),
+            Message::Failed(why) => Err(SessionError::Refused(why)),
+            other => Err(SessionError::Refused(format!(
+                "the image answered {other:?} to Run"
+            ))),
+        }
+    }
+
     /// Kills the scratch image, for one that runs away, and starts a fresh
     /// one; how the old one ended.
     pub fn restart(&mut self) -> Result<ImageExit, SessionError> {
@@ -397,4 +515,12 @@ impl Session {
         self.scratch = spawn_image(&self.command, exit.kind)?;
         Ok(exit)
     }
+}
+
+/// How a run in an image ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunResult {
+    /// The result words. Words that are references point into the image.
+    Finished(Vec<u64>),
+    Trapped(Trap),
 }

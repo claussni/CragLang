@@ -178,6 +178,10 @@ dependencies = [
 name = "crag-session"
 version = "0.0.0"
 dependencies = [
+ "blake3",
+ "crag-abi",
+ "crag-loader",
+ "crag-runtime",
  "libc",
 ]
 

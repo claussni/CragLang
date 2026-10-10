@@ -911,7 +911,7 @@ The host process runs the compiler; user code runs in separate image processes, 
 
 An image is the `crag` binary itself, started as `crag __image <kind> <socket>`, so `crag` stays one binary (§20). The host binds a Unix socket in a fresh directory only its user can enter, starts the image with the socket's path, and accepts its connection. The image's first message is `Hello`, with the protocol version it speaks and its process id; the host checks both, so an image of another version, or a process that is not the one it started, fails the start. So does an image that exits before it connects, which is noticed at once, or one that does not connect within ten seconds.
 
-A frame is the length of its body as four little-endian bytes, then the body: a tag byte and the fields. A frame longer than 1 GiB, an unknown tag, a body cut short or one with bytes left over is corrupt. The messages so far are `Hello`, `Ping` and `Pong`, which check that an image answers, and `Shutdown`. Those that load code, evaluate input and print values come with the components that use them (§11.6.2, §11.6.3, §11.6.5), and pausing, reloading and the debugger's with theirs.
+A frame is the length of its body as four little-endian bytes, then the body: a tag byte and the fields. A sequence is its length and then its items, and an enum a tag and then its fields. A frame longer than 1 GiB, an unknown tag, a sequence longer than what is left, a body cut short or one with bytes left over is corrupt. Besides `Hello`, `Ping` and `Pong`, which check that an image answers, and `Shutdown`, the messages load and run code (§11.6.3). Those that evaluate input and print values come with the components that use them (§11.6.2, §11.6.5), and pausing, reloading and the debugger's with theirs.
 
 A request is a message and its reply. When the stream breaks, the image has died or broken the protocol. A stream that ended belongs to an image that is exiting, which gets a second to do so. One that sent something corrupt is killed at once. The session then reaps the image, reports how it ended, such as "the scratch image (process 4711) was killed by signal 6 (SIGABRT)", and starts a fresh one of its kind. If that fails, the next request tries again. `restart` kills a runaway image and starts another. Dropping a session asks each image to shut down and kills one that does not. An image whose host goes away ends too, since its stream ends.
 
@@ -921,7 +921,7 @@ A SIGSEGV that a test sends to an image from outside does not kill it: the stand
 
 - `ImageHandle` — the image's kind (scratch; the app image comes with hot reload, §11.8.5), process, socket and state, running or exited.
 - `ImageCommand` — the program and first arguments that start an image; `ImageCommand::current()` is the running `crag`.
-- `Message` — `Hello { version, pid }`, `Ping(n)`, `Pong(n)` and `Shutdown`, with `PROTOCOL_VERSION`.
+- `Message` — `Hello { version, pid }`, `Ping(n)`, `Pong(n)` and `Shutdown`, and those of §11.6.3, with `PROTOCOL_VERSION`.
 - `Session` — the command and the scratch image; `ImageExit` — an image's kind, process id and exit status, as the session reports it.
 
 **Functions**
@@ -949,12 +949,25 @@ The REPL reads input, compiles it and shows the result. Each input becomes a def
 
 #### 11.6.3 Code shipping
 
-The host compiles; the image only loads. The host sends code objects with their relocations, and the image's loader places them and patches their addresses. Only instances the image does not already have are sent, identified by their content hash.
+The host compiles; the image only loads, so it links no code generator. To run something in the scratch image, the host compiles what the roots reach, as `crag run` does, and sends the image what it lacks in one `Load`: the code objects with their relocations and their words of parameters and results, the descriptors of the types they use, and the entry stubs to run them with, which the host compiles too. The image loads the functions together with the M0 loader, so they may call each other and what it has already, adds the descriptors to its worker's and the stack maps to its code map, and answers `Loaded`, or `Failed` with the reason and without loading them. `Run` then calls a loaded function without parameters on a fiber of its own; the image answers `Finished` with its result words or `Trapped` with the trap's kind, position and stack, which the host reports against the source as `crag run` does. A trap ends only the run; a crash ends the image, and the session starts another (§11.6.1).
+
+The host remembers what each image has: functions by their id and the hash of their code, stubs by their words, and descriptors by type index. A shipment sends only what is missing, so the second root to call a function does not send it again, and a fresh image after a crash gets everything anew. A function that comes again with other code, as a changed definition would, is refused until slot tables can swap it (§11.6.4).
+
+Result words that are references point into the image and mean nothing to the host; value printing reads values in the image (§11.6.5). A run that does not end blocks the request until `restart` kills the image; interrupting it at a safepoint comes with the REPL (§11.6.2).
+
+**Data structures**
+
+- `ShippedFunction` — a function's id, words of parameters and results, and code object; `Stub` — an entry stub and the words it was compiled for.
+- `Message::Load { types, stubs, functions }`, `Loaded`, `Run(FuncId)`, `Finished(words)`, `Trapped { kind, position, stack }` and `Failed(reason)`.
+- `Image` — in the image: the code arena, symbol table, loaded functions and stubs, descriptors, code map and worker.
+- `Scratch` — in the driver: a session and the names of the functions shipped, for reports.
 
 **Functions**
 
-- `fn ship(image: &mut ImageHandle, code: &[Arc<CodeObject>]) -> io::Result<()>` — on the host side; skips objects the image already has.
-- `fn load_shipped(loader: &mut Loader, code: Vec<CodeObject>) -> Result<(), LoadError>` — in the image: the M0 loader plus registration in the slot table.
+- `Session::ship(&mut self, types, stubs, functions) -> Result<usize, SessionError>` — on the host side; sends what the image lacks and returns how many functions it sent.
+- `Session::run(&mut self, func) -> Result<RunResult, SessionError>` — the result words or the trap.
+- `Image::answer(&mut self, message) -> Option<Message>` — in the image: loads, runs and answers.
+- `Scratch::ship(project, roots)` and `Scratch::run(project, root)` — compile, ship and run, with the trap reported against the source.
 
 #### 11.6.4 Slot tables
 

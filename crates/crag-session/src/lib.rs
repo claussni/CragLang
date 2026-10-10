@@ -18,15 +18,16 @@
 //! image processes apart from the host, so a crash or a runaway loop in it
 //! never takes the compiler down (Specification §20.1). The host starts
 //! the images, talks to them over a local socket in length-prefixed,
-//! versioned messages, and starts a fresh image when one dies.
+//! versioned messages, and starts a fresh image when one dies. The host
+//! compiles; an image loads the code it is shipped and runs it (§11.6.3).
 
 pub mod host;
 pub mod image;
 pub mod protocol;
 
 pub use host::{
-    ImageCommand, ImageExit, ImageHandle, ImageKind, ImageState, Session, SessionError, describe,
-    receive, send, spawn_image,
+    ImageCommand, ImageExit, ImageHandle, ImageKind, ImageState, RunResult, Session, SessionError,
+    describe, receive, send, spawn_image,
 };
-pub use image::serve;
-pub use protocol::{Message, PROTOCOL_VERSION, read_message, write_message};
+pub use image::{Image, serve};
+pub use protocol::{Message, PROTOCOL_VERSION, ShippedFunction, Stub, read_message, write_message};

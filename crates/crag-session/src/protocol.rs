@@ -15,19 +15,25 @@
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
 //! The messages between the host and an image (Implementation Plan
-//! §11.6.1).
+//! §11.6.1, §11.6.3).
 //!
 //! A frame is the length of its body as four little-endian bytes, then the
-//! body: a tag byte and the message's fields, integers little-endian. The
-//! image's first message is `Hello` with the version of the protocol it
-//! speaks, which the host checks before it sends anything. Messages that
-//! load code, evaluate input and print values come with the components
-//! that use them (§11.6.2, §11.6.3, §11.6.5).
+//! body: a tag byte and the message's fields. Integers are little-endian, a
+//! sequence is its length as a `u32` and then its items, and an enum is a
+//! tag byte and then its fields. The image's first message is `Hello` with
+//! the version of the protocol it speaks, which the host checks before it
+//! sends anything. Messages that evaluate input and print values come with
+//! the components that use them (§11.6.2, §11.6.5).
 
 use std::io::{self, Read, Write};
 
+use crag_abi::{
+    CodeObject, CountedField, ElementLayout, FuncId, Reloc, RelocKind, RelocTarget, RuntimeFn,
+    StackCheck, StackMap, TrapKind, TypeDescriptor,
+};
+
 /// The version of the protocol, raised whenever a message changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -43,34 +49,129 @@ pub enum Message {
     Pong(u64),
     /// From the host: the image ends with status 0.
     Shutdown,
+    /// From the host: code to load, with the descriptors of the types it
+    /// uses and the entry stubs to run it with. The functions are loaded
+    /// together, and may call each other and what is already loaded.
+    Load {
+        types: Vec<(u32, TypeDescriptor)>,
+        stubs: Vec<Stub>,
+        functions: Vec<ShippedFunction>,
+    },
+    /// From the image: everything in the `Load` is loaded.
+    Loaded,
+    /// From the host: runs a loaded function without parameters on a fiber
+    /// of its own.
+    Run(FuncId),
+    /// From the image: the run finished with these result words.
+    Finished(Vec<u64>),
+    /// From the image: the run trapped.
+    Trapped {
+        kind: TrapKind,
+        position: Option<u32>,
+        stack: Vec<FuncId>,
+    },
+    /// From the image: it could not do what the host asked, and why; it
+    /// is as it was before.
+    Failed(String),
+}
+
+/// A function's code, shipped to an image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShippedFunction {
+    pub id: FuncId,
+    /// Words of parameters and results.
+    pub params: u32,
+    pub returns: u32,
+    pub object: CodeObject,
+}
+
+/// An entry stub: code that calls a function with `params` parameter words
+/// and `returns` result words from a fiber's start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Stub {
+    pub params: u32,
+    pub returns: u32,
+    pub object: CodeObject,
 }
 
 const HELLO: u8 = 0;
 const PING: u8 = 1;
 const PONG: u8 = 2;
 const SHUTDOWN: u8 = 3;
+const LOAD: u8 = 4;
+const LOADED: u8 = 5;
+const RUN: u8 = 6;
+const FINISHED: u8 = 7;
+const TRAPPED: u8 = 8;
+const FAILED: u8 = 9;
 
 impl Message {
     /// The body of the message's frame.
     pub fn encode(&self) -> Vec<u8> {
-        let mut body = Vec::new();
+        let mut w = Writer(Vec::new());
         match self {
             Message::Hello { version, pid } => {
-                body.push(HELLO);
-                body.extend(version.to_le_bytes());
-                body.extend(pid.to_le_bytes());
+                w.u8(HELLO);
+                w.u32(*version);
+                w.u32(*pid);
             }
             Message::Ping(n) => {
-                body.push(PING);
-                body.extend(n.to_le_bytes());
+                w.u8(PING);
+                w.u64(*n);
             }
             Message::Pong(n) => {
-                body.push(PONG);
-                body.extend(n.to_le_bytes());
+                w.u8(PONG);
+                w.u64(*n);
             }
-            Message::Shutdown => body.push(SHUTDOWN),
+            Message::Shutdown => w.u8(SHUTDOWN),
+            Message::Load {
+                types,
+                stubs,
+                functions,
+            } => {
+                w.u8(LOAD);
+                w.seq(types, |w, (index, d)| {
+                    w.u32(*index);
+                    w.descriptor(d);
+                });
+                w.seq(stubs, |w, s| {
+                    w.u32(s.params);
+                    w.u32(s.returns);
+                    w.object(&s.object);
+                });
+                w.seq(functions, |w, f| w.function(f));
+            }
+            Message::Loaded => w.u8(LOADED),
+            Message::Run(id) => {
+                w.u8(RUN);
+                w.u32(id.0);
+            }
+            Message::Finished(words) => {
+                w.u8(FINISHED);
+                w.seq(words, |w, x| w.u64(*x));
+            }
+            Message::Trapped {
+                kind,
+                position,
+                stack,
+            } => {
+                w.u8(TRAPPED);
+                w.u32(*kind as u32);
+                match position {
+                    None => w.u8(0),
+                    Some(p) => {
+                        w.u8(1);
+                        w.u32(*p);
+                    }
+                }
+                w.seq(stack, |w, f| w.u32(f.0));
+            }
+            Message::Failed(why) => {
+                w.u8(FAILED);
+                w.seq(why.as_bytes(), |w, b| w.u8(*b));
+            }
         }
-        body
+        w.0
     }
 
     /// The message a frame's body holds.
@@ -84,12 +185,56 @@ impl Message {
             PING => Message::Ping(r.u64()?),
             PONG => Message::Pong(r.u64()?),
             SHUTDOWN => Message::Shutdown,
+            LOAD => Message::Load {
+                types: r.seq(|r| Ok((r.u32()?, r.descriptor()?)))?,
+                stubs: r.seq(|r| {
+                    Ok(Stub {
+                        params: r.u32()?,
+                        returns: r.u32()?,
+                        object: r.object()?,
+                    })
+                })?,
+                functions: r.seq(Reader::function)?,
+            },
+            LOADED => Message::Loaded,
+            RUN => Message::Run(FuncId(r.u32()?)),
+            FINISHED => Message::Finished(r.seq(Reader::u64)?),
+            TRAPPED => Message::Trapped {
+                kind: {
+                    let kind = r.u32()?;
+                    TrapKind::from_index(u64::from(kind))
+                        .ok_or_else(|| invalid(format!("the unknown trap kind {kind}")))?
+                },
+                position: match r.u8()? {
+                    0 => None,
+                    1 => Some(r.u32()?),
+                    tag => return Err(invalid(format!("an option with the tag {tag}"))),
+                },
+                stack: r.seq(|r| Ok(FuncId(r.u32()?)))?,
+            },
+            FAILED => {
+                let bytes = r.seq(Reader::u8)?;
+                Message::Failed(
+                    String::from_utf8(bytes)
+                        .map_err(|_| invalid("a reason that is not UTF-8".into()))?,
+                )
+            }
             tag => return Err(invalid(format!("a message with the unknown tag {tag}"))),
         };
         match r.0.len() {
             0 => Ok(message),
             n => Err(invalid(format!("{n} bytes after a message"))),
         }
+    }
+}
+
+impl ShippedFunction {
+    /// The function as the protocol writes it, which its content hash is
+    /// taken of.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer(Vec::new());
+        w.function(self);
+        w.0
     }
 }
 
@@ -125,6 +270,114 @@ fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+/// A body, written from the front.
+struct Writer(Vec<u8>);
+
+impl Writer {
+    fn u8(&mut self, x: u8) {
+        self.0.push(x);
+    }
+
+    fn u32(&mut self, x: u32) {
+        self.0.extend(x.to_le_bytes());
+    }
+
+    fn u64(&mut self, x: u64) {
+        self.0.extend(x.to_le_bytes());
+    }
+
+    fn seq<T>(&mut self, items: &[T], mut item: impl FnMut(&mut Writer, &T)) {
+        // A frame cannot hold more items than this anyway.
+        self.u32(items.len() as u32);
+        for x in items {
+            item(self, x);
+        }
+    }
+
+    fn function(&mut self, f: &ShippedFunction) {
+        self.u32(f.id.0);
+        self.u32(f.params);
+        self.u32(f.returns);
+        self.object(&f.object);
+    }
+
+    fn object(&mut self, o: &CodeObject) {
+        self.seq(&o.code, |w, b| w.u8(*b));
+        self.u32(o.align);
+        self.u32(o.entry);
+        self.seq(&o.relocs, |w, r| {
+            w.u32(r.offset);
+            let RelocKind::Abs64 = r.kind;
+            w.u8(0);
+            match r.target {
+                RelocTarget::Function(id) => {
+                    w.u8(0);
+                    w.u32(id.0);
+                }
+                RelocTarget::Runtime(func) => {
+                    w.u8(1);
+                    w.u32(func as u32);
+                }
+                RelocTarget::Local(offset) => {
+                    w.u8(2);
+                    w.u32(offset);
+                }
+            }
+            w.u64(r.addend as u64);
+        });
+        self.u32(o.footprint);
+        match o.stack_check {
+            StackCheck::None => self.u8(0),
+            StackCheck::Margin => self.u8(1),
+            StackCheck::Sized { needed } => {
+                self.u8(2);
+                self.u32(needed);
+            }
+        }
+        self.seq(&o.stack_maps, |w, m| {
+            w.u32(m.return_offset);
+            w.seq(&m.slots, |w, s| w.u32(*s));
+        });
+    }
+
+    fn descriptor(&mut self, d: &TypeDescriptor) {
+        match d {
+            TypeDescriptor::Record { counted } => {
+                self.u8(0);
+                self.counted(counted);
+            }
+            TypeDescriptor::List { element } => {
+                self.u8(1);
+                self.element(element);
+            }
+            TypeDescriptor::Map { key, value } => {
+                self.u8(2);
+                self.element(key);
+                self.element(value);
+            }
+        }
+    }
+
+    fn element(&mut self, e: &ElementLayout) {
+        self.u32(e.words);
+        self.counted(&e.counted);
+    }
+
+    fn counted(&mut self, fields: &[CountedField]) {
+        self.seq(fields, |w, f| match f {
+            CountedField::Box(offset) => {
+                w.u8(0);
+                w.u32(*offset);
+            }
+            CountedField::Union { offset, boxed } => {
+                w.u8(1);
+                w.u32(*offset);
+                w.seq(boxed, |w, b| w.u32(*b));
+            }
+        });
+    }
+}
+
 /// The fields of a body, read from the front.
 struct Reader<'a>(&'a [u8]);
 
@@ -148,6 +401,113 @@ impl Reader<'_> {
     fn u64(&mut self) -> io::Result<u64> {
         Ok(u64::from_le_bytes(self.take()?))
     }
+
+    /// A sequence. Its length is checked against the bytes left, which
+    /// every item takes at least one of, so a corrupt length cannot make
+    /// the reader allocate more than the frame holds.
+    fn seq<T>(&mut self, mut item: impl FnMut(&mut Self) -> io::Result<T>) -> io::Result<Vec<T>> {
+        let len = self.u32()? as usize;
+        if len > self.0.len() {
+            return Err(invalid("a message cut short".into()));
+        }
+        let mut items = Vec::with_capacity(len);
+        for _ in 0..len {
+            items.push(item(self)?);
+        }
+        Ok(items)
+    }
+
+    fn function(&mut self) -> io::Result<ShippedFunction> {
+        Ok(ShippedFunction {
+            id: FuncId(self.u32()?),
+            params: self.u32()?,
+            returns: self.u32()?,
+            object: self.object()?,
+        })
+    }
+
+    fn object(&mut self) -> io::Result<CodeObject> {
+        Ok(CodeObject {
+            code: self.seq(Reader::u8)?,
+            align: self.u32()?,
+            entry: self.u32()?,
+            relocs: self.seq(|r| {
+                let offset = r.u32()?;
+                let kind = match r.u8()? {
+                    0 => RelocKind::Abs64,
+                    tag => return Err(invalid(format!("a relocation kind with the tag {tag}"))),
+                };
+                let target = match r.u8()? {
+                    0 => RelocTarget::Function(FuncId(r.u32()?)),
+                    1 => {
+                        let index = r.u32()?;
+                        RelocTarget::Runtime(RuntimeFn::from_index(index).ok_or_else(|| {
+                            invalid(format!("the unknown runtime function {index}"))
+                        })?)
+                    }
+                    2 => RelocTarget::Local(r.u32()?),
+                    tag => return Err(invalid(format!("a relocation target with the tag {tag}"))),
+                };
+                Ok(Reloc {
+                    offset,
+                    kind,
+                    target,
+                    addend: r.u64()? as i64,
+                })
+            })?,
+            footprint: self.u32()?,
+            stack_check: match self.u8()? {
+                0 => StackCheck::None,
+                1 => StackCheck::Margin,
+                2 => StackCheck::Sized {
+                    needed: self.u32()?,
+                },
+                tag => return Err(invalid(format!("a stack check with the tag {tag}"))),
+            },
+            stack_maps: self.seq(|r| {
+                Ok(StackMap {
+                    return_offset: r.u32()?,
+                    slots: r.seq(Reader::u32)?,
+                })
+            })?,
+        })
+    }
+
+    fn descriptor(&mut self) -> io::Result<TypeDescriptor> {
+        Ok(match self.u8()? {
+            0 => TypeDescriptor::Record {
+                counted: self.counted()?,
+            },
+            1 => TypeDescriptor::List {
+                element: self.element()?,
+            },
+            2 => TypeDescriptor::Map {
+                key: self.element()?,
+                value: self.element()?,
+            },
+            tag => return Err(invalid(format!("a type descriptor with the tag {tag}"))),
+        })
+    }
+
+    fn element(&mut self) -> io::Result<ElementLayout> {
+        Ok(ElementLayout {
+            words: self.u32()?,
+            counted: self.counted()?,
+        })
+    }
+
+    fn counted(&mut self) -> io::Result<Vec<CountedField>> {
+        self.seq(|r| {
+            Ok(match r.u8()? {
+                0 => CountedField::Box(r.u32()?),
+                1 => CountedField::Union {
+                    offset: r.u32()?,
+                    boxed: r.seq(Reader::u32)?,
+                },
+                tag => return Err(invalid(format!("a counted field with the tag {tag}"))),
+            })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -163,7 +523,109 @@ mod tests {
             Message::Ping(u64::MAX),
             Message::Pong(7),
             Message::Shutdown,
+            Message::Load {
+                types: vec![
+                    (
+                        3,
+                        TypeDescriptor::Record {
+                            counted: vec![
+                                CountedField::Box(16),
+                                CountedField::Union {
+                                    offset: 24,
+                                    boxed: vec![3, 5],
+                                },
+                            ],
+                        },
+                    ),
+                    (
+                        5,
+                        TypeDescriptor::List {
+                            element: ElementLayout {
+                                words: 2,
+                                counted: vec![CountedField::Box(8)],
+                            },
+                        },
+                    ),
+                    (
+                        6,
+                        TypeDescriptor::Map {
+                            key: ElementLayout::default(),
+                            value: ElementLayout {
+                                words: 1,
+                                counted: Vec::new(),
+                            },
+                        },
+                    ),
+                ],
+                stubs: vec![Stub {
+                    params: 0,
+                    returns: 2,
+                    object: object(StackCheck::None),
+                }],
+                functions: vec![
+                    ShippedFunction {
+                        id: FuncId(9),
+                        params: 1,
+                        returns: 1,
+                        object: object(StackCheck::Margin),
+                    },
+                    ShippedFunction {
+                        id: FuncId(10),
+                        params: 0,
+                        returns: 0,
+                        object: object(StackCheck::Sized { needed: 4096 }),
+                    },
+                ],
+            },
+            Message::Loaded,
+            Message::Run(FuncId(9)),
+            Message::Finished(vec![0, u64::MAX]),
+            Message::Trapped {
+                kind: TrapKind::Overflow,
+                position: Some(17),
+                stack: vec![FuncId(9), FuncId(10)],
+            },
+            Message::Trapped {
+                kind: TrapKind::Unsupported,
+                position: None,
+                stack: Vec::new(),
+            },
+            Message::Failed("function 3 is not loaded".into()),
         ]
+    }
+
+    fn object(stack_check: StackCheck) -> CodeObject {
+        CodeObject {
+            code: vec![0x90, 0xc3, 0, 0, 0, 0, 0, 0, 0, 0],
+            align: 16,
+            entry: 1,
+            relocs: vec![
+                Reloc {
+                    offset: 2,
+                    kind: RelocKind::Abs64,
+                    target: RelocTarget::Function(FuncId(10)),
+                    addend: -8,
+                },
+                Reloc {
+                    offset: 2,
+                    kind: RelocKind::Abs64,
+                    target: RelocTarget::Runtime(RuntimeFn::Trap),
+                    addend: 0,
+                },
+                Reloc {
+                    offset: 2,
+                    kind: RelocKind::Abs64,
+                    target: RelocTarget::Local(1),
+                    addend: i64::MAX,
+                },
+            ],
+            footprint: 48,
+            stack_check,
+            stack_maps: vec![StackMap {
+                return_offset: 1,
+                slots: vec![0, 8],
+            }],
+        }
     }
 
     #[test]
@@ -206,5 +668,45 @@ mod tests {
         );
         assert_eq!(invalid(&[0, 0, 0, 0x41]), io::ErrorKind::InvalidData);
         assert_eq!(invalid(&[0, 0, 0, 0]), io::ErrorKind::InvalidData);
+        // A sequence longer than the frame, a trap kind, a runtime function
+        // and an option tag that do not exist.
+        assert_eq!(
+            invalid(&[5, 0, 0, 0, FINISHED, 0xff, 0xff, 0xff, 0xff]),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            invalid(&[10, 0, 0, 0, TRAPPED, 99, 0, 0, 0, 0, 0, 0, 0, 0]),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            invalid(&[10, 0, 0, 0, TRAPPED, 0, 0, 0, 0, 2, 0, 0, 0, 0]),
+            io::ErrorKind::InvalidData
+        );
+        let mut load = vec![LOAD, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0];
+        load.extend(
+            ShippedFunction {
+                id: FuncId(1),
+                params: 0,
+                returns: 0,
+                object: CodeObject {
+                    relocs: vec![Reloc {
+                        offset: 0,
+                        kind: RelocKind::Abs64,
+                        target: RelocTarget::Runtime(RuntimeFn::Trap),
+                        addend: 0,
+                    }],
+                    ..object(StackCheck::Margin)
+                },
+            }
+            .encode(),
+        );
+        // The runtime function's index, after the function's id, words,
+        // code, alignment, entry, relocation count, offset and kinds.
+        let at = 13 + 12 + 4 + 10 + 8 + 4 + 4 + 2;
+        assert_eq!(load[at], RuntimeFn::Trap as u8);
+        load[at] = 200;
+        let mut frame = (load.len() as u32).to_le_bytes().to_vec();
+        frame.extend(load);
+        assert_eq!(invalid(&frame), io::ErrorKind::InvalidData);
     }
 }
