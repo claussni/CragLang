@@ -36,7 +36,7 @@
 //!
 //! Not built yet: conditions with known inputs and type functions, which
 //! wait for conditions and `Type` values in the checker, and `embed`
-//! (§11.6.9).
+//! (§11.6.10).
 
 extern crate crag_db as salsa;
 

@@ -224,11 +224,31 @@ pub enum RuntimeFn {
     /// `rt_trap` would at this call, releasing what the
     /// frames hold as the call's stack map lists it.
     Refuel = 10,
+
+    /// `rt_text_concat(ctx, a0, a1, b0, b1) -> (w0, w1)`.
+    ///
+    /// The string or bytes `a` followed by `b`, both borrowed, as a new
+    /// value with a reference of its own (see [`INLINE_TEXT_MAX`]). Its
+    /// two words come back in the first two result registers.
+    TextConcat = 11,
+
+    /// `rt_text_equals(ctx, a0, a1, b0, b1) -> u64`.
+    ///
+    /// 1 when the strings or bytes `a` and `b`, both borrowed, hold the
+    /// same bytes, else 0.
+    TextEquals = 12,
+
+    /// `rt_text_show(ctx, word, number) -> (w0, w1)`.
+    ///
+    /// A number as a string, as interpolation writes it: the word, of the
+    /// [`Number`] whose [`Number::code`] is `number`. A code point is its
+    /// character.
+    TextShow = 13,
 }
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 11] = [
+    pub const ALL: [RuntimeFn; 14] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -240,6 +260,9 @@ impl RuntimeFn {
         RuntimeFn::MapInsert,
         RuntimeFn::MapGet,
         RuntimeFn::Refuel,
+        RuntimeFn::TextConcat,
+        RuntimeFn::TextEquals,
+        RuntimeFn::TextShow,
     ];
 
     /// The symbol the loader looks up.
@@ -256,6 +279,9 @@ impl RuntimeFn {
             RuntimeFn::MapInsert => "rt_map_insert",
             RuntimeFn::MapGet => "rt_map_get",
             RuntimeFn::Refuel => "rt_refuel",
+            RuntimeFn::TextConcat => "rt_text_concat",
+            RuntimeFn::TextEquals => "rt_text_equals",
+            RuntimeFn::TextShow => "rt_text_show",
         }
     }
 
@@ -350,17 +376,22 @@ pub enum TypeDescriptor {
     /// A list, whose elements each take `element.words` words.
     List { element: ElementLayout },
     /// A map, or a set when the value has no words. Keys are equal when
-    /// their words are, so a key holds no reference and no `Float`.
+    /// their words are, so a key holds no reference and no `Float`, or,
+    /// with `text_keys`, each key is a string or bytes, equal to another
+    /// when their bytes are.
     Map {
         key: ElementLayout,
         value: ElementLayout,
+        text_keys: bool,
     },
 }
 
 /// A field of a box that may hold a reference.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CountedField {
-    /// A box pointer at this offset, or null.
+    /// A box pointer at this offset, or a word that points at none: null,
+    /// as the environment of a function value without one is, or a word
+    /// with its lowest bit set, as the first word of an inline string is.
     Box(u32),
     /// A union at this offset: its type index, then its payload, which is a
     /// box pointer when the index is one of `boxed`, sorted.
@@ -421,6 +452,51 @@ pub const fn class_size(class: u32) -> u32 {
         let top = 6 + (class - 8) / 4;
         (1 << top) + ((class - 8) % 4 + 1) * (1 << (top - 2))
     }
+}
+
+// Strings and bytes take two words (Compiler Architecture §11). A value
+// of at most [`INLINE_TEXT_MAX`] bytes is inline: the lowest byte of the
+// first word is its length shifted left by one, plus one, its bytes follow,
+// and the bytes after them are zero:
+//
+// ```text
+// inline:  w0 = len << 1 | 1 | b0 << 8 | ... | b6 << 56   w1 = b7 | ... | b14 << 56
+// buffer:  w0 = buffer box                                w1 = start << 32 | len
+// ```
+//
+// A longer value is in a buffer, a box of its bytes after the header with
+// [`BUFFER_HEADER`] in place of a type index: the first word points at the
+// buffer, the second holds where its bytes start in the buffer's bytes and
+// how many it has. Boxes are aligned, so the lowest bit of the first word
+// tells the forms apart, and counting a value counts its buffer when it has
+// one. A value of at most 15 bytes is never in a buffer, so two values are
+// equal when their words are, and otherwise when both are in buffers that
+// hold the same bytes. A literal's buffer is static data of its code.
+
+/// The most bytes a string or bytes value holds inline.
+pub const INLINE_TEXT_MAX: usize = 15;
+
+/// The type index word of a buffer of a string or bytes. It names no type
+/// and no node kind, and the runtime frees such a box without a descriptor.
+pub const BUFFER_HEADER: u64 = u64::MAX;
+
+/// The most bytes a string or bytes value holds: its length is the lower
+/// half of a word.
+pub const TEXT_LEN_MAX: u64 = u32::MAX as u64;
+
+/// The two words of an inline string or bytes value, which has at most
+/// [`INLINE_TEXT_MAX`] bytes.
+pub fn inline_text(bytes: &[u8]) -> [u64; 2] {
+    assert!(
+        bytes.len() <= INLINE_TEXT_MAX,
+        "{} bytes inline",
+        bytes.len()
+    );
+    let mut raw = [0u8; 16];
+    raw[0] = (bytes.len() as u8) << 1 | 1;
+    raw[1..=bytes.len()].copy_from_slice(bytes);
+    let word = |k: usize| u64::from_le_bytes(raw[8 * k..8 * k + 8].try_into().unwrap());
+    [word(0), word(1)]
 }
 
 // The heap: the page each size class currently allocates from, one word per
@@ -610,6 +686,9 @@ pub enum Shape {
     Map(u32, u32),
     /// A function value: two words.
     Function,
+    /// A string or bytes value: two words.
+    Str,
+    Bytes,
     /// What cannot be shown yet, by its type, and its words.
     Opaque {
         name: String,
@@ -638,6 +717,30 @@ pub enum Number {
     CodePoint,
 }
 
+impl Number {
+    /// The number as one word, for `rt_text_show`.
+    pub fn code(self) -> u64 {
+        match self {
+            Number::Signed => 0,
+            Number::Unsigned => 1,
+            Number::Float => 2,
+            Number::CodePoint => 3,
+            Number::Fixed(digits) => 4 + u64::from(digits),
+        }
+    }
+
+    /// The number of a code, if any.
+    pub fn from_code(code: u64) -> Option<Number> {
+        Some(match code {
+            0 => Number::Signed,
+            1 => Number::Unsigned,
+            2 => Number::Float,
+            3 => Number::CodePoint,
+            _ => Number::Fixed(u32::try_from(code.checked_sub(4)?).ok()?),
+        })
+    }
+}
+
 impl Shape {
     /// The words of a value of the shape.
     pub fn words(&self) -> u32 {
@@ -649,7 +752,7 @@ impl Shape {
             | Shape::Set(_)
             | Shape::Map(..) => 1,
             Shape::Union { words, .. } | Shape::Opaque { words, .. } => *words,
-            Shape::Function => 2,
+            Shape::Function | Shape::Str | Shape::Bytes => 2,
         }
     }
 }
@@ -657,6 +760,27 @@ impl Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_text_keeps_its_length_and_bytes() {
+        assert_eq!(inline_text(b""), [1, 0]);
+        assert_eq!(inline_text(b"a"), [3 | u64::from(b'a') << 8, 0]);
+        let full = inline_text(b"abcdefghijklmno");
+        assert_eq!(full[0] & 0xff, 31);
+        assert_eq!(full[1] >> 56, u64::from(b'o'));
+        for n in [
+            Number::Signed,
+            Number::Unsigned,
+            Number::Float,
+            Number::CodePoint,
+        ] {
+            assert_eq!(Number::from_code(n.code()), Some(n));
+        }
+        assert_eq!(
+            Number::from_code(Number::Fixed(3).code()),
+            Some(Number::Fixed(3))
+        );
+    }
 
     #[test]
     fn size_classes_cover_each_size_with_the_smallest_class() {

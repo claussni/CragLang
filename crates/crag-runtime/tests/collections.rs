@@ -184,6 +184,7 @@ fn collections_fn() -> LirFunction {
                 term: Term::Return(vec![r(7)]),
             },
         ],
+        data: Vec::new(),
     }
 }
 
@@ -208,6 +209,7 @@ fn check(config: FiberConfig) {
             TypeDescriptor::Map {
                 key: word.clone(),
                 value: word,
+                text_keys: false,
             },
         ),
     ])));

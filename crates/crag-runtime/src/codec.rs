@@ -29,6 +29,8 @@
 //! - A list: its length, eight bytes, then its elements.
 //! - A map or a set: its length, then its entries in the order of their
 //!   keys' bytes, each the key and then the value.
+//! - A string or bytes: its length, eight bytes, then its bytes. A string
+//!   decodes only from valid UTF-8.
 //!
 //! A function value or what the shape cannot show is not encoded: it holds
 //! code addresses, or words whose meaning the shape does not know.
@@ -41,6 +43,7 @@ use crag_abi::{Shape, ShapeField, Shapes, TYPE_INDEX_OFFSET};
 
 use crate::heap::{Heap, alloc_box};
 use crate::rc::Types;
+use crate::text::{bytes_of, make_text};
 use crate::{list, map};
 
 /// What a value held that has no encoding, by its type.
@@ -135,6 +138,12 @@ unsafe fn encode(
         &Shape::Map(key, value) => {
             // SAFETY: a live map of the shapes.
             unsafe { entries(word, shapes, key, Some(value), types, out)? }
+        }
+        Shape::Str | Shape::Bytes => {
+            // SAFETY: the words are a live string or bytes value.
+            let bytes = unsafe { bytes_of(words) };
+            out.extend((bytes.len() as u64).to_le_bytes());
+            out.extend(bytes);
         }
         Shape::Function => return Err(NotSolid("a function value".into())),
         Shape::Opaque { name, .. } => return Err(NotSolid(format!("a value of type {name}"))),
@@ -245,6 +254,17 @@ impl Decoder<'_> {
         }
     }
 
+    /// The next `n` bytes.
+    fn bytes(&mut self, n: usize) -> Result<&[u8], DecodeError> {
+        let end = self.at.checked_add(n).filter(|&e| e <= self.bytes.len());
+        let Some(end) = end else {
+            return Err(DecodeError("the bytes end inside the value".into()));
+        };
+        let taken = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(taken)
+    }
+
     /// Reads past a value of the shape, checking it fits.
     fn check(&mut self, shapes: &Shapes, shape: u32) -> Result<(), DecodeError> {
         let shape_of = |s: u32| {
@@ -316,6 +336,16 @@ impl Decoder<'_> {
                     self.check(shapes, value)?;
                 }
             }
+            Shape::Str => {
+                let n = self.len()?;
+                if std::str::from_utf8(self.bytes(n)?).is_err() {
+                    return Err(DecodeError("a string that is not UTF-8".into()));
+                }
+            }
+            Shape::Bytes => {
+                let n = self.len()?;
+                self.bytes(n)?;
+            }
             Shape::Function => return Err(DecodeError("a function value".into())),
             Shape::Opaque { name, .. } => {
                 return Err(DecodeError(format!("a value of type {name}")));
@@ -384,6 +414,11 @@ impl Decoder<'_> {
             &Shape::Map(key, value) => {
                 // SAFETY: as the caller promises.
                 vec![unsafe { self.map(shapes, shape, key, Some(value), heap, types) }]
+            }
+            Shape::Str | Shape::Bytes => {
+                let n = self.len().expect(ok);
+                let bytes = self.bytes(n).expect(ok);
+                make_text(heap, &[bytes]).to_vec()
             }
             Shape::Function | Shape::Opaque { .. } => unreachable!("checked"),
         }

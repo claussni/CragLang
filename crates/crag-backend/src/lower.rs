@@ -29,15 +29,21 @@
 //! through the address. An environment is a box on the heap, or on the
 //! side stack with a static count, so that counting it does nothing.
 //!
-//! What code generation does not handle yet, such as strings, ends its
-//! block with a trap and is listed.
+//! A string or bytes value is its bytes inline, up to 15 of them, or a
+//! buffer and where its bytes are in it (see `crag_abi`). A longer literal
+//! has a static buffer in the code object; the runtime joins, compares and
+//! writes numbers as text, and counting a value counts its buffer.
+//!
+//! What code generation does not handle yet ends its block with a trap and
+//! is listed.
 
 use std::ops::Range;
 
 use crag_abi::{
-    CELL_FULL, CELL_STATE_OFFSET, CELL_VALUE_OFFSET, COUNT_OFFSET, HEAP_OFFSET, LEN_OFFSET,
-    LIST_SIZE, MAP_SIZE, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, STATIC_COUNT, TYPE_INDEX_OFFSET,
-    TrapKind as AbiTrap, TypeDescriptor, size_class,
+    BUFFER_HEADER, CELL_FULL, CELL_STATE_OFFSET, CELL_VALUE_OFFSET, COUNT_OFFSET, HEAP_OFFSET,
+    INLINE_TEXT_MAX, LEN_OFFSET, LIST_SIZE, MAP_SIZE, PAGE_FREE_OFFSET, PAGE_USED_OFFSET,
+    STATIC_COUNT, TEXT_LEN_MAX, TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TypeDescriptor,
+    inline_text, size_class,
 };
 use crag_codegen::{
     BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, CallTarget, Cond, FuncId, Inst,
@@ -103,6 +109,7 @@ pub fn lower_to_lir<'db>(
         calls: Vec::new(),
         types: Vec::new(),
         tracked: Vec::new(),
+        data: Vec::new(),
         true_index: named("True").map_or(-1, type_index),
         false_index: named("False").map_or(-1, type_index),
         cell,
@@ -118,6 +125,7 @@ pub fn lower_to_lir<'db>(
         match layout {
             Some(Layout::Box) => l.tracked.extend(&regs),
             Some(Layout::Closure) => l.tracked.push(regs[1]),
+            Some(Layout::Pair) => l.tracked.push(regs[0]),
             _ => {}
         }
         l.locals.push(regs);
@@ -168,6 +176,7 @@ pub fn lower_to_lir<'db>(
             vregs: l.vregs,
             tracked: l.tracked,
             blocks,
+            data: l.data,
         },
         unsupported: l.unsupported,
         calls: l.calls,
@@ -193,6 +202,8 @@ struct Lower<'a, 'db> {
     /// The types it allocates, with their descriptors.
     types: Vec<(u32, TypeDescriptor)>,
     tracked: Vec<VReg>,
+    /// The static data of the code: the buffers of long literals.
+    data: Vec<Vec<u8>>,
     true_index: i64,
     false_index: i64,
     /// The cell of the value the code computes, if it is a value's.
@@ -295,8 +306,38 @@ impl<'a, 'db> Lower<'a, 'db> {
                 }
                 Vec::new()
             }
-            Constant::Str(_) | Constant::Bytes(_) => return Err("strings and bytes"),
+            Constant::Str(s) => self.text_literal(s.as_bytes())?,
+            Constant::Bytes(b) => self.text_literal(b)?,
         })
+    }
+
+    /// The words of a string or bytes literal: inline, or a static buffer
+    /// in the code object, which counting leaves alone.
+    fn text_literal(&mut self, bytes: &[u8]) -> Result<Vec<VReg>, Unsupported> {
+        if bytes.len() <= INLINE_TEXT_MAX {
+            let [w0, w1] = inline_text(bytes);
+            return Ok(vec![self.constant(w0 as i64), self.constant(w1 as i64)]);
+        }
+        if bytes.len() as u64 > TEXT_LEN_MAX {
+            return Err("literals of 4 GiB or more");
+        }
+        let mut buffer = Vec::with_capacity(16 + bytes.len());
+        buffer.extend(STATIC_COUNT.to_le_bytes());
+        buffer.extend(BUFFER_HEADER.to_le_bytes());
+        buffer.extend(bytes);
+        let data = match self.data.iter().position(|d| *d == buffer) {
+            Some(d) => d,
+            None => {
+                self.data.push(buffer);
+                self.data.len() - 1
+            }
+        };
+        let ptr = self.reg();
+        self.push(Inst::DataAddr {
+            dst: ptr,
+            data: data as u32,
+        });
+        Ok(vec![ptr, self.constant(bytes.len() as i64)])
     }
 
     /// The type of an operand.
@@ -387,7 +428,23 @@ impl<'a, 'db> Lower<'a, 'db> {
                 self.end(Term::Jump(done), Some(done));
                 Ok(())
             }
-            Some(Layout::Pair) => Err("strings and bytes"),
+            // A buffer, unless the bytes are inline.
+            Some(Layout::Pair) => {
+                let one = self.constant(1);
+                let inline = self.bin(LirBin::And, regs[0], one);
+                let (call, done) = (self.new_block(), self.new_block());
+                self.end(
+                    Term::Branch {
+                        cond: inline,
+                        then: done,
+                        otherwise: call,
+                    },
+                    Some(call),
+                );
+                op(self, regs[0]);
+                self.end(Term::Jump(done), Some(done));
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -599,6 +656,10 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let operand_ty = Ty::builtin(self.db, *b);
                 let x = self.operand(a, operand_ty)?;
                 let y = self.operand(c, operand_ty)?;
+                if let (Builtin::Str | Builtin::Bytes, CmpOp::Eq) = (b, op) {
+                    let flag = self.text_equals(&x, &y)?;
+                    return Ok(vec![self.bool_of(flag)]);
+                }
                 let cond = compare_cond(*op, *b)?;
                 let flag = self.cmp(cond, word(&x)?, word(&y)?);
                 Ok(vec![self.bool_of(flag)])
@@ -693,7 +754,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                     self.runtime(RuntimeFn::ListSlice, vec![ptr, front, back]),
                 ])
             }
-            Rvalue::Concat(_) => Err("strings and bytes"),
+            Rvalue::Concat(parts) => self.concat(parts),
             Rvalue::Closure {
                 code,
                 env,
@@ -763,6 +824,116 @@ impl<'a, 'db> Lower<'a, 'db> {
                 Ok(vec![addr, word(&env)?])
             }
         }
+    }
+
+    /// 1 when two strings or bytes values hold the same bytes, else 0.
+    /// Equal words are equal values, and a value of at most 15 bytes is
+    /// always inline, so only two buffers of the same length need the
+    /// runtime to compare.
+    fn text_equals(&mut self, a: &[VReg], b: &[VReg]) -> Result<VReg, Unsupported> {
+        let ([a0, a1], [b0, b1]) = (a, b) else {
+            return Err("this conversion");
+        };
+        let (a0, a1, b0, b1) = (*a0, *a1, *b0, *b1);
+        let out = self.reg();
+        let same0 = self.cmp(Cond::Eq, a0, b0);
+        let same1 = self.cmp(Cond::Eq, a1, b1);
+        let same = self.bin(LirBin::And, same0, same1);
+        let one = self.constant(1);
+        let either = self.bin(LirBin::Or, a0, b0);
+        let inline = self.bin(LirBin::And, either, one);
+        let mask = self.constant(0xffff_ffff);
+        let a_len = self.bin(LirBin::And, a1, mask);
+        let b_len = self.bin(LirBin::And, b1, mask);
+        let unequal = self.cmp(Cond::Ne, a_len, b_len);
+        let known = self.bin(LirBin::Or, same, inline);
+        let known = self.bin(LirBin::Or, known, unequal);
+        let (fast, slow, done) = (self.new_block(), self.new_block(), self.new_block());
+        self.end(
+            Term::Branch {
+                cond: known,
+                then: fast,
+                otherwise: slow,
+            },
+            Some(fast),
+        );
+        self.push(Inst::Move {
+            dst: out,
+            src: same,
+        });
+        self.end(Term::Jump(done), Some(slow));
+        let equal = self.runtime(RuntimeFn::TextEquals, vec![a0, a1, b0, b1]);
+        self.push(Inst::Move {
+            dst: out,
+            src: equal,
+        });
+        self.end(Term::Jump(done), Some(done));
+        Ok(out)
+    }
+
+    /// Strings joined, each part borrowed: a string, or a number written
+    /// as text. The result has a reference of its own.
+    fn concat(&mut self, parts: &[Operand<'db>]) -> Result<Vec<VReg>, Unsupported> {
+        let db = self.db;
+        let str_ty = Ty::builtin(db, Builtin::Str);
+        // The text so far, and whether this code owns a reference to it.
+        let mut text: Option<(Vec<VReg>, bool)> = None;
+        for part in parts {
+            let ty = self.operand_ty(part, str_ty);
+            let words = self.operand(part, ty)?;
+            let (words, owned) = match ty.as_builtin(db) {
+                Some((Builtin::Str, _)) => (words, false),
+                Some((b, _)) => {
+                    let number = crate::shape::number(b).ok_or("interpolations of this type")?;
+                    let code = self.constant(number.code() as i64);
+                    (
+                        self.runtime2(RuntimeFn::TextShow, vec![word(&words)?, code]),
+                        true,
+                    )
+                }
+                None => return Err("interpolations of this type"),
+            };
+            text = Some(match text {
+                None => (words, owned),
+                Some((so_far, owned_so_far)) => {
+                    let mut args = so_far.clone();
+                    args.extend(&words);
+                    let joined = self.runtime2(RuntimeFn::TextConcat, args);
+                    if owned_so_far {
+                        self.count_text(&so_far, Self::release);
+                    }
+                    if owned {
+                        self.count_text(&words, Self::release);
+                    }
+                    (joined, true)
+                }
+            });
+        }
+        let Some((words, owned)) = text else {
+            return self.text_literal(b"");
+        };
+        if !owned {
+            self.count_text(&words, Self::retain);
+        }
+        Ok(words)
+    }
+
+    /// Retains or releases the buffer of a string's words, if it has one.
+    fn count_text(&mut self, words: &[VReg], op: fn(&mut Self, VReg)) {
+        let str_ty = Ty::builtin(self.db, Builtin::Str);
+        self.count_words(Some(Layout::Pair), str_ty, words, op)
+            .expect("a string is counted");
+    }
+
+    /// Calls a runtime function with two results.
+    fn runtime2(&mut self, func: RuntimeFn, args: Vec<VReg>) -> Vec<VReg> {
+        let dsts = vec![self.reg(), self.reg()];
+        self.push(Inst::CallRuntime {
+            func,
+            args,
+            dsts: dsts.clone(),
+        });
+        dsts
     }
 
     /// Where a call of an instance goes: through its slot.
@@ -886,8 +1057,8 @@ impl<'a, 'db> Lower<'a, 'db> {
                 {
                     "maps with keys of this type"
                 }
-                Some(_) => "collections holding strings or bytes",
-                None => "records holding strings or bytes",
+                Some(_) => "collections of this type",
+                None => "records of this type",
             });
         };
         self.types.push((index, descriptor));
@@ -1029,7 +1200,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             (Layout::Tag, Layout::Union) => vec![self.retag(values[0], from, to), self.constant(0)],
             (Layout::Union, Layout::Union) => vec![self.retag(values[0], from, to), values[1]],
             (Layout::Tag, Layout::Tag) => vec![self.retag(values[0], from, to)],
-            (Layout::Box, Layout::Box) => values,
+            (Layout::Box, Layout::Box) | (Layout::Pair, Layout::Pair) => values,
             (Layout::Union, Layout::Imm(_) | Layout::Box) => vec![values[1]],
             (Layout::Union, Layout::Tag) => vec![values[0]],
             (Layout::Union | Layout::Tag, Layout::Zero) => Vec::new(),
@@ -1517,7 +1688,7 @@ fn compare_cond(op: CmpOp, ty: Builtin) -> Result<Cond, Unsupported> {
         Builtin::UInt8 | Builtin::UInt16 | Builtin::UInt32 | Builtin::UInt64 | Builtin::CodePoint
     );
     Ok(match (ty, op) {
-        (Builtin::Str | Builtin::Bytes, _) => return Err("strings and bytes"),
+        (Builtin::Str | Builtin::Bytes, _) => return Err("orderings of strings and bytes"),
         (Builtin::Float, CmpOp::Eq) => Cond::FEq,
         (Builtin::Float, CmpOp::Ne) => Cond::FNe,
         (Builtin::Float, CmpOp::Lt) => Cond::FLt,

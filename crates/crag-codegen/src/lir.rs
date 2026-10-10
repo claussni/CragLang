@@ -168,7 +168,7 @@ pub enum Inst {
     },
     /// A call of a runtime function with the C calling convention. The task
     /// context goes first, before `args`; `dsts` receive the results, at
-    /// most one.
+    /// most two.
     CallRuntime {
         func: RuntimeFn,
         args: Vec<VReg>,
@@ -184,6 +184,13 @@ pub enum Inst {
     CellAddr {
         dst: VReg,
         cell: SlotKey,
+    },
+    /// `dst` becomes the address of the function's static data `data`,
+    /// aligned to 16 bytes, which stays where it is while the code is
+    /// loaded.
+    DataAddr {
+        dst: VReg,
+        data: u32,
     },
     /// Reads the word at `addr + offset`.
     Load {
@@ -269,6 +276,9 @@ pub struct LirFunction {
     /// code object's stack maps.
     pub tracked: Vec<VReg>,
     pub blocks: Vec<Block>,
+    /// Bytes the code reads, such as the buffers of long string literals:
+    /// placed after the code, in the code object.
+    pub data: Vec<Vec<u8>>,
 }
 
 impl LirFunction {
@@ -307,6 +317,12 @@ impl LirFunction {
                     Inst::Const { dst, .. }
                     | Inst::Context { dst }
                     | Inst::CellAddr { dst, .. } => reg(dst)?,
+                    Inst::DataAddr { dst, data } => {
+                        reg(dst)?;
+                        if *data as usize >= self.data.len() {
+                            return Err(format!("static data {data} out of range"));
+                        }
+                    }
                     Inst::Move { dst, src } => {
                         reg(dst)?;
                         reg(src)?;
@@ -322,8 +338,8 @@ impl LirFunction {
                         [dst, cond, a, b].into_iter().try_for_each(reg)?;
                     }
                     Inst::CallRuntime { args, dsts, .. } => {
-                        if dsts.len() > 1 {
-                            return Err("a runtime call with more than 1 result".into());
+                        if dsts.len() > 2 {
+                            return Err("a runtime call with more than 2 results".into());
                         }
                         args.iter().chain(dsts).try_for_each(reg)?;
                     }

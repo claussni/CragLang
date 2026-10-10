@@ -19,8 +19,9 @@
 //! A value is zero, one or two words. Unit and tags take none; numbers and
 //! box pointers one. A union is its type index plus a payload word, or the
 //! index alone when every member is a tag, as for `Bool`. Strings and
-//! bytes take two words, and so does a function value: the address of its
-//! code and its environment, a box or null (§11.5.9).
+//! bytes take two words, their bytes inline or a buffer with where they are
+//! in it (§11.6.9), and so does a function value: the address of its code
+//! and its environment, a box or null (§11.5.9).
 
 use crag_abi::{CountedField, ElementLayout, HEADER_SIZE, TypeDescriptor};
 use crag_db::Db;
@@ -43,7 +44,8 @@ pub enum Layout {
     /// A union: the type index of the value's member, then its payload,
     /// which is zero for a tag.
     Union,
-    /// Two words of a string or bytes.
+    /// A string or bytes: up to 15 bytes inline, or a buffer, a box,
+    /// and where the bytes are in it (see `crag_abi`).
     Pair,
     /// A function value: its code's address, then its environment, a box
     /// or null.
@@ -218,8 +220,7 @@ pub fn boxed_indices<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Opt
 }
 
 /// The words of a value of `ty` in a collection. None for what has no
-/// layout yet, and for strings and bytes, whose references are not
-/// counted yet.
+/// layout yet.
 pub fn element_layout<'db>(
     db: &'db dyn Db,
     program: Program,
@@ -238,14 +239,16 @@ pub fn element_layout<'db>(
             (2, counted)
         }
         Layout::Closure => (2, vec![CountedField::Box(8)]),
-        Layout::Pair => return None,
+        // A buffer, unless the first word's lowest bit says the bytes are
+        // inline.
+        Layout::Pair => (2, vec![CountedField::Box(0)]),
     };
     Some(ElementLayout { words, counted })
 }
 
 /// Whether two values of `ty` are equal exactly when their words are, as
-/// the runtime compares map keys: numbers but `Float`, code points, tags,
-/// and unions of these.
+/// the runtime compares map keys unless they are strings or bytes:
+/// numbers but `Float`, code points, tags, and unions of these.
 pub fn equal_by_words<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
     ty.members(db)
         .into_iter()
@@ -256,18 +259,25 @@ pub fn equal_by_words<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bo
         })
 }
 
+/// Whether values of `ty` are strings or bytes, which the runtime compares
+/// as map keys by their bytes.
+pub fn is_text<'db>(db: &'db dyn Db, ty: Ty<'db>) -> bool {
+    matches!(ty.as_builtin(db), Some((Builtin::Str | Builtin::Bytes, _)))
+}
+
 /// The descriptor of a record or collection type: for a record the fields
 /// that hold references, which the runtime releases when it frees a box of
 /// the type, and for a collection the layouts of what it holds. None when
-/// a field or an element is a string or bytes, whose references are not
-/// counted yet, or a map's key is not equal by its words.
+/// a field or an element has no layout yet, or a map's key is neither equal
+/// by its words nor a string or bytes.
 pub fn type_descriptor<'db>(
     db: &'db dyn Db,
     program: Program,
     ty: Ty<'db>,
 ) -> Option<TypeDescriptor> {
     let map = |key: Ty<'db>, value: Option<Ty<'db>>| {
-        if !equal_by_words(db, program, key) {
+        let text_keys = is_text(db, key);
+        if !text_keys && !equal_by_words(db, program, key) {
             return None;
         }
         let value = match value {
@@ -275,7 +285,11 @@ pub fn type_descriptor<'db>(
             None => ElementLayout::default(),
         };
         let key = element_layout(db, program, key)?;
-        Some(TypeDescriptor::Map { key, value })
+        Some(TypeDescriptor::Map {
+            key,
+            value,
+            text_keys,
+        })
     };
     match ty.as_builtin(db) {
         Some((Builtin::List, [element])) => {
@@ -301,7 +315,7 @@ pub fn type_descriptor<'db>(
                 }
             }
             Layout::Closure => counted.push(CountedField::Box(slot.offset + 8)),
-            Layout::Pair => return None,
+            Layout::Pair => counted.push(CountedField::Box(slot.offset)),
             Layout::Zero | Layout::Imm(_) | Layout::Tag => {}
         }
     }

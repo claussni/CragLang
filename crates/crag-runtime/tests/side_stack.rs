@@ -52,6 +52,7 @@ fn sum_pair_fn() -> LirFunction {
             ],
             term: Term::Return(vec![r(1)]),
         }],
+        data: Vec::new(),
     }
 }
 
@@ -94,6 +95,7 @@ fn pass_pair_fn(sum_pair: u32) -> LirFunction {
             ],
             term: Term::Return(vec![r(3)]),
         }],
+        data: Vec::new(),
     }
 }
 
@@ -172,6 +174,7 @@ fn sum_through_slots_fn(self_id: u32) -> LirFunction {
                 term: Term::Return(vec![r(5)]),
             },
         ],
+        data: Vec::new(),
     }
 }
 
@@ -241,6 +244,7 @@ fn call_in_loop_fn(callee: u32) -> LirFunction {
                 term: Term::Return(vec![r(1)]),
             },
         ],
+        data: Vec::new(),
     }
 }
 
@@ -290,6 +294,7 @@ fn push_and_touch_fn(size: u32, align: u32) -> LirFunction {
             ],
             term: Term::Return(vec![r(0)]),
         }],
+        data: Vec::new(),
     }
 }
 

@@ -33,7 +33,7 @@ use crag_abi::{
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -503,6 +503,8 @@ impl Writer {
                 self.text(name);
                 self.u32(*words);
             }
+            Shape::Str => self.u8(10),
+            Shape::Bytes => self.u8(11),
         }
     }
 
@@ -516,10 +518,15 @@ impl Writer {
                 self.u8(1);
                 self.element(element);
             }
-            TypeDescriptor::Map { key, value } => {
+            TypeDescriptor::Map {
+                key,
+                value,
+                text_keys,
+            } => {
                 self.u8(2);
                 self.element(key);
                 self.element(value);
+                self.u8(u8::from(*text_keys));
             }
         }
     }
@@ -717,6 +724,8 @@ impl Reader<'_> {
                 name: self.text()?,
                 words: self.u32()?,
             },
+            10 => Shape::Str,
+            11 => Shape::Bytes,
             tag => return Err(invalid(format!("a shape with the tag {tag}"))),
         })
     }
@@ -732,6 +741,11 @@ impl Reader<'_> {
             2 => TypeDescriptor::Map {
                 key: self.element()?,
                 value: self.element()?,
+                text_keys: match self.u8()? {
+                    0 => false,
+                    1 => true,
+                    flag => return Err(invalid(format!("a key flag {flag}"))),
+                },
             },
             tag => return Err(invalid(format!("a type descriptor with the tag {tag}"))),
         })
@@ -802,6 +816,18 @@ mod tests {
                                 words: 1,
                                 counted: Vec::new(),
                             },
+                            text_keys: false,
+                        },
+                    ),
+                    (
+                        7,
+                        TypeDescriptor::Map {
+                            key: ElementLayout {
+                                words: 2,
+                                counted: vec![CountedField::Box(0)],
+                            },
+                            value: ElementLayout::default(),
+                            text_keys: true,
                         },
                     ),
                 ],
@@ -898,9 +924,11 @@ mod tests {
                         Shape::Unit,
                         Shape::Function,
                         Shape::Opaque {
-                            name: "Str".into(),
-                            words: 2,
+                            name: "Ref[Int]".into(),
+                            words: 1,
                         },
+                        Shape::Str,
+                        Shape::Bytes,
                     ],
                     records: vec![(7, 0)],
                     boxes: vec![(0, 7, 32), (4, 9, 16), (5, 10, 40)],

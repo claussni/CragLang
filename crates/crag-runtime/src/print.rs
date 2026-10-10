@@ -18,13 +18,16 @@
 //! writes it, walked through the shape of its type, without generated
 //! code. A box of a record type is shown by the type in its header, which
 //! may be a subtype of the static one. Entries of maps and sets are shown
-//! in the order of their keys' words, which for numbers is their order.
-//! Limits cut deep, long and large values short with `…`.
+//! in the order of their keys' words, which for numbers is their order,
+//! and of their bytes for strings and bytes. A string is shown as a literal
+//! with escapes and doubled braces, bytes as a byte literal. Limits cut
+//! deep, long and large values short with `…`.
 
 use crag_abi::{Number, Shape, Shapes, TYPE_INDEX_OFFSET};
 
 use crate::heap::Heap;
 use crate::rc::{Types, drop_box};
+use crate::text::{bytes_of, in_buffer};
 use crate::{list, map};
 
 /// How much of a value is shown.
@@ -174,8 +177,54 @@ impl Printer<'_> {
                 unsafe { self.entries(word, key, Some(value), depth) }
             }
             Shape::Function => self.out.push_str("<function>"),
+            // SAFETY: the words are a live string or bytes value.
+            Shape::Str => unsafe { self.text(bytes_of(words)) },
+            Shape::Bytes => unsafe { self.bytes(bytes_of(words)) },
             Shape::Opaque { name, .. } => self.out.push_str(&format!("<a value of type {name}>")),
         }
+    }
+
+    /// A string as a literal: quotes, escapes and doubled braces.
+    fn text(&mut self, bytes: &[u8]) {
+        self.out.push('"');
+        for c in String::from_utf8_lossy(bytes).chars() {
+            if self.stop() {
+                return;
+            }
+            match c {
+                '"' => self.out.push_str("\\\""),
+                '\\' => self.out.push_str("\\\\"),
+                '\n' => self.out.push_str("\\n"),
+                '\t' => self.out.push_str("\\t"),
+                '\r' => self.out.push_str("\\r"),
+                '\0' => self.out.push_str("\\0"),
+                '{' => self.out.push_str("{{"),
+                '}' => self.out.push_str("}}"),
+                c if c.is_control() => self.out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+                c => self.out.push(c),
+            }
+        }
+        self.out.push('"');
+    }
+
+    /// Bytes as a byte literal: what is not printable ASCII as `\xHH`.
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.out.push_str("b\"");
+        for &b in bytes {
+            if self.stop() {
+                return;
+            }
+            match b {
+                b'"' => self.out.push_str("\\\""),
+                b'\\' => self.out.push_str("\\\\"),
+                b'\n' => self.out.push_str("\\n"),
+                b'\t' => self.out.push_str("\\t"),
+                b'\r' => self.out.push_str("\\r"),
+                b' '..=b'~' => self.out.push(char::from(b)),
+                b => self.out.push_str(&format!("\\x{b:02x}")),
+            }
+        }
+        self.out.push('"');
     }
 
     /// Before the element `i` of `len`: the separator, or the end of what
@@ -201,7 +250,13 @@ impl Printer<'_> {
             // SAFETY: each entry is its key's words, then its value's.
             .map(|at| unsafe { std::slice::from_raw_parts(at, kw + vw) })
             .collect();
-        entries.sort_by_key(|e| e[..kw].iter().map(|&w| w as i64).collect::<Vec<_>>());
+        match self.shape(key) {
+            // SAFETY: the keys are live strings or bytes.
+            Shape::Str | Shape::Bytes => {
+                entries.sort_by(|a, b| unsafe { bytes_of(&a[..kw]).cmp(bytes_of(&b[..kw])) })
+            }
+            _ => entries.sort_by_key(|e| e[..kw].iter().map(|&w| w as i64).collect::<Vec<_>>()),
+        }
         if entries.is_empty() {
             self.out
                 .push_str(if value.is_some() { "[:]" } else { "[]" });
@@ -227,7 +282,7 @@ impl Printer<'_> {
 }
 
 /// A number as source writes it.
-fn number(n: Number, word: u64) -> String {
+pub(crate) fn number(n: Number, word: u64) -> String {
     match n {
         Number::Signed => (word as i64).to_string(),
         Number::Unsigned => word.to_string(),
@@ -283,6 +338,7 @@ pub unsafe fn release_value(
         }
         // The environment, or null.
         Shape::Function => words[1],
+        Shape::Str | Shape::Bytes if in_buffer(words[0]) => words[0],
         _ => 0,
     };
     if ptr != 0 {

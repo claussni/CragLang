@@ -26,7 +26,8 @@
 //! entries whatever the order they came in. Below the depth where the hash
 //! runs out, collision nodes hold entries with equal hashes in a list.
 //!
-//! Keys are equal when their words are (see `crag_abi::TypeDescriptor`).
+//! Keys are equal when their words are, or, for strings and bytes, their
+//! bytes (see `crag_abi::TypeDescriptor`).
 //! Like a list, a map taken by value is updated in place where only its
 //! reference reaches, and a set is a map whose values have no words.
 
@@ -39,6 +40,7 @@ use crate::rc::{
     Types, boxes_in, drop_box, header, is_unique, release_value, retain, retain_value,
 };
 use crate::system::worker_of;
+use crate::text;
 
 const BITS: u32 = 5;
 
@@ -71,14 +73,51 @@ fn hash(key: &[u64]) -> u64 {
         // Few bits, so that keys collide all the way down.
         return key.first().map_or(0, |w| w % 3) << 62;
     }
-    // The finalizer of SplitMix64 over each word in turn.
-    let mut h = 0x9e37_79b9_7f4a_7c15u64;
-    for &w in key {
-        h = (h ^ w).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        h ^= h >> 31;
+    key.iter().fold(SEED, |h, &w| mix(h, w))
+}
+
+const SEED: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// The finalizer of SplitMix64 over a hash and a word.
+fn mix(h: u64, w: u64) -> u64 {
+    let mut h = (h ^ w).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
+}
+
+/// The hash of a key, by its bytes when it is a string or bytes.
+///
+/// # Safety
+///
+/// `key` holds a live key, of a string or bytes when `text` is set.
+unsafe fn hash_key(key: &[u64], text: bool) -> u64 {
+    if !text {
+        return hash(key);
     }
-    h
+    // SAFETY: as the caller promises.
+    let bytes = unsafe { text::bytes_of(key) };
+    #[cfg(test)]
+    if tests::WEAK_HASH.get() {
+        return bytes.first().map_or(0, |&b| u64::from(b) % 3) << 62;
+    }
+    bytes
+        .chunks(8)
+        .fold(mix(SEED, bytes.len() as u64), |h, chunk| {
+            let mut word = [0; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            mix(h, u64::from_le_bytes(word))
+        })
+}
+
+/// Whether two keys are equal: their words, or for strings and bytes their
+/// bytes.
+///
+/// # Safety
+///
+/// As for [`hash_key`], for both keys.
+unsafe fn equal_keys(a: &[u64], b: &[u64], text: bool) -> bool {
+    // SAFETY: as the caller promises.
+    a == b || text && unsafe { text::bytes_of(a) == text::bytes_of(b) }
 }
 
 /// The bit of a hash at a depth's shift.
@@ -110,6 +149,8 @@ struct Maps<'a> {
     kw: usize,
     ew: usize,
     index: u64,
+    /// Keys are strings or bytes.
+    text: bool,
 }
 
 impl<'a> Maps<'a> {
@@ -118,7 +159,7 @@ impl<'a> Maps<'a> {
     /// `map` points at a live map whose type `types` describes.
     unsafe fn new(heap: &'a mut Heap, types: &'a Types, map: *mut u8) -> Maps<'a> {
         // SAFETY: as the caller promises.
-        let (key, value, index) = unsafe { layouts(types, map) };
+        let (key, value, index, text) = unsafe { layouts(types, map) };
         Maps {
             heap,
             types,
@@ -127,6 +168,7 @@ impl<'a> Maps<'a> {
             kw: key.words as usize,
             ew: (key.words + value.words) as usize,
             index,
+            text,
         }
     }
 
@@ -169,7 +211,16 @@ impl<'a> Maps<'a> {
 
     unsafe fn same_key(&self, entry: *mut u64, key: &[u64]) -> bool {
         // SAFETY: see above.
-        unsafe { std::slice::from_raw_parts(entry, self.kw) == &key[..self.kw] }
+        unsafe {
+            let words = std::slice::from_raw_parts(entry, self.kw);
+            equal_keys(words, &key[..self.kw], self.text)
+        }
+    }
+
+    /// The hash of a key, whose words are its first.
+    unsafe fn hash(&self, key: &[u64]) -> u64 {
+        // SAFETY: see above.
+        unsafe { hash_key(&key[..self.kw], self.text) }
     }
 
     /// The number of entries and children of a node; a collision node has
@@ -271,7 +322,8 @@ impl<'a> Maps<'a> {
         if shift >= 64 {
             return self.collision(&[a, b].concat());
         }
-        let (ha, hb) = (hash(&a[..self.kw]), hash(&b[..self.kw]));
+        // SAFETY: the entries hold keys of the map's type.
+        let (ha, hb) = unsafe { (self.hash(a), self.hash(b)) };
         let (ba, bb) = (bit(ha, shift), bit(hb, shift));
         let c = if ba == bb {
             Contents {
@@ -415,11 +467,15 @@ impl<'a> Maps<'a> {
 /// # Safety
 ///
 /// `map` points at a live map whose type `types` describes.
-unsafe fn layouts(types: &Types, map: *mut u8) -> (&ElementLayout, &ElementLayout, u64) {
+unsafe fn layouts(types: &Types, map: *mut u8) -> (&ElementLayout, &ElementLayout, u64, bool) {
     // SAFETY: as the caller promises.
     unsafe {
         match types.of(map) {
-            TypeDescriptor::Map { key, value } => (key, value, header(map) & 0xffff_ffff),
+            TypeDescriptor::Map {
+                key,
+                value,
+                text_keys,
+            } => (key, value, header(map) & 0xffff_ffff, *text_keys),
             _ => die("a map whose type is not a map type"),
         }
     }
@@ -492,12 +548,12 @@ pub unsafe fn length(map: *mut u8) -> usize {
 pub unsafe fn get(types: &Types, map: *mut u8, key: &[u64]) -> *mut u64 {
     // SAFETY: as the caller promises.
     unsafe {
-        let (k, value, _) = layouts(types, map);
+        let (k, value, _, text) = layouts(types, map);
         let (kw, ew) = (k.words as usize, (k.words + value.words) as usize);
         let key = &key[..kw];
-        let found = |entry: *mut u64| std::slice::from_raw_parts(entry, kw) == key;
+        let found = |entry: *mut u64| equal_keys(std::slice::from_raw_parts(entry, kw), key, text);
         let entry = |node: *mut u8, i: usize| at(node, ENTRIES + 8 * ew * i);
-        let h = hash(key);
+        let h = hash_key(key, text);
         let mut node = root(map);
         let mut shift = 0;
         while !node.is_null() {
@@ -554,14 +610,14 @@ pub unsafe fn insert(
         let len = length(map);
         if node.is_null() {
             let c = Contents {
-                entries: bit(hash(&entry[..m.kw]), 0),
+                entries: bit(m.hash(entry), 0),
                 children: 0,
                 words: entry.to_vec(),
                 nodes: Vec::new(),
             };
             set_root(map, m.bitmap(&c), 1);
         } else {
-            let (node, added) = m.insert_node(node, hash(&entry[..m.kw]), 0, entry);
+            let (node, added) = m.insert_node(node, m.hash(entry), 0, entry);
             set_root(map, node, len + usize::from(added));
         }
         map
@@ -582,7 +638,7 @@ pub unsafe fn remove(heap: &mut Heap, types: &Types, map: *mut u8, key: &[u64]) 
         let mut m = Maps::new(heap, types, map);
         let key = &key[..m.kw];
         let map = unique_map(&mut m, map);
-        let node = m.remove_node(root(map), hash(key), 0, key);
+        let node = m.remove_node(root(map), m.hash(key), 0, key);
         set_root(map, node, length(map) - 1);
         map
     }
@@ -628,7 +684,7 @@ pub struct MapIter {
 pub unsafe fn iter(types: &Types, map: *mut u8) -> MapIter {
     // SAFETY: as the caller promises.
     unsafe {
-        let (key, value, _) = layouts(types, map);
+        let (key, value, ..) = layouts(types, map);
         let node = root(map);
         MapIter {
             ew: (key.words + value.words) as usize,
@@ -802,6 +858,7 @@ mod tests {
                 TypeDescriptor::Map {
                     key: word(vec![]),
                     value: word(vec![]),
+                    text_keys: false,
                 },
             ),
             (
@@ -809,6 +866,7 @@ mod tests {
                 TypeDescriptor::Map {
                     key: word(vec![]),
                     value: word(vec![CountedField::Box(0)]),
+                    text_keys: false,
                 },
             ),
             (
@@ -816,6 +874,7 @@ mod tests {
                 TypeDescriptor::Map {
                     key: word(vec![]),
                     value: ElementLayout::default(),
+                    text_keys: false,
                 },
             ),
         ])
@@ -851,10 +910,10 @@ mod tests {
             let mut total = n;
             if kind(node) == COLLISION {
                 assert!(shift >= 64);
-                let h = hash(std::slice::from_raw_parts(m.entry(node, 0), m.kw));
+                let h = m.hash(std::slice::from_raw_parts(m.entry(node, 0), m.kw));
                 for i in 0..n {
                     let key = std::slice::from_raw_parts(m.entry(node, i), m.kw);
-                    assert_eq!(hash(key), h);
+                    assert_eq!(m.hash(key), h);
                 }
             } else {
                 let (entries, children) = bitmaps(node);
@@ -862,7 +921,7 @@ mod tests {
                 let mut bits = (0..32).filter(|b| entries & 1 << b != 0);
                 for i in 0..n {
                     let key = std::slice::from_raw_parts(m.entry(node, i), m.kw);
-                    assert_eq!(bit(hash(key), shift), 1 << bits.next().unwrap());
+                    assert_eq!(bit(m.hash(key), shift), 1 << bits.next().unwrap());
                 }
                 for j in 0..c {
                     total += check_node(m, m.slot(node, j).read(), shift + BITS, false);
@@ -975,6 +1034,74 @@ mod tests {
         WEAK_HASH.set(true);
         random_operations(BOXES, 4, 2000, 40);
         WEAK_HASH.set(false);
+    }
+
+    /// A map from strings to words, the long strings in buffers.
+    fn text_keys(weak: bool) {
+        const TEXTS: u32 = 33;
+        WEAK_HASH.set(weak);
+        let mut heap = Heap::new();
+        let types = Types::new([(
+            TEXTS,
+            TypeDescriptor::Map {
+                key: ElementLayout {
+                    words: 2,
+                    counted: vec![CountedField::Box(0)],
+                },
+                value: ElementLayout {
+                    words: 1,
+                    counted: vec![],
+                },
+                text_keys: true,
+            },
+        )]);
+        let name = |heap: &mut Heap, n: u64| {
+            let text = match n % 2 {
+                0 => format!("k{n}"),
+                _ => format!("a longer key, number {n}"),
+            };
+            text::make_text(heap, &[text.as_bytes()])
+        };
+        // SAFETY: the map and the keys are live, and the map owns its keys.
+        unsafe {
+            let mut map = empty(&mut heap, TEXTS);
+            for n in 0..300 {
+                let key = name(&mut heap, n);
+                map = insert(&mut heap, &types, map, &key, &[n]);
+            }
+            // An equal key in another buffer finds the entry, and binding it
+            // again keeps the map's key and releases the one given.
+            for n in 0..300 {
+                let key = name(&mut heap, n);
+                let at = get(&types, map, &key);
+                assert!(!at.is_null(), "key {n}");
+                assert_eq!(at.read(), n);
+                map = insert(&mut heap, &types, map, &key, &[n + 1]);
+            }
+            assert_eq!(length(map), 300);
+            let m = Maps::new(&mut heap, &types, map);
+            assert_eq!(check_node(&m, root(map), 0, true), 300);
+            let missing = text::make_text(&mut heap, &[b"a longer key, number 301"]);
+            assert!(get(&types, map, &missing).is_null());
+            drop_box(&mut heap, &types, missing[0] as *mut u8);
+            for n in (0..300).step_by(3) {
+                let key = name(&mut heap, n);
+                map = remove(&mut heap, &types, map, &key);
+                if text::in_buffer(key[0]) {
+                    drop_box(&mut heap, &types, key[0] as *mut u8);
+                }
+            }
+            assert_eq!(length(map), 200);
+            drop_box(&mut heap, &types, map);
+        }
+        assert_eq!(heap.live_blocks(), 0);
+        WEAK_HASH.set(false);
+    }
+
+    #[test]
+    fn string_keys_are_equal_when_their_bytes_are() {
+        text_keys(false);
+        text_keys(true);
     }
 
     #[test]

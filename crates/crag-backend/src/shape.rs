@@ -90,6 +90,8 @@ impl<'db> Builder<'db> {
                 }
             }
             (Some(Layout::Closure), _) => Shape::Function,
+            (Some(Layout::Pair), TyKind::Builtin(Builtin::Str, _)) => Shape::Str,
+            (Some(Layout::Pair), TyKind::Builtin(Builtin::Bytes, _)) => Shape::Bytes,
             (Some(l), _) => opaque(l.words() as u32),
             (None, _) => opaque(0),
         };
@@ -141,7 +143,7 @@ impl<'db> Builder<'db> {
     }
 }
 
-fn number(builtin: Builtin) -> Option<Number> {
+pub(crate) fn number(builtin: Builtin) -> Option<Number> {
     Some(match builtin {
         Builtin::Int | Builtin::Int8 | Builtin::Int16 | Builtin::Int32 => Number::Signed,
         Builtin::UInt8 | Builtin::UInt16 | Builtin::UInt32 | Builtin::UInt64 => Number::Unsigned,

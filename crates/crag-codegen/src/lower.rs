@@ -54,6 +54,8 @@ const NS_LOCAL: u32 = 2;
 const NS_SLOT: u32 = 3;
 /// A value's cell, by its place in `Imports::keys` as for slots.
 const NS_CELL: u32 = 4;
+/// Static data of the function, by its index.
+const NS_DATA: u32 = 5;
 
 /// A machine the facade can generate code for.
 #[derive(Clone)]
@@ -128,11 +130,15 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
     let body = run_backend(isa, func, &keys)?;
     let footprint = body.footprint(isa, tail_args_growth(lir));
     if footprint <= FRAME_BUDGET {
+        let mut code = body.code;
+        let mut relocs = body.relocs;
+        let align = place_data(&mut code, &mut relocs, &body.data_relocs, &lir.data);
+        let align = align.max(body.align);
         return Ok(CodeObject {
-            code: body.code,
-            align: body.align,
+            code,
+            align,
             entry: 0,
-            relocs: body.relocs,
+            relocs,
             footprint,
             stack_check: StackCheck::Margin,
             stack_maps: body.stack_maps,
@@ -152,11 +158,14 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
         });
     }
 
-    let align = wrapper.align.max(body.align).max(1);
+    let mut align = wrapper.align.max(body.align).max(1);
     let mut code = wrapper.code;
     code.resize(code.len().next_multiple_of(align as usize), 0);
     let body_offset = code.len() as u32;
     code.extend_from_slice(&body.code);
+    let mut body_relocs = body.relocs;
+    let data_align = place_data(&mut code, &mut body_relocs, &body.data_relocs, &lir.data);
+    align = align.max(data_align);
 
     let mut relocs = wrapper.relocs;
     for reloc in &mut relocs {
@@ -164,7 +173,7 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
             reloc.target = RelocTarget::Local(body_offset);
         }
     }
-    relocs.extend(body.relocs.into_iter().map(|r| Reloc {
+    relocs.extend(body_relocs.into_iter().map(|r| Reloc {
         offset: r.offset + body_offset,
         ..r
     }));
@@ -184,6 +193,31 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
         stack_check: StackCheck::Sized { needed: footprint },
         stack_maps,
     })
+}
+
+/// Appends the function's static data to its code, each 16-aligned, and
+/// points the relocations that name data at it: `named` gives each such
+/// relocation's place in `relocs` and the data it names. The alignment
+/// the code then needs.
+fn place_data(
+    code: &mut Vec<u8>,
+    relocs: &mut [Reloc],
+    named: &[(usize, u32)],
+    data: &[Vec<u8>],
+) -> u32 {
+    if data.is_empty() {
+        return 1;
+    }
+    let mut offsets = Vec::new();
+    for bytes in data {
+        code.resize(code.len().next_multiple_of(16), 0);
+        offsets.push(code.len() as u32);
+        code.extend_from_slice(bytes);
+    }
+    for &(reloc, d) in named {
+        relocs[reloc].target = RelocTarget::Local(offsets[d as usize]);
+    }
+    16
 }
 
 /// Compiles the stub through which Rust enters Crag code:
@@ -282,6 +316,7 @@ struct Imports {
     keys: Vec<SlotKey>,
     slot_values: HashMap<SlotKey, GlobalValue>,
     cell_values: HashMap<SlotKey, GlobalValue>,
+    data_values: HashMap<u32, GlobalValue>,
 }
 
 /// How a call reaches its callee.
@@ -373,6 +408,25 @@ impl Imports {
             tls: false,
         });
         values.insert(key, value);
+        value
+    }
+
+    /// The symbol of the function's static data `data`, declared once.
+    fn data(&mut self, b: &mut FunctionBuilder, data: u32) -> GlobalValue {
+        if let Some(&value) = self.data_values.get(&data) {
+            return value;
+        }
+        let name = b.func.declare_imported_user_function(UserExternalName {
+            namespace: NS_DATA,
+            index: data,
+        });
+        let value = b.create_global_value(GlobalValueData::Symbol {
+            name: ExternalName::user(name),
+            offset: Imm64::new(0),
+            colocated: false,
+            tls: false,
+        });
+        self.data_values.insert(data, value);
         value
     }
 
@@ -745,6 +799,11 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa, metered: bool) -> (Functio
                     let v = b.ins().symbol_value(I64, symbol);
                     b.def_var(vars[dst.0 as usize], v);
                 }
+                Inst::DataAddr { dst, data } => {
+                    let symbol = imports.data(&mut b, *data);
+                    let v = b.ins().symbol_value(I64, symbol);
+                    b.def_var(vars[dst.0 as usize], v);
+                }
                 Inst::Load { dst, addr, offset } => {
                     let p = b.use_var(vars[addr.0 as usize]);
                     let v = b.ins().load(I64, MemFlagsData::trusted(), p, *offset);
@@ -884,6 +943,10 @@ struct Compiled {
     code: Vec<u8>,
     align: u32,
     relocs: Vec<Reloc>,
+    /// The relocations that name static data, by their place in `relocs`,
+    /// with the data; their target is a placeholder until the data is
+    /// placed.
+    data_relocs: Vec<(usize, u32)>,
     stack_maps: Vec<StackMap>,
     /// Distance from the frame pointer down to the stack pointer.
     frame_below_fp: u32,
@@ -910,6 +973,7 @@ fn run_backend(
     let names = ctx.func.params.user_named_funcs();
 
     let mut relocs = Vec::new();
+    let mut data_relocs = Vec::new();
     for reloc in buffer.relocs() {
         let unsupported = || CodegenError::UnsupportedRelocation(format!("{reloc:?}"));
         if reloc.kind != ClifReloc::Abs8 {
@@ -927,6 +991,10 @@ fn run_backend(
             NS_LOCAL => RelocTarget::Local(name.index),
             NS_SLOT => RelocTarget::Slot(*keys.get(name.index as usize).ok_or_else(unsupported)?),
             NS_CELL => RelocTarget::Cell(*keys.get(name.index as usize).ok_or_else(unsupported)?),
+            NS_DATA => {
+                data_relocs.push((relocs.len(), name.index));
+                RelocTarget::Local(0)
+            }
             _ => return Err(unsupported()),
         };
         relocs.push(Reloc {
@@ -954,6 +1022,7 @@ fn run_backend(
         code: buffer.data().to_vec(),
         align: buffer.alignment,
         relocs,
+        data_relocs,
         stack_maps,
         frame_below_fp: frame.frame_to_fp_offset,
     })

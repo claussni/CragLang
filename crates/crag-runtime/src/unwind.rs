@@ -32,7 +32,7 @@ use crag_abi::{CodeObject, FuncId, NO_POSITION, TrapKind};
 
 use crate::die;
 use crate::fiber::{STATUS_TRAPPED, TaskContext, Worker};
-use crate::rc::drop_box;
+use crate::rc::{drop_box, holds_box};
 
 /// What the runtime knows of the loaded code: the stack maps of its calls,
 /// by return address, and where each function lies.
@@ -167,9 +167,10 @@ unsafe fn unwind(worker: *mut Worker, mut ret: *const usize, mut fp: usize) -> V
             let sp = ret as usize + 8;
             stack.extend(code.function_at(ret.read()));
             for &offset in code.slots(ret.read()) {
-                // A function value's environment may be null.
+                // A function value's environment may be null, and the
+                // first word of an inline string no pointer.
                 let ptr = ((sp + offset as usize) as *const *mut u8).read();
-                if !ptr.is_null() {
+                if holds_box(ptr) {
                     drop_box(heap, types, ptr);
                 }
             }

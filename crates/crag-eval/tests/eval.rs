@@ -25,6 +25,7 @@ use crag_runtime::Meter;
 
 const PRELUDE: &str = r#"pub type Int
 pub type Float
+pub type Str
 pub type True
 pub type False
 pub type Bool = True | False
@@ -129,6 +130,8 @@ let same = [1: 10, 2: 20]
 let picked: Option[Int] = 5
 let none: Option[Int] = Empty
 let looped = sum(10)
+let greeting = "Hello, {base}!"
+let long = "a long constant, {base} times as long as {greeting}"
 
 fn sum(n: Int) -> Int {
   var t = 0
@@ -160,6 +163,13 @@ fn sum(n: Int) -> Int {
     assert_eq!(picked[4..], words(&[5]));
     assert_eq!(none.len(), 4);
     assert_ne!(picked[..4], none[..4]);
+    // A string: its length, then its bytes.
+    let text = |t: &str| [&(t.len() as u64).to_le_bytes()[..], t.as_bytes()].concat();
+    assert_eq!(p.bytes("greeting"), text("Hello, 20!"));
+    assert_eq!(
+        p.bytes("long"),
+        text("a long constant, 20 times as long as Hello, 20!")
+    );
     // The query keeps the result.
     let site = EvalSite::Value(p.item("answer"));
     assert_eq!(const_eval(&p.db, p.program, site), &Ok(answer));

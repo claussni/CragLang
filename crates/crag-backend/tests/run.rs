@@ -31,7 +31,8 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 use crag_abi::{
-    HEADER_SIZE, HEAP_OFFSET, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, Shapes, TrapKind,
+    HEADER_SIZE, HEAP_OFFSET, Number, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, Shapes,
+    TrapKind, inline_text,
 };
 use crag_backend::{code, shapes, type_index};
 use crag_codegen::{
@@ -41,10 +42,11 @@ use crag_db::RootDatabase;
 use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, lower_body, owners};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{InstanceKey, Tier, collect_instances};
+use crag_runtime::text::TextWords;
 use crag_runtime::{
     CodeMap, Fiber, FiberConfig, FiberState, Heap, Meter, PrintLimits, StopReason, Trap, Types,
     Worker, alloc_box, decode_value, encode_value, list, map, print_value, release_box,
-    release_value, request_stop,
+    release_value, request_stop, text,
 };
 use crag_types::{Ty, TyKind, prelude_item, signature};
 
@@ -54,6 +56,8 @@ pub type UInt8
 pub type Float
 pub type Fixed[S]
 pub type CodePoint
+pub type Str
+pub type Bytes
 pub type True
 pub type False
 pub type Bool = True | False
@@ -79,6 +83,8 @@ pub fn negate(a: Float) -> Float
 pub fn equals(a: Int, b: Int) -> Bool
 pub fn lessThan(a: Int, b: Int) -> Bool
 pub fn lessThan(a: Float, b: Float) -> Bool
+pub fn equals(a: Str, b: Str) -> Bool
+pub fn equals(a: Bytes, b: Bytes) -> Bool
 "#;
 
 thread_local! {
@@ -87,6 +93,8 @@ thread_local! {
     /// Calls of `rt_release`: boxes whose count generated code took to
     /// zero, not counting the fields freed with them.
     static RELEASED: Cell<usize> = const { Cell::new(0) };
+    /// Calls of `rt_text_equals`: strings compared byte by byte.
+    static TEXT_COMPARES: Cell<usize> = const { Cell::new(0) };
     /// The descriptors of the module running on this thread.
     static TYPES: Cell<*const Types> = const { Cell::new(std::ptr::null()) };
 }
@@ -160,6 +168,29 @@ extern "C" fn rt_map_insert(
 extern "C" fn rt_map_get(_ctx: *mut u64, map: *mut u8, k0: u64, k1: u64) -> *mut u64 {
     // SAFETY: see above.
     unsafe { map::get(types(), map, &[k0, k1]) }
+}
+
+extern "C" fn rt_text_concat(ctx: *mut u64, a0: u64, a1: u64, b0: u64, b1: u64) -> TextWords {
+    // SAFETY: see above; the values are borrowed live ones.
+    unsafe {
+        let (a, b) = ([a0, a1], [b0, b1]);
+        let parts = [text::bytes_of(&a), text::bytes_of(&b)];
+        let [w0, w1] = text::make_text(heap_of(ctx), &parts);
+        TextWords(w0, w1)
+    }
+}
+
+extern "C" fn rt_text_equals(_ctx: *mut u64, a0: u64, a1: u64, b0: u64, b1: u64) -> u64 {
+    TEXT_COMPARES.set(TEXT_COMPARES.get() + 1);
+    // SAFETY: see above.
+    unsafe { u64::from(text::bytes_of(&[a0, a1]) == text::bytes_of(&[b0, b1])) }
+}
+
+extern "C" fn rt_text_show(ctx: *mut u64, word: u64, number: u64) -> TextWords {
+    let shown = text::show_number(Number::from_code(number).unwrap(), word);
+    // SAFETY: see above.
+    let [w0, w1] = text::make_text(unsafe { heap_of(ctx) }, &[shown.as_bytes()]);
+    TextWords(w0, w1)
 }
 
 extern "C" fn rt_trap(_ctx: *mut u64, kind: u64) {
@@ -274,6 +305,9 @@ impl Module {
                 RuntimeFn::ListSlice => rt_list_slice as *const () as usize,
                 RuntimeFn::MapInsert => rt_map_insert as *const () as usize,
                 RuntimeFn::MapGet => rt_map_get as *const () as usize,
+                RuntimeFn::TextConcat => rt_text_concat as *const () as usize,
+                RuntimeFn::TextEquals => rt_text_equals as *const () as usize,
+                RuntimeFn::TextShow => rt_text_show as *const () as usize,
                 f => crag_runtime::runtime_fn_addr(f),
             };
             symbols.define_runtime(func, addr);
@@ -853,7 +887,7 @@ fn total(n: Int) -> Int {
 fn what_cannot_compile_is_listed() {
     let mut m = Module::new(
         r#"fn label(n: Int) -> Int {
-  let text = "many"
+  let text: Option[Str] = "many"
   n
 }
 
@@ -873,11 +907,145 @@ fn first() -> Int {
     assert_eq!(
         m.unsupported,
         [
-            "label: strings and bytes",
+            "label: values of this type",
             "first: module-level `let`s with patterns"
         ]
     );
     assert_eq!(m.int("plain", &[21]), 42);
+}
+
+#[test]
+fn strings_run() {
+    let mut m = Module::new(
+        r#"type Person(name: Str, age: Int)
+
+fn greet(name: Str) -> Str { "Hello, {name}!" }
+fn join(a: Str, b: Str) -> Str { "{a}{b}" }
+fn hello() -> Str { greet("Ada") }
+fn welcome() -> Str { greet("Ada Lovelace, Countess") }
+fn report() -> Str { "{40 + 2} {0.5} {'q'} {-7}" }
+fn plain() -> Str { "a literal that is long enough for a buffer" }
+fn nothing() -> Str { "" }
+fn braces() -> Str { "{{x}}\n\"q\"" }
+
+fn kind(s: Str) -> Int {
+  case s {
+    "one" -> 1
+    "a long literal compared by its bytes" -> 2
+    _ -> 0
+  }
+}
+
+fn kinds() -> List[Int] {
+  [
+    kind("one"),
+    kind("a long literal compared by its bytes"),
+    kind(join("on", "e")),
+    kind("two"),
+    kind(join("a long literal compared ", "by its bytes")),
+  ]
+}
+
+fn same() -> List[Bool] {
+  [
+    join("a", "b") == "ab",
+    join("a long one, ", "made at run time") == "a long one, made at run time",
+    join("a long one, ", "made at run time") == "a long one, made at run time!",
+    "short" == "a long string that is not short",
+  ]
+}
+
+fn people() -> List[Person] {
+  [Person(name: "Ada", age: 36), Person(name: "Alan Mathison Turing", age: 41)]
+}
+fn ages() -> Map[Str, Int] { ["ada": 36, "alan mathison turing": 41] }
+fn lookup() -> Option[Int] { ages()[join("alan mathison ", "turing")] }
+fn data() -> Bytes { b"\x00\xff and enough bytes for a buffer" }
+fn names() -> Set[Str] { ["b", "a", "a long name in a set of names", "b"] }
+
+let motto = "a module-level value that holds a long string"
+fn mottoOf() -> Str { motto }
+
+fn copies() -> List[Str] {
+  let s = join("a string in a buffer, ", "copied by interpolation")
+  ["{s}", s]
+}
+"#,
+    );
+    assert!(m.unsupported.is_empty(), "{:?}", m.unsupported);
+    let expected = [
+        ("hello", r#""Hello, Ada!""#),
+        ("welcome", r#""Hello, Ada Lovelace, Countess!""#),
+        ("report", r#""42 0.5 q -7""#),
+        ("plain", r#""a literal that is long enough for a buffer""#),
+        ("nothing", r#""""#),
+        ("braces", r#""{{x}}\n\"q\"""#),
+        ("kinds", "[1, 2, 1, 0, 2]"),
+        ("same", "[True, True, False, False]"),
+        (
+            "people",
+            r#"[Person(name: "Ada", age: 36), Person(name: "Alan Mathison Turing", age: 41)]"#,
+        ),
+        ("ages", r#"["ada": 36, "alan mathison turing": 41]"#),
+        ("lookup", "41"),
+        ("data", r#"b"\x00\xff and enough bytes for a buffer""#),
+        ("names", r#"["a", "a long name in a set of names", "b"]"#),
+        (
+            "mottoOf",
+            r#""a module-level value that holds a long string""#,
+        ),
+        (
+            "mottoOf",
+            r#""a module-level value that holds a long string""#,
+        ),
+        // One part, which the result shares with a reference of its own.
+        (
+            "copies",
+            r#"["a string in a buffer, copied by interpolation", "a string in a buffer, copied by interpolation"]"#,
+        ),
+    ];
+    TEXT_COMPARES.set(0);
+    for (name, shown) in expected {
+        assert_eq!(m.shown(name), shown, "{name}");
+        // The cell holds a static string, which takes no block.
+        assert_eq!(m.heap.live_blocks(), 0, "{name}");
+    }
+    // Only strings in buffers of the same length that differ in their
+    // words are compared by the runtime: a buffer made at run time and a
+    // literal's, or the literals of two functions.
+    assert_eq!(TEXT_COMPARES.get(), 3);
+    // Short strings are inline, long ones point at their buffer.
+    let words = m.call("hello", &[]);
+    assert_eq!(words, inline_text(b"Hello, Ada!"));
+}
+
+#[test]
+fn strings_run_on_fibers_and_unwind() {
+    let mut m = Module::new(
+        r#"fn greet(name: Str) -> Str { "Hello, {name}, who is {40 + 2}!" }
+fn kind(s: Str) -> Int {
+  case s {
+    "Hello, someone with a long name, who is 42!" -> 2
+    _ -> 0
+  }
+}
+fn ratio(a: Int, b: Int) -> Int { a / b }
+fn holds(n: Int) -> Int {
+  let long = greet("someone with a long name")
+  let short = "x"
+  let k = ratio(10, n)
+  kind(long) + k + kind(short)
+}
+"#,
+    );
+    assert!(m.unsupported.is_empty(), "{:?}", m.unsupported);
+    assert_eq!(m.run("holds", &[5]), Ok(vec![4]));
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+    // The frame of `holds` keeps both strings across the call that traps;
+    // the unwinder releases the buffer and skips the inline one.
+    let trap = m.run("holds", &[0]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::DivideByZero);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
 }
 
 #[test]
@@ -1211,11 +1379,17 @@ fn empty() -> List[Int] { [] }
 fn nothing() -> Map[Int, Int] { [:] }
 type Pair(u: Int, v: Int)
 fn both() -> (p: Point, w: Pair) { (p: Point(x: 1, y: 2), w: Pair(u: 1, v: 2)) }
+fn words() -> Map[Str, List[Str]] {
+  ["k": ["a", "a string long enough for a buffer"], "a key long enough for a buffer": []]
+}
+fn texts() -> (name: Str, data: Bytes, none: Str) {
+  (name: "Grüße aus Crag, lang genug", data: b"\x00\xff", none: "")
+}
 "#,
     );
     let names = [
         "deep", "chain", "points", "ages", "set", "maybe", "none", "tags", "mixed", "empty",
-        "nothing", "both",
+        "nothing", "both", "words", "texts",
     ];
     let limits = PrintLimits::default();
     for name in names {
@@ -1289,6 +1463,35 @@ fn both() -> (p: Point, w: Pair) { (p: Point(x: 1, y: 2), w: Pair(u: 1, v: 2)) }
     // SAFETY: as above.
     let member = unsafe { decode_value(&[7, 0, 0, 0], &shapes, root, &mut m.heap, &m.types) };
     assert!(member.is_err());
+    // A string decodes only from UTF-8, and bytes from anything.
+    let words = m.call("texts", &[]);
+    let (shapes, root) = m.result_shapes("texts");
+    // SAFETY: as above.
+    let bytes = unsafe { encode_value(&words, &shapes, root, &m.types).unwrap() };
+    unsafe { release_value(&mut m.heap, &m.types, &words, &shapes, root) };
+    // The record's shape, then its fields by name: the bytes, the name
+    // and the empty string, each its length and then its bytes.
+    let name = "Grüße aus Crag, lang genug".len();
+    assert_eq!(bytes.len(), 4 + 8 + 2 + 8 + name + 8);
+    assert_eq!(bytes[4..12], 2u64.to_le_bytes());
+    assert_eq!(bytes[14..22], (name as u64).to_le_bytes());
+    let mut not_utf8 = bytes.clone();
+    not_utf8[22] = 0xff;
+    // SAFETY: as above.
+    let result = unsafe { decode_value(&not_utf8, &shapes, root, &mut m.heap, &m.types) };
+    assert!(result.is_err());
+    let mut other_bytes = bytes.clone();
+    other_bytes[12] = 0xfe;
+    // SAFETY: as above.
+    unsafe {
+        let decoded = decode_value(&other_bytes, &shapes, root, &mut m.heap, &m.types).unwrap();
+        let shown = print_value(&decoded, &shapes, root, &m.types, limits);
+        assert_eq!(
+            shown,
+            r#"(data: b"\xfe\xff", name: "Grüße aus Crag, lang genug", none: "")"#
+        );
+        release_value(&mut m.heap, &m.types, &decoded, &shapes, root);
+    }
     assert_eq!(m.heap.live_blocks(), 0);
 }
 

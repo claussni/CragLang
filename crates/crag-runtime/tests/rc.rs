@@ -137,6 +137,7 @@ fn chain_fn() -> LirFunction {
                 term: Term::Return(vec![r(10)]),
             },
         ],
+        data: Vec::new(),
     }
 }
 

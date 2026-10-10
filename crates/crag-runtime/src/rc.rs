@@ -30,7 +30,8 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 use crag_abi::{
-    COUNT_OFFSET, CountedField, ElementLayout, STATIC_COUNT, TYPE_INDEX_OFFSET, TypeDescriptor,
+    BUFFER_HEADER, COUNT_OFFSET, CountedField, ElementLayout, STATIC_COUNT, TYPE_INDEX_OFFSET,
+    TypeDescriptor,
 };
 
 use crate::die;
@@ -159,7 +160,8 @@ pub(crate) unsafe fn is_unique(ptr: *mut u8) -> bool {
 }
 
 /// Calls `f` with each box the counted fields at `base` hold. A box field
-/// may be null: the environment of a function value without one.
+/// may hold none: it is null, the environment of a function value without
+/// one, or has its lowest bit set, the first word of an inline string.
 ///
 /// # Safety
 ///
@@ -171,7 +173,7 @@ pub(crate) unsafe fn boxes_in(base: *mut u8, fields: &[CountedField], mut f: imp
             match field {
                 CountedField::Box(offset) => {
                     let ptr = base.add(*offset as usize).cast::<*mut u8>().read();
-                    if !ptr.is_null() {
+                    if holds_box(ptr) {
                         f(ptr);
                     }
                 }
@@ -184,6 +186,12 @@ pub(crate) unsafe fn boxes_in(base: *mut u8, fields: &[CountedField], mut f: imp
             }
         }
     }
+}
+
+/// Whether a word of a box field points at a box: it is not null and its
+/// lowest bit is clear.
+pub(crate) fn holds_box(ptr: *mut u8) -> bool {
+    !ptr.is_null() && ptr as usize & 1 == 0
 }
 
 /// Adds a reference to each box a value of `layout` at `base` holds.
@@ -229,6 +237,11 @@ pub unsafe fn release_box(heap: &mut Heap, types: &Types, ptr: *mut u8) {
         while !pending.is_null() {
             let ptr = pending;
             pending = link(ptr).read();
+            if header(ptr) == BUFFER_HEADER {
+                // A buffer of a string or bytes holds no references.
+                heap.free(ptr);
+                continue;
+            }
             let kind = (header(ptr) >> 32) as u32;
             let mut dead = |child: *mut u8| {
                 if release(child) {
@@ -239,7 +252,7 @@ pub unsafe fn release_box(heap: &mut Heap, types: &Types, ptr: *mut u8) {
             match types.of(ptr) {
                 TypeDescriptor::Record { counted } => boxes_in(ptr, counted, &mut dead),
                 TypeDescriptor::List { element } => list::boxes_of(ptr, kind, element, &mut dead),
-                TypeDescriptor::Map { key, value } => {
+                TypeDescriptor::Map { key, value, .. } => {
                     map::boxes_of(ptr, kind, key, value, &mut dead)
                 }
             }

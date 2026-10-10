@@ -147,6 +147,7 @@ Every Crag type occupies zero, one or two machine words, so a parameter or resul
 
 - A collection is one pointer to a runtime root node; empty collections are shared static singletons. `List[UInt8]` and the other sized-integer lists use packed leaves (§3.1.3).
 - In-place updates check for a count of one at run time, as in Perceus, unless the compiler already proved the value unique.
+- A string or bytes value of at most 15 bytes is always inline, so equal words are equal values, and only two buffers of the same length are compared byte by byte. Map keys that are strings hash and compare by their bytes. A literal's buffer is static data of its code object, with a static count.
 - The codec writes `NaN` in its canonical bit pattern and map keys in sorted order, so equal values encode and hash equally.
 
 ## 12 Known risks

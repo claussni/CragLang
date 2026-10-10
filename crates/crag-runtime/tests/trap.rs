@@ -104,6 +104,7 @@ fn deep_fn() -> LirFunction {
                 term: Term::Return(vec![r(7)]),
             },
         ],
+        data: Vec::new(),
     }
 }
 

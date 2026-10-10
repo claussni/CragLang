@@ -78,6 +78,37 @@ fn expressions_run_and_show_their_values() {
 }
 
 #[test]
+fn strings_run_and_show_as_literals() {
+    let mut r = repl();
+    // A constant, computed by the host and decoded in the image.
+    let name = "Ada Lovelace, Countess of Lovelace";
+    assert_eq!(eval(&mut r, &format!("let name = \"{name}\"")), "");
+    assert_eq!(eval(&mut r, "name"), format!("\"{name}\"\n"));
+    assert_eq!(
+        eval(&mut r, "\"Hello, {name}!\""),
+        format!("\"Hello, {name}!\"\n")
+    );
+    assert_eq!(
+        eval(&mut r, "\"{1 + 1} items at {2.5}\""),
+        "\"2 items at 2.5\"\n"
+    );
+    assert_eq!(eval(&mut r, &format!("name == \"{name}\"")), "True\n");
+    assert_eq!(eval(&mut r, "name == \"Ada\""), "False\n");
+    assert_eq!(
+        eval(
+            &mut r,
+            "[\"b\": 2, \"a long key, in a buffer\": 1][\"a long key, in a buffer\"]"
+        ),
+        "1\n"
+    );
+    assert_eq!(
+        eval(&mut r, "\"tab\\tand {{braces}}\""),
+        "\"tab\\tand {{braces}}\"\n"
+    );
+    assert_eq!(eval(&mut r, "b\"\\x01 bytes\""), "b\"\\x01 bytes\"\n");
+}
+
+#[test]
 fn definitions_stay_and_names_are_defined_once() {
     let mut r = repl();
     assert_eq!(eval(&mut r, "type Point(x: Int, y: Int)"), "");

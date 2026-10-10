@@ -20,7 +20,7 @@
 //! the context switch, stack growth by copying, the side stack, the sentinel
 //! stop request and the stress harness. M1 adds the allocator, reference
 //! counting, lists and maps, and traps (§11.4.11 to §11.4.14). M3 adds the
-//! metered tier's budgets (§11.6.6).
+//! metered tier's budgets (§11.6.6), and strings and bytes (§11.6.9).
 //!
 //! Runtime discipline (Compiler Architecture §2.1): no thread-locals, no
 //! callbacks into Crag code from the runtime stack, panics abort in images
@@ -55,6 +55,7 @@ pub mod stack;
 pub mod stress;
 #[cfg(test)]
 mod testing;
+pub mod text;
 pub mod unwind;
 
 pub use codec::{DecodeError, NotSolid, decode_value, encode_value};
@@ -82,6 +83,9 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::MapGet => map::rt_map_get as *const () as usize,
         RuntimeFn::Trap => unwind::rt_trap as *const () as usize,
         RuntimeFn::Refuel => meter::rt_refuel as *const () as usize,
+        RuntimeFn::TextConcat => text::rt_text_concat as *const () as usize,
+        RuntimeFn::TextEquals => text::rt_text_equals as *const () as usize,
+        RuntimeFn::TextShow => text::rt_text_show as *const () as usize,
     }
 }
 
