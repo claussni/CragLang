@@ -32,9 +32,9 @@ use crag_hir::{
     PRELUDE, Pat, PatId, Program, Resolution, Stmt, StrPart, hir_body, lower_body,
 };
 use crag_types::{
-    Builtin, Callee, DecisionTree, InferenceResult, ListLen, Position, Signature, Step, Ty, TyKind,
-    TypeDefKind, Value, body_types, decision_tree, declared_fields, fields_of, literal_value,
-    prelude_item, signature, type_def,
+    Builtin, Callee, DecisionTree, Dispatch, InferenceResult, ListLen, Position, Signature, Step,
+    Ty, TyKind, TypeDefKind, Value, body_types, decision_tree, declared_fields, fields_of,
+    literal_value, prelude_item, signature, type_def,
 };
 
 use crate::InstanceKey;
@@ -779,8 +779,139 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             // Instances are compiled with monomorphization (§11.5.10).
             Some(Callee::Instance(_)) => self.unsupported(expr, "calls of generic functions"),
             Some(Callee::Slot(_)) => self.unsupported(expr, "calls through forms"),
+            Some(Callee::Dispatch(dispatch)) => self.dispatch(expr, &dispatch, &positional, fields),
             _ => self.unsupported(expr, "calls of function values"),
         }
+    }
+
+    /// A lifted call (§4.6.1): the arguments are evaluated once, then a
+    /// switch on the tag of each split argument reaches the call for its
+    /// members, which gets them converted to the members' types.
+    fn dispatch(
+        &mut self,
+        expr: ExprId,
+        dispatch: &Dispatch<'db>,
+        positional: &[ExprId],
+        fields: Option<&[FieldArg<'db>]>,
+    ) -> Operand<'db> {
+        let db = self.db;
+        if fields.is_some_and(|f| !f.is_empty()) {
+            return self.unsupported(expr, "lifted calls with named arguments");
+        }
+        let mut functions = Vec::new();
+        for arm in &dispatch.arms {
+            match arm.callee {
+                Callee::Function(f) => {
+                    let sig = signature(db, self.program, f);
+                    if sig.type_params > 0 {
+                        return self.unsupported(expr, "calls of generic functions");
+                    }
+                    if sig.params.len() != positional.len() {
+                        return self.unsupported(expr, "default arguments");
+                    }
+                    functions.push(f);
+                }
+                Callee::Instance(_) => return self.unsupported(expr, "calls of generic functions"),
+                Callee::Slot(_) => return self.unsupported(expr, "calls through forms"),
+                _ => return self.trap(TrapKind::Error, Some(expr)),
+            }
+        }
+        let args: Vec<(Local, Ty<'db>)> = positional
+            .iter()
+            .map(|&arg| {
+                let ty = self.ty(arg);
+                let op = self.expr(arg);
+                (self.materialize(op, ty), ty)
+            })
+            .collect();
+        let dst = self.temp(self.ty(expr));
+        let join = self.new_block();
+        self.dispatch_arms(
+            expr,
+            dispatch,
+            &functions,
+            &args,
+            &mut Vec::new(),
+            dst,
+            join,
+        );
+        self.switch_to(join);
+        Operand::Local(dst)
+    }
+
+    /// The switch on the split argument at `indices.len()`, or the call
+    /// for the members at `indices`.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_arms(
+        &mut self,
+        expr: ExprId,
+        dispatch: &Dispatch<'db>,
+        functions: &[ItemId<'db>],
+        args: &[(Local, Ty<'db>)],
+        indices: &mut Vec<usize>,
+        dst: Local,
+        join: BlockId,
+    ) {
+        let level = indices.len();
+        if level < dispatch.args.len() {
+            let members = &dispatch.members[level];
+            let blocks: Vec<BlockId> = members.iter().map(|_| self.new_block()).collect();
+            let fail = self.new_block();
+            self.terminate(Terminator::Switch {
+                place: Place::local(args[dispatch.args[level]].0),
+                cases: members
+                    .iter()
+                    .copied()
+                    .zip(blocks.iter().copied())
+                    .collect(),
+                otherwise: fail,
+            });
+            self.switch_to(fail);
+            self.trap(TrapKind::NoMatch, Some(expr));
+            for (i, block) in blocks.into_iter().enumerate() {
+                self.switch_to(block);
+                indices.push(i);
+                self.dispatch_arms(expr, dispatch, functions, args, indices, dst, join);
+                indices.pop();
+            }
+            return;
+        }
+        let index = indices
+            .iter()
+            .zip(&dispatch.members)
+            .fold(0, |n, (&i, members)| n * members.len() + i);
+        let (function, result) = (functions[index], dispatch.arms[index].result);
+        let params = &signature(self.db, self.program, function).params;
+        let mut ops = Vec::new();
+        for (k, (&(local, ty), param)) in args.iter().zip(params).enumerate() {
+            let (op, from) = match dispatch.args.iter().position(|&a| a == k) {
+                Some(level) => {
+                    let member = dispatch.members[level][indices[level]];
+                    (self.coerce(Operand::Local(local), ty, member), member)
+                }
+                None => (Operand::Local(local), ty),
+            };
+            ops.push(self.coerce(op, from, param.ty));
+        }
+        let op = match self.primitive(function) {
+            Some(primitive) => self.primitive_ops(expr, primitive, result, ops),
+            None => {
+                let func = InstanceKey::new(self.db, Owner::Item(function), Vec::new());
+                let out = self.temp(result);
+                let target = self.new_block();
+                self.terminate(Terminator::Call {
+                    func,
+                    args: ops,
+                    dst: out,
+                    target,
+                    site: expr,
+                });
+                self.switch_to(target);
+                Operand::Local(out)
+            }
+        };
+        self.assign_to(dst, op, result);
+        self.terminate(Terminator::Jump(join));
     }
 
     fn call_function(
@@ -977,9 +1108,27 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         args: &[ExprId],
     ) -> Operand<'db> {
         let ty = self.ty(expr);
-        match (primitive, args) {
-            (Primitive::Arith { op, ty: b, checked }, [x, y]) => {
-                let (a, c) = (self.expr(*x), self.expr(*y));
+        // `-1` is a constant, so `Int8.min` can be written.
+        if let (Primitive::Negate(_), [x]) = (primitive, args)
+            && let Expr::Literal(literal) = self.body.expr(*x)
+        {
+            return Operand::Const(self.literal(literal, ty, true));
+        }
+        let ops = args.iter().map(|&arg| self.expr(arg)).collect();
+        self.primitive_ops(expr, primitive, ty, ops)
+    }
+
+    /// The operation of a primitive on operands, giving a `ty`.
+    fn primitive_ops(
+        &mut self,
+        expr: ExprId,
+        primitive: Primitive,
+        ty: Ty<'db>,
+        ops: Vec<Operand<'db>>,
+    ) -> Operand<'db> {
+        let mut ops = ops.into_iter();
+        match (primitive, ops.next(), ops.next()) {
+            (Primitive::Arith { op, ty: b, checked }, Some(a), Some(c)) => {
                 let check = checked.then_some(expr);
                 self.assign(
                     ty,
@@ -992,12 +1141,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     },
                 )
             }
-            (Primitive::Negate(b), [x]) => {
-                // `-1` is a constant, so `Int8.min` can be written.
-                if let Expr::Literal(literal) = self.body.expr(*x) {
-                    return Operand::Const(self.literal(literal, ty, true));
-                }
-                let a = self.expr(*x);
+            (Primitive::Negate(b), Some(a), None) => {
                 let rvalue = match b {
                     // -0.0 must stay negative zero; -1.0 * x keeps the sign.
                     Builtin::Float => Rvalue::Binary {
@@ -1017,8 +1161,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 };
                 self.assign(ty, rvalue)
             }
-            (Primitive::Compare(op, b), [x, y]) => {
-                let (a, c) = (self.expr(*x), self.expr(*y));
+            (Primitive::Compare(op, b), Some(a), Some(c)) => {
                 self.assign(ty, Rvalue::Compare { op, ty: b, a, b: c })
             }
             _ => self.trap(TrapKind::Error, Some(expr)),

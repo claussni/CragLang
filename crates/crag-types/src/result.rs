@@ -73,6 +73,41 @@ pub enum Callee<'db> {
     Value,
     /// The construction of a record or collection type (§6.7).
     Construct(Ty<'db>),
+    /// A call split by the members of its union arguments, or a function
+    /// value that splits its parameters so (§4.6.1).
+    Dispatch(Dispatch<'db>),
+}
+
+/// A lifted call: the arguments it splits and one call per combination
+/// of their members (§11.5.5).
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct Dispatch<'db> {
+    /// The positional arguments split, the receiver first, or the
+    /// parameters of a function value.
+    pub args: Vec<usize>,
+    /// The members of each, in the order of the union.
+    pub members: Vec<Vec<Ty<'db>>>,
+    /// One per combination of members, the last argument's member
+    /// varying fastest.
+    pub arms: Vec<DispatchArm<'db>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct DispatchArm<'db> {
+    /// A declared function, an instance or a slot.
+    pub callee: Callee<'db>,
+    pub result: Ty<'db>,
+}
+
+impl<'db> Dispatch<'db> {
+    /// The arm for the members at these indices, one per split argument.
+    pub fn arm(&self, indices: &[usize]) -> &DispatchArm<'db> {
+        let index = indices
+            .iter()
+            .zip(&self.members)
+            .fold(0, |n, (&i, members)| n * members.len() + i);
+        &self.arms[index]
+    }
 }
 
 /// A node of a body, where an error is reported.
@@ -119,6 +154,12 @@ pub enum ErrorKind<'db> {
     NoMatch {
         name: Name<'db>,
         args: Vec<Ty<'db>>,
+    },
+    /// A lifted call whose members have no function that takes them
+    /// (§4.6.1).
+    NoLift {
+        name: Name<'db>,
+        members: Vec<Ty<'db>>,
     },
     /// Several do (§5.6.1).
     Ambiguous {
@@ -266,6 +307,15 @@ impl<'db> ErrorKind<'db> {
                 "no function `{}` takes ({})",
                 name(n),
                 args.iter()
+                    .map(|t| t.display(db))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            ErrorKind::NoLift { name: n, members } => format!(
+                "no function `{}` takes ({}), which union lifting needs for each member",
+                name(n),
+                members
+                    .iter()
                     .map(|t| t.display(db))
                     .collect::<Vec<_>>()
                     .join(", ")

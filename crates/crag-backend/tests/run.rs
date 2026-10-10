@@ -69,6 +69,7 @@ pub fn divide(a: Int, b: Int) -> Int
 pub fn remainder(a: Int, b: Int) -> Int
 pub fn addWrapping(a: Int8, b: Int8) -> Int8
 pub fn negate(a: Int) -> Int
+pub fn negate(a: Float) -> Float
 pub fn equals(a: Int, b: Int) -> Bool
 pub fn lessThan(a: Int, b: Int) -> Bool
 pub fn lessThan(a: Float, b: Float) -> Bool
@@ -929,4 +930,47 @@ fn pick(i: Int) -> Int {
         (TrapKind::Index, at("points[i]"))
     );
     assert_eq!(m.worker.heap().live_blocks(), 0);
+}
+
+#[test]
+fn lifted_calls_run() {
+    let mut m = Module::new(
+        r#"type Circle(r: Int)
+type Rect(w: Int, h: Int)
+
+fn area(c: Circle) -> Int { 3 * c.r * c.r }
+fn area(r: Rect) -> Int { r.w * r.h }
+
+fn shape(n: Int) -> Circle | Rect {
+  if 0 < n { Circle(r: n) } else { Rect(w: 2, h: 0 - n) }
+}
+
+fn areas(n: Int) -> Int {
+  area(shape(n)) + shape(0 - n).area() * 1000
+}
+
+fn pair(a: Circle, b: Circle) -> Int { 1 }
+fn pair(a: Circle, b: Rect) -> Int { 2 }
+fn pair(a: Rect, b: Circle | Rect) -> Int { 3 }
+
+fn pairs(n: Int) -> Int {
+  pair(shape(n), shape(n)) + pair(shape(n), shape(0 - n)) * 10 + pair(shape(0 - n), shape(n)) * 100
+}
+
+fn flip(x: Int | Float) -> Int | Float { -x }
+
+fn flips(n: Int) -> Int {
+  case flip(n) {
+    i: Int -> i
+    _ -> 0
+  }
+}
+"#,
+    );
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    assert_eq!(m.int("areas", &[2]), 12 + 4 * 1000);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("pairs", &[2]), 1 + 2 * 10 + 3 * 100);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("flips", &[5]), -5);
 }

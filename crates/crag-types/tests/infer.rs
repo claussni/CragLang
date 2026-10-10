@@ -1315,3 +1315,62 @@ fn f(t: Text) {
         ]
     );
 }
+
+#[test]
+fn union_arguments_are_lifted_over_overloads() {
+    // §4.6.1: with an overload for every member, a call dispatches on the
+    // union's tag and gives the union of the chosen results.
+    let text = "type Circle(r: Int)
+type Rect(w: Int, h: Int)
+fn area(c: Circle) -> Float { 1.0 }
+fn area(r: Rect) -> Int { 1 }
+fn mix(c: Circle, n: Int) -> Int { n }
+fn mix(r: Rect, n: Int) -> Str { \"r\" }
+fn pair(a: Circle, b: Circle) -> Int { 1 }
+fn pair(a: Circle, b: Rect) -> Int { 2 }
+fn pair(a: Rect, b: Circle | Rect) -> Str { \"x\" }
+fn whole(s: Circle | Rect) -> Str { \"w\" }
+fn whole(c: Circle) -> Int { 1 }
+fn f(s: Circle | Rect, t: Circle | Rect, shapes: List[Circle | Rect]) {
+  let a = area(s)
+  let b = s.area()
+  let c = mix(s, 1)
+  let d = pair(s, t)
+  let e = whole(s)
+  let g: (Circle | Rect) -> Float | Int = area
+  let h = shapes.map(area)
+}";
+    assert_eq!(
+        ok(text).last().unwrap(),
+        "s: Circle | Rect, t: Circle | Rect, shapes: List[Circle | Rect], a: Float | Int, \
+         b: Float | Int, c: Int | Str, d: Int | Str, e: Str, g: (Circle | Rect) -> Float | Int, \
+         h: List[Float | Int], -> ()"
+    );
+}
+
+#[test]
+fn lifting_needs_a_function_for_every_member() {
+    let text = "type Circle(r: Int)
+type Rect(w: Int, h: Int)
+type Square(s: Int)
+type Point(x: Int)
+fn area(c: Circle) -> Float { 1.0 }
+fn area(r: Rect) -> Float { 1.0 }
+fn scale(c: Circle, k: Int) -> Int { 1 }
+fn scale(r: Rect, k: Float) -> Int { 1 }
+fn f(k: Circle | Square, q: Square | Point, s: Circle | Rect) {
+  let a = area(k)
+  let b = area(q)
+  let c = scale(s, 2)
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`area(k)`: no function `area` takes (Square), which union lifting needs for each \
+             member",
+            "`area(q)`: no function `area` takes (Point | Square)",
+            "`scale(s, 2)`: lifted calls whose arguments typed by the context differ by member \
+             are not supported yet",
+        ]
+    );
+}

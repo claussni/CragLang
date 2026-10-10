@@ -57,7 +57,7 @@ pub use group::{
 pub use infer::constant as literal_value;
 pub use overload::{Ranked, Specificity, compare_param, most_specific, overload_errors};
 pub use relate::{declared_fields, fields_of, is_subtype, join, normalize, parent, subst};
-pub use result::{Callee, ErrorKind, InferenceResult, Site, TypeError};
+pub use result::{Callee, Dispatch, DispatchArm, ErrorKind, InferenceResult, Site, TypeError};
 pub use ty::{Builtin, Ty, TyKind};
 
 /// The types of a body: a function, a module-level `let`, a test, or the

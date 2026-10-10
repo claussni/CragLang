@@ -776,15 +776,23 @@ Candidate A is more specific than B when every call A accepts, B also accepts, b
 
 #### 11.5.5 Union lifting
 
-When an argument is a union and no overload accepts the whole union but one accepts each member, the call is split into one call per member (union lifting, §4.6). THIR records this as an explicit dispatch node, later compiled to a switch on the value's tag.
+When no candidate accepts a call's arguments but one accepts each combination of the members of its union arguments, the call is split into one call per combination (union lifting, §4.6.1). The arguments split are the unions no candidate takes whole at their position; if that leaves a combination without a function, every union argument is split. Each combination is resolved like a call of its own (§11.5.4), and the call gives the union of their results. A combination without a function, or with several, is an error once another combination resolves; when none does, the call reports its own error. The arguments typed by the context are typed once, so their parameter must be the same for every combination. A generic candidate takes its type arguments from the members, and a lifted call building a record is not supported yet.
+
+An overloaded name used as a value whose expected function type has union parameters is lifted the same way, so `shapes.map(area)` works: a function name passed where the parameter's type chooses or instantiates it waits for that type, like a closure (§11.5.3).
+
+The call records a `Dispatch`. MIR evaluates the arguments once and switches on the tag of each split argument in turn; each arm converts the arguments to their members and calls its function, which may be a primitive operation, and the result is converted to the union. Arms that call instances or slots wait for monomorphization (§11.5.10), and lifted function values for closure conversion (§11.5.9).
 
 **Data structures**
 
-- `DispatchNode` — the scrutinized argument and one resolved call per union member.
+- `Dispatch` — the split arguments, the members of each, and one `DispatchArm` per combination, the last argument's member varying fastest; `Callee::Dispatch` records it for a call or a function value.
+- `DispatchArm` — the callee of one combination, a function, an instance or a slot, and its result.
 
 **Functions**
 
-- `fn try_lift(cx: &mut InferCtx, call: ExprId, args: &[TypeId]) -> Result<DispatchNode, TypeError>`.
+- `Infer::select` — resolution without reporting: the chosen candidate, none, several, or candidates of several modules.
+- `Infer::split` — the arguments split and the candidate chosen for each combination, or the error of the first combination that does not resolve.
+- `Infer::lift` and `Infer::lift_value` — a lifted call and a lifted function value.
+- `MirBuilder::dispatch` — the switches and calls in MIR.
 
 #### 11.5.6 Recursive-group diagnostic
 
