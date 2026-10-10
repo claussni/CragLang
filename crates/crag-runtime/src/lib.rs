@@ -57,7 +57,7 @@ pub mod stress;
 mod testing;
 pub mod unwind;
 
-pub use codec::{NotSolid, encode_value};
+pub use codec::{DecodeError, NotSolid, decode_value, encode_value};
 pub use fiber::{Fiber, FiberConfig, FiberState, TaskContext, Worker};
 pub use heap::{Heap, alloc_box};
 pub use meter::Meter;

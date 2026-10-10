@@ -22,11 +22,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crag_backend::func_id;
-use crag_driver::{Project, Scratch};
+use crag_backend::{func_id, shapes, slot_key};
+use crag_driver::{Image, Project, Scratch};
 use crag_hir::{ItemKind, Owner, item_tree};
 use crag_mir::InstanceKey;
-use crag_session::{ImageCommand, RunResult};
+use crag_session::{Fill, ImageCommand, RunResult};
 
 const APP: &str = r#"type Point(x: Int, y: Int)
 
@@ -289,4 +289,70 @@ fn sigint_stops_a_run_at_a_safepoint_and_the_image_runs_on() {
         assert_eq!(s.session().scratch().pid() as libc::pid_t, pid);
     }
     assert_eq!(s.run(&p, function(&p, "answer")).unwrap(), Ok(vec![42]));
+}
+
+/// The body of a module-level value of `demo.app`.
+fn value<'a>(project: &'a Project, name: &str) -> InstanceKey<'a> {
+    let db = &project.db;
+    let module = project.module("demo.app").unwrap();
+    let item = item_tree(db, module)
+        .items
+        .iter()
+        .map(|i| i.id)
+        .find(|id| *id.kind(db) == ItemKind::Value && id.name(db).text(db) == name)
+        .unwrap();
+    InstanceKey::body(db, Owner::Item(item))
+}
+
+#[test]
+fn constants_arrive_in_their_cells() {
+    let p = project("constants", APP);
+    // Built in this process: `corner` is computed while compiling.
+    let mut image = Image::build(&p, &[function(&p, "cornered")]).unwrap();
+    assert_eq!(image.constants(), 1);
+    assert_eq!(image.run(func_id(function(&p, "cornered"))), Ok(vec![42]));
+    let image = Image::build(&p, &[function(&p, "area")]).unwrap();
+    assert_eq!(image.constants(), 0);
+
+    // The scratch image reads what its cell holds: a value filled in that
+    // the code would not compute shows.
+    let mut s = scratch();
+    let cornered = function(&p, "cornered");
+    assert!(matches!(
+        s.execute(&p, cornered),
+        Ok(RunResult::Finished(w)) if w == [42]
+    ));
+    // Sent once, while its code stays the same.
+    assert_eq!(s.constants(), 1);
+    s.execute(&p, function(&p, "theCorner")).unwrap();
+    assert_eq!(s.constants(), 1);
+    let (db, program) = (&p.db, p.program);
+    let corner = value(&p, "corner");
+    let ty = crag_mir::mir(db, program, corner, crag_mir::Tier::Baseline)
+        .as_ref()
+        .unwrap()
+        .result;
+    let (shapes, root) = shapes(db, program, ty);
+    let mut bytes = root.to_le_bytes().to_vec();
+    bytes.extend([1u64, 1].iter().flat_map(|w| w.to_le_bytes()));
+    let fill = Fill {
+        cell: slot_key(db, program, corner),
+        shapes,
+        root,
+        bytes,
+    };
+    s.session()
+        .ship(&[], &[], &[], &[], std::slice::from_ref(&fill))
+        .unwrap();
+    assert!(matches!(
+        s.execute(&p, cornered),
+        Ok(RunResult::Finished(w)) if w == [2]
+    ));
+    // Bytes that are no such value are refused.
+    let broken = Fill {
+        bytes: vec![0; 3],
+        ..fill
+    };
+    let refused = s.session().ship(&[], &[], &[], &[], &[broken]);
+    assert!(refused.unwrap_err().to_string().contains("cannot decode"));
 }

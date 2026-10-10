@@ -970,20 +970,20 @@ The host compiles; the image only loads, so it links no code generator. To run s
 
 The host remembers what each image has: functions by their id and the hash of their code, stubs by their words, and descriptors by type index. A shipment sends only what is missing, so the second root to call a function does not send it again, and a fresh image after a crash gets everything anew. A function that comes again with other code, as a changed definition does, is sent again and replaces the old code (§11.6.4).
 
-The image keeps the values of module-level `let`s in their cells between runs (§11.4.10). The host remembers, for each value, a hash of the code it is computed with: its own and that of every function it reaches. When the hash changes, the `Load` names the value's cell and the image empties it after loading, so the next read computes the value with the new code. Code the value does not run leaves it as it is. Every run ships its root first, and the root reaches every value the run may read, so no run reads a value computed with other code. The value an emptied cell held is not released yet.
+The image keeps the values of module-level `let`s in their cells between runs (§11.4.10). The host remembers, for each value, a hash of the code it is computed with: its own and that of every function it reaches. When the hash changes, the `Load` names the value's cell and the image empties it after loading, so the next read computes the value with the new code. When the value is a constant, the `Load` also carries what the compiler computed, and the image fills the emptied cell with it (§11.6.8). Code the value does not run leaves it as it is. Every run ships its root first, and the root reaches every value the run may read, so no run reads a value computed with other code. The value an emptied cell held is not released yet.
 
 Result words that are references point into the image and mean nothing to the host; value printing reads values in the image (§11.6.5). SIGINT stops a run at its next safepoint, and the image answers `Interrupted` (§11.6.2); `restart` kills an image that does not answer.
 
 **Data structures**
 
 - `ShippedFunction` — a function's id, the signature of its slot, words of parameters and results, and code object; `Stub` — an entry stub and the words it was compiled for.
-- `Message::Load { types, stubs, functions, reset }`, `Loaded`, `Run(FuncId)`, `Finished(words)`, `Trapped { kind, position, stack }`, `Interrupted` and `Failed(reason)`; `Show` and `Shown` (§11.6.5).
+- `Message::Load { types, stubs, functions, reset, fills }`, `Loaded`, `Run(FuncId)`, `Finished(words)`, `Trapped { kind, position, stack }`, `Interrupted` and `Failed(reason)`; `Show` and `Shown` (§11.6.5).
 - `Image` — in the image: the code arena, symbol table, loaded functions and stubs, descriptors, code map and worker.
 - `Scratch` — in the driver: a session and the names of the functions shipped, for reports.
 
 **Functions**
 
-- `Session::ship(&mut self, types, stubs, functions, reset) -> Result<usize, SessionError>` — on the host side; sends what the image lacks and the cells to empty, and returns how many functions it sent.
+- `Session::ship(&mut self, types, stubs, functions, reset, fills) -> Result<usize, SessionError>` — on the host side; sends what the image lacks, the cells to empty and the constants to fill them with, and returns how many functions it sent.
 - `Session::run(&mut self, func) -> Result<RunResult, SessionError>` — the result words or the trap.
 - `Image::answer(&mut self, message) -> Option<Message>` — in the image: loads, runs and answers.
 - `Scratch::ship(project, roots)` and `Scratch::run(project, root)` — compile, ship and run, with the trap reported against the source.
@@ -1065,7 +1065,7 @@ Constants, conditions with known inputs, `embed` handlers and type functions are
 
 Built so far are constants: a module-level value whose body has no effects. The type checker walks the effects of values as it does those of functions; a value that calls what does I/O, directly or through what it calls, is no constant. `const_eval` collects the instances the value reaches, compiles them metered, loads them into a code arena of its own with a fresh worker, and runs the value on a fiber under the meter: 100 million steps and 256 MiB. The stack of a metered fiber counts against its memory, since a recursion holds memory there. The result is encoded with the Solid codec (§11.6.8), hashed with BLAKE3 and released. The value's cell, and the cells of the values it read, hold references of their own, which are released too, so the worker's heap ends empty and is unmapped.
 
-An evaluation that traps, or runs out of steps or memory, is a compile error at the value's declaration, such as ``error: `ratio` cannot be computed at compile time: it traps with division by zero in down``. That holds for every constant, read or not, and the REPL reports it when the value is defined. An evaluation that reaches code with errors, or what code generation does not support yet, or that gives what has no encoding, such as a function value, is no error: the value is not a constant and is computed when the program runs, as before (§11.6.2). The result is not yet used by the code that reads the value; that is the codec's other half (§11.6.8).
+An evaluation that traps, or runs out of steps or memory, is a compile error at the value's declaration, such as ``error: `ratio` cannot be computed at compile time: it traps with division by zero in down``. That holds for every constant, read or not, and the REPL reports it when the value is defined. An evaluation that reaches code with errors, or what code generation does not support yet, or that gives what has no encoding, such as a function value, is no error: the value is not a constant and is computed when the program runs, as before (§11.6.2). Images start with the result in the value's cell, so the code that reads the value finds it computed (§11.6.8).
 
 At each refill of the fuel the runtime asks the fiber's poll, and the host's poll asks whether an edit has cancelled the query. A cancelled evaluation traps with `Cancelled`, and once the fiber has stopped the query unwinds as cancelled queries do: Salsa cancels by unwinding, which must not cross the frames of generated code, so the poll catches it and the query raises it again in Rust.
 
@@ -1089,13 +1089,23 @@ Conditions with known inputs wait for conditions in the checker, type functions 
 
 Compile-time results must be stored, hashed and embedded into code objects, and later the transport sends values between processes. The codec turns Solid values (immutable, with no refs or handles) into bytes and back, deterministically, so equal values give equal bytes and equal hashes.
 
-The encoder came first, with compile-time evaluation (§11.6.7). It walks a value by the shape of its type (§11.6.5), not by the runtime's `TypeDescriptor`, which keeps only what releasing a box takes. Numbers are their word, eight bytes little-endian; a union is the member's place among its shape's members, four bytes, then the member; a record is the index of the shape of the box's own type, which may be a subtype's, then its fields in the shape's order; a list is its length, eight bytes, then its elements; a map or a set is its length, then its entries in the order of their keys' bytes. Tags and `()` take no bytes. A function value and what a shape cannot show have no encoding.
+The codec walks a value by the shape of its type (§11.6.5), not by the runtime's `TypeDescriptor`, which keeps only what releasing a box takes. Numbers are their word, eight bytes little-endian; a union is the member's place among its shape's members, four bytes, then the member; a record is the index of the shape of the box's own type, which may be a subtype's, then its fields in the shape's order; a list is its length, eight bytes, then its elements; a map or a set is its length, then its entries in the order of their keys' bytes. Tags and `()` take no bytes. A function value and what a shape cannot show have no encoding.
+
+To build a value the decoder needs what a box is: the shapes now also give each box's shape its type index and its size. Decoding checks the bytes against the shapes first, allocating nothing, and then builds the value on a heap: records with `alloc_box`, lists and maps from empty ones by pushing and inserting, so they are laid out as the runtime lays them out. Bytes that end early, run on, name a member or a shape the table lacks, or give a field's box a type that does not keep the field's own fields, by name, offset and shape, are refused, and nothing is left on the heap.
+
+Constants reach the code that reads them through its cell (§11.6.2), not through static data in the code object as first planned: an image fills the cell of each constant before any code runs, and the value's code finds it full. In-process images (`crag run`, `crag test`) decode the constants when they are built; the scratch image receives them in `Load`, as `Fill`s, for the cells of values whose code changed. The value's code stays loaded, so a value that is no constant is still computed on its first read. Placing bytes in static data waits for release builds (§11.10.3), which have no host to compute them at load time.
+
+**Data structures**
+
+- `Shapes::boxes` — for each shape of a box, its type index and size; `Shapes::boxed(shape)`.
+- `Fill { cell, shapes, root, bytes }` — a constant for a cell, in `Message::Load`.
 
 **Functions**
 
 - `unsafe fn encode_value(words: &[u64], shapes: &Shapes, shape: u32, types: &Types) -> Result<Vec<u8>, NotSolid>` — in the runtime; canonical: sorted map keys, fixed integer widths.
-- `fn decode(bytes: &[u8], shapes: &Shapes, shape: u32, heap: &mut Heap) -> Result<Vec<u64>, DecodeError>` — not built yet.
-- `fn embed_constant(code: &mut CodeObject, value: &ConstValue) -> DataOffset` — places the bytes in the code object's static data; not built yet.
+- `unsafe fn decode_value(bytes: &[u8], shapes: &Shapes, shape: u32, heap: &mut Heap, types: &Types) -> Result<Vec<u64>, DecodeError>` — the value's words; the caller owns it.
+- `CellTable::fill(key, words)` — in the loader; the cell holds the value and is full.
+- `fn constants(project, values) -> Vec<Fill>` — in the driver: the constants among the values compiled, from `const_eval`.
 
 #### 11.6.9 embed handlers
 

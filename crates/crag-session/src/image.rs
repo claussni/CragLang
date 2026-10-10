@@ -45,12 +45,12 @@ use crag_abi::{CodeObject, FuncId, RuntimeFn, Shapes, SlotKey, TypeDescriptor};
 use crag_loader::{CodeArena, SymbolTable, load, replace_group};
 use crag_runtime::{
     CodeMap, Fiber, FiberConfig, FiberState, PrintLimits, StopHandle, StopReason, Types, Worker,
-    print_value, release_value,
+    decode_value, print_value, release_value,
 };
 
 use crate::host::ImageKind;
 use crate::protocol::{
-    Message, PROTOCOL_VERSION, ShippedFunction, Stub, read_message, write_message,
+    Fill, Message, PROTOCOL_VERSION, ShippedFunction, Stub, read_message, write_message,
 };
 
 /// The address range reserved for an image's code.
@@ -128,12 +128,16 @@ impl Image {
                 stubs,
                 functions,
                 reset,
+                fills,
             } => match self.load(types, stubs, functions) {
                 Ok(()) => {
                     for key in reset {
                         self.symbols.cells().reset(key);
                     }
-                    Message::Loaded
+                    match self.fill(fills) {
+                        Ok(()) => Message::Loaded,
+                        Err(why) => Message::Failed(why),
+                    }
                 }
                 Err(why) => Message::Failed(why),
             },
@@ -144,6 +148,25 @@ impl Image {
             Message::Show { func, shapes, root } => self.show(func, &shapes, root),
             other => Message::Failed(format!("an image does not take {other:?}")),
         })
+    }
+
+    /// Fills cells with the values the compiler computed, built on the
+    /// worker's heap. A fill that fails leaves its cell as it was and the
+    /// rest unfilled.
+    fn fill(&mut self, fills: Vec<Fill>) -> Result<(), String> {
+        let types = self.worker.types();
+        for f in fills {
+            if self.symbols.cells().address(f.cell).is_none() {
+                return Err(format!("no cell for {:?}", f.cell));
+            }
+            // SAFETY: the host compiled the image's code and gave its types'
+            // descriptors with it, and the shapes describe the same layouts.
+            let words =
+                unsafe { decode_value(&f.bytes, &f.shapes, f.root, self.worker.heap(), &types) }
+                    .map_err(|e| format!("cannot decode the value of {:?}: {}", f.cell, e.0))?;
+            self.symbols.cells().fill(f.cell, &words);
+        }
+        Ok(())
     }
 
     /// Loads what the host shipped. When it fails, the functions are not

@@ -46,6 +46,7 @@ fn load(types: Vec<(u32, TypeDescriptor)>, functions: Vec<ShippedFunction>) -> M
         stubs: Vec::new(),
         functions,
         reset: Vec::new(),
+        fills: Vec::new(),
     }
 }
 

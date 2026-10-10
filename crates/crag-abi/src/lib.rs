@@ -562,12 +562,24 @@ pub struct Shapes {
     /// The shapes of the record types a box may have, by the type index
     /// in its header: a value of a record type may be one of a subtype.
     pub records: Vec<(u32, u32)>,
+    /// For each shape of a box, a record, a list, a set or a map: the
+    /// shape, the type index in the box's header and the box's bytes, so
+    /// a value can be built from its encoding (§11.6.8).
+    pub boxes: Vec<(u32, u32, u32)>,
 }
 
 impl Shapes {
     /// The shape of a record by the type index of its box, if known.
     pub fn record(&self, index: u32) -> Option<u32> {
         self.records.iter().find(|r| r.0 == index).map(|r| r.1)
+    }
+
+    /// The type index and the bytes of the boxes of a shape, if known.
+    pub fn boxed(&self, shape: u32) -> Option<(u32, u32)> {
+        self.boxes
+            .iter()
+            .find(|b| b.0 == shape)
+            .map(|&(_, index, size)| (index, size))
     }
 }
 

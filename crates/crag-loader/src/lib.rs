@@ -48,7 +48,8 @@
 //! (Implementation Plan §11.6.2), named like a slot by that code's key.
 //! Loading a group makes the cells its code names, empty; the code fills
 //! its cell on the first read. The image empties a cell to have the value
-//! computed again.
+//! computed again, and fills one with a value the compiler computed
+//! (§11.6.8), which the code then finds there.
 
 #![cfg(unix)]
 
@@ -57,7 +58,8 @@ use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crag_abi::{
-    CELL_EMPTY, CELL_SIZE, CodeObject, FuncId, RelocKind, RelocTarget, RuntimeFn, SlotKey,
+    CELL_EMPTY, CELL_FULL, CELL_SIZE, CodeObject, FuncId, RelocKind, RelocTarget, RuntimeFn,
+    SlotKey,
 };
 
 /// The address of a loaded code object's entry point.
@@ -171,6 +173,22 @@ impl CellTable {
     /// The state of a key's cell: `CELL_EMPTY` or `CELL_FULL`.
     pub fn state(&self, key: SlotKey) -> Option<u64> {
         Some(self.cell(*self.index.get(&key)?)[0].load(Ordering::Acquire))
+    }
+
+    /// Fills a key's cell with a value's words, which the
+    /// cell then holds with their references. Whether the key has a cell.
+    /// Called while no code that reads the cell runs.
+    pub fn fill(&self, key: SlotKey, words: &[u64]) -> bool {
+        let Some(&index) = self.index.get(&key) else {
+            return false;
+        };
+        let cell = self.cell(index);
+        assert!(words.len() < cell.len(), "a value of {} words", words.len());
+        for (slot, &word) in cell[1..].iter().zip(words) {
+            slot.store(word, Ordering::Relaxed);
+        }
+        cell[0].store(CELL_FULL, Ordering::Release);
+        true
     }
 
     /// Empties a key's cell, so the value is computed again when it is next

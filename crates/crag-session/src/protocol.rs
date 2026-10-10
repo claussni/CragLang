@@ -33,7 +33,7 @@ use crag_abi::{
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -53,12 +53,14 @@ pub enum Message {
     /// uses and the entry stubs to run it with. The functions are loaded
     /// together, and may call each other and what is already loaded. Then
     /// the cells of the values in `reset` are emptied, so the values are
-    /// computed again (§11.6.2).
+    /// computed again (§11.6.2), and those in `fills` are filled with the
+    /// values the compiler computed (§11.6.8).
     Load {
         types: Vec<(u32, TypeDescriptor)>,
         stubs: Vec<Stub>,
         functions: Vec<ShippedFunction>,
         reset: Vec<SlotKey>,
+        fills: Vec<Fill>,
     },
     /// From the image: everything in the `Load` is loaded.
     Loaded,
@@ -99,6 +101,17 @@ pub struct ShippedFunction {
     pub params: u32,
     pub returns: u32,
     pub object: CodeObject,
+}
+
+/// A value computed at compile time, for the cell of the code that
+/// computes it: its bytes in the Solid codec, of the shape `root` of
+/// `shapes`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fill {
+    pub cell: SlotKey,
+    pub shapes: Shapes,
+    pub root: u32,
+    pub bytes: Vec<u8>,
 }
 
 /// An entry stub: code that calls a function with `params` parameter words
@@ -148,6 +161,7 @@ impl Message {
                 stubs,
                 functions,
                 reset,
+                fills,
             } => {
                 w.u8(LOAD);
                 w.seq(types, |w, (index, d)| {
@@ -161,6 +175,12 @@ impl Message {
                 });
                 w.seq(functions, |w, f| w.function(f));
                 w.seq(reset, |w, key| w.slot_key(key));
+                w.seq(fills, |w, f| {
+                    w.slot_key(&f.cell);
+                    w.shapes(&f.shapes);
+                    w.u32(f.root);
+                    w.seq(&f.bytes, |w, b| w.u8(*b));
+                });
             }
             Message::Loaded => w.u8(LOADED),
             Message::Run(id) => {
@@ -228,6 +248,20 @@ impl Message {
                 })?,
                 functions: r.seq(Reader::function)?,
                 reset: r.seq(Reader::slot_key)?,
+                fills: r.seq(|r| {
+                    let cell = r.slot_key()?;
+                    let shapes = r.shapes()?;
+                    let root = r.u32()?;
+                    if root as usize >= shapes.shapes.len() {
+                        return Err(invalid(format!("a value of no shape {root}")));
+                    }
+                    Ok(Fill {
+                        cell,
+                        shapes,
+                        root,
+                        bytes: r.seq(Reader::u8)?,
+                    })
+                })?,
             },
             LOADED => Message::Loaded,
             RUN => Message::Run(FuncId(r.u32()?)),
@@ -399,6 +433,11 @@ impl Writer {
         self.seq(&shapes.records, |w, &(index, shape)| {
             w.u32(index);
             w.u32(shape);
+        });
+        self.seq(&shapes.boxes, |w, &(shape, index, size)| {
+            w.u32(shape);
+            w.u32(index);
+            w.u32(size);
         });
     }
 
@@ -619,6 +658,7 @@ impl Reader<'_> {
         let shapes = Shapes {
             shapes: self.seq(Reader::shape)?,
             records: self.seq(|r| Ok((r.u32()?, r.u32()?)))?,
+            boxes: self.seq(|r| Ok((r.u32()?, r.u32()?, r.u32()?)))?,
         };
         // Every shape a shape names is in the table.
         let n = shapes.shapes.len() as u32;
@@ -630,7 +670,10 @@ impl Reader<'_> {
             Shape::Map(k, v) => inside(k) && inside(v),
             _ => true,
         });
-        if !named || !shapes.records.iter().map(|r| &r.1).all(inside) {
+        if !named
+            || !shapes.records.iter().map(|r| &r.1).all(inside)
+            || !shapes.boxes.iter().map(|b| &b.0).all(inside)
+        {
             return Err(invalid("a shape that names no shape of its table".into()));
         }
         Ok(shapes)
@@ -787,6 +830,19 @@ mod tests {
                     func: FuncId(10),
                     signature: 2,
                 }],
+                fills: vec![Fill {
+                    cell: SlotKey {
+                        func: FuncId(10),
+                        signature: 2,
+                    },
+                    shapes: Shapes {
+                        shapes: vec![Shape::List(1), Shape::Number(Number::Signed)],
+                        records: Vec::new(),
+                        boxes: vec![(0, 5, 40)],
+                    },
+                    root: 0,
+                    bytes: vec![1, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0],
+                }],
             },
             Message::Loaded,
             Message::Run(FuncId(9)),
@@ -847,6 +903,7 @@ mod tests {
                         },
                     ],
                     records: vec![(7, 0)],
+                    boxes: vec![(0, 7, 32), (4, 9, 16), (5, 10, 40)],
                 },
                 root: 2,
             },
@@ -979,8 +1036,8 @@ mod tests {
             }
             .encode(),
         );
-        // No cells to empty.
-        load.extend([0, 0, 0, 0]);
+        // No cells to empty, and none to fill.
+        load.extend([0, 0, 0, 0, 0, 0, 0, 0]);
         // The runtime function's index, after the function's id, signature,
         // words, code, alignment, entry, relocation count, offset and kinds.
         let at = 13 + 16 + 4 + 10 + 8 + 4 + 4 + 2;
@@ -1005,15 +1062,24 @@ mod tests {
             Shapes {
                 shapes: vec![Shape::List(1)],
                 records: Vec::new(),
+                boxes: Vec::new(),
             },
             Shapes {
                 shapes: vec![Shape::Unit],
                 records: vec![(3, 1)],
+                boxes: Vec::new(),
+            },
+            // A box's shape.
+            Shapes {
+                shapes: vec![Shape::Unit],
+                records: Vec::new(),
+                boxes: vec![(1, 3, 16)],
             },
             // The root, too.
             Shapes {
                 shapes: Vec::new(),
                 records: Vec::new(),
+                boxes: Vec::new(),
             },
         ] {
             let show = Message::Show {
@@ -1024,5 +1090,26 @@ mod tests {
             let err = Message::decode(&show.encode()).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         }
+        // A value to fill whose root its table lacks.
+        let load = Message::Load {
+            types: Vec::new(),
+            stubs: Vec::new(),
+            functions: Vec::new(),
+            reset: Vec::new(),
+            fills: vec![Fill {
+                cell: SlotKey {
+                    func: FuncId(1),
+                    signature: 0,
+                },
+                shapes: Shapes {
+                    shapes: vec![Shape::Unit],
+                    ..Shapes::default()
+                },
+                root: 1,
+                bytes: Vec::new(),
+            }],
+        };
+        let err = Message::decode(&load.encode()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

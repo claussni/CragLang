@@ -30,4 +30,6 @@ pub use host::{
     describe, receive, send, spawn_image,
 };
 pub use image::{Image, serve};
-pub use protocol::{Message, PROTOCOL_VERSION, ShippedFunction, Stub, read_message, write_message};
+pub use protocol::{
+    Fill, Message, PROTOCOL_VERSION, ShippedFunction, Stub, read_message, write_message,
+};

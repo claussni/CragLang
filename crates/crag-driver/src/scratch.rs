@@ -30,7 +30,7 @@ use crag_runtime::Trap;
 use crag_session::{ImageCommand, RunResult, Session, ShippedFunction, Stub};
 use crag_types::Ty;
 
-use crate::exec::{Function, Sources, compile, report, stub_settings};
+use crate::exec::{Function, Sources, compile, constants, report, stub_settings};
 use crate::project::Project;
 
 /// A session with its scratch image, and what the host knows of the code
@@ -42,6 +42,8 @@ pub struct Scratch {
     /// For each module-level value, a hash of the code its value was
     /// computed with: its own and what that calls.
     values: HashMap<SlotKey, u64>,
+    /// How many values the compiler computed were sent to their cells.
+    constants: usize,
 }
 
 impl Scratch {
@@ -51,7 +53,14 @@ impl Scratch {
             settings: stub_settings().map_err(io::Error::other)?,
             functions: HashMap::new(),
             values: HashMap::new(),
+            constants: 0,
         })
+    }
+
+    /// How many values the compiler computed were sent to their cells,
+    /// each time their code changed.
+    pub fn constants(&self) -> usize {
+        self.constants
     }
 
     pub fn session(&mut self) -> &mut Session {
@@ -108,12 +117,22 @@ impl Scratch {
             }
         }
         let reset: Vec<SlotKey> = values.iter().map(|&(cell, _)| cell).collect();
+        // A value computed again with new code is filled with what the
+        // compiler computed, if it is a constant.
+        let changed: Vec<_> = compiled
+            .values
+            .iter()
+            .filter(|(cell, _)| reset.contains(cell))
+            .copied()
+            .collect();
+        let fills = constants(project, &changed);
         let sent = self
             .session
-            .ship(&compiled.types, &stubs, &functions, &reset)
+            .ship(&compiled.types, &stubs, &functions, &reset, &fills)
             .map_err(|e| e.to_string())?;
         self.functions.extend(compiled.functions);
         self.values.extend(values);
+        self.constants += fills.len();
         Ok(sent)
     }
 

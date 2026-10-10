@@ -30,7 +30,9 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 
-use crag_abi::{HEADER_SIZE, HEAP_OFFSET, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, TrapKind};
+use crag_abi::{
+    HEADER_SIZE, HEAP_OFFSET, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, Shapes, TrapKind,
+};
 use crag_backend::{code, shapes, type_index};
 use crag_codegen::{
     CodeObject, CodegenSettings, OptLevel, SlotKey, compile_entry_stub, target_for,
@@ -41,7 +43,8 @@ use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{InstanceKey, Tier, collect_instances};
 use crag_runtime::{
     CodeMap, Fiber, FiberConfig, FiberState, Heap, Meter, PrintLimits, StopReason, Trap, Types,
-    Worker, alloc_box, list, map, print_value, release_box, release_value, request_stop,
+    Worker, alloc_box, decode_value, encode_value, list, map, print_value, release_box,
+    release_value, request_stop,
 };
 use crag_types::{Ty, TyKind, prelude_item, signature};
 
@@ -426,8 +429,8 @@ impl Module {
         self.shown_with(name, limits)
     }
 
-    fn shown_with(&mut self, name: &str, limits: PrintLimits) -> String {
-        let words = self.call(name, &[]);
+    /// The shapes of the result of a function of the module.
+    fn result_shapes(&self, name: &str) -> (Shapes, u32) {
         let (db, program) = (&self.db, self.program);
         let module = program.modules(db)[1];
         let owner = owners(db, module)
@@ -438,7 +441,12 @@ impl Module {
             .as_ref()
             .unwrap()
             .result;
-        let (shapes, root) = shapes(db, program, ty);
+        shapes(db, program, ty)
+    }
+
+    fn shown_with(&mut self, name: &str, limits: PrintLimits) -> String {
+        let words = self.call(name, &[]);
+        let (shapes, root) = self.result_shapes(name);
         TYPES.set(&self.types);
         // SAFETY: the words are the function's result, of type `ty`, which
         // the call left to the test.
@@ -1180,6 +1188,108 @@ fn depth(n: Int) -> Int {
             .kind,
         TrapKind::OutOfSteps
     );
+}
+
+#[test]
+fn values_decode_to_what_they_encode() {
+    let mut m = Module::new(
+        r#"type Point(x: Int, y: Int)
+type Point3(..Point, z: Int)
+type Nil
+type Cons(head: Int, tail: Cons | Nil)
+
+fn deep() -> Point { Point3(x: 1, y: 2, z: 3) }
+fn chain() -> Cons { Cons(head: 1, tail: Cons(head: 2, tail: Nil)) }
+fn points() -> List[Point] { [Point(x: 1, y: 2), Point3(x: 3, y: 4, z: 5)] }
+fn ages() -> Map[Int, List[Int]] { [2: [20], 1: [10, 11], 3: []] }
+fn set() -> Set[Int] { [3, 1, 2] }
+fn maybe() -> Option[Point] { Point(x: 5, y: 6) }
+fn none() -> Option[Point] { Empty }
+fn tags() -> List[Bool] { [True, False, True] }
+fn mixed() -> (a: Fixed[2], b: List[Option[Int]], c: Float) { (a: 1.25, b: [1, Empty], c: 0.5) }
+fn empty() -> List[Int] { [] }
+fn nothing() -> Map[Int, Int] { [:] }
+type Pair(u: Int, v: Int)
+fn both() -> (p: Point, w: Pair) { (p: Point(x: 1, y: 2), w: Pair(u: 1, v: 2)) }
+"#,
+    );
+    let names = [
+        "deep", "chain", "points", "ages", "set", "maybe", "none", "tags", "mixed", "empty",
+        "nothing", "both",
+    ];
+    let limits = PrintLimits::default();
+    for name in names {
+        let words = m.call(name, &[]);
+        let (shapes, root) = m.result_shapes(name);
+        let types = &m.types;
+        TYPES.set(types);
+        // SAFETY: the words are the function's result, of the shape, and
+        // the decoded value is built for the module's types.
+        unsafe {
+            let bytes = encode_value(&words, &shapes, root, types).unwrap();
+            let decoded = decode_value(&bytes, &shapes, root, &mut m.heap, types).unwrap();
+            assert_eq!(
+                encode_value(&decoded, &shapes, root, types).unwrap(),
+                bytes,
+                "{name}"
+            );
+            assert_eq!(
+                print_value(&decoded, &shapes, root, types, limits),
+                print_value(&words, &shapes, root, types, limits),
+                "{name}"
+            );
+            release_value(&mut m.heap, types, &words, &shapes, root);
+            release_value(&mut m.heap, types, &decoded, &shapes, root);
+        }
+        assert_eq!(m.heap.live_blocks(), 0, "{name}");
+    }
+
+    // Bytes that do not fit the shape are refused, and nothing is left.
+    let words = m.call("points", &[]);
+    let (shapes, root) = m.result_shapes("points");
+    let types = &m.types;
+    // SAFETY: as above.
+    let bytes = unsafe { encode_value(&words, &shapes, root, types).unwrap() };
+    unsafe { release_value(&mut m.heap, types, &words, &shapes, root) };
+    let mut broken = vec![
+        bytes[..bytes.len() - 1].to_vec(),
+        [&bytes[..], &[0]].concat(),
+        // A length beyond the bytes.
+        [&[9, 0, 0, 0, 0, 0, 0, 0][..], &bytes[8..]].concat(),
+    ];
+    // The first point's box of a shape that is no record.
+    let mut not_record = bytes.clone();
+    not_record[8..12].copy_from_slice(&(root).to_le_bytes());
+    broken.push(not_record);
+    let mut no_shape = bytes.clone();
+    no_shape[8..12].copy_from_slice(&999u32.to_le_bytes());
+    broken.push(no_shape);
+    for (i, b) in broken.iter().enumerate() {
+        // SAFETY: as above.
+        let result = unsafe { decode_value(b, &shapes, root, &mut m.heap, types) };
+        assert!(result.is_err(), "broken {i}");
+    }
+    // A box of a record type that is no subtype of the field's, though laid
+    // out alike: `Pair` for the `Point` of `both`, and the other way.
+    let words = m.call("both", &[]);
+    let (shapes, root) = m.result_shapes("both");
+    // SAFETY: as above.
+    let bytes = unsafe { encode_value(&words, &shapes, root, &m.types).unwrap() };
+    unsafe { release_value(&mut m.heap, &m.types, &words, &shapes, root) };
+    let shape_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    // The outer record, then `p`'s shape and two words, then `w`'s shape.
+    let (point, wide) = (shape_at(4), shape_at(4 + 4 + 16));
+    let mut swapped = bytes.clone();
+    swapped[4..8].copy_from_slice(&wide.to_le_bytes());
+    swapped[4 + 4 + 16..4 + 4 + 16 + 4].copy_from_slice(&point.to_le_bytes());
+    // SAFETY: as above.
+    let result = unsafe { decode_value(&swapped, &shapes, root, &mut m.heap, &m.types) };
+    assert!(result.is_err());
+    let (shapes, root) = m.result_shapes("maybe");
+    // SAFETY: as above.
+    let member = unsafe { decode_value(&[7, 0, 0, 0], &shapes, root, &mut m.heap, &m.types) };
+    assert!(member.is_err());
+    assert_eq!(m.heap.live_blocks(), 0);
 }
 
 #[test]

@@ -45,7 +45,7 @@ use crag_abi::{FuncId, Shapes, SlotKey, TypeDescriptor};
 use crag_runtime::Trap;
 
 use crate::protocol::{
-    Message, PROTOCOL_VERSION, ShippedFunction, Stub, read_message, write_message,
+    Fill, Message, PROTOCOL_VERSION, ShippedFunction, Stub, read_message, write_message,
 };
 
 /// How long an image may take to connect and say `Hello`.
@@ -409,7 +409,8 @@ impl Session {
 
     /// Ships code to the scratch image: the functions, stubs and type
     /// descriptors it lacks, loaded together, and then empties the cells
-    /// of the values in `reset`. Returns how many functions were sent. A
+    /// of the values in `reset` and fills those in `fills`. Returns how many
+    /// functions were sent. A
     /// function that comes again with the code it has is not sent; one that
     /// comes with other code is, and replaces the old code in the image.
     pub fn ship(
@@ -418,6 +419,7 @@ impl Session {
         stubs: &[Stub],
         functions: &[ShippedFunction],
         reset: &[SlotKey],
+        fills: &[Fill],
     ) -> Result<usize, SessionError> {
         let image = &self.scratch;
         let mut hashes = HashMap::new();
@@ -450,7 +452,12 @@ impl Session {
             .cloned()
             .collect();
         let sent = new_functions.len();
-        if sent == 0 && new_stubs.is_empty() && new_types.is_empty() && reset.is_empty() {
+        if sent == 0
+            && new_stubs.is_empty()
+            && new_types.is_empty()
+            && reset.is_empty()
+            && fills.is_empty()
+        {
             return Ok(0);
         }
         let load = Message::Load {
@@ -458,6 +465,7 @@ impl Session {
             stubs: new_stubs,
             functions: new_functions,
             reset: reset.to_vec(),
+            fills: fills.to_vec(),
         };
         match self.request(&load)? {
             Message::Loaded => {

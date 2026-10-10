@@ -19,13 +19,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crag_abi::{FuncId, RuntimeFn, SlotKey, TrapKind, TypeDescriptor};
-use crag_backend::{code, func_id};
+use crag_abi::{CELL_FULL, FuncId, RuntimeFn, SlotKey, TrapKind, TypeDescriptor};
+use crag_backend::{code, func_id, shapes};
 use crag_codegen::{CodeObject, CodegenSettings, OptLevel, compile_entry_stub, target_for};
-use crag_hir::{ItemKind, ModuleId, Owner};
+use crag_eval::{EvalSite, const_eval};
+use crag_hir::{ItemId, ItemKind, ModuleId, Owner};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
-use crag_mir::{Entry, InstanceKey, Tier, collect_instances};
-use crag_runtime::{CodeMap, Fiber, FiberConfig, FiberState, Trap, Types, Worker};
+use crag_mir::{Entry, InstanceKey, Tier, collect_instances, mir};
+use crag_runtime::{CodeMap, Fiber, FiberConfig, FiberState, Trap, Types, Worker, decode_value};
+use crag_session::Fill;
 
 use crate::diagnostics::render_at;
 use crate::project::Project;
@@ -39,6 +41,8 @@ pub struct Image {
     /// Each function's entry.
     entries: HashMap<FuncId, usize>,
     worker: Worker,
+    /// The values the compiler computed, whose cells were filled.
+    constants: usize,
 }
 
 /// A compiled function as runs and reports need it.
@@ -64,6 +68,33 @@ pub struct Compiled<'a> {
     /// The descriptors of the types the code uses, by index.
     pub types: Vec<(u32, TypeDescriptor)>,
     pub functions: HashMap<FuncId, Function>,
+    /// The module-level values reached, by the keys of their cells.
+    pub values: Vec<(SlotKey, ItemId<'a>)>,
+}
+
+/// The values among those compiled that the compiler computed, ready for
+/// their cells (§11.6.8). A value that is no constant is computed when it
+/// is first read, as before.
+pub fn constants<'a>(project: &'a Project, values: &[(SlotKey, ItemId<'a>)]) -> Vec<Fill> {
+    let (db, program) = (&project.db, project.program);
+    let mut fills = Vec::new();
+    for &(cell, item) in values {
+        let Ok(value) = const_eval(db, program, EvalSite::Value(item)) else {
+            continue;
+        };
+        let instance = InstanceKey::body(db, Owner::Item(item));
+        let Some(body) = mir(db, program, instance, Tier::Baseline) else {
+            continue;
+        };
+        let (shapes, root) = shapes(db, program, body.result);
+        fills.push(Fill {
+            cell,
+            shapes,
+            root,
+            bytes: value.bytes.clone(),
+        });
+    }
+    fills
 }
 
 /// Compiles the instances and everything they call.
@@ -76,6 +107,7 @@ pub fn compile<'a>(
         objects: Vec::new(),
         types: Vec::new(),
         functions: HashMap::new(),
+        values: Vec::new(),
     };
     for instance in collect_instances(db, program, roots, Tier::Baseline) {
         let owner = *instance.owner(db);
@@ -93,6 +125,12 @@ pub fn compile<'a>(
             None => return Err(format!("{name} has no body to compile")),
         };
         compiled.objects.push((code.slot, &code.object));
+        if let Owner::Item(item) = owner
+            && value
+            && *instance.entry(db) == Entry::Body
+        {
+            compiled.values.push((code.slot, item));
+        }
         for t in &code.types {
             if !compiled.types.contains(t) {
                 compiled.types.push(t.clone());
@@ -200,6 +238,7 @@ impl Image {
             objects,
             types,
             functions,
+            values,
         } = compile(project, roots)?;
         let io = |e: std::io::Error| format!("cannot map memory for code: {e}");
         let mut arena = CodeArena::new(64 << 20).map_err(io)?;
@@ -216,8 +255,24 @@ impl Image {
             addrs.insert(slot.func, entry.addr());
         }
         let mut worker = Worker::new();
-        worker.set_types(Arc::new(Types::new(types)));
+        let types = Arc::new(Types::new(types));
+        worker.set_types(types.clone());
         worker.set_code_map(Arc::new(map));
+        // The constants are in their cells before any code runs.
+        for fill in constants(project, &values) {
+            // SAFETY: the shapes describe the layouts the code was compiled
+            // with, whose descriptors the worker has.
+            let words = unsafe {
+                decode_value(&fill.bytes, &fill.shapes, fill.root, worker.heap(), &types)
+            }
+            .map_err(|e| format!("cannot decode a constant: {}", e.0))?;
+            symbols.cells().fill(fill.cell, &words);
+        }
+        let cells = symbols.cells();
+        let constants = values
+            .iter()
+            .filter(|(key, _)| cells.state(*key) == Some(CELL_FULL))
+            .count();
         Ok(Image {
             arena,
             symbols,
@@ -225,6 +280,7 @@ impl Image {
             functions,
             entries: addrs,
             worker,
+            constants,
         })
     }
 
@@ -253,6 +309,12 @@ impl Image {
     /// A trap as the user sees it.
     pub fn report(&self, project: &Project, trap: &Trap) -> String {
         report(project, &self.functions, trap)
+    }
+
+    /// How many values were in their cells when the image was built: the
+    /// values the compiler computed.
+    pub fn constants(&self) -> usize {
+        self.constants
     }
 
     /// The heap the image's fibers allocate from.

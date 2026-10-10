@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use crag_abi::{Number, Shape, ShapeField, Shapes};
+use crag_abi::{LIST_SIZE, MAP_SIZE, Number, Shape, ShapeField, Shapes};
 use crag_db::Db;
 use crag_hir::Program;
 use crag_types::{Builtin, Ty, TyKind, declared_fields};
@@ -93,6 +93,16 @@ impl<'db> Builder<'db> {
             (Some(l), _) => opaque(l.words() as u32),
             (None, _) => opaque(0),
         };
+        let size = match &shape {
+            Shape::List(_) => Some(LIST_SIZE),
+            // A set is a map whose values have no words.
+            Shape::Set(_) | Shape::Map(..) => Some(MAP_SIZE),
+            Shape::Record { .. } => record_layout(db, program, ty).map(|(_, size)| size),
+            _ => None,
+        };
+        if let Some(size) = size {
+            self.shapes.boxes.push((index, type_index(ty) as u32, size));
+        }
         self.shapes.shapes[index as usize] = shape;
         if let TyKind::Named(..) = ty.kind(db)
             && matches!(self.shapes.shapes[index as usize], Shape::Record { .. })
