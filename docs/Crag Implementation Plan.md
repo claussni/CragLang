@@ -907,18 +907,30 @@ A local function called in tail position, `go(n)` at the end of its declaring fu
 
 #### 11.6.1 Session manager
 
-The host process runs the compiler; user code runs in separate image processes, so a crash or an infinite loop in user code never takes the compiler down (§20.1). The session manager starts the images, talks to them over a local socket and restarts an image that dies.
+The host process runs the compiler; user code runs in separate image processes, so a crash or an infinite loop in user code never takes the compiler down (§20.1). The session manager starts the images, talks to them over a local socket and restarts an image that dies. It is the `crag-session` crate.
+
+An image is the `crag` binary itself, started as `crag __image <kind> <socket>`, so `crag` stays one binary (§20). The host binds a Unix socket in a fresh directory only its user can enter, starts the image with the socket's path, and accepts its connection. The image's first message is `Hello`, with the protocol version it speaks and its process id; the host checks both, so an image of another version, or a process that is not the one it started, fails the start. So does an image that exits before it connects, which is noticed at once, or one that does not connect within ten seconds.
+
+A frame is the length of its body as four little-endian bytes, then the body: a tag byte and the fields. A frame longer than 1 GiB, an unknown tag, a body cut short or one with bytes left over is corrupt. The messages so far are `Hello`, `Ping` and `Pong`, which check that an image answers, and `Shutdown`. Those that load code, evaluate input and print values come with the components that use them (§11.6.2, §11.6.3, §11.6.5), and pausing, reloading and the debugger's with theirs.
+
+A request is a message and its reply. When the stream breaks, the image has died or broken the protocol. A stream that ended belongs to an image that is exiting, which gets a second to do so. One that sent something corrupt is killed at once. The session then reaps the image, reports how it ended, such as "the scratch image (process 4711) was killed by signal 6 (SIGABRT)", and starts a fresh one of its kind. If that fails, the next request tries again. `restart` kills a runaway image and starts another. Dropping a session asks each image to shut down and kills one that does not. An image whose host goes away ends too, since its stream ends.
+
+A SIGSEGV that a test sends to an image from outside does not kill it: the standard library's handler for stack overflows returns from a signal that is no fault. The tests use SIGABRT, which is how an image ends on a panic (Compiler Architecture §2.1).
 
 **Data structures**
 
-- `ImageHandle` — process id, socket, kind (scratch, later app), state.
-- `Message` — a length-prefixed, versioned message: load code, evaluate, print value, pause, reload, debugger requests, and replies.
+- `ImageHandle` — the image's kind (scratch; the app image comes with hot reload, §11.8.5), process, socket and state, running or exited.
+- `ImageCommand` — the program and first arguments that start an image; `ImageCommand::current()` is the running `crag`.
+- `Message` — `Hello { version, pid }`, `Ping(n)`, `Pong(n)` and `Shutdown`, with `PROTOCOL_VERSION`.
+- `Session` — the command and the scratch image; `ImageExit` — an image's kind, process id and exit status, as the session reports it.
 
 **Functions**
 
-- `fn spawn_image(kind: ImageKind) -> io::Result<ImageHandle>`.
-- `fn send(image: &mut ImageHandle, msg: &Message) -> io::Result<()>` and `fn receive(image: &mut ImageHandle) -> io::Result<Message>`.
-- `fn on_image_exit(session: &mut Session, image: ImageId, status: ExitStatus)` — reports the reason and starts a fresh image.
+- `fn spawn_image(command: &ImageCommand, kind: ImageKind) -> io::Result<ImageHandle>` — starts the image and waits for its `Hello`.
+- `fn send(image: &mut ImageHandle, msg: &Message) -> io::Result<()>` and `fn receive(image: &mut ImageHandle) -> io::Result<Message>`; `fn write_message` and `fn read_message` frame a message on any stream.
+- `Session::request(&mut self, msg) -> Result<Message, SessionError>` — the reply, or the `ImageExit` of an image that died on the way, already replaced; `Session::restart`.
+- `Session::on_image_exit(&mut self, status: ExitStatus) -> io::Result<ImageExit>` — reports the reason and starts a fresh image.
+- `fn serve(kind: ImageKind, socket: &Path) -> io::Result<()>` — the image's loop: connects, says `Hello` and answers until `Shutdown` or the end of the stream.
 
 #### 11.6.2 REPL
 

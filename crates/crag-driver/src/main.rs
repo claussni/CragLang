@@ -15,7 +15,9 @@
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
 //! The `crag` command. M1 has `run` and `test` (Specification §20.6); they
-//! work on the project in the current directory.
+//! work on the project in the current directory. `crag __image` is not for
+//! people: the session manager starts images with it (Implementation Plan
+//! §11.6.1).
 
 use std::process::ExitCode;
 
@@ -31,6 +33,7 @@ fn main() -> ExitCode {
         ["run"] => ExitCode::from(crag_run(root, &mut std::io::stderr())),
         ["test"] => test(root, None),
         ["test", filter] => test(root, Some(filter)),
+        [crag_session::host::IMAGE_ARG, kind, socket] => image(kind, socket),
         _ => {
             eprint!("{USAGE}");
             ExitCode::from(2)
@@ -41,4 +44,18 @@ fn main() -> ExitCode {
 fn test(root: &std::path::Path, filter: Option<&str>) -> ExitCode {
     let report = crag_test(root, filter, &mut std::io::stdout());
     ExitCode::from(if report.success() { 0 } else { 1 })
+}
+
+fn image(kind: &str, socket: &str) -> ExitCode {
+    let Some(kind) = crag_session::ImageKind::from_name(kind) else {
+        eprintln!("crag image: no image is called `{kind}`");
+        return ExitCode::from(2);
+    };
+    match crag_session::serve(kind, std::path::Path::new(socket)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("crag image: {e}");
+            ExitCode::from(1)
+        }
+    }
 }

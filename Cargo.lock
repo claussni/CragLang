@@ -133,8 +133,10 @@ dependencies = [
  "crag-loader",
  "crag-mir",
  "crag-runtime",
+ "crag-session",
  "crag-syntax",
  "crag-types",
+ "libc",
 ]
 
 [[package]]
@@ -169,6 +171,13 @@ dependencies = [
  "crag-abi",
  "crag-codegen",
  "crag-loader",
+ "libc",
+]
+
+[[package]]
+name = "crag-session"
+version = "0.0.0"
+dependencies = [
  "libc",
 ]
 
