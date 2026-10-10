@@ -1569,3 +1569,95 @@ fn u() {
         ]
     );
 }
+
+/// Each function of the module with the escape level of each parameter
+/// (§11.5.8).
+fn summaries(text: &str) -> Vec<String> {
+    let db = RootDatabase::new();
+    let (program, _, module) = setup(&db, text);
+    let tree = crag_hir::item_tree(&db, module);
+    tree.items
+        .iter()
+        .filter(|i| *i.id.kind(&db) == ItemKind::Function)
+        .map(|i| {
+            let levels: Vec<String> = crag_types::param_escapes(&db, program, i.id)
+                .iter()
+                .map(|l| format!("{l:?}"))
+                .collect();
+            format!("{}: {}", i.id.name(&db).text(&db), levels.join(", "))
+        })
+        .collect()
+}
+
+#[test]
+fn parameters_are_summarized_by_where_they_go() {
+    let text = "fn id(x: Int) -> Int { x }
+fn sum(a: Int, b: Int) -> Int { a + b }
+fn keep(x: Int) -> (v: Int) { (v: x) }
+fn call(f: (Int) -> Int) -> Int { f(1) }
+fn forward(f: (Int) -> Int) -> Int { call(f) }
+fn hand(f: (Int) -> Int, g: ((Int) -> Int) -> Int) -> Int { g(f) }
+fn wrap(x: Int) -> () -> Int { { -> x + 1 } }
+fn ping(x: Int, n: Int) -> Int { if n == 0 { x } else { pong(x, n - 1) } }
+fn pong(x: Int, n: Int) -> Int { ping(x, n) }
+fn mapped(xs: List[Int], k: Int) -> List[Int] { xs.map { n -> n + k } }";
+    assert_eq!(check(text).errors, Vec::<String>::new());
+    assert_eq!(
+        summaries(text),
+        [
+            "id: Escaping",
+            "sum: Local, Local",
+            "keep: Escaping",
+            "call: Local",
+            "forward: Local",
+            "hand: Escaping, Local",
+            "wrap: Escaping",
+            "ping: Escaping, Local",
+            "pong: Escaping, Local",
+            "mapped: Local, Local",
+        ]
+    );
+}
+
+#[test]
+fn bindings_only_values_never_escape() {
+    // §3.12, §9.2, §6.4.1.
+    let text = "fn tally(xs: List[Int]) -> Int {
+  ref total = 0
+  let add = { n: Int -> total.update { t -> t + n } }
+  for x in xs { add(x) }
+  let jobs = [add]
+  total.use()
+}
+fn leak() -> Ref[Int] {
+  ref r = 1
+  r
+}
+fn store(r: Ref[Int]) -> (cell: Ref[Int]) { (cell: r) }
+fn unknown(f: ((Int) -> Int) -> Int) -> Int {
+  ref r = 0
+  f({ n -> r.use() + n })
+}
+fn counter() -> () -> Int {
+  var n = 0
+  { -> n }
+}
+fn fine(xs: List[Int]) -> List[Int] {
+  ref k = 1
+  xs.map { x -> x + k.use() }
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`add`: a closure that carries a ref is bindings-only: it cannot be returned, stored, \
+             emitted or passed to an unknown function",
+            "`r`: a ref is bindings-only: it cannot be returned, stored, emitted or passed to an \
+             unknown function",
+            "`r`: a ref is bindings-only: it cannot be returned, stored, emitted or passed to an \
+             unknown function",
+            "`{ n -> r.use() + n }`: a closure that carries a ref is bindings-only: it cannot be \
+             returned, stored, emitted or passed to an unknown function",
+            "`{ -> n }`: this closure escapes, so it cannot capture the `var` `n`",
+        ]
+    );
+}

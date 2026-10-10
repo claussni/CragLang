@@ -30,7 +30,8 @@
 //! candidates are ranked by specificity (§11.5.4). A call whose union
 //! arguments no candidate takes whole is lifted: split by their members
 //! and recorded as a dispatch (§11.5.5). Once a body is inferred, its
-//! effects are found by a walk over it (§11.5.7). The rest of M2 comes
+//! effects are found by a walk over it (§11.5.7), and where its values go
+//! by another (§11.5.8). The rest of M2 comes
 //! later (§11.5); what needs it is reported as not supported yet rather
 //! than guessed.
 
@@ -47,8 +48,11 @@ use crate::def::{
     HeaderKind, TypeLowerer, alias_target, prelude_item, signature, type_header, value_type,
 };
 use crate::effect::{EffectSet, Walker};
+use crate::escape::{EscapeLevel, EscapeWalker, Escapes};
 use crate::generic::{CallSite, Slot, bind, instantiate, mentions, slots, type_param_names};
-use crate::group::{GroupMember, error_type, function_effects, group_of, result_type};
+use crate::group::{
+    GroupMember, error_type, function_effects, group_of, param_escapes, result_type,
+};
 use crate::overload::{Ranked, most_specific};
 use crate::relate::{declared_fields, fields_of, is_subtype, join, normalize};
 use crate::result::{Callee, Dispatch, DispatchArm, ErrorKind, InferenceResult, Site, TypeError};
@@ -132,6 +136,24 @@ pub fn infer_in_group<'db>(
             walked.effects
         }
     };
+    let escapes = match owner {
+        Owner::Item(item) if *item.kind(db) != ItemKind::Function => Escapes::default(),
+        _ => {
+            let summary_of = |f: ItemId<'db>| cx.escapes_of(f);
+            let names_of = |f: ItemId<'db>| -> Vec<Option<Name<'db>>> {
+                signature(db, program, f)
+                    .params
+                    .iter()
+                    .map(|p| p.name)
+                    .collect()
+            };
+            let walker =
+                EscapeWalker::new(db, body, &cx.bindings, &cx.callees, &summary_of, &names_of);
+            let walked = walker.walk_body();
+            cx.lower.errors.extend(walked.errors);
+            walked.escapes
+        }
+    };
     InferenceResult {
         exprs: cx.exprs,
         pats: cx.pats,
@@ -141,6 +163,7 @@ pub fn infer_in_group<'db>(
         result,
         holes: cx.holes,
         effects,
+        escapes,
         errors: cx.lower.errors,
     }
 }
@@ -420,6 +443,15 @@ impl<'a, 'db> Infer<'a, 'db> {
             return Some(self.join(success, member.errors));
         }
         result_type(self.db, self.program, function)
+    }
+
+    /// The levels of `function`'s parameters: of its group's solution so
+    /// far while that is solved.
+    fn escapes_of(&self, function: ItemId<'db>) -> Vec<EscapeLevel> {
+        match self.group.iter().find(|m| m.function == function) {
+            Some(member) => member.escapes.clone(),
+            None => param_escapes(self.db, self.program, function).clone(),
+        }
     }
 
     /// The effects of `function`: of its group's solution so far while

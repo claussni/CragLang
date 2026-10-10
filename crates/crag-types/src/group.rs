@@ -37,6 +37,7 @@ use crag_hir::{
 
 use crate::def::{prelude_item, signature, success_type};
 use crate::effect::{EffectSet, intrinsic_effects};
+use crate::escape::{EscapeLevel, intrinsic_escapes};
 use crate::infer::infer_in_group;
 use crate::relate::{is_subtype, join, normalize};
 use crate::result::{ErrorKind, Site, TypeError};
@@ -238,6 +239,8 @@ pub struct GroupMember<'db> {
     pub function: ItemId<'db>,
     pub errors: Ty<'db>,
     pub effects: EffectSet,
+    /// The level of each parameter (§11.5.8).
+    pub escapes: Vec<EscapeLevel>,
 }
 
 /// The errors and effects of each member of the group whose first member
@@ -258,6 +261,7 @@ pub fn group_errors<'db>(
             function,
             errors: never,
             effects: EffectSet::NONE,
+            escapes: vec![EscapeLevel::Local; signature(db, program, function).params.len()],
         })
         .collect();
     loop {
@@ -270,9 +274,25 @@ pub fn group_errors<'db>(
                 .map_or(never, |r| error_members(db, program, r));
             let errors = join(db, program, members[i].errors, found);
             let effects = members[i].effects.union(inferred.effects);
-            if errors != members[i].errors || effects != members[i].effects {
+            let escapes: Vec<EscapeLevel> = members[i]
+                .escapes
+                .iter()
+                .zip(
+                    inferred
+                        .escapes
+                        .params
+                        .iter()
+                        .chain(std::iter::repeat(&EscapeLevel::Local)),
+                )
+                .map(|(&a, &b)| a.max(b))
+                .collect();
+            if errors != members[i].errors
+                || effects != members[i].effects
+                || escapes != members[i].escapes
+            {
                 members[i].errors = errors;
                 members[i].effects = effects;
+                members[i].escapes = escapes;
                 grew = true;
             }
         }
@@ -307,6 +327,36 @@ pub fn function_effects<'db>(
         .iter()
         .find(|m| m.function == function)
         .map_or(EffectSet::NONE, |m| m.effects)
+}
+
+/// The level of each parameter of a function: its escape summary
+/// (§11.5.8).
+#[crag_db::tracked(returns(ref), cycle_result = param_escapes_cycle)]
+pub fn param_escapes<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    function: ItemId<'db>,
+) -> Vec<EscapeLevel> {
+    if let Some(escapes) = intrinsic_escapes(db, program, function) {
+        return escapes;
+    }
+    let root = group_of(db, program, function).members[0];
+    group_errors(db, program, root)
+        .iter()
+        .find(|m| m.function == function)
+        .map_or_else(
+            || vec![EscapeLevel::Escaping; signature(db, program, function).params.len()],
+            |m| m.escapes.clone(),
+        )
+}
+
+fn param_escapes_cycle<'db>(
+    db: &'db dyn Db,
+    _id: crag_db::Id,
+    program: Program,
+    function: ItemId<'db>,
+) -> Vec<EscapeLevel> {
+    vec![EscapeLevel::Escaping; signature(db, program, function).params.len()]
 }
 
 /// A function whose effects depend on themselves outside a group, through

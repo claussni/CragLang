@@ -831,18 +831,20 @@ To make the rules checkable, inference now types `ref` and `ext` bindings as `Re
 
 The compiler must know whether a value can outlive the frame that created it: refs and other bindings-only values must never do so (§3.12), and values that never escape can live on the stack or side stack. Each value gets one of three levels: Local (used only in this frame), Scoped (captured by a task that ends before the scope) or Escaping (returned, stored or passed somewhere unknown). Callees are summarized per parameter, and summaries are solved in the group fixpoint (Section 8 of the architecture).
 
+The analysis walks a body once inference has resolved its calls, and gives each binding and each frame, a closure, a `lazy` expression or a local function's body, a level that grows from Local until nothing changes. A value is Escaping where it is returned, also from a closure, whose caller is unknown, placed in a record, collection or construction, held by a `ref` or `ext` cell, emitted, or passed to a closure parameter, a field or a slot. An argument of a declared function goes at the level its summary gives the parameter; a `let` passes on the level of its binding, and a `case` subject the levels of the arms' bindings. A use in a frame that does not declare the binding captures it, so the binding is at least at that frame's level. A summary is the level of each parameter. A C function may keep any argument; the prelude's operations call the functions they are passed and keep only what their result's type parameters can hold, and an access function keeps the value it places in its cell.
+
+Bindings-only values are the `ref` and `ext` cells, values of the types `Ref[T]` and `Ext[T]`, and the closures, `lazy` values and local functions that capture one, directly or through another. Where one goes out itself it is an error; a capture is reported at the closure that carries it. An escaping closure that captures a `var` is an error at the closure (§6.4.1). Nothing gives Scoped yet: the combinators and groups whose tasks capture values, and the rules for groups, hubs and stream ends with their capture counts, come with M4 (§11.7.3, §11.7.5).
+
 **Data structures**
 
 - `EscapeLevel` — Local, Scoped or Escaping, ordered.
-- `ParamSummary` — one level per parameter of a function.
-- `CaptureCount` — per stream end, how many task closures capture it.
+- `Escapes` — the levels of a body's parameters, its summary, and of its frames, which closure conversion places (§11.5.9).
+- `BindingsOnly` — a ref, an `ext` cell, a closure or a `lazy` value, in the error that names it.
 
 **Functions**
 
-- `fn escape_of(value: LocalId, body: &Thir, summaries: &SummaryTable) -> EscapeLevel` — the maximum level over all uses.
-- `fn check_bindings_only(body: &Thir, summaries: &SummaryTable) -> Vec<Diagnostic>` — errors for stored or returned refs, `ext` bindings, groups, hubs, stream ends and ref-carrying closures.
-- `fn check_stream_ends(body: &Thir) -> Vec<Diagnostic>` — each end captured exactly once; a capture inside a loop counts as many.
-- `fn check_var_capture(body: &Thir, escape: &EscapeResult) -> Vec<Diagnostic>` — escaping closures must not capture vars.
+- `fn param_escapes(db: &dyn Db, program: Program, function: ItemId) -> &Vec<EscapeLevel>` — the summary, from the group's solution or by `intrinsic_escapes` for a function without a body.
+- `EscapeWalker::walk_body` — the levels of a body, the errors of its bindings-only values and its escaping closures that capture `var`s.
 
 #### 11.5.9 Closure conversion
 

@@ -21,6 +21,7 @@ use crag_db::Db;
 use crag_hir::{BindingId, BodySourceMap, ExprId, ItemId, Name, PatId, TypeRefId};
 
 use crate::effect::{EffectSet, Restriction};
+use crate::escape::{BindingsOnly, Escapes};
 use crate::generic::{FitError, Instance};
 use crate::ty::Ty;
 
@@ -42,6 +43,8 @@ pub struct InferenceResult<'db> {
     pub holes: Vec<(ExprId, Ty<'db>)>,
     /// What the body does beyond computing (§3.14).
     pub effects: EffectSet,
+    /// Where its parameters and closures go (§11.5.8).
+    pub escapes: Escapes,
     pub errors: Vec<TypeError<'db>>,
 }
 
@@ -308,6 +311,15 @@ pub enum ErrorKind<'db> {
     PureCall {
         function: ItemId<'db>,
     },
+    /// A bindings-only value that is returned, stored, emitted or passed
+    /// to an unknown function (§3.12, §9.2).
+    BindingsOnly {
+        what: BindingsOnly,
+    },
+    /// An escaping closure that captures a `var` (§6.4.1).
+    EscapingVar {
+        name: Name<'db>,
+    },
     /// A ref resolved in another ref's `update` closure (§9.5).
     SecondRef,
     /// An `ext` accessed in an `ext` closure (§9.6).
@@ -476,6 +488,21 @@ impl<'db> ErrorKind<'db> {
             ErrorKind::PureCall { function } => format!(
                 "`{}` is Pure, so the functions passed to it must have no effects",
                 item(function)
+            ),
+            ErrorKind::BindingsOnly { what } => {
+                let what = match what {
+                    BindingsOnly::Ref => "a ref",
+                    BindingsOnly::Ext => "an `ext` cell",
+                    BindingsOnly::Closure => "a closure that carries a ref",
+                    BindingsOnly::Lazy => "a `lazy` value that carries a ref",
+                };
+                format!(
+                    "{what} is bindings-only: it cannot be returned, stored, emitted or passed to an unknown function"
+                )
+            }
+            ErrorKind::EscapingVar { name: n } => format!(
+                "this closure escapes, so it cannot capture the `var` `{}`",
+                name(n)
             ),
             ErrorKind::SecondRef => {
                 "an `update` closure resolves only its own ref; update several in an `atomic` block"
