@@ -47,6 +47,8 @@ pub enum TyKind<'db> {
     Fn {
         params: Vec<Ty<'db>>,
         result: Ty<'db>,
+        /// `is Pure`: the function has no effects (§3.14).
+        pure: bool,
     },
     /// At least two members, none containing another, in a fixed order; no
     /// members is `Never` (§3.6.3).
@@ -79,6 +81,8 @@ pub enum Builtin {
     Set,
     Grid,
     Ref,
+    /// The locking ref of an `ext` binding (§9.6).
+    Ext,
     Lazy,
     /// The type functions `Oks[X]` and `Errs[X]`, the members of `X` that
     /// are not errors and those that are (§8.1). They stay applied only to
@@ -110,6 +114,7 @@ impl Builtin {
             "Set" => (Builtin::Set, 1),
             "Grid" => (Builtin::Grid, 1),
             "Ref" => (Builtin::Ref, 1),
+            "Ext" => (Builtin::Ext, 1),
             "Lazy" => (Builtin::Lazy, 1),
             "Oks" => (Builtin::Oks, 1),
             "Errs" => (Builtin::Errs, 1),
@@ -137,6 +142,7 @@ impl Builtin {
             Builtin::Set => "Set",
             Builtin::Grid => "Grid",
             Builtin::Ref => "Ref",
+            Builtin::Ext => "Ext",
             Builtin::Lazy => "Lazy",
             Builtin::Oks => "Oks",
             Builtin::Errs => "Errs",
@@ -248,8 +254,13 @@ impl<'db> Ty<'db> {
                 }
                 format!("({})", parts.join(", "))
             }
-            TyKind::Fn { params, result } => {
-                format!("({}) -> {}", list(params), result.display(db))
+            TyKind::Fn {
+                params,
+                result,
+                pure,
+            } => {
+                let pure = if *pure { " is Pure" } else { "" };
+                format!("({}) -> {}{pure}", list(params), result.display(db))
             }
             TyKind::Union(members) if members.is_empty() => "Never".into(),
             // Members by their text, which does not depend on the order

@@ -91,6 +91,10 @@ pub(crate) fn atom(p: &mut Parser) {
                 p.start(S::ParenType);
                 p.bump();
                 ty(p);
+                // A function type's markers: `((Int) -> Int is Pure)`.
+                if p.at(T::Is) {
+                    is_clause(p);
+                }
                 p.expect(T::RParen, "`)`");
                 p.finish_node();
             }

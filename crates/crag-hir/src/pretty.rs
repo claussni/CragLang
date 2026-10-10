@@ -36,6 +36,9 @@ pub fn pretty(db: &dyn Db, body: &Body) -> String {
         if let Some(result) = body.result {
             let _ = write!(out, " -> {}", p.ty(result));
         }
+        if body.pure {
+            out.push_str(" is Pure");
+        }
         out.push(' ');
     }
     if let Some((pat, ty)) = body.pattern {
@@ -435,9 +438,14 @@ impl Printer<'_, '_> {
                 }
                 format!("({})", fields.join(", "))
             }
-            TypeRef::Fn { params, result } => {
+            TypeRef::Fn {
+                params,
+                result,
+                pure,
+            } => {
                 let params: Vec<String> = params.iter().map(|&p| self.ty(p)).collect();
-                format!("(({}) -> {})", params.join(", "), self.ty(*result))
+                let pure = if *pure { " is Pure" } else { "" };
+                format!("(({}) -> {}{pure})", params.join(", "), self.ty(*result))
             }
             TypeRef::Union(members) => {
                 let members: Vec<String> = members.iter().map(|&m| self.ty(m)).collect();

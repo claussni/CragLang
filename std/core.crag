@@ -59,6 +59,24 @@ pub fn discard[X](x: X) -> () | Errs[X] prefix "~"
 pub fn check[X](x: X) -> Option[Oks[X]] prefix "?"
 pub fn expect[X](x: X) -> Oks[X] prefix "!!"
 
+// Shared state (§9): the refs of `ref` and the locking refs of `ext`, with
+// their access functions, which pass closures (§9.3).
+pub type Ref[T]
+pub type Ext[T]
+pub fn use[T](r: Ref[T]) -> T
+pub fn use[T, U](r: Ref[T], f: (T) -> U) -> U
+pub fn update[T, R](r: Ref[T], f: (T) -> R) -> () | Errs[R]
+pub fn swap[T](r: Ref[T], new: T) -> T
+pub fn empty[T](r: Ref[Option[T]]) -> Option[T]
+pub fn use[T](r: Ext[T]) -> T
+pub fn use[T, U](r: Ext[T], f: (T) -> U) -> U
+pub fn update[T, R](r: Ext[T], f: (T) -> R) -> () | Errs[R]
+pub fn swap[T](r: Ext[T], new: T) -> T
+pub fn empty[T](r: Ext[Option[T]]) -> Option[T]
+
+// The parent of every signal type (§11.1).
+pub distinct type Signal
+
 pub type Range[T](first: T, last: T)
 pub type RangeFrom[T](first: T)
 

@@ -50,6 +50,19 @@ pub type Errs[X]
 pub fn discard[X](x: X) -> () | Errs[X] prefix "~"
 pub fn check[X](x: X) -> Option[Oks[X]] prefix "?"
 pub fn expect[X](x: X) -> Oks[X] prefix "!!"
+pub type Ref[T]
+pub type Ext[T]
+pub fn use[T](r: Ref[T]) -> T
+pub fn use[T, U](r: Ref[T], f: (T) -> U) -> U
+pub fn update[T, R](r: Ref[T], f: (T) -> R) -> () | Errs[R]
+pub fn swap[T](r: Ref[T], new: T) -> T
+pub fn empty[T](r: Ref[Option[T]]) -> Option[T]
+pub fn use[T](r: Ext[T]) -> T
+pub fn use[T, U](r: Ext[T], f: (T) -> U) -> U
+pub fn update[T, R](r: Ext[T], f: (T) -> R) -> () | Errs[R]
+pub fn swap[T](r: Ext[T], new: T) -> T
+pub fn empty[T](r: Ext[Option[T]]) -> Option[T]
+pub distinct type Signal
 pub fn add(a: Int, b: Int) -> Int
 pub fn add(a: Int8, b: Int8) -> Int8
 pub fn add(a: Float, b: Float) -> Float
@@ -574,14 +587,10 @@ fn f(p: Pair[Int], q: Pair, r: Fixed[Int], t: Tree) -> Int {
 fn not_yet_supported_is_reported() {
     let text = "fn f(xs: List[Int]) {
   fn local[T](x: T) -> T { x }
-  ref r = 1
 }";
     assert_eq!(
         errors(text),
-        [
-            "`local`: generic local functions are not supported yet",
-            "`r`: `ref` and `ext` bindings are not supported yet",
-        ]
+        ["`local`: generic local functions are not supported yet"]
     );
 }
 
@@ -1402,6 +1411,49 @@ fn user(n: Int) -> Int { depth(n) }";
              `measure` must state their success types",
             "`b(n)`: this call makes `a`, `b` and `c` recursive, so `a`, `b` and `c` must state \
              their success types",
+        ]
+    );
+}
+
+#[test]
+fn refs_atomic_blocks_and_signals_are_typed() {
+    // §9.3: refs are cells reached through access functions that pass
+    // closures; an `atomic` block gives its value or the error that
+    // aborts it (§9.5.1); a signal spreads `Signal` (§11.1).
+    let text = "type Account(balance: Int)
+type InsufficientFunds(..Error)
+type Placed(..Signal, id: Int)
+fn f(amount: Int) {
+  ref hits = 0
+  hits.update { n -> n + 1 }
+  let snapshot = hits.use { n -> n * 2 }
+  let n = hits.use()
+  let old = hits.swap(5)
+  ref from = Account(balance: 100)
+  let r = atomic {
+    if from.use { a -> a.balance } < amount { return InsufficientFunds() }
+    from.update { a -> Account(balance: a.balance - amount) }
+  }
+  emit Placed(id: 1)
+}";
+    assert_eq!(
+        ok(text).last().unwrap(),
+        "amount: Int, hits: Ref[Int], n: Int, n: Int, snapshot: Int, n: Int, old: Int, from: Ref[Account], \
+         a: Account, a: Account, r: () | InsufficientFunds, -> ()"
+    );
+    let text = "type Note(text: Str)
+fn f() {
+  ref hits = 0
+  hits.update { n -> \"x\" }
+  emit Note(text: \"n\")
+  let x: Int = hits
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`hits.update { n -> \"x\" }`: expected Int, found Str",
+            "`Note(text: \"n\")`: expected Signal, found Note",
+            "`hits`: expected Int, found Ref[Int]",
         ]
     );
 }

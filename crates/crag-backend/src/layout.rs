@@ -70,6 +70,7 @@ pub fn layout<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Lay
             | Builtin::Set
             | Builtin::Grid
             | Builtin::Ref
+            | Builtin::Ext
             | Builtin::Lazy => Layout::Box,
             b => Layout::Imm(*b),
         },

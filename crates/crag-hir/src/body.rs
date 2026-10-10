@@ -94,6 +94,7 @@ pub fn lower_body<'db>(db: &'db dyn Db, program: Program, owner: Owner<'db>) -> 
     match node.kind() {
         S::FnDecl => {
             let (params, result, root) = lower.function(&node);
+            lower.body.pure = lower.pure_marker(&node);
             lower.body.params = params;
             lower.body.result = result;
             lower.body.root = root;

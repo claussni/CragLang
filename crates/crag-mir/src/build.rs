@@ -80,6 +80,7 @@ pub(crate) fn counted<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bo
                 | Builtin::Set
                 | Builtin::Grid
                 | Builtin::Ref
+                | Builtin::Ext
                 | Builtin::Lazy
                 | Builtin::Oks
                 | Builtin::Errs

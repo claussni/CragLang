@@ -476,11 +476,22 @@ impl<'a, 'db> TypeLowerer<'a, 'db> {
                 }
                 Ty::record(db, lowered, open)
             }
-            TypeRef::Fn { params, result } => {
-                let (params, result) = (params.clone(), *result);
+            TypeRef::Fn {
+                params,
+                result,
+                pure,
+            } => {
+                let (params, result, pure) = (params.clone(), *result, *pure);
                 let params = params.into_iter().map(|p| self.lower(p)).collect();
                 let result = self.lower(result);
-                Ty::new(db, TyKind::Fn { params, result })
+                Ty::new(
+                    db,
+                    TyKind::Fn {
+                        params,
+                        result,
+                        pure,
+                    },
+                )
             }
             TypeRef::Union(members) => {
                 let members: Vec<_> = members.clone().into_iter().map(|m| self.lower(m)).collect();

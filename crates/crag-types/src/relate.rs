@@ -89,13 +89,18 @@ fn subtype<'db>(db: &'db dyn Db, program: Program, s: Ty<'db>, t: Ty<'db>, depth
             TyKind::Fn {
                 params: s_params,
                 result: s_result,
+                pure: s_pure,
             },
             TyKind::Fn {
                 params: t_params,
                 result: t_result,
+                pure: t_pure,
             },
         ) => {
-            s_params.len() == t_params.len()
+            // A Pure function fits where any is expected, never the
+            // reverse (§3.13.3).
+            (*s_pure || !*t_pure)
+                && s_params.len() == t_params.len()
                 && t_params.iter().zip(s_params).all(|(&x, &y)| fits(x, y))
                 && fits(*s_result, *t_result)
         }
@@ -325,9 +330,14 @@ pub fn subst<'db>(
             fields: fields.iter().map(|&(n, t)| (n, go(t))).collect(),
             open: *open,
         },
-        TyKind::Fn { params, result } => TyKind::Fn {
+        TyKind::Fn {
+            params,
+            result,
+            pure,
+        } => TyKind::Fn {
             params: params.iter().map(|&t| go(t)).collect(),
             result: go(*result),
+            pure: *pure,
         },
         // A member can become a union, or contain another member.
         TyKind::Union(members) => {

@@ -85,6 +85,7 @@ fn lower(text: &str) -> (Vec<String>, Vec<String>) {
                 LowerError::MisplacedSpread { range } => ("misplaced spread".into(), range),
                 LowerError::ExpectedType { range } => ("expected a type".into(), range),
                 LowerError::ExpectedValue { range } => ("expected a value".into(), range),
+                LowerError::Marker { range } => ("not a function marker".into(), range),
             };
             errors.push(format!("line {}: {what}", line(range.start)));
         }
@@ -383,4 +384,23 @@ test "t" { ~ !! parse("1") }
             pretty(&db, body);
         }
     }
+}
+
+#[test]
+fn functions_and_function_types_are_marked_pure() {
+    let (bodies, errors) = lower(
+        "fn f(g: ((Int) -> Int is Pure), h: (Int) -> Int) -> Int is Pure { 1 }\n\
+         fn k(x: (Int is Pure)) -> Int is Solid { 1 }",
+    );
+    assert_eq!(
+        errors,
+        [
+            "line 2: not a function marker",
+            "line 2: not a function marker"
+        ]
+    );
+    assert_eq!(
+        bodies[0],
+        "(params g$0: ((Int) -> Int is Pure) h$1: ((Int) -> Int)) -> Int is Pure {1}"
+    );
 }

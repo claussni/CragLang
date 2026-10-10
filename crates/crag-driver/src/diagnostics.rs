@@ -216,6 +216,10 @@ fn lower_error(db: &dyn Db, error: &LowerError) -> (Range<u32>, String) {
         LowerError::ExpectedValue { range } => {
             (range.clone(), "a value is expected here, not a type".into())
         }
+        LowerError::Marker { range } => (
+            range.clone(),
+            "only `Pure` marks a function or a function type".into(),
+        ),
     }
 }
 

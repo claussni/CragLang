@@ -676,11 +676,9 @@ impl<'a, 'db> Infer<'a, 'db> {
                 self.error(Site::Expr(id), ErrorKind::PassOutsideCase);
                 self.err_ty()
             }
-            Expr::Atomic(inner) => {
-                self.error(Site::Expr(id), ErrorKind::Unsupported("`atomic` blocks"));
-                self.synth(*inner);
-                self.err_ty()
-            }
+            // A transaction: its value, an error aborting it, and a
+            // `return` ends it with its value (§9.5.1).
+            Expr::Atomic(inner) => self.frame(expected, *inner, false),
             Expr::Lazy(inner) => {
                 let wanted = expected.and_then(|e| self.member_builtin(e, &[Builtin::Lazy]));
                 let ty = match wanted {
@@ -809,7 +807,14 @@ impl<'a, 'db> Infer<'a, 'db> {
             .map(|p| p.ty)
             .collect();
         let result = self.success(id, function);
-        Ty::new(db, TyKind::Fn { params, result })
+        Ty::new(
+            db,
+            TyKind::Fn {
+                params,
+                result,
+                pure: false,
+            },
+        )
     }
 
     /// A call of a function whose success type is unknown. One of a
@@ -857,7 +862,14 @@ impl<'a, 'db> Infer<'a, 'db> {
                     CandidateKind::Slot(k) => self.slots()[k as usize].result,
                     _ => self.result_of(c.function).unwrap_or_else(|| self.err_ty()),
                 };
-                let ty = Ty::new(db, TyKind::Fn { params, result });
+                let ty = Ty::new(
+                    db,
+                    TyKind::Fn {
+                        params,
+                        result,
+                        pure: false,
+                    },
+                );
                 if c.kind != CandidateKind::Generic {
                     return Some((i, ty, Vec::new()));
                 }
@@ -957,7 +969,7 @@ impl<'a, 'db> Infer<'a, 'db> {
         expected: Option<Ty<'db>>,
     ) -> Option<Ty<'db>> {
         let db = self.db;
-        let TyKind::Fn { params, result } = expected?.kind(db) else {
+        let TyKind::Fn { params, result, .. } = expected?.kind(db) else {
             return None;
         };
         let (params, result) = (params.clone(), *result);
@@ -986,7 +998,14 @@ impl<'a, 'db> Infer<'a, 'db> {
             arms,
         };
         self.callees.push((id, Callee::Dispatch(dispatch)));
-        Some(Ty::new(db, TyKind::Fn { params, result }))
+        Some(Ty::new(
+            db,
+            TyKind::Fn {
+                params,
+                result,
+                pure: false,
+            },
+        ))
     }
 
     /// A type named where a value is expected: a tag, whose type
@@ -1161,7 +1180,7 @@ impl<'a, 'db> Infer<'a, 'db> {
         fields: Option<&[FieldArg<'db>]>,
     ) -> Ty<'db> {
         let db = self.db;
-        let TyKind::Fn { params, result } = ty.kind(db) else {
+        let TyKind::Fn { params, result, .. } = ty.kind(db) else {
             if !ty.is_error(db) {
                 self.error(Site::Expr(id), ErrorKind::NotCallable { ty });
             }
@@ -1483,7 +1502,14 @@ impl<'a, 'db> Infer<'a, 'db> {
         };
         if let Some(callee) = callee {
             let params = params.iter().map(|p| p.ty).collect();
-            self.exprs[callee.index()] = Some(Ty::new(db, TyKind::Fn { params, result }));
+            self.exprs[callee.index()] = Some(Ty::new(
+                db,
+                TyKind::Fn {
+                    params,
+                    result,
+                    pure: false,
+                },
+            ));
         }
         result
     }
@@ -1615,7 +1641,14 @@ impl<'a, 'db> Infer<'a, 'db> {
         };
         self.callees.push((id, Callee::Dispatch(dispatch)));
         if let Some(callee) = callee {
-            self.exprs[callee.index()] = Some(Ty::new(db, TyKind::Fn { params, result }));
+            self.exprs[callee.index()] = Some(Ty::new(
+                db,
+                TyKind::Fn {
+                    params,
+                    result,
+                    pure: false,
+                },
+            ));
         }
         Some(result)
     }
@@ -2024,6 +2057,22 @@ impl<'a, 'db> Infer<'a, 'db> {
         let db = self.db;
         let mapping = function.module(db).path(db) == PRELUDE
             && matches!(function.name(db).text(db).as_str(), "check" | "expect");
+        // `update`'s closure gives the ref's type or an error (§9.3).
+        if function.module(db).path(db) == PRELUDE
+            && function.name(db).text(db) == "update"
+            && let [t, r] = args
+            && !t.is_error(db)
+            && !r.is_error(db)
+        {
+            let found = self.successes_of(*r);
+            if !self.fits(found, *t) {
+                let kind = ErrorKind::Mismatch {
+                    expected: *t,
+                    found,
+                };
+                self.error(Site::Expr(id), kind);
+            }
+        }
         let [x] = args else { return };
         if !mapping || x.is_error(db) {
             return;
@@ -2282,7 +2331,17 @@ impl<'a, 'db> Infer<'a, 'db> {
             Expr::Closure { params, .. } => {
                 let params = vec![Ty::error(db); params.len()];
                 let result = Ty::error(db);
-                self.infer(arg, Some(Ty::new(db, TyKind::Fn { params, result })));
+                self.infer(
+                    arg,
+                    Some(Ty::new(
+                        db,
+                        TyKind::Fn {
+                            params,
+                            result,
+                            pure: false,
+                        },
+                    )),
+                );
             }
             // A function that only the call's parameter would choose.
             Expr::Name { .. } => self.exprs[arg.index()] = Some(Ty::error(db)),
@@ -2861,9 +2920,9 @@ impl<'a, 'db> Infer<'a, 'db> {
         let db = self.db;
         let wanted = expected.and_then(|e| {
             e.members(db).into_iter().find_map(|m| match m.kind(db) {
-                TyKind::Fn { params: p, result } if p.len() == params.len() => {
-                    Some((p.clone(), *result))
-                }
+                TyKind::Fn {
+                    params: p, result, ..
+                } if p.len() == params.len() => Some((p.clone(), *result)),
                 _ => None,
             })
         });
@@ -2908,6 +2967,7 @@ impl<'a, 'db> Infer<'a, 'db> {
             TyKind::Fn {
                 params: param_tys,
                 result,
+                pure: false,
             },
         )
     }
@@ -3245,19 +3305,19 @@ impl<'a, 'db> Infer<'a, 'db> {
                 unit
             }
             Stmt::Bind { binding, ty, value } => {
-                if self.body.binding(*binding).kind != crag_hir::BindingKind::Var {
-                    let kind = ErrorKind::Unsupported("`ref` and `ext` bindings");
-                    self.error(Site::Binding(*binding), kind);
-                    self.synth(*value);
-                    self.bindings[binding.index()] = Some(self.err_ty());
-                    return unit;
-                }
                 let ty = match self.written(*ty) {
                     Some(ty) => {
                         self.check(*value, ty);
                         ty
                     }
                     None => self.synth(*value),
+                };
+                // A `ref` or `ext` binding is the cell, not its value
+                // (§9.1, §9.6).
+                let ty = match self.body.binding(*binding).kind {
+                    BindingKind::Ref => self.builtin_of(Builtin::Ref, vec![ty]),
+                    BindingKind::Ext => self.builtin_of(Builtin::Ext, vec![ty]),
+                    _ => ty,
                 };
                 self.bindings[binding.index()] = Some(ty);
                 unit
@@ -3288,9 +3348,14 @@ impl<'a, 'db> Infer<'a, 'db> {
                 self.meet(vec![(unit, before), (ty, after)]);
                 unit
             }
+            // A signal spreads the prelude's `Signal` (§11.1).
             Stmt::Emit { value, .. } => {
-                self.error(Site::Expr(*value), ErrorKind::Unsupported("signals"));
-                self.synth(*value);
+                if prelude_item(db, self.program, "Signal").is_some() {
+                    let signal = prelude_type(db, self.program, "Signal");
+                    self.check(*value, signal);
+                } else {
+                    self.synth(*value);
+                }
                 unit
             }
             Stmt::Return(value) => {
@@ -3541,6 +3606,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                 TyKind::Fn {
                     params: params.clone(),
                     result,
+                    pure: false,
                 },
             );
             self.bindings[binding.index()] = Some(ty);
@@ -3552,7 +3618,14 @@ impl<'a, 'db> Infer<'a, 'db> {
             None => expected.unwrap_or_else(|| Ty::error(db)),
         };
         self.narrowed = outside;
-        self.bindings[binding.index()] = Some(Ty::new(db, TyKind::Fn { params, result }));
+        self.bindings[binding.index()] = Some(Ty::new(
+            db,
+            TyKind::Fn {
+                params,
+                result,
+                pure: false,
+            },
+        ));
     }
 
     // Patterns.

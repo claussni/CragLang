@@ -114,6 +114,11 @@ pub enum LowerError<'db> {
     ExpectedValue {
         range: Range<u32>,
     },
+    /// A marker other than `Pure` on a function or a function type, or a
+    /// marker on another type in parentheses (§3.14).
+    Marker {
+        range: Range<u32>,
+    },
 }
 
 pub(crate) struct Lowerer<'a, 'db> {
@@ -470,6 +475,32 @@ impl<'a, 'db> Lowerer<'a, 'db> {
         decl
     }
 
+    /// Whether an `is` clause among a node's children marks it `Pure`;
+    /// other markers are errors.
+    pub(crate) fn pure_marker(&mut self, node: &SyntaxNode) -> bool {
+        let Some(clause) = child(node, S::IsClause) else {
+            return false;
+        };
+        let mut pure = false;
+        for marker in clause.children().filter(|n| n.kind() == S::Marker) {
+            let negated = marker.tokens().any(|t| t.kind() == LeafKind::Token(T::Not));
+            let named = marker
+                .children()
+                .next()
+                .filter(|t| t.kind() == S::NamedType && child(t, S::TypeArgs).is_none())
+                .and_then(|t| first_token(&t))
+                .is_some_and(|t| t.text() == "Pure");
+            if named && !negated {
+                pure = true;
+            } else {
+                self.errors.push(LowerError::Marker {
+                    range: marker.range(),
+                });
+            }
+        }
+        pure
+    }
+
     pub fn function(
         &mut self,
         node: &SyntaxNode,
@@ -629,6 +660,7 @@ impl<'a, 'db> Lowerer<'a, 'db> {
                     None => self.alloc_binding(None, BindingKind::Fn, node.range()),
                 };
                 let (params, result, body) = self.closure_scope(|this| this.function(node));
+                let pure = self.pure_marker(node);
                 Stmt::Fn {
                     binding,
                     function: LocalFn {
@@ -636,6 +668,7 @@ impl<'a, 'db> Lowerer<'a, 'db> {
                             || child(node, S::WhereClause).is_some(),
                         params,
                         result,
+                        pure,
                         body,
                     },
                 }
@@ -1604,7 +1637,26 @@ impl<'a, 'db> Lowerer<'a, 'db> {
             S::InferType | S::Placeholder => TypeRef::Infer,
             S::UnitType => TypeRef::Unit,
             S::ParenType => {
-                return self.type_or_missing(node.children().next(), node);
+                let inner = self.type_or_missing(node.children().next(), node);
+                if child(node, S::IsClause).is_none() {
+                    return inner;
+                }
+                let pure = self.pure_marker(node);
+                match self.body.types[inner.index()].clone() {
+                    TypeRef::Fn { params, result, .. } => TypeRef::Fn {
+                        params,
+                        result,
+                        pure,
+                    },
+                    other => {
+                        if pure {
+                            self.errors.push(LowerError::Marker {
+                                range: range.clone(),
+                            });
+                        }
+                        other
+                    }
+                }
             }
             S::ParenExpr => {
                 let inner = node.children().next().and_then(|l| l.children().next());
@@ -1670,7 +1722,11 @@ impl<'a, 'db> Lowerer<'a, 'db> {
                     .unwrap_or_default();
                 let result = node.children().find(|n| n.kind() != S::FnTypeParams);
                 let result = self.type_or_missing(result, node);
-                TypeRef::Fn { params, result }
+                TypeRef::Fn {
+                    params,
+                    result,
+                    pure: false,
+                }
             }
             S::UnionType => TypeRef::Union(node.children().map(|t| self.type_node(&t)).collect()),
             _ => self.not_a_type(node),

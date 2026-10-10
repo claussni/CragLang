@@ -363,6 +363,10 @@ pub(crate) fn fn_decl(p: &mut Parser) {
         p.bump();
         ty(p);
         p.finish_node();
+        // `is Pure` (§3.14).
+        if p.at(T::Is) {
+            is_clause(p);
+        }
     }
     if p.nth_past_newlines(0).0 == T::Where {
         p.eat_newlines();

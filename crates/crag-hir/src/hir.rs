@@ -59,6 +59,8 @@ pub struct Body<'db> {
     pub params: Vec<Param>,
     /// A function's written result type.
     pub result: Option<TypeRefId>,
+    /// Whether a function is marked `is Pure` (§3.14).
+    pub pure: bool,
     /// A module-level `let`: its pattern, whose bindings are the module's
     /// values, and its type.
     pub pattern: Option<(PatId, Option<TypeRefId>)>,
@@ -480,6 +482,8 @@ pub struct LocalFn {
     pub generic: bool,
     pub params: Vec<Param>,
     pub result: Option<TypeRefId>,
+    /// Whether it is marked `is Pure` (§3.14).
+    pub pure: bool,
     pub body: Option<ExprId>,
 }
 
@@ -551,6 +555,8 @@ pub enum TypeRef<'db> {
     Fn {
         params: Vec<TypeRefId>,
         result: TypeRefId,
+        /// Marked `is Pure`: its functions have no effects (§3.14).
+        pure: bool,
     },
     Union(Vec<TypeRefId>),
 }

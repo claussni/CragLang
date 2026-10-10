@@ -572,6 +572,7 @@ fn fit_slots<'db>(
             TyKind::Fn {
                 params: params.clone(),
                 result,
+                pure: false,
             },
         );
         match fill(db, program, name, &params, result, at, depth) {
@@ -703,7 +704,7 @@ pub(crate) fn mentions<'db>(
         TyKind::Error | TyKind::Param(None, ..) => false,
         TyKind::Builtin(_, args) | TyKind::Named(_, args) => args.iter().any(go),
         TyKind::Record { fields, .. } => fields.iter().any(|(_, t)| go(t)),
-        TyKind::Fn { params, result } => params.iter().any(go) || go(result),
+        TyKind::Fn { params, result, .. } => params.iter().any(go) || go(result),
         TyKind::Union(members) => members.iter().any(go),
     }
 }
@@ -717,7 +718,7 @@ pub(crate) fn mentions_any<'db>(db: &'db dyn Db, ty: Ty<'db>) -> bool {
             args.iter().any(|&t| mentions_any(db, t))
         }
         TyKind::Record { fields, .. } => fields.iter().any(|&(_, t)| mentions_any(db, t)),
-        TyKind::Fn { params, result } => {
+        TyKind::Fn { params, result, .. } => {
             params.iter().any(|&t| mentions_any(db, t)) || mentions_any(db, *result)
         }
         TyKind::Union(members) => members.iter().any(|&t| mentions_any(db, t)),
@@ -777,10 +778,12 @@ pub(crate) fn bind<'db>(
             TyKind::Fn {
                 params: pp,
                 result: pr,
+                ..
             },
             TyKind::Fn {
                 params: fp,
                 result: fr,
+                ..
             },
         ) if pp.len() == fp.len() => {
             for (&p, &f) in pp.iter().zip(fp) {
