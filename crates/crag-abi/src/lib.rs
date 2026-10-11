@@ -244,11 +244,23 @@ pub enum RuntimeFn {
     /// [`Number`] whose [`Number::code`] is `number`. A code point is its
     /// character.
     TextShow = 13,
+
+    /// `rt_disposal(ctx) -> (ptr, code)`.
+    ///
+    /// The next box whose dispose handler must run, and the address of its
+    /// dispose code, or two zeros when none waits (Implementation Plan
+    /// §11.6.11). Freeing a box of a type with a handler does not free it:
+    /// the runtime gives it a count of one again and queues it, since it
+    /// never runs Crag code itself. Generated code calls this after every
+    /// release that may free boxes, and calls each `code(ctx, ptr)`, which
+    /// takes the reference. The runtime clears the box's word of the code
+    /// first, so the next time its count reaches zero it is freed.
+    Disposal = 14,
 }
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 14] = [
+    pub const ALL: [RuntimeFn; 15] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -263,6 +275,7 @@ impl RuntimeFn {
         RuntimeFn::TextConcat,
         RuntimeFn::TextEquals,
         RuntimeFn::TextShow,
+        RuntimeFn::Disposal,
     ];
 
     /// The symbol the loader looks up.
@@ -282,6 +295,7 @@ impl RuntimeFn {
             RuntimeFn::TextConcat => "rt_text_concat",
             RuntimeFn::TextEquals => "rt_text_equals",
             RuntimeFn::TextShow => "rt_text_show",
+            RuntimeFn::Disposal => "rt_disposal",
         }
     }
 
@@ -371,8 +385,13 @@ pub const STATIC_COUNT: u64 = 1 << 63;
 /// it allocates, and the image indexes the descriptors by type index.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TypeDescriptor {
-    /// A record: the fields that hold counted references.
-    Record { counted: Vec<CountedField> },
+    /// A record: the fields that hold counted references, and for a type
+    /// with a dispose handler the offset of the word that holds the
+    /// address of its dispose code, zero once the handler has run.
+    Record {
+        counted: Vec<CountedField>,
+        dispose: Option<u32>,
+    },
     /// A list, whose elements each take `element.words` words.
     List { element: ElementLayout },
     /// A map, or a set when the value has no words. Keys are equal when

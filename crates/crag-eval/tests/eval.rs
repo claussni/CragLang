@@ -47,6 +47,7 @@ pub fn lessThan(a: Int, b: Int) -> Bool
 pub fn equals(a: Str, b: Str) -> Bool
 pub distinct type Error
 pub distinct type LifecycleHandler
+pub distinct type Dispose[T](..LifecycleHandler) where HandlerForm[(T) -> ()]
 pub distinct type Embed[T](..LifecycleHandler)
   where HandlerForm[((Bytes) -> T | EmbedError) | ((Str) -> T | EmbedError), is Pure]
 pub type EmbedError(..Error, message: Str, line: Int = 0, column: Int = 0)
@@ -390,12 +391,28 @@ let stamp = clock()
 let adder = { n: Int -> n + 1 }
 let named: (Int) -> Int = inc
 let pair = (f: inc, n: 1)
+
+distinct type Guard(n: Int)
+  on Dispose close
+fn close(g: Guard) -> () {}
+let guard = Guard(n: 1)
+let through = { let g = Guard(n: 2); g.n }
 "#,
     );
     for name in ["adder", "named", "pair"] {
         assert_eq!(
             p.eval(name),
             Err(EvalError::NotConstant("it holds a function value".into())),
+            "{name}"
+        );
+    }
+    // Dispose handlers run when the program drops values.
+    for name in ["guard", "through"] {
+        assert_eq!(
+            p.eval(name),
+            Err(EvalError::NotConstant(
+                "it makes values with dispose handlers".into()
+            )),
             "{name}"
         );
     }

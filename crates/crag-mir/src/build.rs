@@ -42,9 +42,9 @@ use crag_hir::{
 use crag_types::{
     Builtin, Callee, DecisionTree, Dispatch, EscapeLevel, Filling, Handler, HandlerCode,
     InferenceResult, Instance, ListLen, Position, SigParam, Signature, Step, Ty, TyKind,
-    TypeDefKind, Value, body_types, decision_tree_with, declared_fields, fields_of,
-    lifecycle_handler, literal_value, prelude_item, result_type, signature, subst, type_def,
-    type_header, value_type,
+    TypeDefKind, Value, body_types, decision_tree_with, declared_fields, dispose_handler,
+    fields_of, lifecycle_handler, literal_value, prelude_item, result_type, signature, subst,
+    type_def, type_header, value_type,
 };
 
 use crate::ir::{
@@ -86,6 +86,7 @@ pub fn build<'db>(
         Entry::Closure(frame) => b.closure_entry(frame),
         Entry::Function(expr) => b.function_entry(expr),
         Entry::Default(expr) => b.default_entry(expr),
+        Entry::Dispose => b.dispose_entry(),
     };
     match start {
         Some(start) if ok => start(&mut b),
@@ -446,6 +447,50 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         };
         self.params = self.locals.len();
         Some(Box::new(move |b| b.eval(default, Dest::Return)))
+    }
+
+    /// The dispose code of the type: the box, whose count reached zero and
+    /// which the runtime gave a reference again, then a call of the
+    /// handler, which takes it.
+    fn dispose_entry(&mut self) -> Option<Start<'a, 'db>> {
+        let db = self.db;
+        let Owner::Item(item) = self.owner else {
+            return None;
+        };
+        let ty = Ty::new(db, TyKind::Named(item, self.instance.args(db).clone()));
+        let handler = lifecycle_handler(db, self.program, ty, "Dispose")?;
+        let value = self.temp(ty);
+        self.params = self.locals.len();
+        Some(Box::new(move |b| {
+            let param = match handler.ty.kind(db) {
+                TyKind::Fn { params, .. } => params.first().copied().unwrap_or(ty),
+                _ => ty,
+            };
+            let arg = b.coerce(Operand::Local(value), ty, param);
+            let site = handler.clause;
+            if b.call_handler(&handler, vec![arg], site).is_none() {
+                b.trap(TrapKind::Error, Some(site));
+                return;
+            }
+            b.terminate(Terminator::Return(b.unit()));
+        }))
+    }
+
+    /// The dispose code a box of a record type holds: that of the nearest
+    /// type it is or spreads with a handler.
+    fn dispose_code(&self, ty: Ty<'db>) -> Option<InstanceKey<'db>> {
+        let db = self.db;
+        let (declaring, _) = dispose_handler(db, self.program, ty)?;
+        let TyKind::Named(item, args) = declaring.kind(db) else {
+            return None;
+        };
+        Some(InstanceKey::new(
+            db,
+            Owner::Item(*item),
+            args.clone(),
+            Vec::new(),
+            Entry::Dispose,
+        ))
     }
 
     /// The code of a declared function used as a value at `expr`: an empty
@@ -1102,7 +1147,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     let op = self.coerce(op, self.ty(e), field_ty);
                     values.push((name, op));
                 }
-                self.assign(ty, Rvalue::Record { ty, fields: values })
+                let dispose = self.dispose_code(ty);
+                self.assign(
+                    ty,
+                    Rvalue::Record {
+                        ty,
+                        fields: values,
+                        dispose,
+                    },
+                )
             }
             Expr::Record(fields) => self.record(expr, ty, &[], fields),
             Expr::List(items) => {
@@ -2175,7 +2228,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             };
             out.push((name, op));
         }
-        self.assign(ty, Rvalue::Record { ty, fields: out })
+        let dispose = self.dispose_code(ty);
+        self.assign(
+            ty,
+            Rvalue::Record {
+                ty,
+                fields: out,
+                dispose,
+            },
+        )
     }
 
     // Statements.

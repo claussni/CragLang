@@ -60,7 +60,9 @@ pub use group::{
     Group, GroupMember, callees, error_members, error_type, function_effects, group_errors,
     group_of, param_escapes, recursion_errors, result_type, success_members,
 };
-pub use handler::{Handler, HandlerCode, Handlers, lifecycle_handler, type_handlers};
+pub use handler::{
+    Handler, HandlerCode, Handlers, dispose_handler, lifecycle_handler, type_handlers,
+};
 pub use infer::constant as literal_value;
 pub use overload::{Ranked, Specificity, compare_param, most_specific, overload_errors};
 pub use relate::{declared_fields, fields_of, is_subtype, join, normalize, parent, subst};

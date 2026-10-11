@@ -852,7 +852,13 @@ mod tests {
     fn types() -> Types {
         let word = |counted| ElementLayout { words: 1, counted };
         Types::new([
-            (REC, TypeDescriptor::Record { counted: vec![] }),
+            (
+                REC,
+                TypeDescriptor::Record {
+                    counted: vec![],
+                    dispose: None,
+                },
+            ),
             (
                 INTS,
                 TypeDescriptor::Map {

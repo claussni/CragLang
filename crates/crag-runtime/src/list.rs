@@ -899,7 +899,13 @@ mod tests {
             element: ElementLayout { words, counted },
         };
         Types::new([
-            (REC, TypeDescriptor::Record { counted: vec![] }),
+            (
+                REC,
+                TypeDescriptor::Record {
+                    counted: vec![],
+                    dispose: None,
+                },
+            ),
             (INTS, list(1, vec![])),
             (BOXES, list(1, vec![CountedField::Box(0)])),
             (

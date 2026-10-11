@@ -173,10 +173,12 @@ pub enum Rvalue<'db> {
         a: Operand<'db>,
         b: Operand<'db>,
     },
-    /// A record, its fields in the order of `fields_of`.
+    /// A record, its fields in the order of `fields_of`; for a type with a
+    /// dispose handler, the dispose code its box holds (§11.6.11).
     Record {
         ty: Ty<'db>,
         fields: Vec<(Name<'db>, Operand<'db>)>,
+        dispose: Option<InstanceKey<'db>>,
     },
     /// A list, or a set when the local is one.
     List(Vec<Operand<'db>>),
@@ -463,7 +465,12 @@ impl<'db> MirBody<'db> {
             for statement in &block.statements {
                 if let Statement::Assign(
                     _,
-                    Rvalue::Closure { code, .. } | Rvalue::FnValue { code, .. },
+                    Rvalue::Closure { code, .. }
+                    | Rvalue::FnValue { code, .. }
+                    | Rvalue::Record {
+                        dispose: Some(code),
+                        ..
+                    },
                 ) = statement
                 {
                     out.push(*code);
@@ -568,7 +575,11 @@ fn rvalue_text<'db>(db: &'db dyn Db, rvalue: &Rvalue<'db>) -> String {
             };
             format!("{}.{name}({}, {})", ty_name(*ty), op(a), op(b))
         }
-        Rvalue::Record { ty, fields } => {
+        Rvalue::Record {
+            ty,
+            fields,
+            dispose,
+        } => {
             let fields: Vec<String> = fields
                 .iter()
                 .map(|(n, o)| format!("{}: {}", n.text(db), op(o)))
@@ -577,7 +588,11 @@ fn rvalue_text<'db>(db: &'db dyn Db, rvalue: &Rvalue<'db>) -> String {
                 TyKind::Record { .. } => String::new(),
                 _ => ty.display(db),
             };
-            format!("{name}({})", fields.join(", "))
+            let dispose = match dispose {
+                Some(code) => format!(" disposed by {}", func_name(db, *code)),
+                None => String::new(),
+            };
+            format!("{name}({}){dispose}", fields.join(", "))
         }
         Rvalue::List(items) => format!("[{}]", ops(items)),
         Rvalue::Map(entries) if entries.is_empty() => "[:]".into(),
@@ -703,6 +718,7 @@ fn func_name<'db>(db: &'db dyn Db, func: InstanceKey<'db>) -> String {
         Entry::Body => owner,
         Entry::Closure(e) | Entry::Function(e) => format!("{owner}#{}", e.index()),
         Entry::Default(e) => format!("{owner}#default{}", e.index()),
+        Entry::Dispose => format!("{owner}#dispose"),
     }
 }
 

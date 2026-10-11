@@ -103,8 +103,8 @@ impl<'db> InstanceKey<'db> {
 }
 
 /// Which code of an owner an instance is (§11.5.9). Every entry but the
-/// body and a default is called as a function value: its first parameter
-/// is the environment, a box or null.
+/// body, a default and dispose code is called as a function value: its
+/// first parameter is the environment, a box or null.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
 pub enum Entry {
     Body,
@@ -119,12 +119,16 @@ pub enum Entry {
     /// with the parameters before it where a call or a construction
     /// leaves it out.
     Default(ExprId),
+    /// The dispose code of a type with an `on Dispose` handler: called
+    /// with a box of the type, or of a subtype, whose count reached zero,
+    /// it calls the handler (§11.6.11).
+    Dispose,
 }
 
 impl Entry {
     /// Whether the code takes an environment first.
     pub fn takes_env(self) -> bool {
-        !matches!(self, Entry::Body | Entry::Default(_))
+        !matches!(self, Entry::Body | Entry::Default(_) | Entry::Dispose)
     }
 }
 

@@ -51,7 +51,10 @@ fn load(types: Vec<(u32, TypeDescriptor)>, functions: Vec<ShippedFunction>) -> M
 }
 
 fn record(counted: Vec<CountedField>) -> TypeDescriptor {
-    TypeDescriptor::Record { counted }
+    TypeDescriptor::Record {
+        counted,
+        dispose: None,
+    }
 }
 
 #[test]

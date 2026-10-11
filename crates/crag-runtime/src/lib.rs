@@ -63,7 +63,7 @@ pub use fiber::{Fiber, FiberConfig, FiberState, TaskContext, Worker};
 pub use heap::{Heap, alloc_box};
 pub use meter::Meter;
 pub use print::{PrintLimits, print_value, release_value};
-pub use rc::{Types, release_box};
+pub use rc::{Disposal, Types, next_disposal, release_box};
 pub use sentinel::{StopHandle, StopReason, request_stop};
 pub use unwind::{CodeMap, Trap};
 
@@ -86,6 +86,7 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::TextConcat => text::rt_text_concat as *const () as usize,
         RuntimeFn::TextEquals => text::rt_text_equals as *const () as usize,
         RuntimeFn::TextShow => text::rt_text_show as *const () as usize,
+        RuntimeFn::Disposal => rc::rt_disposal as *const () as usize,
     }
 }
 

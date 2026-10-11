@@ -30,6 +30,10 @@
 //! whose type arguments the form fixes, or one that takes no type
 //! arguments and fits whatever the parameters are.
 //!
+//! `Dispose` takes a record type only, whose values are boxes with a life
+//! to end; a subtype is disposed by the handler of the nearest type it
+//! spreads that declares one.
+//!
 //! A handler may be a closure written in the clause, code of the declaring
 //! type. Inference checks it against the one member of the form its
 //! written parameter types accept, Pure when the form is.
@@ -41,10 +45,10 @@ use crag_hir::{
 };
 
 use crate::body_types;
-use crate::def::{TypeLowerer, prelude_item, signature, type_header};
+use crate::def::{TypeDefKind, TypeLowerer, prelude_item, signature, type_def, type_header};
 use crate::generic::{CallSite, Instance, bind, instantiate};
 use crate::group::{function_effects, result_type};
-use crate::relate::{is_subtype, subst};
+use crate::relate::{is_subtype, parent, subst};
 use crate::result::{ErrorKind, Site, TypeError};
 use crate::ty::{Ty, TyKind};
 
@@ -58,6 +62,8 @@ pub struct Handler<'db> {
     pub form: Ty<'db>,
     /// Its whole result included, errors and all.
     pub ty: Ty<'db>,
+    /// The handler as the clause writes it, in the declaring type's body.
+    pub clause: ExprId,
 }
 
 /// What a handler runs.
@@ -122,6 +128,12 @@ pub fn type_handlers<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) 
             error(Site::Type(clause.kind), ErrorKind::NotALifecycleKind);
             continue;
         };
+        if Some(kind) == prelude_item(db, program, "Dispose")
+            && !matches!(type_def(db, program, item).kind, TypeDefKind::Record { .. })
+        {
+            error(at, ErrorKind::DisposeOfNoBox);
+            continue;
+        }
         if out.handlers.iter().any(|h| h.kind == kind) {
             error(
                 at,
@@ -164,6 +176,7 @@ pub fn type_handlers<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) 
                         },
                         form: member,
                         ty,
+                        clause: clause.handler,
                     });
                 } else {
                     error(
@@ -218,6 +231,7 @@ pub fn type_handlers<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) 
                     code: HandlerCode::Function(function),
                     form: member,
                     ty,
+                    clause: clause.handler,
                 });
             }
             [] => error(
@@ -285,7 +299,28 @@ pub fn lifecycle_handler<'db>(
         code,
         form: in_args(handler.form),
         ty: in_args(handler.ty),
+        clause: handler.clause,
     })
+}
+
+/// The `Dispose` handler of a type, or of the nearest type it spreads that
+/// declares one, and that type.
+pub fn dispose_handler<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    ty: Ty<'db>,
+) -> Option<(Ty<'db>, Handler<'db>)> {
+    let mut current = Some(ty);
+    while let Some(t) = current {
+        if !matches!(t.kind(db), TyKind::Named(..)) {
+            return None;
+        }
+        if let Some(handler) = lifecycle_handler(db, program, t, "Dispose") {
+            return Some((t, handler));
+        }
+        current = parent(db, program, t);
+    }
+    None
 }
 
 /// The type a closure written as the handler of a clause of `item` is

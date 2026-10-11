@@ -54,6 +54,7 @@ pub distinct type Error
 // Lifecycle handlers (§11.4): the parent of their kinds, and the kinds the
 // compiler runs so far.
 pub distinct type LifecycleHandler
+pub distinct type Dispose[T](..LifecycleHandler) where HandlerForm[(T) -> ()]
 pub distinct type Embed[T](..LifecycleHandler)
   where HandlerForm[((Bytes) -> T | EmbedError) | ((Str) -> T | EmbedError), is Pure]
 

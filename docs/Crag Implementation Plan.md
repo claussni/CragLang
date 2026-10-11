@@ -133,7 +133,7 @@ The REPL and compile-time evaluation share the metered tier: both run code the h
 - **Solid value codec.** Serialization of Solid values, so results can be hashed, cached and embedded in code objects.
 - **Strings and bytes.** Two-word values, their bytes inline or in a buffer: literals, interpolation, equality, string keys, printing and encoding, which constants and `embed` need.
 - **Embedded resources.** `embed` declarations whose files are query inputs, as `Bytes` or `Str` constants, or values of a type with an `on Embed` handler.
-- **Lifecycle handlers.** `on` clauses on nominal types, checked against the forms their kinds prescribe; `Embed` is the kind the compiler runs so far.
+- **Lifecycle handlers.** `on` clauses on nominal types, functions or closures checked against the forms their kinds prescribe; `Embed` runs at compile time, and `Dispose` when a value is dropped.
 
 **Exit:** daily work happens in the REPL; dogfooding starts here.
 
@@ -608,7 +608,7 @@ Generated code allocates a box inline: it pops the free list of the heap's curre
 
 Crag frees memory by reference counting: every box has a count of references, and the box is freed when it reaches zero. Values can be shared across threads, so counts change with atomic instructions. A static value, such as a literal in the image, has a count with its top bit set and is never counted.
 
-Generated code counts inline. A retain tests the count's sign and adds one atomically; a release tests the sign, subtracts one atomically, and calls `rt_release` when the count was one. For a union, both first test whether the index names a box. `rt_release` switches to the system stack and frees the box there, releasing its fields as the descriptor of its type lists them. A field whose count reaches zero goes on a list of boxes to free, linked through their dead count words, so freeing a long chain is a loop, needs no memory and cannot overflow a stack. The descriptors are data rather than generated drop glue: the runtime never calls back into Crag code (Compiler Architecture §2.1), and glue that runs Crag code at a drop comes with drop handlers and deferred teardown (Specification §13.5).
+Generated code counts inline. A retain tests the count's sign and adds one atomically; a release tests the sign, subtracts one atomically, and calls `rt_release` when the count was one. For a union, both first test whether the index names a box. `rt_release` switches to the system stack and frees the box there, releasing its fields as the descriptor of its type lists them. A field whose count reaches zero goes on a list of boxes to free, linked through their dead count words, so freeing a long chain is a loop, needs no memory and cannot overflow a stack. The descriptors are data rather than generated drop glue: the runtime never calls back into Crag code (Compiler Architecture §2.1). A box whose type has a dispose handler is queued rather than freed, and generated code runs its handler (§11.6.11).
 
 Code generation describes each record and collection type it allocates or reads: the code of an instance lists the descriptors of those types, and the image indexes them by type index. A worker holds the image's descriptors. A string or bytes field counts its buffer, if it has one (§11.6.9). A function value's environment is counted like a box, and a null one is skipped (§11.5.9).
 
@@ -655,7 +655,7 @@ A trap (overflow, failed `where` condition, out-of-range index) stops the curren
 
 The frame that traps has already released what it holds: MIR traps in a block of its own that releases what is live (§11.4.9). Every frame below it is suspended at a call, and the stack map of that call lists the slots of the boxes the frame keeps across it. Each such box has a reference of its own, because a counted local owns one while it is live, and a part read out of a value is retained when it lives on. `rt_trap` switches to the system stack and walks the frame-pointer chain down to the fiber's first frame, whose saved frame pointer is zero. It finds each call's stack map by its return address and releases the boxes in its slots. Then it records the trap in the fiber and switches to the worker, and the fiber is `Trapped`. Code generation passes the byte offset of the expression that trapped in its module's source; the code map gives the function of each frame from its return address, and the driver turns both into a report (§11.4.15).
 
-Crag has no trap handlers before signals and handlers (M2), so a trap always ends its task, and the handler table comes with them. Stack maps list only registers holding boxes, so a box inside a union a frame holds is not released when it unwinds: a leak until stack maps carry unions, never a double release. `Immediate` handlers wait for dispose handlers (Specification §13.3).
+Crag has no trap handlers before signals and handlers (M2), so a trap always ends its task, and the handler table comes with them. Stack maps list only registers holding boxes, so a box inside a union a frame holds is not released when it unwinds: a leak until stack maps carry unions, never a double release. A box with a dispose handler that an unwinding frame holds is queued, and its handler runs when code on the worker next drains the queue (§11.6.11).
 
 **Data structures**
 
@@ -1170,14 +1170,21 @@ The prelude declares `LifecycleHandler`, the kind `Embed` and `EmbedError(..Erro
 
 A default is code of its own, an entry of its owner, `Entry::Default`, that runs where a call or a construction leaves the parameter or field out. A parameter's default is an entry of its function, instance by instance, and takes the parameters before it, which the call passes to it as well; a field's is an entry of the type that declares the field last, with the type's arguments, and takes nothing. Defaults run after the written arguments, in the order of the parameters or fields, and a literal one is a constant. A function's defaults are part of what its calls do, so their effects are the function's, and an `is Pure` function's must have none. A field's default runs in constructions anywhere, an `is Pure` function's among them, so it must have no effects at all.
 
-What waits: `Dispose`, whose handler the runtime would call when a value is removed, and `Encode` and `Decode`, which come with the standard library's codecs.
+`on Dispose` takes record types only, whose values are boxes with lives that end; a type that spreads one is disposed by the nearest handler among its parents. A box of such a type holds the address of its dispose code, an `Entry::Dispose` of the type that declares the handler, which calls the handler with the box. Its word is placed after the fields of the parents without a handler, and the type's descriptor gives its offset (Compiler Architecture §11.1); MIR names the code in `Rvalue::Record`, and code generation stores its address when it makes the box. The runtime never runs Crag code, so `release_box`, meeting a box whose word is set, gives it a count of one again and queues it on the heap instead of freeing it. Generated code calls `rt_disposal` after every `rt_release`, and after a map literal, whose key written twice drops a value inside the runtime. It gets each queued box with its code, the word already cleared, and calls the code, which takes the reference, until the queue is empty. When the handler's reference goes, the count reaches zero again and the box is freed with its fields. So a handler runs at the drop, on the fiber that dropped the value, wherever the box was: in a local, a field, a list, a map, a union or an environment. Compile-time evaluation makes no values with dispose handlers: their code is no constant, and a handler, which may have effects, runs only when the program does.
+
+What waits:
+- `Deferred` handlers run at once, like `Immediate` ones, until deferred teardown queues them (§11.7.12).
+- A value the runtime releases outside generated code, as the REPL does after printing, or a trap does as it unwinds, waits on the queue until code on the worker next drains it.
+- A trap inside a handler traps the task that dropped the value; that it becomes a trap signal and teardown goes on comes with signals (§11.7.10).
+- `Encode` and `Decode` come with the standard library's codecs.
 
 **Data structures**
 
 - `TypeDecl::handlers: Vec<HandlerClause { kind, handler }>` and `TypeDecl::form: Option<HandlerForm { ty, pure }>` — in HIR.
 - `Handler { kind, code, form, ty }` and `Handlers { handlers, errors }` — in `crag-types`: a checked handler, its code, the member of the form it fits and its type as a function value; `Handler::result` is the type of what it gives.
 - `HandlerCode::Function(Instance)` and `HandlerCode::Closure { item, args, expr }` — a declared function with its type arguments, or a closure of the declaring type with the type's arguments.
-- `ErrorKind::HandlerOnStructural`, `NotALifecycleKind`, `SecondHandler`, `HandlerDoesNotFit`, `ClosureDoesNotFit` and `HandlerNotPure`.
+- `ErrorKind::HandlerOnStructural`, `NotALifecycleKind`, `SecondHandler`, `HandlerDoesNotFit`, `ClosureDoesNotFit`, `HandlerNotPure` and `DisposeOfNoBox`.
+- `Entry::Dispose` and `Rvalue::Record::dispose` — in MIR: a type's dispose code, and the code a new box holds; `TypeDescriptor::Record::dispose` — in `crag-abi`: the offset of the box's word for it; the heap's queue of disposals in `crag-runtime`.
 - `Entry::Default(ExprId)` — in MIR: the code of a parameter's or a field's default; `Restriction::Default` — in `crag-types`: a field's default, which has no effects.
 - `Body::defaults()` — in HIR: the defaults of a body's parameters and fields, which the effect and escape walks take as roots of their own.
 
@@ -1186,6 +1193,8 @@ What waits: `Dispose`, whose handler the runtime would call when a value is remo
 - `fn type_handlers(db: &dyn Db, program: Program, item: ItemId) -> &Handlers` — the query: the handlers a type declares, and the errors of its clauses.
 - `fn lifecycle_handler(db: &dyn Db, program: Program, ty: Ty, kind: &str) -> Option<Handler>` — the handler of a prelude kind a type declares, for the type's arguments, which inference, MIR and compile-time evaluation ask for `Embed`.
 - `fn handler_code(db: &dyn Db, handler: &Handler) -> InstanceKey` — in `crag-mir`: the code a handler runs.
+- `fn dispose_handler(db: &dyn Db, program: Program, ty: Ty) -> Option<(Ty, Handler)>` — the `Dispose` handler of a type or of the nearest parent with one, and that type; `fn dispose_word` in `crag-backend` gives the offset of the word.
+- `rt_disposal(ctx) -> (ptr, code)` — the next queued box and its dispose code, or zeros.
 
 ### 11.7 M4 components
 
@@ -1350,7 +1359,7 @@ A `lazy` value is computed at most once, by whichever task first needs it; other
 
 #### 11.7.12 Deferred teardown
 
-Dropping a large structure must not stall a task (§13.5). Above a size threshold, the release is queued and a runtime fiber frees it gradually, running `Deferred` dispose handlers on the way. `Immediate` values are never queued.
+Dropping a large structure must not stall a task (§13.5). Above a size threshold, the release is queued and a runtime fiber frees it gradually, running `Deferred` dispose handlers on the way. `Immediate` values are never queued. Until then every dispose handler runs at the drop, through the heap's queue of disposals that generated code drains (§11.6.11).
 
 **Data structures**
 

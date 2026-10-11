@@ -114,6 +114,7 @@ fn check(config: FiberConfig) {
     let mut worker = Worker::new();
     let record = TypeDescriptor::Record {
         counted: Vec::new(),
+        dispose: None,
     };
     worker.set_types(Arc::new(Types::new([(BOX as u32, record)])));
     worker.set_code_map(Arc::new(std::mem::take(&mut image.code)));

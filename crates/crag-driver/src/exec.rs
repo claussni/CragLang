@@ -118,6 +118,7 @@ pub fn compile<'a>(
                 format!("a function value in {}", owner_name(project, owner))
             }
             Entry::Default(_) => format!("a default in {}", owner_name(project, owner)),
+            Entry::Dispose => format!("the dispose code of {}", owner_name(project, owner)),
         };
         let value = matches!(owner, Owner::Item(item) if item.kind(db).is_value());
         let code = match code(db, program, instance, Tier::Baseline) {

@@ -59,8 +59,8 @@ use crag_mir::{
 use crag_types::{Builtin, Step, Ty, TyKind, prelude_item, signature};
 
 use crate::layout::{
-    Layout, boxed_indices, equal_by_words, layout, record_layout, subtypes, type_descriptor,
-    type_index,
+    Layout, boxed_indices, dispose_word, equal_by_words, layout, record_layout, subtypes,
+    type_descriptor, type_index,
 };
 use crate::slot_key;
 
@@ -496,7 +496,35 @@ impl<'a, 'db> Lower<'a, 'db> {
             args: vec![ptr],
             dsts: Vec::new(),
         });
+        self.dispose();
         self.end(Term::Jump(done), Some(done));
+    }
+
+    /// Runs the dispose code of each box the runtime queued, until none is
+    /// left (§11.6.11): after a release that may have freed boxes, so that
+    /// each handler runs at the drop, on the fiber that dropped the box.
+    fn dispose(&mut self) {
+        let (next, run, done) = (self.new_block(), self.new_block(), self.new_block());
+        self.end(Term::Jump(next), Some(next));
+        let [ptr, code] = self.runtime2(RuntimeFn::Disposal, Vec::new())[..] else {
+            unreachable!("two words");
+        };
+        let zero = self.constant(0);
+        let none = self.cmp(Cond::Eq, ptr, zero);
+        self.end(
+            Term::Branch {
+                cond: none,
+                then: done,
+                otherwise: run,
+            },
+            Some(run),
+        );
+        self.push(Inst::CallIndirect {
+            callee: code,
+            args: vec![ptr],
+            dsts: Vec::new(),
+        });
+        self.end(Term::Jump(next), Some(done));
     }
 
     /// Whether a box is counted: its count is not negative, which a static
@@ -664,7 +692,11 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let flag = self.cmp(cond, word(&x)?, word(&y)?);
                 Ok(vec![self.bool_of(flag)])
             }
-            Rvalue::Record { ty: record, fields } => {
+            Rvalue::Record {
+                ty: record,
+                fields,
+                dispose,
+            } => {
                 let (slots, size) =
                     record_layout(self.db, self.program, *record).ok_or("records of this type")?;
                 let index = type_index(*record);
@@ -686,6 +718,27 @@ impl<'a, 'db> Lower<'a, 'db> {
                             offset: (offset + 8 * k as u32) as i32,
                         });
                     }
+                }
+                // The box holds the address of its dispose code, which the
+                // runtime gives generated code when the count reaches zero.
+                if let Some(code) = dispose {
+                    let at = dispose_word(self.db, self.program, *record)
+                        .ok_or("records of this type")?;
+                    if !self.calls.contains(code) {
+                        self.calls.push(*code);
+                    }
+                    let addr = self.reg();
+                    self.push(Inst::FuncAddr {
+                        dst: addr,
+                        func: self.slot(*code),
+                        params: 1,
+                        returns: 0,
+                    });
+                    self.push(Inst::Store {
+                        src: addr,
+                        addr: ptr,
+                        offset: at as i32,
+                    });
                 }
                 Ok(vec![ptr])
             }
@@ -1132,6 +1185,8 @@ impl<'a, 'db> Lower<'a, 'db> {
             let [v0, v1] = self.pad(v);
             map = self.runtime(RuntimeFn::MapInsert, vec![map, k0, k1, v0, v1]);
         }
+        // A key written twice releases the value it had first.
+        self.dispose();
         Ok(map)
     }
 

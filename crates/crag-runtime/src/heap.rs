@@ -46,6 +46,7 @@
 //! segments are abandoned until a later heap adopts them, which comes with
 //! the scheduler (Plan §11.7.1).
 
+use std::collections::VecDeque;
 use std::mem::offset_of;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU64, Ordering};
@@ -220,6 +221,10 @@ pub struct Heap {
     free_pages: Vec<*mut Page>,
     /// The budget of the metered fiber running, if one is.
     meter: Option<HeapMeter>,
+    /// Boxes whose dispose handlers must run before they are freed, each
+    /// with a reference of its own, in the order their counts reached
+    /// zero (Implementation Plan §11.6.11).
+    disposals: VecDeque<*mut u8>,
 }
 
 /// What a metered fiber may still make the heap take.
@@ -251,7 +256,24 @@ impl Heap {
             segments: Vec::new(),
             free_pages: Vec::new(),
             meter: None,
+            disposals: VecDeque::new(),
         }
+    }
+
+    /// Queues a box whose dispose handler must run, which holds a
+    /// reference to it.
+    pub(crate) fn queue_disposal(&mut self, ptr: *mut u8) {
+        self.disposals.push_back(ptr);
+    }
+
+    /// The box whose dispose handler runs next, with the queue's reference.
+    pub(crate) fn next_disposal(&mut self) -> Option<*mut u8> {
+        self.disposals.pop_front()
+    }
+
+    /// How many boxes wait for their dispose handlers.
+    pub fn disposals(&self) -> usize {
+        self.disposals.len()
     }
 
     /// Charges what the heap takes from now on to a budget of `left`

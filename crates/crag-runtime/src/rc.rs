@@ -25,6 +25,11 @@
 //! words, which no one reads once the count is zero. A long chain of boxes
 //! is therefore freed in a loop, with no stack to overflow and no memory to
 //! allocate.
+//!
+//! A box of a type with a dispose handler is not freed when its count
+//! first reaches zero: it gets a count of one again and goes on the heap's
+//! queue of disposals, which generated code drains, running each handler
+//! (Implementation Plan §11.6.11). The runtime never runs Crag code.
 
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicU64, Ordering, fence};
@@ -256,7 +261,15 @@ pub unsafe fn release_box(heap: &mut Heap, types: &Types, ptr: *mut u8) {
                 continue;
             }
             match types.of(ptr) {
-                TypeDescriptor::Record { counted } => boxes_in(ptr, counted, &mut dead),
+                // Its handler has yet to run, and takes the reference.
+                TypeDescriptor::Record {
+                    dispose: Some(at), ..
+                } if ptr.add(*at as usize).cast::<u64>().read() != 0 => {
+                    count(ptr).store(1, Ordering::Relaxed);
+                    heap.queue_disposal(ptr);
+                    continue;
+                }
+                TypeDescriptor::Record { counted, .. } => boxes_in(ptr, counted, &mut dead),
                 TypeDescriptor::List { element } => list::boxes_of(ptr, kind, element, &mut dead),
                 TypeDescriptor::Map { key, value, .. } => {
                     map::boxes_of(ptr, kind, key, value, &mut dead)
@@ -286,13 +299,71 @@ unsafe extern "C" fn release_entry(ctx: *const TaskContext, ptr: *mut u8) {
     }
 }
 
+/// Two words of a runtime function's result, in its two result registers.
+#[repr(C)]
+pub struct Disposal {
+    ptr: *mut u8,
+    code: u64,
+}
+
+system_stack_fn! {
+    /// `rt_disposal(ctx) -> (ptr, code)`: see `crag_abi::RuntimeFn::Disposal`.
+    fn rt_disposal(ctx: *const TaskContext) -> Disposal => disposal_entry
+}
+
+/// The Rust half of `rt_disposal`, on the system stack.
+///
+/// # Safety
+///
+/// Called only by `rt_disposal`.
+unsafe extern "C" fn disposal_entry(ctx: *const TaskContext) -> Disposal {
+    // SAFETY: as the caller promises.
+    let (heap, types) = unsafe { worker_of(ctx) };
+    // SAFETY: a queued box is live, with the reference the queue holds,
+    // and its type has a dispose word.
+    unsafe { next_disposal(heap, types) }
+}
+
+/// The next box whose handler must run and its dispose code, which takes
+/// the queue's reference, with the box's word of the code cleared; or null
+/// and zero.
+///
+/// # Safety
+///
+/// Every box queued is live, with the reference the queue holds.
+pub unsafe fn next_disposal(heap: &mut Heap, types: &Types) -> Disposal {
+    let Some(ptr) = heap.next_disposal() else {
+        return Disposal {
+            ptr: null_mut(),
+            code: 0,
+        };
+    };
+    // SAFETY: as the caller promises; only a type with a dispose word
+    // queues its boxes.
+    unsafe {
+        let TypeDescriptor::Record {
+            dispose: Some(at), ..
+        } = types.of(ptr)
+        else {
+            die("a box queued for disposal whose type has no handler");
+        };
+        let word = ptr.add(*at as usize).cast::<u64>();
+        let code = word.read();
+        word.write(0);
+        Disposal { ptr, code }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::heap::alloc_box;
 
     fn record(counted: Vec<CountedField>) -> TypeDescriptor {
-        TypeDescriptor::Record { counted }
+        TypeDescriptor::Record {
+            counted,
+            dispose: None,
+        }
     }
 
     const NODE: u32 = 7;

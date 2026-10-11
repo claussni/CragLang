@@ -453,6 +453,11 @@ distinct type Wrong(n: Int)
 distinct type Loud(n: Int)
   on Embed { text: Str -> Loud(n: now()) }
 
+// Only boxes have lives that end.
+distinct type Token
+  on Dispose closeToken
+fn closeToken(t: Token) -> () {}
+
 // A kind whose form a closure fits twice.
 distinct type Both[T](..LifecycleHandler)
   where HandlerForm[((Int) -> T | Bool) | ((Int) -> T | EmbedError)]
@@ -492,6 +497,7 @@ fn main() {}
             "the type cannot be inferred here; write it",
             "this closure must fit exactly one member of the form of `Embed`: ((Bytes) -> EmbedError | Wrong) | ((Str) -> EmbedError | Wrong)",
             "expected (Str) -> EmbedError | Loud is Pure, found (Str) -> EmbedError | Loud",
+            "only a record type has values whose lives end, so only it takes an `on Dispose` handler",
             "this closure must fit exactly one member of the form of `Both`: ((Int) -> EmbedError | Twofold) | ((Int) -> False | True | Twofold)",
             "an `embed` of `Unknown` needs an `on Embed` handler, which `Unknown` does not declare; an `embed` of `Bytes` or `Str` needs none",
         ],

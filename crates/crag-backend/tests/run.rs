@@ -44,9 +44,9 @@ use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{InstanceKey, Tier, collect_instances};
 use crag_runtime::text::TextWords;
 use crag_runtime::{
-    CodeMap, Fiber, FiberConfig, FiberState, Heap, Meter, PrintLimits, StopReason, Trap, Types,
-    Worker, alloc_box, decode_value, encode_value, list, map, print_value, release_box,
-    release_value, request_stop, text,
+    CodeMap, Disposal, Fiber, FiberConfig, FiberState, Heap, Meter, PrintLimits, StopReason, Trap,
+    Types, Worker, alloc_box, decode_value, encode_value, list, map, next_disposal, print_value,
+    release_box, release_value, request_stop, text,
 };
 use crag_types::{Ty, TyKind, prelude_item, signature};
 
@@ -65,6 +65,7 @@ pub type Empty[T]
 pub type Option[T] = T | Empty[T]
 pub distinct type Error
 pub distinct type LifecycleHandler
+pub distinct type Dispose[T](..LifecycleHandler) where HandlerForm[(T) -> ()]
 pub distinct type Embed[T](..LifecycleHandler)
   where HandlerForm[((Bytes) -> T | EmbedError) | ((Str) -> T | EmbedError), is Pure]
 pub type EmbedError(..Error, message: Str, line: Int = 0, column: Int = 0)
@@ -195,6 +196,11 @@ extern "C" fn rt_text_show(ctx: *mut u64, word: u64, number: u64) -> TextWords {
     // SAFETY: see above.
     let [w0, w1] = text::make_text(unsafe { heap_of(ctx) }, &[shown.as_bytes()]);
     TextWords(w0, w1)
+}
+
+extern "C" fn rt_disposal(ctx: *mut u64) -> Disposal {
+    // SAFETY: see above.
+    unsafe { next_disposal(heap_of(ctx), types()) }
 }
 
 extern "C" fn rt_trap(_ctx: *mut u64, kind: u64) {
@@ -328,6 +334,7 @@ impl Module {
                 RuntimeFn::TextConcat => rt_text_concat as *const () as usize,
                 RuntimeFn::TextEquals => rt_text_equals as *const () as usize,
                 RuntimeFn::TextShow => rt_text_show as *const () as usize,
+                RuntimeFn::Disposal => rt_disposal as *const () as usize,
                 f => crag_runtime::runtime_fn_addr(f),
             };
             symbols.define_runtime(func, addr);
@@ -2356,4 +2363,96 @@ fn closed(x: Int) -> Int {
     let trap = m.run("nested", &[40]).unwrap_err();
     assert_eq!(trap.kind, TrapKind::Unsupported);
     assert_eq!(m.worker.heap().live_blocks(), 0);
+}
+
+#[test]
+fn dispose_handlers_run_when_values_are_dropped() {
+    // A handler traps for a value whose `n` is zero, which shows that it
+    // ran, with the value, where the value was dropped.
+    let mut m = Module::new(
+        r#"distinct type Guard(n: Int)
+  on Dispose check
+fn check(g: Guard) -> () {
+  if g.n == 0 {
+    ???
+  }
+}
+
+// What holds a value with a handler disposes of it when it is freed.
+type Holder(g: Guard, k: Int)
+distinct type Sub(..Guard, m: Int)
+distinct type Lid(n: Int)
+  on Dispose { l: Lid -> if l.n == 0 { ??? } }
+distinct type Cell[T](v: T, n: Int)
+  on Dispose closeCell
+fn closeCell[T](c: Cell[T]) -> () {
+  if c.n == 0 {
+    ???
+  }
+}
+
+fn plain(n: Int) -> Int {
+  let g = Guard(n: n)
+  g.n + 1
+}
+fn held(n: Int) -> Int {
+  let h = Holder(g: Guard(n: n), k: 3)
+  h.k
+}
+fn listed(n: Int) -> Int {
+  let gs = [Guard(n: 1), Guard(n: n)]
+  5
+}
+fn optional(n: Int) -> Int {
+  let o: Option[Guard] = Guard(n: n)
+  6
+}
+fn sub(n: Int) -> Int {
+  let s = Sub(n: n, m: 7)
+  s.m
+}
+fn lid(n: Int) -> Int {
+  let l = Lid(n: n)
+  8
+}
+fn cell(n: Int) -> Int {
+  let c: Cell[Str] = Cell(v: "a string long enough for a buffer", n: n)
+  9
+}
+fn kept(n: Int) -> Guard { Guard(n: n) }
+fn shownSub() -> Sub { Sub(n: 4, m: 5) }
+// The value a key written twice had is dropped in the runtime.
+fn mapped(n: Int) -> Map[Int, Guard] { [1: Guard(n: n), 1: Guard(n: 1)] }
+"#,
+    );
+    assert!(m.unsupported.is_empty(), "{:?}", m.unsupported);
+    let cases = [
+        ("plain", 2),
+        ("held", 3),
+        ("listed", 5),
+        ("optional", 6),
+        ("sub", 7),
+        ("lid", 8),
+        ("cell", 9),
+    ];
+    for (name, result) in cases {
+        assert_eq!(m.int(name, &[1]), result, "{name}");
+        assert_eq!(m.heap.live_blocks(), 0, "{name}");
+        assert_eq!(m.heap.disposals(), 0, "{name}");
+        let trap = m.run(name, &[0]).unwrap_err();
+        assert_eq!(trap.kind, TrapKind::Hole, "{name}");
+    }
+    // A value given away is not dropped.
+    assert_eq!(m.run("kept", &[0]).map(|w| w.len()), Ok(1));
+    assert_eq!(m.run("mapped", &[1]).map(|w| w.len()), Ok(1));
+    // Printing skips the word of the dispose code. A value the runtime
+    // releases outside generated code waits for the next code that drains
+    // the queue.
+    assert_eq!(m.shown("shownSub"), "Sub(n: 4, m: 5)");
+    assert_eq!(m.heap.disposals(), 1);
+    assert_eq!(m.int("plain", &[1]), 2);
+    assert_eq!(m.heap.disposals(), 0);
+    assert_eq!(m.heap.live_blocks(), 0);
+    let trap = m.run("mapped", &[0]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::Hole);
 }

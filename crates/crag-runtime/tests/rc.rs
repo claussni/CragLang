@@ -152,6 +152,7 @@ fn check(config: FiberConfig) {
                 offset: 16,
                 boxed: vec![NODE as u32],
             }],
+            dispose: None,
         },
     )])));
     assert_eq!(worker.resume(&mut fiber), FiberState::Finished);

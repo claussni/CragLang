@@ -339,6 +339,8 @@ pub enum ErrorKind<'db> {
         name: Name<'db>,
         form: Ty<'db>,
     },
+    /// `on Dispose` on a type whose values are no boxes.
+    DisposeOfNoBox,
     /// A closure written as a handler whose type fits no member of its
     /// kind's form, or several.
     ClosureDoesNotFit {
@@ -557,6 +559,9 @@ impl<'db> ErrorKind<'db> {
             }
             ErrorKind::SecondHandler { kind } => {
                 format!("the type already declares a handler of `{}`", name(kind))
+            }
+            ErrorKind::DisposeOfNoBox => {
+                "only a record type has values whose lives end, so only it takes an `on Dispose` handler".into()
             }
             ErrorKind::ClosureDoesNotFit { kind, form } => format!(
                 "this closure must fit exactly one member of the form of `{}`: {}",

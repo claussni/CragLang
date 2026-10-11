@@ -251,6 +251,11 @@ impl<'db> Evaluation<'db> {
         let mut names = Vec::new();
         let mut cells = Vec::new();
         for instance in collect_instances(db, program, &[root], Tier::Metered) {
+            // A dispose handler runs when the program drops a value, and a
+            // constant has no box of its own to drop (§11.6.11).
+            if *instance.entry(db) == Entry::Dispose {
+                return Err("it makes values with dispose handlers".into());
+            }
             let compiled = match code(db, program, instance, Tier::Metered) {
                 Some(Ok(compiled)) => compiled,
                 Some(Err(e)) => return Err(format!("its code does not compile: {e}")),
@@ -266,6 +271,7 @@ impl<'db> Evaluation<'db> {
                 Entry::Closure(_) => format!("a closure in {name}"),
                 Entry::Function(_) => format!("a function value in {name}"),
                 Entry::Default(_) => format!("a default in {name}"),
+                Entry::Dispose => format!("the dispose code of {name}"),
             };
             let value = matches!(owner, Owner::Item(i) if i.kind(db).is_value());
             if value && *instance.entry(db) == Entry::Body {
