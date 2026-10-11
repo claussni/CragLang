@@ -20,12 +20,19 @@
 //! manifest comes with the resolver (Implementation Plan §11.9.1). Every
 //! other `.crag` file below the root is a module, named by the package and
 //! its path: `geo/shape.crag` in package `demo` is `demo.geo.shape`.
+//!
+//! The resources the modules' `embed` declarations name are files of the
+//! package too, resolved against the module's file (Specification
+//! §18.4.1). The project reads them when it is loaded and again on
+//! `read_resources`, and gives the database what it read; a resource that
+//! did not change keeps its input, so nothing that reads it is redone.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use crag_db::{RootDatabase, Setter};
-use crag_hir::{ModuleId, PRELUDE, Program, SourceFile};
+use crag_hir::{ModuleId, PRELUDE, Program, Resource, SourceFile, embed_sources};
 
 /// The prelude, bundled with the tool (Specification §19.4).
 const CORE: &str = include_str!("../../../std/core.crag");
@@ -37,6 +44,9 @@ pub struct ModuleFile {
     /// The path shown to the user, relative to the project's root, or the
     /// prelude's module path.
     pub shown: String,
+    /// The directory of the file, relative to the project's root, against
+    /// which its `embed` sources resolve.
+    pub dir: PathBuf,
 }
 
 /// The project's modules in a database.
@@ -48,6 +58,9 @@ pub struct Project {
     pub main: Option<String>,
     /// The prelude first, then the project's modules by path.
     pub files: Vec<ModuleFile>,
+    /// The project's root; none outside a project, where `embed` sources
+    /// resolve against the working directory.
+    pub root: Option<PathBuf>,
 }
 
 impl Project {
@@ -88,12 +101,15 @@ impl Project {
             files.push(ModuleFile {
                 module,
                 shown: relative.display().to_string(),
+                dir: relative.parent().map(Path::to_path_buf).unwrap_or_default(),
             });
         }
         let modules = project.files.iter().map(|f| f.module).collect();
         project.program.set_modules(&mut project.db).to(modules);
         project.package = package;
         project.main = main;
+        project.root = Some(root.to_path_buf());
+        project.read_resources();
         Ok(project)
     }
 
@@ -108,14 +124,16 @@ impl Project {
         let files = vec![ModuleFile {
             module: core,
             shown: format!("{PRELUDE} (bundled)"),
+            dir: PathBuf::new(),
         }];
-        let program = Program::new(&db, vec![core]);
+        let program = Program::new(&db, vec![core], Vec::new());
         Project {
             db,
             program,
             package: String::new(),
             main: None,
             files,
+            root: None,
         }
     }
 
@@ -126,6 +144,7 @@ impl Project {
         self.files.push(ModuleFile {
             module,
             shown: shown.to_string(),
+            dir: PathBuf::new(),
         });
         let modules = self.files.iter().map(|f| f.module).collect();
         self.program.set_modules(&mut self.db).to(modules);
@@ -160,6 +179,81 @@ impl Project {
     pub fn set_source(&mut self, module: ModuleId, text: String) {
         let file = module.file(&self.db);
         file.set_text(&mut self.db).to(text);
+        self.read_resources();
+    }
+
+    /// Reads the resources the modules' `embed` declarations name and
+    /// gives the database those that changed: new sources, other content,
+    /// or a read that now fails or succeeds.
+    pub fn read_resources(&mut self) {
+        let root = self.root.clone().unwrap_or_else(|| PathBuf::from("."));
+        let old = self.program.resources(&self.db).clone();
+        let mut resources = Vec::new();
+        for file in &self.files {
+            for source in embed_sources(&self.db, file.module) {
+                if resources
+                    .iter()
+                    .any(|(m, s, _): &(ModuleId, String, Resource)| {
+                        *m == file.module && *s == source
+                    })
+                {
+                    continue;
+                }
+                let content = read_resource(&root, &file.dir, &source);
+                let known = old
+                    .iter()
+                    .find(|(m, s, _)| *m == file.module && *s == source);
+                let resource = match known {
+                    Some(&(_, _, resource)) => {
+                        if *resource.content(&self.db) != content {
+                            let _old = resource.set_content(&mut self.db).to(content);
+                        }
+                        resource
+                    }
+                    None => Resource::new(&self.db, content),
+                };
+                resources.push((file.module, source, resource));
+            }
+        }
+        if resources != old {
+            self.program.set_resources(&mut self.db).to(resources);
+        }
+    }
+}
+
+/// The content of the file an `embed` source names: a path relative to the
+/// directory `dir` of the module's file, within the package at `root`.
+fn read_resource(root: &Path, dir: &Path, source: &str) -> Result<Arc<[u8]>, String> {
+    let outside = || format!("`{source}` is outside the package");
+    let mut path = PathBuf::new();
+    for part in dir.join(source).components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !path.pop() {
+                    return Err(outside());
+                }
+            }
+            Component::Normal(name) => path.push(name),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "`{source}` is absolute; an `embed` names a file relative to its module"
+                ));
+            }
+        }
+    }
+    let full = root.join(&path);
+    // A link may lead out of the package.
+    let real = full.canonicalize();
+    let base = root.canonicalize();
+    if let (Ok(real), Ok(base)) = (&real, &base)
+        && !real.starts_with(base)
+    {
+        return Err(outside());
+    }
+    match fs::read(&full) {
+        Ok(bytes) => Ok(Arc::from(bytes)),
+        Err(e) => Err(format!("cannot read `{source}`: {e}")),
     }
 }
 

@@ -99,11 +99,12 @@ pub fn infer_in_group<'db>(
         group,
         error: error_type(db, program),
         generic: generic_owner.filter(|&item| *item.kind(db) == ItemKind::Function),
+        embed: generic_owner.filter(|&item| *item.kind(db) == ItemKind::Embed),
     };
     let result = match owner {
         Owner::Item(item) => match *item.kind(db) {
             ItemKind::Function => cx.function(),
-            ItemKind::Value => cx.module_value(),
+            ItemKind::Value | ItemKind::Embed => cx.module_value(),
             ItemKind::Type => {
                 cx.type_defaults();
                 None
@@ -121,7 +122,9 @@ pub fn infer_in_group<'db>(
     // values, which compile-time evaluation runs only without them (§3.14,
     // §18.4).
     let effects = match owner {
-        Owner::Item(item) if !matches!(*item.kind(db), ItemKind::Function | ItemKind::Value) => {
+        Owner::Item(item)
+            if !matches!(*item.kind(db), ItemKind::Function) && !item.kind(db).is_value() =>
+        {
             EffectSet::NONE
         }
         _ => {
@@ -220,6 +223,8 @@ struct Infer<'a, 'db> {
     /// The function being checked, whose type parameters are opaque here
     /// and whose slots its body calls (§11.5.3).
     generic: Option<ItemId<'db>>,
+    /// The `embed` being checked, whose resource its body is.
+    embed: Option<ItemId<'db>>,
 }
 
 /// The narrowed type of each binding at a point of the body, by binding.
@@ -540,6 +545,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                 ty
             }
             Expr::Literal(literal) => self.literal(id, literal, expected),
+            Expr::Embed => self.embed(id, expected),
             Expr::Str(parts) => {
                 for part in parts {
                     if let crag_hir::StrPart::Expr(e) = part {
@@ -761,6 +767,38 @@ impl<'a, 'db> Infer<'a, 'db> {
     }
 
     /// The type of a literal, from the context when it gives one (§2.6).
+    /// The content of an `embed`'s resource, of its written type: `Bytes`
+    /// without one, and `Str` only when it is UTF-8 (§18.4.1). Any other
+    /// type needs an `on Embed` handler, which is not built yet.
+    fn embed(&mut self, id: ExprId, expected: Option<Ty<'db>>) -> Ty<'db> {
+        let db = self.db;
+        let bytes = self.builtin(Builtin::Bytes);
+        let Some(expected) = expected else {
+            return bytes;
+        };
+        match expected.as_builtin(db) {
+            _ if expected.is_error(db) => {}
+            Some((Builtin::Bytes, _)) => {}
+            Some((Builtin::Str, _)) => {
+                let content = self
+                    .embed
+                    .map(|e| crag_hir::embed_content(db, self.program, e));
+                // A resource that cannot be read was reported.
+                if let Some(Ok(content)) = content
+                    && let Err(e) = std::str::from_utf8(content)
+                {
+                    let at = e.valid_up_to();
+                    self.error(Site::Expr(id), ErrorKind::NotUtf8 { at });
+                }
+            }
+            _ => {
+                self.error(Site::Expr(id), ErrorKind::EmbedHandler { ty: expected });
+                return self.err_ty();
+            }
+        }
+        expected
+    }
+
     fn literal(&mut self, id: ExprId, literal: &Literal, expected: Option<Ty<'db>>) -> Ty<'db> {
         let ty = self.literal_ty(literal, expected);
         if !self.literal_fits(literal, ty) {

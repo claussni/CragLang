@@ -119,6 +119,7 @@ impl Printer<'_, '_> {
         match self.body.expr(id) {
             Expr::Missing => "<missing>".into(),
             Expr::Hole => "???".into(),
+            Expr::Embed => "embed".into(),
             Expr::Literal(literal) => self.literal(literal),
             Expr::Str(parts) => {
                 let parts: String = parts

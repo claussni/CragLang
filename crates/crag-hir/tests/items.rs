@@ -19,7 +19,7 @@ extern crate crag_db as salsa;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crag_db::{Db, RootDatabase, Setter};
-use crag_hir::{Import, Item, ItemTree, ModuleId, SourceFile, item_tree};
+use crag_hir::{Import, Item, ItemTree, ModuleId, SourceFile, embed_sources, item_tree};
 use crag_syntax::{GreenNode, SyntaxNode};
 
 const MODULE: &str = r#"import std.io
@@ -111,6 +111,8 @@ fn the_item_tree_lists_declarations_with_their_signatures() {
             "Embed logo#0 @12: embed logo : Bytes from \"logo.png\"",
         ]
     );
+    // Parsing alone finds the resources (§18.4.1).
+    assert_eq!(embed_sources(&db, module), ["logo.png"]);
 
     let imports: Vec<String> = tree
         .imports

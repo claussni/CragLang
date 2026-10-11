@@ -81,6 +81,12 @@ pub enum LowerError<'db> {
         message: String,
         range: Range<u32>,
     },
+    /// An `embed` whose resource cannot be read, or whose source is no
+    /// string literal (§18.4.1).
+    Embed {
+        message: String,
+        range: Range<u32>,
+    },
     /// A run of prefix symbols that no declared prefixes make up (§8.5).
     UnknownPrefix {
         text: String,
@@ -1411,6 +1417,36 @@ impl<'a, 'db> Lowerer<'a, 'db> {
         };
         self.declare_all(&cx);
         pat
+    }
+
+    /// An `embed` declaration (§18.4.1): its name, bound to the content of
+    /// its resource, and its written type. `read` says whether the driver
+    /// read the resource of a source.
+    pub fn embed_decl(&mut self, node: &SyntaxNode, read: impl Fn(&str) -> Result<(), String>) {
+        let ty = node
+            .children()
+            .find(|n| !matches!(n.kind(), S::Literal | S::StrExpr))
+            .map(|t| self.type_node(&t));
+        let root = match crate::embed::source_of(node) {
+            Some((source, range)) => match source.and_then(|s| read(&s)) {
+                Ok(()) => self.alloc_expr(Expr::Embed, range),
+                Err(message) => {
+                    self.errors.push(LowerError::Embed {
+                        message,
+                        range: range.clone(),
+                    });
+                    self.alloc_expr(Expr::Missing, range)
+                }
+            },
+            None => self.alloc_expr(Expr::Missing, node.range()),
+        };
+        self.body.root = Some(root);
+        if let Some(name) = ident(node) {
+            let text = self.name(name.text());
+            let binding = self.alloc_binding(Some(text), BindingKind::Module, name.range());
+            let pat = self.alloc_pat(Pat::Bind { binding, sub: None }, name.range());
+            self.body.pattern = Some((pat, ty));
+        }
     }
 
     /// The pattern of a module-level `let`, whose names are the module's.

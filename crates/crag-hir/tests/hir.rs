@@ -51,7 +51,7 @@ fn setup(db: &RootDatabase, text: &str) -> (Program, ModuleId) {
         SourceFile::new(db, PRELUDE.to_string()),
     );
     let module = ModuleId::new(db, "app".to_string(), SourceFile::new(db, text.to_string()));
-    (Program::new(db, vec![core, module]), module)
+    (Program::new(db, vec![core, module], Vec::new()), module)
 }
 
 /// Every body of the module, printed, and the errors lowering them.
@@ -74,6 +74,7 @@ fn lower(text: &str) -> (Vec<String>, Vec<String>) {
                 }
                 LowerError::UnnamedField { range } => ("unnamed field".into(), range),
                 LowerError::Literal { message, range } => (message.clone(), range),
+                LowerError::Embed { message, range } => (message.clone(), range),
                 LowerError::UnknownPrefix { text, range } => {
                     (format!("unknown prefix {text}"), range)
                 }
@@ -266,7 +267,7 @@ fn operators_need_their_functions() {
         "alone".to_string(),
         SourceFile::new(&db, "fn f(a: Int) { a + 1 }".to_string()),
     );
-    let program = Program::new(&db, vec![module]);
+    let program = Program::new(&db, vec![module], Vec::new());
     let owner = owners(&db, module)[0];
     let errors: Vec<String> = lower_body(&db, program, owner)
         .errors

@@ -238,7 +238,7 @@ impl Module {
             "app".to_string(),
             SourceFile::new(&db, text.to_string()),
         );
-        let program = Program::new(&db, vec![core, module]);
+        let program = Program::new(&db, vec![core, module], Vec::new());
         let syntax = &crag_hir::parse(&db, *module.file(&db)).errors;
         assert!(syntax.is_empty(), "{syntax:?}");
         let lowering: Vec<_> = owners(&db, module)

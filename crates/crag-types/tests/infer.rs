@@ -99,7 +99,11 @@ fn setup(db: &RootDatabase, text: &str) -> (Program, ModuleId, ModuleId) {
         SourceFile::new(db, PRELUDE.to_string()),
     );
     let module = ModuleId::new(db, "app".to_string(), SourceFile::new(db, text.to_string()));
-    (Program::new(db, vec![core, module]), core, module)
+    (
+        Program::new(db, vec![core, module], Vec::new()),
+        core,
+        module,
+    )
 }
 
 fn check(text: &str) -> Checked {

@@ -24,7 +24,7 @@ Oct 3, 2026 · @Ralf Claußnitzer
   - [11.5 M2 components](#115-m2-components)
     - [11.5.1 Unions and narrowing](#1151-unions-and-narrowing) · [11.5.2 Error inference over recursive groups](#1152-error-inference-over-recursive-groups) · [11.5.3 Generics and forms](#1153-generics-and-forms) · [11.5.4 Overload resolution and UFCS](#1154-overload-resolution-and-ufcs) · [11.5.5 Union lifting](#1155-union-lifting) · [11.5.6 Recursive-group diagnostic](#1156-recursive-group-diagnostic) · [11.5.7 Effects](#1157-effects) · [11.5.8 Escape and bindings-only analysis](#1158-escape-and-bindings-only-analysis) · [11.5.9 Closure conversion](#1159-closure-conversion) · [11.5.10 Monomorphization](#11510-monomorphization) · [11.5.11 Tail calls](#11511-tail-calls)
   - [11.6 M3 components](#116-m3-components)
-    - [11.6.1 Session manager](#1161-session-manager) · [11.6.2 REPL](#1162-repl) · [11.6.3 Code shipping](#1163-code-shipping) · [11.6.4 Slot tables](#1164-slot-tables) · [11.6.5 Value printing](#1165-value-printing) · [11.6.6 Metered tier](#1166-metered-tier) · [11.6.7 Compile-time evaluation](#1167-compile-time-evaluation) · [11.6.8 Solid value codec](#1168-solid-value-codec) · [11.6.9 Strings and bytes](#1169-strings-and-bytes) · [11.6.10 embed handlers](#11610-embed-handlers)
+    - [11.6.1 Session manager](#1161-session-manager) · [11.6.2 REPL](#1162-repl) · [11.6.3 Code shipping](#1163-code-shipping) · [11.6.4 Slot tables](#1164-slot-tables) · [11.6.5 Value printing](#1165-value-printing) · [11.6.6 Metered tier](#1166-metered-tier) · [11.6.7 Compile-time evaluation](#1167-compile-time-evaluation) · [11.6.8 Solid value codec](#1168-solid-value-codec) · [11.6.9 Strings and bytes](#1169-strings-and-bytes) · [11.6.10 Embedded resources](#11610-embedded-resources)
   - [11.7 M4 components](#117-m4-components)
     - [11.7.1 Scheduler](#1171-scheduler) · [11.7.2 I/O poller and timers](#1172-io-poller-and-timers) · [11.7.3 Combinators and groups](#1173-combinators-and-groups) · [11.7.4 Cancellation checks](#1174-cancellation-checks) · [11.7.5 Streams and hubs](#1175-streams-and-hubs) · [11.7.6 Refs](#1176-refs) · [11.7.7 STM](#1177-stm) · [11.7.8 Commutative updates](#1178-commutative-updates) · [11.7.9 ext](#1179-ext) · [11.7.10 Signals](#11710-signals) · [11.7.11 Lazy cells](#11711-lazy-cells) · [11.7.12 Deferred teardown](#11712-deferred-teardown) · [11.7.13 Verification](#11713-verification)
   - [11.8 M5 components](#118-m5-components)
@@ -132,7 +132,7 @@ The REPL and compile-time evaluation share the metered tier: both run code the h
 - **Compile-time evaluation.** `const_eval(site)` queries compile `is Pure` MIR in the host, run it under the step limit (§18.4), and store results as hashed Solid values, also in type positions for type functions.
 - **Solid value codec.** Serialization of Solid values, so results can be hashed, cached and embedded in code objects.
 - **Strings and bytes.** Two-word values, their bytes inline or in a buffer: literals, interpolation, equality, string keys, printing and encoding, which constants and `embed` need.
-- **embed handlers.** Handlers run through compile-time evaluation, with their source files as query inputs.
+- **Embedded resources.** `embed` declarations whose files are query inputs, as `Bytes` or `Str` constants; `on Embed` handlers wait for lifecycle handlers.
 
 **Exit:** daily work happens in the REPL; dogfooding starts here.
 
@@ -1070,12 +1070,12 @@ An evaluation that traps, or runs out of steps or memory, is a compile error at 
 
 At each refill of the fuel the runtime asks the fiber's poll, and the host's poll asks whether an edit has cancelled the query. A cancelled evaluation traps with `Cancelled`, and once the fiber has stopped the query unwinds as cancelled queries do: Salsa cancels by unwinding, which must not cross the frames of generated code, so the poll catches it and the query raises it again in Rust.
 
-Conditions with known inputs wait for conditions in the checker, type functions for `Type` values, and `embed` for §11.6.10. A constant may be a string (§11.6.9).
+Conditions with known inputs wait for conditions in the checker, and type functions for `Type` values. A constant may be a string (§11.6.9), and an `embed` is a constant too (§11.6.10).
 
 **Data structures**
 
 - `ConstValue` — the bytes of a Solid value, plus their hash.
-- `EvalSite` — where evaluation was requested: so far a module-level value; type positions and `embed` sites are to come.
+- `EvalSite` — where evaluation was requested: so far a module-level value, a `let`'s or an `embed`'s; type positions are to come.
 - `EvalError` — `Trap { kind, position, stack }`, a compile error, or `NotConstant(why)`, which is not.
 - `Meter` with the poll: `Fiber::set_poll`, asked at each refill; `TrapKind::Cancelled`.
 
@@ -1128,14 +1128,27 @@ What waits: a union with a string member, such as `Option[Str]`, needs a member 
 - `rt_text_concat(ctx, a0, a1, b0, b1) -> (w0, w1)`, `rt_text_equals(ctx, a0, a1, b0, b1) -> u64` and `rt_text_show(ctx, word, number) -> (w0, w1)` — what generated code calls (`crag_abi::RuntimeFn`); they run on the system stack.
 - `fn make_text(heap: &mut Heap, parts: &[&[u8]]) -> [u64; 2]` and `unsafe fn bytes_of(words: &[u64]) -> &[u8]` — in the runtime's `text` module.
 
-#### 11.6.10 embed handlers
+#### 11.6.10 Embedded resources
 
-`embed` runs a handler at compile time over a source file, such as parsing a data file into a constant. The file's content becomes a query input, so editing the file reruns only the affected evaluations.
+`embed name: T from "path"` binds a module-level value to the content of a file of the package (Specification §18.4.1). The source is a string literal, so parsing alone finds every resource: `embed_sources` reads them from the item tree, and the driver resolves each against the directory of its module's file, reads it and gives the database what it read, or why it could not, as a `Resource` input of the program. Compile-time code never reads a file. A path that is absolute, or leaves the package by `..` or through a link, is refused, and a resource that cannot be read is a compile error at its source, as is a source that is no plain string literal.
+
+An `embed` is a module value whose body is the content of its resource, an `Expr::Embed` that holds no bytes, so the body stays equal when the file changes. Inference gives it its written type: `Bytes` without one, and `Str` only when the content is UTF-8, else an error that names the first byte that is not. Any other type needs an `on Embed` handler. The MIR of the body is the content as a constant of the type, so the value is computed, encoded and placed in its cell like any constant (§11.6.7–11.6.8), and the code that reads it finds it there; a literal longer than 15 bytes is static data of the value's code (§11.6.9).
+
+The driver reads the resources when it loads the project, and the REPL again before each input, so an edit of the file is seen by the next input; a resource whose content did not change keeps its input, and only what reads a changed one is redone: the value's types and MIR, its constant, and the constants and code that read it. A watch of the files while nothing is typed waits for the language server (§11.8.1). Resources are kept whole in the database and in the code of their values; release builds place them in static data (§11.10.3).
+
+What waits: `on Embed` handlers, which turn a resource into a value of another type at compile time, such as `embed cfg: Toml from "limits.toml"`. They need lifecycle handlers (`on` clauses, Specification §11.4), which no component builds yet: `on` clauses are parsed but not lowered or checked. A handler would be evaluated as a constant is, on the content as `Bytes` or `Str`, and an `EmbedError` it returns would be a compile error at the `embed`, with the line and column it carries. Sources other than package files, such as URLs with a pinned hash, are deferred by the specification.
+
+**Data structures**
+
+- `Resource { content: Result<Arc<[u8]>, String> }` — an input: what the driver read for a source; `Program::resources` lists them by module and source as written.
+- `ItemKind::Embed`, with `ItemKind::is_value`; `Expr::Embed`; `LowerError::Embed`; `ErrorKind::NotUtf8 { at }` and `ErrorKind::EmbedHandler { ty }`.
+- `ModuleFile::dir` and `Project::root` — in the driver: where sources resolve.
 
 **Functions**
 
-- `fn embed_source(db: &dyn Db, path: EmbedPath) -> Arc<[u8]>` — an input query, watched for changes.
-- `fn run_embed(db: &dyn Db, site: EmbedSite) -> Result<ConstValue, EvalError>` — `const_eval` with the file contents as argument.
+- `fn embed_sources(db: &dyn Db, module: ModuleId) -> Vec<String>` — the sources a module's `embed`s name, from the item tree.
+- `fn embed_content(db: &dyn Db, program: Program, item: ItemId) -> Result<&Arc<[u8]>, String>` — the content of an `embed`'s resource, which inference and MIR read.
+- `Project::read_resources(&mut self)` — reads the resources and sets the inputs that changed.
 
 ### 11.7 M4 components
 

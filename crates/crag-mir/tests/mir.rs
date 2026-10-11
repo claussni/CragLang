@@ -60,7 +60,7 @@ fn mir_of(text: &str) -> String {
         "app".to_string(),
         SourceFile::new(&db, text.to_string()),
     );
-    let program = Program::new(&db, vec![core, module]);
+    let program = Program::new(&db, vec![core, module], Vec::new());
     let mut out = String::new();
     let mut printed = std::collections::HashSet::new();
     for (_, error) in crag_types::module_type_errors(&db, program, module) {
@@ -1268,7 +1268,7 @@ fn instance_and_type_ids_are_never_reused() {
     );
     let file = SourceFile::new(&db, String::new());
     let module = ModuleId::new(&db, "app".to_string(), file);
-    let program = Program::new(&db, vec![core, module]);
+    let program = Program::new(&db, vec![core, module], Vec::new());
     let mut instances = std::collections::HashSet::new();
     let mut types = std::collections::HashSet::new();
     for i in 0..20 {

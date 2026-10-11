@@ -243,3 +243,99 @@ test "overflows in a closure" {
         "trap: arithmetic overflow\n  --> app.crag:16:24\n   |\n16 |   let y = apply({ n -> n * big }, 2)\n   |                        ^\n  in a closure in test \"overflows in a closure\"\n  in test \"overflows in a closure\"\n"
     );
 }
+
+#[test]
+fn embeds_give_the_files_they_name() {
+    let shape = r#"embed greeting: Str from "../res/greeting.txt"
+embed raw: Bytes from "../res/raw.bin"
+embed short: Str from "./../res/short.txt"
+// The module's own `data.txt`, not the one beside `app.crag`.
+embed data: Str from "data.txt"
+
+pub fn score() -> Int {
+  var n = 0
+  if greeting == "Hello from a file of the package\n" { n = n + 1 }
+  if raw == b"\x00\xff\x01" { n = n + 2 }
+  if short == "hi" and data == "geo" { n = n + 4 }
+  n
+}
+"#;
+    let app = r#"import demo.geo.shape
+
+embed motto: Str from "res/greeting.txt"
+embed data: Str from "data.txt"
+
+let twice = "{motto}{motto}"
+
+fn main() -> ExitCode {
+  var n = score()
+  if twice == "Hello from a file of the package\nHello from a file of the package\n" and data == "app" {
+    n = n + 8
+  }
+  ExitCode(code: n)
+}
+"#;
+    let root = project(
+        "embed",
+        &[
+            ("package.crag", MANIFEST),
+            ("geo/shape.crag", shape),
+            ("app.crag", app),
+            ("res/greeting.txt", "Hello from a file of the package\n"),
+            ("res/short.txt", "hi"),
+            ("geo/data.txt", "geo"),
+            ("data.txt", "app"),
+        ],
+    );
+    fs::write(root.join("res/raw.bin"), [0u8, 0xff, 1]).unwrap();
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 15, "{}", text(out));
+}
+
+#[test]
+fn an_embed_that_cannot_be_read_is_an_error_at_its_source() {
+    let app = r#"embed a from "missing.txt"
+embed b from "../outside.txt"
+embed c from "/etc/hostname"
+embed d: Str from "bad.bin"
+embed e: Int from "bad.bin"
+embed f from "{1}.txt"
+embed g from "link.txt"
+
+fn main() {}
+"#;
+    let root = project(
+        "embed-errors",
+        &[("package.crag", MANIFEST), ("app.crag", app)],
+    );
+    fs::write(root.join("bad.bin"), [b'o', b'k', 0xc3]).unwrap();
+    let outside = root.with_extension("outside");
+    fs::write(&outside, "secret").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, root.join("link.txt")).unwrap();
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 1);
+    let out = text(out);
+    let messages: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("error: "))
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "cannot read `missing.txt`: No such file or directory (os error 2)",
+            "`../outside.txt` is outside the package",
+            "`/etc/hostname` is absolute; an `embed` names a file relative to its module",
+            "an `embed` of `Str` needs UTF-8, which the resource is not at byte 2",
+            "an `embed` of `Int` needs an `on Embed` handler, which the compiler does not support yet; an `embed` of `Bytes` or `Str` needs none",
+            "the source of an `embed` is a string literal, never computed",
+            "`link.txt` is outside the package",
+        ][..messages.len().min(7)],
+        "{out}"
+    );
+    assert_eq!(messages.len(), 7, "{out}");
+    assert!(
+        out.contains(" --> app.crag:4:19\n  |\n4 | embed d: Str from \"bad.bin\"\n  |                   ^^^^^^^^^\n"),
+        "{out}"
+    );
+}

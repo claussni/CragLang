@@ -31,7 +31,7 @@ fn redeclarations(text: &str) -> Vec<String> {
         "app".to_string(),
         SourceFile::new(&db, text.to_string()),
     );
-    let program = Program::new(&db, vec![core, module]);
+    let program = Program::new(&db, vec![core, module], Vec::new());
     let line = |offset: u32| text[..offset as usize].matches('\n').count() + 1;
     check_shadowing(&db, program, module)
         .iter()

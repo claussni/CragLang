@@ -47,10 +47,20 @@ pub enum ItemKind {
     Function,
     /// A module-level `let` binding (§5.5).
     Value,
+    /// An `embed` declaration: a module-level value whose content comes
+    /// from a resource (§18.4.1).
     Embed,
     /// A function a form requires (§4.1). It is no name of the module's
     /// scope: a generic function sees it through its bounds.
     Slot,
+}
+
+impl ItemKind {
+    /// Whether the item is a module-level value: a `let`'s or an
+    /// `embed`'s.
+    pub fn is_value(self) -> bool {
+        matches!(self, ItemKind::Value | ItemKind::Embed)
+    }
 }
 
 /// An item, stable across edits to bodies: its module, name and kind, and

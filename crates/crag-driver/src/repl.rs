@@ -415,6 +415,7 @@ impl Repl {
         let text = self.session.layout(self.input.as_deref()).text;
         let file = self.session.module.file(&self.project.db);
         file.set_text(&mut self.project.db).to(text);
+        self.project.read_resources();
     }
 
     /// The errors of the session's module, rendered.

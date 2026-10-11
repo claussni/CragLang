@@ -218,6 +218,7 @@ fn lower_error(db: &dyn Db, error: &LowerError) -> (Range<u32>, String) {
         ),
         LowerError::UnnamedField { range } => (range.clone(), "a record field needs a name".into()),
         LowerError::Literal { message, range } => (range.clone(), message.clone()),
+        LowerError::Embed { message, range } => (range.clone(), message.clone()),
         LowerError::UnknownPrefix { text, range } => (
             range.clone(),
             format!("no declared prefixes make up `{text}`"),

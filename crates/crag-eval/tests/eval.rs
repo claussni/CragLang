@@ -20,12 +20,15 @@
 use crag_abi::TrapKind;
 use crag_db::{Db, RootDatabase, Setter, catch_cancelled};
 use crag_eval::{ConstValue, EvalError, EvalSite, LIMITS, const_eval, eval_errors, evaluate};
-use crag_hir::{ItemId, ModuleId, Program, SourceFile, item_tree};
+use std::sync::Arc;
+
+use crag_hir::{ItemId, ModuleId, Program, Resource, SourceFile, item_tree};
 use crag_runtime::Meter;
 
 const PRELUDE: &str = r#"pub type Int
 pub type Float
 pub type Str
+pub type Bytes
 pub type True
 pub type False
 pub type Bool = True | False
@@ -52,6 +55,11 @@ struct Project {
 
 impl Project {
     fn new(text: &str) -> Project {
+        Project::with(text, &[])
+    }
+
+    /// A project whose `embed`s may name the resources.
+    fn with(text: &str, resources: &[(&str, &[u8])]) -> Project {
         let db = RootDatabase::new();
         let core = ModuleId::new(
             &db,
@@ -60,7 +68,14 @@ impl Project {
         );
         let file = SourceFile::new(&db, text.to_string());
         let module = ModuleId::new(&db, "app".to_string(), file);
-        let program = Program::new(&db, vec![core, module]);
+        let resources = resources
+            .iter()
+            .map(|(source, bytes)| {
+                let content = Ok(Arc::from(*bytes));
+                (module, source.to_string(), Resource::new(&db, content))
+            })
+            .collect();
+        let program = Program::new(&db, vec![core, module], resources);
         let errors = crag_types::module_type_errors(&db, program, module);
         assert!(
             errors.is_empty(),
@@ -173,6 +188,37 @@ fn sum(n: Int) -> Int {
     // The query keeps the result.
     let site = EvalSite::Value(p.item("answer"));
     assert_eq!(const_eval(&p.db, p.program, site), &Ok(answer));
+}
+
+#[test]
+fn embeds_are_constants_of_their_resources() {
+    let mut p = Project::with(
+        r#"embed note: Str from "note.txt"
+embed raw from "note.txt"
+let loud = "{note}!"
+"#,
+        &[("note.txt", b"quiet")],
+    );
+    let text = |t: &[u8]| [&(t.len() as u64).to_le_bytes()[..], t].concat();
+    assert_eq!(p.bytes("note"), text(b"quiet"));
+    assert_eq!(p.bytes("raw"), text(b"quiet"));
+    assert_eq!(p.bytes("loud"), text(b"quiet!"));
+    // A new content is a new constant, for what reads it too.
+    let resource = p.program.resources(&p.db)[0].2;
+    let long = b"long enough to be in a buffer";
+    let _old = resource.set_content(&mut p.db).to(Ok(Arc::from(&long[..])));
+    assert_eq!(p.bytes("note"), text(long));
+    assert_eq!(p.bytes("loud"), text(b"long enough to be in a buffer!"));
+    // `raw` reads no `Str`, so bytes that are no UTF-8 suit it; `note`
+    // has an error now, and is no constant.
+    let _old = resource
+        .set_content(&mut p.db)
+        .to(Ok(Arc::from(&b"\xff"[..])));
+    assert_eq!(p.bytes("raw"), text(b"\xff"));
+    assert_eq!(
+        p.eval("note"),
+        Err(EvalError::NotConstant("it has errors".into()))
+    );
 }
 
 #[test]

@@ -242,3 +242,7 @@ pub fn greaterOrEqual(a: CodePoint, b: CodePoint) -> Bool
 // Str
 
 pub fn equals(a: Str, b: Str) -> Bool
+
+// Bytes
+
+pub fn equals(a: Bytes, b: Bytes) -> Bool

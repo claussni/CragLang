@@ -32,8 +32,8 @@ use crate::lower::{BodySourceMap, LowerError, Lowerer, let_parts};
 use crate::scope::{Resolution, module_scope};
 
 /// What has a body: a function, a module-level `let` (through any of the
-/// values it binds), a test, or a type or form declaration, whose types,
-/// and a type's defaults, are lowered like one.
+/// values it binds), an `embed`, a test, or a type or form declaration,
+/// whose types, and a type's defaults, are lowered like one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
 pub enum Owner<'db> {
     Item(ItemId<'db>),
@@ -56,7 +56,11 @@ pub fn owners<'db>(db: &'db dyn Db, module: ModuleId) -> Vec<Owner<'db>> {
     for item in &tree.items {
         let kind = *item.id.kind(db);
         let first_of_let = kind == ItemKind::Value && owners.iter().all(|(d, _)| *d != item.decl);
-        if matches!(kind, ItemKind::Function | ItemKind::Type | ItemKind::Form) || first_of_let {
+        let owns = matches!(
+            kind,
+            ItemKind::Function | ItemKind::Type | ItemKind::Form | ItemKind::Embed
+        );
+        if owns || first_of_let {
             owners.push((item.decl, Owner::Item(item.id)));
         }
     }
@@ -129,6 +133,11 @@ pub fn lower_body<'db>(db: &'db dyn Db, program: Program, owner: Owner<'db>) -> 
             if let Some(pattern) = parts.pattern {
                 lower.body.pattern = Some((lower.module_pattern(&pattern), ty));
             }
+        }
+        S::EmbedDecl => {
+            let read =
+                |source: &str| crate::embed::content(db, program, module, source).map(|_| ());
+            lower.embed_decl(&node, read);
         }
         S::TypeDecl => {
             lower.body.type_decl = Some(lower.type_decl(&node));

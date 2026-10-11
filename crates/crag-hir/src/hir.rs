@@ -154,9 +154,12 @@ impl<'db> Body<'db> {
                 .collect()
         };
         match self.expr(expr) {
-            Expr::Missing | Expr::Hole | Expr::Literal(_) | Expr::Name { .. } | Expr::Pass => {
-                Vec::new()
-            }
+            Expr::Missing
+            | Expr::Hole
+            | Expr::Literal(_)
+            | Expr::Embed
+            | Expr::Name { .. }
+            | Expr::Pass => Vec::new(),
             Expr::Str(parts) => parts
                 .iter()
                 .filter_map(|p| match p {
@@ -295,6 +298,9 @@ pub enum Expr<'db> {
     /// `???` (§6.11).
     Hole,
     Literal(Literal),
+    /// The content of the resource an `embed` declaration names: the whole
+    /// body of the declaration (§18.4.1).
+    Embed,
     /// A string with interpolations.
     Str(Vec<StrPart>),
     /// A name: a local binding, items, or both, since a binding may share

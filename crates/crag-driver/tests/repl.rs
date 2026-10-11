@@ -109,6 +109,49 @@ fn strings_run_and_show_as_literals() {
 }
 
 #[test]
+fn embeds_read_their_files_again_when_they_change() {
+    let dir = std::env::temp_dir().join(format!("crag-repl-embed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let note = dir.join("note.txt");
+    std::fs::write(&note, "first").unwrap();
+    let scratch = Scratch::start(ImageCommand {
+        program: env!("CARGO_BIN_EXE_crag").into(),
+        args: vec!["__image".into()],
+    })
+    .unwrap();
+    let mut project = Project::bare();
+    project.root = Some(dir.clone());
+    let mut r = Repl::new(project, scratch);
+    assert_eq!(eval(&mut r, "embed note: Str from \"note.txt\""), "");
+    assert_eq!(eval(&mut r, "embed raw from \"note.txt\""), "");
+    assert_eq!(eval(&mut r, "let loud = \"{note}!\""), "");
+    assert_eq!(eval(&mut r, "loud"), "\"first!\"\n");
+    assert_eq!(eval(&mut r, "raw"), "b\"first\"\n");
+    // An edit of the file is seen by the next input, through what reads
+    // it.
+    std::fs::write(&note, "second, long enough for a buffer").unwrap();
+    assert_eq!(
+        eval(&mut r, "loud"),
+        "\"second, long enough for a buffer!\"\n"
+    );
+    // A file that stops being UTF-8 is an error of the session, at the
+    // `embed`, until it is again.
+    std::fs::write(&note, [0xffu8]).unwrap();
+    let error = eval(&mut r, "raw");
+    assert!(
+        error.starts_with("error: an `embed` of `Str` needs UTF-8, which the resource is not at byte 0\n --> note:1:22\n"),
+        "{error}"
+    );
+    std::fs::write(&note, "third").unwrap();
+    assert_eq!(eval(&mut r, "raw"), "b\"third\"\n");
+    let error = eval(&mut r, "embed gone from \"gone.txt\"");
+    assert!(
+        error.starts_with("error: cannot read `gone.txt`: "),
+        "{error}"
+    );
+}
+
+#[test]
 fn definitions_stay_and_names_are_defined_once() {
     let mut r = repl();
     assert_eq!(eval(&mut r, "type Point(x: Int, y: Int)"), "");

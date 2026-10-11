@@ -324,6 +324,15 @@ pub enum ErrorKind<'db> {
     SecondRef,
     /// An `ext` accessed in an `ext` closure (§9.6).
     NestedExt,
+    /// A `Str` resource that is not UTF-8 from this byte on (§18.4.1).
+    NotUtf8 {
+        at: usize,
+    },
+    /// An `embed` of a type other than `Bytes` and `Str`, which needs an
+    /// `on Embed` handler (§18.4.1).
+    EmbedHandler {
+        ty: Ty<'db>,
+    },
     /// Something core inference does not handle yet; later milestones of
     /// the Implementation Plan add it.
     Unsupported(&'static str),
@@ -511,6 +520,14 @@ impl<'db> ErrorKind<'db> {
             ErrorKind::NestedExt => {
                 "an `ext` closure accesses no other `ext`, so that locks never nest".into()
             }
+            ErrorKind::NotUtf8 { at } => {
+                format!("an `embed` of `Str` needs UTF-8, which the resource is not at byte {at}")
+            }
+            ErrorKind::EmbedHandler { ty } => format!(
+                "an `embed` of `{}` needs an `on Embed` handler, which the compiler does not \
+                 support yet; an `embed` of `Bytes` or `Str` needs none",
+                ty.display(db)
+            ),
             ErrorKind::Unsupported(what) => format!("{what} are not supported yet"),
         }
     }

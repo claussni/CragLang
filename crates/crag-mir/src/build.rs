@@ -65,7 +65,7 @@ pub fn build<'db>(
 ) -> Option<MirBody<'db>> {
     let (owner, entry) = (*instance.owner(db), *instance.entry(db));
     if let Owner::Item(item) = owner {
-        if !matches!(*item.kind(db), ItemKind::Function | ItemKind::Value) {
+        if *item.kind(db) != ItemKind::Function && !item.kind(db).is_value() {
             return None;
         }
         if *item.kind(db) == ItemKind::Function
@@ -318,7 +318,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             None => Ty::unit(self.db),
         };
         if let Owner::Item(item) = *self.instance.owner(self.db)
-            && *item.kind(self.db) == ItemKind::Value
+            && item.kind(self.db).is_value()
         {
             // The code of a value keeps what it gives (§11.6.2), so it ends
             // in no tail call.
@@ -1000,6 +1000,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Expr::Missing => self.trap(TrapKind::Error, Some(expr)),
             Expr::Hole => self.trap(TrapKind::Hole, Some(expr)),
             Expr::Literal(literal) => Operand::Const(self.literal(literal, ty, false)),
+            Expr::Embed => self.embed(expr, ty),
             Expr::Str(parts) => {
                 let mut ops = Vec::new();
                 for part in parts {
@@ -1104,6 +1105,26 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Expr::Atomic(_) => self.unsupported(expr, "`atomic` blocks"),
             Expr::Lazy(_) => self.unsupported(expr, "`lazy`"),
         }
+    }
+
+    /// The content of an `embed`'s resource as a constant of its type,
+    /// which inference made `Bytes` or a `Str` that is UTF-8 (§18.4.1).
+    fn embed(&mut self, expr: ExprId, ty: Ty<'db>) -> Operand<'db> {
+        let db = self.db;
+        let Owner::Item(item) = *self.instance.owner(db) else {
+            return self.trap(TrapKind::Error, Some(expr));
+        };
+        let Ok(content) = crag_hir::embed_content(db, self.program, item) else {
+            return self.trap(TrapKind::Error, Some(expr));
+        };
+        let constant = match ty.as_builtin(db) {
+            Some((Builtin::Str, _)) => match std::str::from_utf8(content) {
+                Ok(text) => Constant::Str(text.to_string()),
+                Err(_) => return self.trap(TrapKind::Error, Some(expr)),
+            },
+            _ => Constant::Bytes(content.to_vec()),
+        };
+        Operand::Const(constant)
     }
 
     /// The value of a module-level `let`: a call of the code that computes

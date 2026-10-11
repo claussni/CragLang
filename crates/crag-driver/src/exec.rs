@@ -23,7 +23,7 @@ use crag_abi::{CELL_FULL, FuncId, RuntimeFn, SlotKey, TrapKind, TypeDescriptor};
 use crag_backend::{code, func_id, shapes};
 use crag_codegen::{CodeObject, CodegenSettings, OptLevel, compile_entry_stub, target_for};
 use crag_eval::{EvalSite, const_eval};
-use crag_hir::{ItemId, ItemKind, ModuleId, Owner};
+use crag_hir::{ItemId, ModuleId, Owner};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{Entry, InstanceKey, Tier, collect_instances, mir};
 use crag_runtime::{CodeMap, Fiber, FiberConfig, FiberState, Trap, Types, Worker, decode_value};
@@ -118,7 +118,7 @@ pub fn compile<'a>(
                 format!("a function value in {}", owner_name(project, owner))
             }
         };
-        let value = matches!(owner, Owner::Item(item) if *item.kind(db) == ItemKind::Value);
+        let value = matches!(owner, Owner::Item(item) if item.kind(db).is_value());
         let code = match code(db, program, instance, Tier::Baseline) {
             Some(Ok(code)) => code,
             Some(Err(e)) => return Err(format!("cannot compile {name}: {e}")),

@@ -17,6 +17,8 @@
 //! The inputs: source files, the modules they make and the program the
 //! modules belong to, and the parse of a file.
 
+use std::sync::Arc;
+
 use crag_syntax::{GreenNode, ParseError, lex};
 
 /// The text of one source file, as a buffer or a file on disk shows it.
@@ -41,6 +43,19 @@ pub struct ModuleId {
 pub struct Program {
     #[returns(ref)]
     pub modules: Vec<ModuleId>,
+    /// The resources the modules' `embed` declarations name: the module,
+    /// the source as written, and what the driver read (§18.4.1).
+    #[returns(ref)]
+    pub resources: Vec<(ModuleId, String, Resource)>,
+}
+
+/// The content of a resource an `embed` names, as the driver read it, or
+/// why it could not: a file of the package, read when the program was
+/// loaded and again when it changes.
+#[crag_db::input(debug)]
+pub struct Resource {
+    #[returns(ref)]
+    pub content: Result<Arc<[u8]>, String>,
 }
 
 /// A file's syntax tree and syntax errors.

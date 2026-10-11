@@ -29,6 +29,7 @@
 extern crate crag_db as salsa;
 
 mod body;
+mod embed;
 mod hir;
 mod input;
 mod items;
@@ -40,8 +41,9 @@ mod scope;
 mod shadow;
 
 pub use body::{LoweredBody, Owner, hir_body, lower_body, owners, prefixes};
+pub use embed::{embed_content, embed_sources};
 pub use hir::*;
-pub use input::{ModuleId, Parse, Program, SourceFile, parse};
+pub use input::{ModuleId, Parse, Program, Resource, SourceFile, parse};
 pub use items::{
     Import, ImportItem, Item, ItemId, ItemKind, ItemTree, Name, SlotItem, Test, TestId, c_function,
     form_slots, item_tree, slot_item, type_param_count,

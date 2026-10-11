@@ -34,9 +34,11 @@
 //! the query, and stops if so. The query then unwinds as cancelled queries
 //! do, from Rust, after the fiber has stopped.
 //!
-//! Not built yet: conditions with known inputs and type functions, which
-//! wait for conditions and `Type` values in the checker, and `embed`
+//! An `embed` is a value too, whose body is the content of its resource
 //! (§11.6.10).
+//!
+//! Not built yet: conditions with known inputs and type functions, which
+//! wait for conditions and `Type` values in the checker.
 
 extern crate crag_db as salsa;
 
@@ -47,7 +49,7 @@ use crag_abi::{CELL_FULL, CELL_VALUE_OFFSET, FuncId, RuntimeFn, SlotKey, TrapKin
 use crag_backend::{code, func_id, shapes};
 use crag_codegen::{CodegenSettings, OptLevel, Target, compile_entry_stub, target_for};
 use crag_db::{Db, catch_cancelled, check_cancelled};
-use crag_hir::{ItemId, ItemKind, ModuleId, Owner, Program};
+use crag_hir::{ItemId, ModuleId, Owner, Program};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{Entry, InstanceKey, Tier, collect_instances, mir};
 use crag_runtime::{
@@ -119,7 +121,7 @@ pub fn eval_errors<'db>(
 ) -> Vec<(ItemId<'db>, EvalError)> {
     let mut out = Vec::new();
     for item in &crag_hir::item_tree(db, module).items {
-        if *item.id.kind(db) != ItemKind::Value {
+        if !item.id.kind(db).is_value() {
             continue;
         }
         if let Err(e @ EvalError::Trap { .. }) = const_eval(db, program, EvalSite::Value(item.id)) {
@@ -210,7 +212,7 @@ impl<'db> Evaluation<'db> {
                 Entry::Closure(_) => format!("a closure in {name}"),
                 Entry::Function(_) => format!("a function value in {name}"),
             };
-            let value = matches!(owner, Owner::Item(i) if *i.kind(db) == ItemKind::Value);
+            let value = matches!(owner, Owner::Item(i) if i.kind(db).is_value());
             if value && *instance.entry(db) == Entry::Body {
                 let body = mir(db, program, instance, Tier::Baseline);
                 cells.extend(body.as_ref().map(|b| (compiled.slot, b.result)));

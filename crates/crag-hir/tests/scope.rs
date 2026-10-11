@@ -32,7 +32,7 @@ fn program(db: &RootDatabase, files: &[(&str, &str)]) -> (Program, Vec<ModuleId>
             ModuleId::new(db, path.to_string(), file)
         })
         .collect();
-    (Program::new(db, modules.clone()), modules)
+    (Program::new(db, modules.clone(), Vec::new()), modules)
 }
 
 fn id(db: &dyn Db, id: ItemId) -> String {

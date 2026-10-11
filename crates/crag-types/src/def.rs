@@ -343,7 +343,7 @@ pub fn value_type<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> 
     let owner = tree
         .items
         .iter()
-        .find(|i| i.decl == decl && *i.id.kind(db) == ItemKind::Value)?
+        .find(|i| i.decl == decl && i.id.kind(db).is_value())?
         .id;
     let body = hir_body(db, program, Owner::Item(owner));
     let result = infer(db, program, Owner::Item(owner));
