@@ -171,6 +171,16 @@ pub(crate) fn counted<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bo
     }
 }
 
+/// Whether values of a type take two words: strings, bytes and function
+/// values, which a union holds in a member box (Compiler Architecture
+/// §11).
+pub(crate) fn two_words<'db>(db: &'db dyn Db, ty: Ty<'db>) -> bool {
+    matches!(
+        ty.kind(db),
+        TyKind::Builtin(Builtin::Str | Builtin::Bytes, _) | TyKind::Fn { .. }
+    )
+}
+
 /// Where the value of an expression goes.
 #[derive(Clone, Copy)]
 enum Dest {
@@ -1242,11 +1252,12 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 let list = Place::local(container);
                 self.assign(ty, Rvalue::Index { list, index })
             }
-            Some((Builtin::Map, [k, _])) => {
+            Some((Builtin::Map, [k, v])) => {
+                let boxed = two_words(db, *v);
                 let key = self.expr(*arg);
                 let key = self.coerce(key, self.ty(*arg), *k);
                 let map = Place::local(container);
-                self.assign(ty, Rvalue::MapGet { map, key })
+                self.assign(ty, Rvalue::MapGet { map, key, boxed })
             }
             _ => self.trap(TrapKind::Error, Some(expr)),
         }

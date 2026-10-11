@@ -1116,12 +1116,15 @@ Counting a value counts its buffer, if it has one. Generated code tests the lowe
 
 Interpolation joins its parts with `rt_text_concat`, which borrows both and makes a new value, inline when it fits. A number or a code point in braces is first written as text by `rt_text_show`, as the REPL shows it, except that a code point is its character; other types wait for the `Show` form. `==` on strings and bytes compares the words inline and calls `rt_text_equals` only for two buffers of the same length, and `case` on string literals uses it. A map or a set keyed by strings or bytes hashes and compares its keys by their bytes, which its descriptor says. Values print as literals, with escapes and doubled braces, the entries of a map by their keys' bytes. The codec writes a value as its length, eight bytes, and its bytes, and decodes a string only from valid UTF-8; constants may be strings.
 
-What waits: a union with a string member, such as `Option[Str]`, needs a member of two words, as a union with a function value does. The functions of the standard library on strings and bytes, such as their length, search, slicing and the conversions between `Str` and `Bytes`, come with the standard library, and ordering strings with `compare`.
+A union is two words, its type index and a payload, so it holds a member of two words, a string, bytes or a function value as in `Option[Str]` or `Option[(Int) -> Int]`, in a member box: a box of the two words, whose type index word is `TEXT_BOX_HEADER` or `FUNCTION_BOX_HEADER`, and whose pointer is the payload. The union's type index says which member it holds, so the box names no type, and the runtime frees it without a descriptor, releasing the one word that may hold a box: the buffer of a string, the environment of a function value. Counting the union counts the box, as for a record member. Putting a value into the union moves it into a new box; taking it out gives its words references of their own and gives up the box. A map's value found by a lookup is borrowed, but when the values take two words the `Option` the lookup gives holds them in a box of its own: MIR marks such a lookup, `MapGet::boxed`, so liveness counts its result as the code's, and the value found gets a reference for the box. Printing, the codec and releasing a value follow the payload into the box when the member's shape takes two words. Like any box in a union, a member box is not in the stack maps, so a frame that unwinds leaks it (§11.4.14).
+
+What waits: the functions of the standard library on strings and bytes, such as their length, search, slicing and the conversions between `Str` and `Bytes`, come with the standard library, and ordering strings with `compare`.
 
 **Data structures**
 
 - `INLINE_TEXT_MAX`, `BUFFER_HEADER`, `TEXT_LEN_MAX` and `inline_text(bytes) -> [u64; 2]` — in `crag-abi`; `TypeDescriptor::Map::text_keys`; `Shape::Str` and `Shape::Bytes`.
 - `LirFunction::data` and `Inst::DataAddr` — static data of a function, placed after its code and reached through a relocation of the code object to itself. A runtime call may now give two words.
+- `TEXT_BOX_HEADER`, `FUNCTION_BOX_HEADER`, `MEMBER_BOX_SIZE`, `member_box_field(header)` and `Shape::member_box()` — in `crag-abi`: member boxes; `Rvalue::MapGet::boxed` in MIR.
 
 **Functions**
 

@@ -143,7 +143,7 @@ fn statement_uses(body: &MirBody<'_>, holds: &[LocalSet], statement: &Statement<
                     uses.operand(o, true)
                 }
                 Rvalue::Read(p) | Rvalue::Len(p) | Rvalue::Slice { list: p, .. } => uses.place(p),
-                Rvalue::Index { list: p, index: o } | Rvalue::MapGet { map: p, key: o } => {
+                Rvalue::Index { list: p, index: o } | Rvalue::MapGet { map: p, key: o, .. } => {
                     uses.place(p);
                     uses.operand(o, false);
                 }
@@ -221,7 +221,7 @@ fn terminator_uses(body: &MirBody<'_>, holds: &[LocalSet], terminator: &Terminat
 fn borrows(rvalue: &Rvalue<'_>) -> bool {
     matches!(
         rvalue,
-        Rvalue::Read(_) | Rvalue::Index { .. } | Rvalue::MapGet { .. }
+        Rvalue::Read(_) | Rvalue::Index { .. } | Rvalue::MapGet { boxed: false, .. }
     )
 }
 

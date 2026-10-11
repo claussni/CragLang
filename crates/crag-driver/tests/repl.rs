@@ -106,6 +106,21 @@ fn strings_run_and_show_as_literals() {
         "\"tab\\tand {{braces}}\"\n"
     );
     assert_eq!(eval(&mut r, "b\"\\x01 bytes\""), "b\"\\x01 bytes\"\n");
+    // A string in a union is in a member box, which constants decode too.
+    let maybe = "a constant in a member box of its own";
+    assert_eq!(
+        eval(&mut r, &format!("let maybe: Option[Str] = \"{maybe}\"")),
+        ""
+    );
+    assert_eq!(eval(&mut r, "maybe"), format!("\"{maybe}\"\n"));
+    assert_eq!(
+        eval(&mut r, "[maybe, \"x\"]"),
+        format!("[\"{maybe}\", \"x\"]\n")
+    );
+    assert_eq!(
+        eval(&mut r, "case maybe { s: Str -> s == \"x\"\n _ -> True }"),
+        "False\n"
+    );
 }
 
 #[test]

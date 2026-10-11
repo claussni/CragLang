@@ -190,10 +190,14 @@ pub enum Rvalue<'db> {
         list: Place<'db>,
         index: Operand<'db>,
     },
-    /// The value of a map at a key, or `Empty`: an `Option`, borrowed.
+    /// The value of a map at a key, or `Empty`: an `Option`, borrowed,
+    /// unless the values take two words, strings, bytes or function values:
+    /// then the `Option` holds the value found in a member box of its own
+    /// (Compiler Architecture §11), and is the code's.
     MapGet {
         map: Place<'db>,
         key: Operand<'db>,
+        boxed: bool,
     },
     /// A list without its first `front` and last `back` elements.
     Slice {
@@ -388,7 +392,7 @@ impl<'db> Rvalue<'db> {
                     out.extend(v.locals_mut());
                 }
             }
-            Rvalue::Index { list: p, index: o } | Rvalue::MapGet { map: p, key: o } => {
+            Rvalue::Index { list: p, index: o } | Rvalue::MapGet { map: p, key: o, .. } => {
                 out.push(&mut p.local);
                 out.extend(o.locals_mut());
             }
@@ -588,7 +592,7 @@ fn rvalue_text<'db>(db: &'db dyn Db, rvalue: &Rvalue<'db>) -> String {
         Rvalue::Concat(parts) => format!("concat({})", ops(parts)),
         Rvalue::Len(p) => format!("len {}", place(p)),
         Rvalue::Index { list, index } => format!("{}[{}]", place(list), op(index)),
-        Rvalue::MapGet { map, key } => format!("get {}[{}]", place(map), op(key)),
+        Rvalue::MapGet { map, key, .. } => format!("get {}[{}]", place(map), op(key)),
         Rvalue::Slice { list, front, back } => {
             format!("slice {}[{front}..-{back}]", place(list))
         }

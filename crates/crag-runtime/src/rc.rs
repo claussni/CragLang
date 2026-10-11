@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 use crag_abi::{
     BUFFER_HEADER, COUNT_OFFSET, CountedField, ElementLayout, STATIC_COUNT, TYPE_INDEX_OFFSET,
-    TypeDescriptor,
+    TypeDescriptor, member_box_field,
 };
 
 use crate::die;
@@ -249,6 +249,12 @@ pub unsafe fn release_box(heap: &mut Heap, types: &Types, ptr: *mut u8) {
                     pending = child;
                 }
             };
+            if let Some(at) = member_box_field(header(ptr)) {
+                // A member box of a union holds the member's words.
+                boxes_in(ptr, &[CountedField::Box(at)], &mut dead);
+                heap.free(ptr);
+                continue;
+            }
             match types.of(ptr) {
                 TypeDescriptor::Record { counted } => boxes_in(ptr, counted, &mut dead),
                 TypeDescriptor::List { element } => list::boxes_of(ptr, kind, element, &mut dead),

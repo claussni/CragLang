@@ -21,7 +21,8 @@
 //! index alone when every member is a tag, as for `Bool`. Strings and
 //! bytes take two words, their bytes inline or a buffer with where they are
 //! in it (§11.6.9), and so does a function value: the address of its code
-//! and its environment, a box or null (§11.5.9).
+//! and its environment, a box or null (§11.5.9). A union holds a member of
+//! two words in a member box, whose pointer is the payload (`crag_abi`).
 
 use crag_abi::{CountedField, ElementLayout, HEADER_SIZE, TypeDescriptor};
 use crag_db::Db;
@@ -63,8 +64,7 @@ impl Layout {
 }
 
 /// The layout of a type; none for what code generation does not handle
-/// yet: open records, type parameters, and unions with a member of two
-/// words.
+/// yet: open records and type parameters.
 pub fn layout<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Layout> {
     Some(match ty.kind(db) {
         TyKind::Error | TyKind::Param(..) => return None,
@@ -94,8 +94,8 @@ pub fn layout<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Lay
             for &m in members {
                 match layout(db, program, m)? {
                     Layout::Zero => {}
-                    Layout::Imm(_) | Layout::Box => tags = false,
-                    _ => return None,
+                    Layout::Imm(_) | Layout::Box | Layout::Pair | Layout::Closure => tags = false,
+                    Layout::Tag | Layout::Union => return None,
                 }
             }
             if tags { Layout::Tag } else { Layout::Union }
@@ -205,13 +205,16 @@ pub fn record_subtypes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> V
 }
 
 /// The type indices a value of the union `ty` may carry with a box as its
-/// payload: those of its members that are boxes, and of their subtypes.
-/// None when a member has no layout yet.
+/// payload: those of its members that are boxes, and of their subtypes,
+/// and of its members of two words, in member boxes. None when a member
+/// has no layout yet.
 pub fn boxed_indices<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Vec<u32>> {
     let mut out = Vec::new();
     for m in ty.members(db) {
-        if layout(db, program, m)? == Layout::Box {
-            out.extend(subtypes(db, program, m).into_iter().map(|i| i as u32));
+        match layout(db, program, m)? {
+            Layout::Box => out.extend(subtypes(db, program, m).into_iter().map(|i| i as u32)),
+            Layout::Pair | Layout::Closure => out.push(type_index(m) as u32),
+            _ => {}
         }
     }
     out.sort_unstable();

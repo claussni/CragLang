@@ -23,7 +23,7 @@
 //! with escapes and doubled braces, bytes as a byte literal. Limits cut
 //! deep, long and large values short with `…`.
 
-use crag_abi::{Number, Shape, Shapes, TYPE_INDEX_OFFSET};
+use crag_abi::{HEADER_SIZE, Number, Shape, Shapes, TYPE_INDEX_OFFSET};
 
 use crate::heap::Heap;
 use crate::rc::{Types, drop_box};
@@ -116,7 +116,10 @@ impl Printer<'_> {
                 let member = members.iter().find(|m| u64::from(m.0) == word);
                 match member {
                     // SAFETY: the payload is the member's.
-                    Some(&(_, m)) => unsafe { self.value(&words[1..n as usize], m, depth) },
+                    Some(&(_, m)) => unsafe {
+                        let payload = member_words(&words[1..n as usize], self.shape(m));
+                        self.value(payload, m, depth)
+                    },
                     None => self.out.push_str(&format!("<a member of type {word}>")),
                 }
             }
@@ -312,6 +315,25 @@ pub(crate) fn number(n: Number, word: u64) -> String {
 /// Gives up the references a value's words hold, freeing what only they
 /// held.
 ///
+/// The words of a union's member, from its payload: the payload itself, or
+/// for a member of two words the words of the member box it points at.
+///
+/// # Safety
+///
+/// The payload is a live member of the shape `member`, and the box
+/// outlives the borrow.
+pub(crate) unsafe fn member_words<'a>(payload: &'a [u64], member: &Shape) -> &'a [u64] {
+    match member.member_box() {
+        // SAFETY: as the caller promises; a member box holds two words
+        // after its header.
+        Some(_) => unsafe {
+            let at = (payload[0] as *const u8).add(HEADER_SIZE as usize);
+            std::slice::from_raw_parts(at.cast::<u64>(), 2)
+        },
+        None => payload,
+    }
+}
+
 /// # Safety
 ///
 /// The caller owns the value, of the shape, and gives it up.
@@ -332,7 +354,9 @@ pub unsafe fn release_value(
         _ if boxed(shape) => words[0],
         Shape::Union { members, words: 2 } => {
             match members.iter().find(|m| u64::from(m.0) == words[0]) {
-                Some(&(_, m)) if boxed(m) => words[1],
+                Some(&(_, m)) if boxed(m) || shapes.shapes[m as usize].member_box().is_some() => {
+                    words[1]
+                }
                 _ => 0,
             }
         }

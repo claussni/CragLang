@@ -480,6 +480,36 @@ pub const INLINE_TEXT_MAX: usize = 15;
 /// and no node kind, and the runtime frees such a box without a descriptor.
 pub const BUFFER_HEADER: u64 = u64::MAX;
 
+// A union is two words at most, a type index and a payload word, so a
+// member of two words, a string, bytes or a function value, is kept in a
+// member box: the header, with [`TEXT_BOX_HEADER`] or [`FUNCTION_BOX_HEADER`]
+// in place of a type index, then the member's two words. The payload points
+// at the box, which owns the member's references. The union's type index
+// says which member it holds, so the box needs none; the runtime frees it
+// without a descriptor, releasing the one word of the member that may hold
+// a box.
+
+/// The type index word of a member box holding a string or bytes value,
+/// whose first word may be a buffer.
+pub const TEXT_BOX_HEADER: u64 = u64::MAX - 1;
+
+/// The type index word of a member box holding a function value, whose
+/// second word may be an environment.
+pub const FUNCTION_BOX_HEADER: u64 = u64::MAX - 2;
+
+/// The size of a member box: the header and two words.
+pub const MEMBER_BOX_SIZE: u32 = HEADER_SIZE + 16;
+
+/// The offset of the word of a member box that may point at a box, by the
+/// box's type index word; none for a box that is no member box.
+pub fn member_box_field(header: u64) -> Option<u32> {
+    match header {
+        TEXT_BOX_HEADER => Some(HEADER_SIZE),
+        FUNCTION_BOX_HEADER => Some(HEADER_SIZE + 8),
+        _ => None,
+    }
+}
+
 /// The most bytes a string or bytes value holds: its length is the lower
 /// half of a word.
 pub const TEXT_LEN_MAX: u64 = u32::MAX as u64;
@@ -668,7 +698,8 @@ pub enum Shape {
     /// A word.
     Number(Number),
     /// A union: the type index of the member, then in a two-word union the
-    /// member's word. Each member by its type index.
+    /// member's word, which for a member of two words points at the member
+    /// box that holds them. Each member by its type index.
     Union {
         members: Vec<(u32, u32)>,
         words: u32,
@@ -753,6 +784,17 @@ impl Shape {
             | Shape::Map(..) => 1,
             Shape::Union { words, .. } | Shape::Opaque { words, .. } => *words,
             Shape::Function | Shape::Str | Shape::Bytes => 2,
+        }
+    }
+
+    /// The type index word of the member box that holds a value of the
+    /// shape in a union; none for a shape of fewer than two words, which
+    /// a union holds as it is.
+    pub fn member_box(&self) -> Option<u64> {
+        match self {
+            Shape::Str | Shape::Bytes => Some(TEXT_BOX_HEADER),
+            Shape::Function => Some(FUNCTION_BOX_HEADER),
+            _ => None,
         }
     }
 }

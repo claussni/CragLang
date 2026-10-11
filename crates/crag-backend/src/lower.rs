@@ -40,10 +40,10 @@
 use std::ops::Range;
 
 use crag_abi::{
-    BUFFER_HEADER, CELL_FULL, CELL_STATE_OFFSET, CELL_VALUE_OFFSET, COUNT_OFFSET, HEAP_OFFSET,
-    INLINE_TEXT_MAX, LEN_OFFSET, LIST_SIZE, MAP_SIZE, PAGE_FREE_OFFSET, PAGE_USED_OFFSET,
-    STATIC_COUNT, TEXT_LEN_MAX, TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TypeDescriptor,
-    inline_text, size_class,
+    BUFFER_HEADER, CELL_FULL, CELL_STATE_OFFSET, CELL_VALUE_OFFSET, COUNT_OFFSET,
+    FUNCTION_BOX_HEADER, HEADER_SIZE, HEAP_OFFSET, INLINE_TEXT_MAX, LEN_OFFSET, LIST_SIZE,
+    MAP_SIZE, MEMBER_BOX_SIZE, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, STATIC_COUNT, TEXT_BOX_HEADER,
+    TEXT_LEN_MAX, TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TypeDescriptor, inline_text, size_class,
 };
 use crag_codegen::{
     BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, CallTarget, Cond, FuncId, Inst,
@@ -732,7 +732,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let index = word(&self.operand(index, int)?)?;
                 self.element(ptr, list_ty, index)
             }
-            Rvalue::MapGet { map, key } => {
+            Rvalue::MapGet { map, key, boxed } => {
                 let map_ty = self.place_ty(map)?;
                 let Some((Builtin::Map, &[k, v])) = map_ty.as_builtin(self.db) else {
                     return Err("collections of this type");
@@ -742,7 +742,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let key = self.operand(key, k)?;
                 let [k0, k1] = self.pad(key);
                 let at = self.runtime(RuntimeFn::MapGet, vec![ptr, k0, k1]);
-                self.option(at, v, ty)
+                self.option(at, v, ty, *boxed)
             }
             Rvalue::Slice { list, front, back } => {
                 let list_ty = self.place_ty(list)?;
@@ -987,6 +987,10 @@ impl<'a, 'db> Lower<'a, 'db> {
                     let target = self.layout_of(*member)?;
                     values = match (current, target) {
                         (Layout::Union, Layout::Zero) | (Layout::Tag, Layout::Zero) => Vec::new(),
+                        // Borrowed from the member box.
+                        (Layout::Union, Layout::Pair | Layout::Closure) => {
+                            self.member_words(values[1])
+                        }
                         (Layout::Union, _) => vec![values[1]],
                         (Layout::Box, Layout::Box) => values,
                         _ => return Err("this conversion"),
@@ -1141,8 +1145,15 @@ impl<'a, 'db> Lower<'a, 'db> {
     }
 
     /// The `Option` of a map's value: the value at `at`, or `Empty` when
-    /// `at` is null.
-    fn option(&mut self, at: VReg, value: Ty<'db>, ty: Ty<'db>) -> Result<Vec<VReg>, Unsupported> {
+    /// `at` is null. A `boxed` value gets a reference of its own, which
+    /// its member box takes.
+    fn option(
+        &mut self,
+        at: VReg,
+        value: Ty<'db>,
+        ty: Ty<'db>,
+        boxed: bool,
+    ) -> Result<Vec<VReg>, Unsupported> {
         let db = self.db;
         let present = value.members(db);
         let empty = ty
@@ -1161,7 +1172,14 @@ impl<'a, 'db> Lower<'a, 'db> {
         };
         self.end(term, Some(hit));
         let words = self.layout_of(value)?.words();
-        let found = (0..words).map(|k| self.load(at, 8 * k as i32)).collect();
+        let found: Vec<VReg> = (0..words).map(|k| self.load(at, 8 * k as i32)).collect();
+        let layout = self.layout_of(value)?;
+        if boxed != matches!(layout, Layout::Pair | Layout::Closure) {
+            return Err("this conversion");
+        }
+        if boxed {
+            self.count_words(Some(layout), value, &found, Self::retain)?;
+        }
         let found = self.convert(found, value, ty)?;
         self.moves(&out, found)?;
         self.end(Term::Jump(done), Some(miss));
@@ -1208,8 +1226,40 @@ impl<'a, 'db> Lower<'a, 'db> {
             // or one that is not Pure.
             (Layout::Closure, Layout::Closure) if self.same_code(from, to) => values,
             (Layout::Closure, Layout::Closure) => return Err("conversions of function values"),
+            // A member of two words goes into a member box, which takes
+            // over its references, and comes out with references of its
+            // own, giving up the box.
+            (Layout::Pair | Layout::Closure, Layout::Union) => {
+                let header = match f {
+                    Layout::Pair => TEXT_BOX_HEADER,
+                    _ => FUNCTION_BOX_HEADER,
+                };
+                let ptr = self.alloc(MEMBER_BOX_SIZE, header as i64);
+                for (k, src) in values.into_iter().enumerate() {
+                    let offset = (HEADER_SIZE + 8 * k as u32) as i32;
+                    self.push(Inst::Store {
+                        src,
+                        addr: ptr,
+                        offset,
+                    });
+                }
+                vec![self.constant(tag), ptr]
+            }
+            (Layout::Union, Layout::Pair | Layout::Closure) => {
+                let words = self.member_words(values[1]);
+                self.count_words(Some(t), to, &words, Self::retain)?;
+                self.release(values[1]);
+                words
+            }
             _ => return Err("this conversion"),
         })
+    }
+
+    /// The two words of a union's member in the member box at `ptr`.
+    fn member_words(&mut self, ptr: VReg) -> Vec<VReg> {
+        (0..2)
+            .map(|k| self.load(ptr, (HEADER_SIZE + 8 * k) as i32))
+            .collect()
     }
 
     /// Whether values of two function types call the same code: their

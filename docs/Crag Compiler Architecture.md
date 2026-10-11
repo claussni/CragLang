@@ -127,7 +127,7 @@ Every Crag type occupies zero, one or two machine words, so a parameter or resul
 - **Zero words.** Unit `()` and tag types such as `True`, `Empty[Int]` or `NotFound`; a tag's identity is its type.
 - **One word, immediate.** `Int`, the sized integers, `Float`, `CodePoint`, `Fixed[S]` as an `i64` scaled by 10^S (about ±9.2·10^14 at S = 4), arena handles (32-bit index, 32-bit generation), and unions of tags such as `Bool`, which need only the type index.
 - **One word, box pointer.** Records, collections, grids, lazy cells and runtime objects (refs, `ext`, stream ends, hubs, groups).
-- **Two words.** Other unions: a type index plus a payload (an immediate, a box pointer, or nothing for tags). `Str` and `Bytes`: up to 15 bytes inline, otherwise a buffer pointer with offset and length, which is how slices share storage (§12.4). Closures: a code pointer plus an environment pointer, null for plain functions.
+- **Two words.** Other unions: a type index plus a payload (an immediate, a box pointer, or nothing for tags). `Str` and `Bytes`: up to 15 bytes inline, otherwise a buffer pointer with offset and length, which is how slices share storage (§12.4). Closures: a code pointer plus an environment pointer, null for plain functions. A union holds a member of two words, a string, bytes or a closure, in a member box, a box of the two words whose pointer is the payload, so it stays two words.
 
 ### 11.1 Records
 

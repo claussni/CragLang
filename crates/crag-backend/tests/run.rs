@@ -886,9 +886,8 @@ fn total(n: Int) -> Int {
 #[test]
 fn what_cannot_compile_is_listed() {
     let mut m = Module::new(
-        r#"fn label(n: Int) -> Int {
-  let text: Option[Str] = "many"
-  n
+        r#"fn label(r: (n: Int, ..)) -> Int {
+  r.n
 }
 
 fn plain(n: Int) -> Int {
@@ -907,7 +906,7 @@ fn first() -> Int {
     assert_eq!(
         m.unsupported,
         [
-            "label: values of this type",
+            "label: types of parameters or results",
             "first: module-level `let`s with patterns"
         ]
     );
@@ -1017,6 +1016,140 @@ fn copies() -> List[Str] {
     // Short strings are inline, long ones point at their buffer.
     let words = m.call("hello", &[]);
     assert_eq!(words, inline_text(b"Hello, Ada!"));
+}
+
+#[test]
+fn unions_hold_members_of_two_words_in_boxes() {
+    let mut m = Module::new(
+        r#"type Named(name: Option[Str], age: Int)
+type Cell(n: Int)
+
+fn maybe(n: Int) -> Option[Str] {
+  if n == 0 { Empty } else { "a long string, so in a buffer: {n}" }
+}
+fn short(n: Int) -> Option[Str] {
+  if n == 0 { Empty } else { "hi" }
+}
+fn kind(o: Option[Str]) -> Int {
+  case o {
+    s: Str -> if s == "hi" { 1 } else { 2 }
+    _ -> 0
+  }
+}
+fn early(o: Option[Str]) -> Str {
+  if o is Empty { return "none" }
+  o
+}
+fn kinds() -> List[Int] {
+  [kind(maybe(1)), kind(maybe(0)), kind(short(1)), kind(Empty), kind("hi")]
+}
+fn earlies() -> List[Str] { [early(maybe(2)), early(Empty), early(short(1))] }
+fn options() -> List[Option[Str]] { [maybe(3), Empty, short(1)] }
+fn mixed(n: Int) -> Str | Int | Bytes {
+  case n {
+    0 -> "a string long enough for a buffer"
+    1 -> b"bytes long enough for a buffer too"
+    _ -> n
+  }
+}
+fn mixes() -> List[Str | Int | Bytes] { [mixed(0), mixed(1), mixed(2)] }
+fn people() -> List[Named] {
+  [Named(name: maybe(1), age: 3), Named(name: Empty, age: 4), Named(name: short(1), age: 5)]
+}
+fn names() -> Int {
+  var out = 0
+  for p in people() {
+    out = out * 10 + kind(p.name)
+  }
+  out
+}
+fn table() -> Map[Int, Option[Str]] { [1: maybe(1), 2: Empty] }
+fn words() -> Map[Str, Str] {
+  ["a": "a value made at run time, {1} buffer", "b": "hi"]
+}
+fn found() -> List[Option[Str]] {
+  let m = words()
+  [m["a"], m["b"], m["c"]]
+}
+fn lookups() -> Int {
+  let m = words()
+  kind(m["a"]) * 100 + kind(m["b"]) * 10 + kind(m["c"]) + kind(m["a"]) * 1000
+}
+fn kept() -> (first: Option[Str], words: Map[Str, Str]) {
+  let m = words()
+  let first = m["a"]
+  kind(m["a"])
+  (first: first, words: m)
+}
+fn named(p: Named) -> Str {
+  case p.name {
+    s: Str -> s
+    _ -> "none"
+  }
+}
+fn nameds() -> List[Str] {
+  [named(Named(name: maybe(4), age: 1)), named(Named(name: Empty, age: 2))]
+}
+fn adder(k: Int) -> Option[(Int) -> Int] {
+  let c = Cell(n: k)
+  if k == 0 { Empty } else { { n -> n + c.n } }
+}
+fn apply(f: Option[(Int) -> Int], x: Int) -> Int {
+  if f is Empty { return x }
+  f(x)
+}
+fn applied() -> List[Int] { [apply(adder(5), 1), apply(adder(0), 1)] }
+fn functions() -> Map[Str, (Int) -> Int] {
+  let c = Cell(n: 7)
+  ["add": { n -> n + c.n }]
+}
+fn calls() -> Int {
+  let fs = functions()
+  apply(fs["add"], 1) * 10 + apply(fs["none"], 1)
+}
+"#,
+    );
+    assert!(m.unsupported.is_empty(), "{:?}", m.unsupported);
+    let expected = [
+        ("kinds", "[2, 0, 1, 0, 1]"),
+        (
+            "earlies",
+            r#"["a long string, so in a buffer: 2", "none", "hi"]"#,
+        ),
+        (
+            "options",
+            r#"["a long string, so in a buffer: 3", Empty, "hi"]"#,
+        ),
+        (
+            "mixes",
+            r#"["a string long enough for a buffer", b"bytes long enough for a buffer too", 2]"#,
+        ),
+        (
+            "people",
+            r#"[Named(name: "a long string, so in a buffer: 1", age: 3), Named(name: Empty, age: 4), Named(name: "hi", age: 5)]"#,
+        ),
+        ("names", "201"),
+        (
+            "table",
+            r#"[1: "a long string, so in a buffer: 1", 2: Empty]"#,
+        ),
+        (
+            "found",
+            r#"["a value made at run time, 1 buffer", "hi", Empty]"#,
+        ),
+        ("lookups", "2210"),
+        (
+            "kept",
+            r#"(first: "a value made at run time, 1 buffer", words: ["a": "a value made at run time, 1 buffer", "b": "hi"])"#,
+        ),
+        ("nameds", r#"["a long string, so in a buffer: 4", "none"]"#),
+        ("applied", "[6, 1]"),
+        ("calls", "81"),
+    ];
+    for (name, shown) in expected {
+        assert_eq!(m.shown(name), shown, "{name}");
+        assert_eq!(m.heap.live_blocks(), 0, "{name}");
+    }
 }
 
 #[test]
@@ -1385,11 +1518,15 @@ fn words() -> Map[Str, List[Str]] {
 fn texts() -> (name: Str, data: Bytes, none: Str) {
   (name: "Grüße aus Crag, lang genug", data: b"\x00\xff", none: "")
 }
+fn alone() -> Option[Str] { "a string made at run time: {2}" }
+fn boxed() -> List[Option[Str] | Bytes] {
+  ["a string long enough for a buffer", Empty, "short", b"\x01 bytes long enough for a buffer"]
+}
 "#,
     );
     let names = [
         "deep", "chain", "points", "ages", "set", "maybe", "none", "tags", "mixed", "empty",
-        "nothing", "both", "words", "texts",
+        "nothing", "both", "words", "texts", "boxed", "alone",
     ];
     let limits = PrintLimits::default();
     for name in names {

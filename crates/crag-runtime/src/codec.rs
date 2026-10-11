@@ -39,9 +39,10 @@
 //! and then builds the value, so bytes that do not fit leave no boxes
 //! behind. The boxes get the type indices and sizes the shapes give them.
 
-use crag_abi::{Shape, ShapeField, Shapes, TYPE_INDEX_OFFSET};
+use crag_abi::{HEADER_SIZE, MEMBER_BOX_SIZE, Shape, ShapeField, Shapes, TYPE_INDEX_OFFSET};
 
 use crate::heap::{Heap, alloc_box};
+use crate::print::member_words;
 use crate::rc::Types;
 use crate::text::{bytes_of, make_text};
 use crate::{list, map};
@@ -84,8 +85,12 @@ unsafe fn encode(
                 return Err(NotSolid(format!("a member of type {word}")));
             };
             out.extend((at as u32).to_le_bytes());
+            let member = members[at].1;
             // SAFETY: the payload is the member's.
-            unsafe { encode(&words[1..*n as usize], shapes, members[at].1, types, out)? };
+            unsafe {
+                let payload = member_words(&words[1..*n as usize], &shapes.shapes[member as usize]);
+                encode(payload, shapes, member, types, out)?
+            };
         }
         Shape::Record { .. } => {
             let ptr = word as *const u8;
@@ -288,7 +293,13 @@ impl Decoder<'_> {
                 let Some(&(_, member)) = members.get(at) else {
                     return Err(DecodeError(format!("no member {at}")));
                 };
-                if shape_of(member)?.words() + 1 > (*words).max(1) {
+                // A member of two words is in a member box.
+                let member_shape = shape_of(member)?;
+                let held = match member_shape.member_box() {
+                    Some(_) => 1,
+                    None => member_shape.words(),
+                };
+                if held + 1 > (*words).max(1) {
                     return Err(DecodeError(format!("member {at} does not fit")));
                 }
                 self.check(shapes, member)?;
@@ -371,7 +382,19 @@ impl Decoder<'_> {
                 let (index, member) = members[self.u32().expect(ok) as usize];
                 let mut out = vec![u64::from(index)];
                 // SAFETY: as the caller promises.
-                out.extend(unsafe { self.build(shapes, member, heap, types) });
+                let value = unsafe { self.build(shapes, member, heap, types) };
+                match shapes.shapes[member as usize].member_box() {
+                    Some(header) => {
+                        let ptr = alloc_box(heap, MEMBER_BOX_SIZE as usize, header);
+                        // SAFETY: the box holds two words after its header.
+                        unsafe {
+                            let at = ptr.add(HEADER_SIZE as usize).cast::<u64>();
+                            std::ptr::copy_nonoverlapping(value.as_ptr(), at, 2);
+                        }
+                        out.push(ptr as u64);
+                    }
+                    None => out.extend(value),
+                }
                 out.resize(*n as usize, 0);
                 out
             }
