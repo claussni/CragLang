@@ -256,11 +256,20 @@ pub enum RuntimeFn {
     /// takes the reference. The runtime clears the box's word of the code
     /// first, so the next time its count reaches zero it is freed.
     Disposal = 14,
+
+    /// `rt_yield(ctx)`.
+    ///
+    /// Gives the other fibers a turn: the fiber suspends, goes to the back
+    /// of a run queue and continues when a worker picks it again
+    /// (Implementation Plan §11.7.1). Like every runtime function that may
+    /// suspend, it returns on the fiber stack it was called on, possibly
+    /// on another thread.
+    Yield = 15,
 }
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 15] = [
+    pub const ALL: [RuntimeFn; 16] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -276,6 +285,7 @@ impl RuntimeFn {
         RuntimeFn::TextEquals,
         RuntimeFn::TextShow,
         RuntimeFn::Disposal,
+        RuntimeFn::Yield,
     ];
 
     /// The symbol the loader looks up.
@@ -296,6 +306,7 @@ impl RuntimeFn {
             RuntimeFn::TextEquals => "rt_text_equals",
             RuntimeFn::TextShow => "rt_text_show",
             RuntimeFn::Disposal => "rt_disposal",
+            RuntimeFn::Yield => "rt_yield",
         }
     }
 

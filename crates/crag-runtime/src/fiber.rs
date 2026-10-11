@@ -26,7 +26,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::mem::offset_of;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use crag_abi::{
     FUEL_OFFSET, HEAP_OFFSET, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET, STACK_MARGIN,
@@ -35,6 +35,7 @@ use crag_abi::{
 use crate::heap::Heap;
 use crate::meter::{Meter, Metering};
 use crate::rc::Types;
+use crate::sched::{Local, PARK_NONE, WaitReason, settle};
 use crate::side_stack::SideStack;
 use crate::stack::StackMemory;
 use crate::unwind::{CodeMap, Trap};
@@ -72,6 +73,11 @@ pub struct TaskContext {
     pub(crate) pending: AtomicUsize,
     /// The fiber this context belongs to, while a worker runs it.
     pub(crate) fiber: AtomicPtr<Fiber>,
+    /// Where the fiber is in suspending and waking (`sched::PARK_*`).
+    pub(crate) park: AtomicUsize,
+    /// The words a suspending runtime function returns when the fiber is
+    /// woken, which the waker leaves here.
+    pub(crate) wake_words: [AtomicU64; 2],
 }
 
 const _: () = assert!(offset_of!(TaskContext, stack_limit) == STACK_LIMIT_OFFSET as usize);
@@ -95,6 +101,8 @@ pub enum FiberState {
     Finished,
     /// Its function trapped; the trap says why and where.
     Trapped,
+    /// Suspended in a runtime function until something wakes it.
+    Waiting(WaitReason),
 }
 
 /// How a fiber's stack starts and grows.
@@ -163,6 +171,8 @@ pub struct Fiber {
     pub(crate) trap: Option<Trap>,
     /// What metered code it runs may still use, if it is metered.
     pub(crate) metering: Option<Metering>,
+    /// What it waits for while it is suspended.
+    pub(crate) wait: WaitReason,
 }
 
 impl Fiber {
@@ -198,6 +208,8 @@ impl Fiber {
             status: AtomicUsize::new(0),
             pending: AtomicUsize::new(0),
             fiber: AtomicPtr::new(std::ptr::null_mut()),
+            park: AtomicUsize::new(0),
+            wake_words: [AtomicU64::new(0), AtomicU64::new(0)],
         });
 
         // The first switch into the fiber pops six registers and returns, so
@@ -241,6 +253,7 @@ impl Fiber {
             results,
             trap: None,
             metering: None,
+            wait: WaitReason::Yield,
         }))
     }
 
@@ -327,6 +340,8 @@ pub struct Worker {
     types: Arc<Types>,
     /// The stack maps of the image's code, for unwinding.
     code: Arc<CodeMap>,
+    /// Its part of the scheduler, if a scheduler runs it.
+    pub(crate) sched: Option<Local>,
 }
 
 const _: () = assert!(offset_of!(Worker, sp) == 0);
@@ -345,6 +360,7 @@ impl Worker {
             heap: Heap::new(),
             types: Arc::default(),
             code: Arc::default(),
+            sched: None,
         }
     }
 
@@ -391,7 +407,9 @@ impl Worker {
     }
 
     /// Runs the fiber until it finishes or stops, and returns its new state:
-    /// `Finished`, `Paused`, or `Runnable` after a preemption.
+    /// `Finished`, `Trapped`, `Paused`, `Runnable` after a preemption or
+    /// when it was woken while it suspended, or `Waiting` when it suspended
+    /// and waits for a wake.
     pub fn resume(&mut self, fiber: &mut Fiber) -> FiberState {
         assert!(
             matches!(fiber.state, FiberState::Runnable | FiberState::Paused),
@@ -434,6 +452,9 @@ impl Worker {
             match (*ctx).status.load(Ordering::Relaxed) {
                 STATUS_FINISHED => (*fiber).state = FiberState::Finished,
                 STATUS_TRAPPED => (*fiber).state = FiberState::Trapped,
+                _ if (*ctx).park.load(Ordering::Acquire) != PARK_NONE => {
+                    (*fiber).state = settle(&*ctx, (*fiber).wait);
+                }
                 _ => {}
             }
             (*fiber).state
@@ -446,8 +467,9 @@ impl Worker {
     }
 
     /// The run loop: resumes queued fibers in turn until none is runnable. A
-    /// preempted fiber goes to the back of the queue. Returns the fibers that
-    /// finished, trapped or paused, in that order.
+    /// preempted fiber, or one that suspended and was woken at once, goes to
+    /// the back of the queue. Returns the fibers that finished, trapped,
+    /// paused or wait, in the order they stopped.
     pub fn run(&mut self) -> Vec<Box<Fiber>> {
         let mut stopped = Vec::new();
         while let Some(mut fiber) = self.queue.pop_front() {

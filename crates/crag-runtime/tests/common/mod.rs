@@ -34,6 +34,8 @@ pub struct Image {
     arena: CodeArena,
     symbols: SymbolTable,
     pub settings: CodegenSettings,
+    /// The entry stubs loaded so far, by the number of arguments.
+    stubs: std::collections::HashMap<usize, usize>,
 }
 
 impl Image {
@@ -79,18 +81,26 @@ impl Image {
             arena,
             symbols,
             settings,
+            stubs: std::collections::HashMap::new(),
         }
     }
 
     /// A fiber that will call function `func` with `args`, expecting one
     /// result.
     pub fn fiber(&mut self, func: usize, args: &[u64], config: FiberConfig) -> Box<Fiber> {
-        let stub = compile_entry_stub(args.len() as u32, 1, &self.settings).unwrap();
-        let stub = load(&mut self.arena, &self.symbols, &stub).unwrap();
+        let stub = match self.stubs.get(&args.len()) {
+            Some(&stub) => stub,
+            None => {
+                let stub = compile_entry_stub(args.len() as u32, 1, &self.settings).unwrap();
+                let stub = load(&mut self.arena, &self.symbols, &stub).unwrap().addr();
+                self.stubs.insert(args.len(), stub);
+                stub
+            }
+        };
         // SAFETY: the stub was compiled for this argument count and one
         // result, like every function in these tests, and the image outlives
         // the fiber in each test.
-        unsafe { Fiber::new(stub.addr(), self.functions[func], args, config).unwrap() }
+        unsafe { Fiber::new(stub, self.functions[func], args, config).unwrap() }
     }
 }
 

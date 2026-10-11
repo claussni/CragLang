@@ -145,7 +145,7 @@ Concurrency grows from the M0 fiber runtime into the full set of Chapters 9 to 1
 
 **Components and algorithms**
 
-- **Scheduler.** Per-worker run queues with work stealing (Chase–Lev deques), parking idle workers, and preemption through the sentinel.
+- **Scheduler.** Per-worker run queues with work stealing (Chase–Lev deques), parking idle workers, preemption through the sentinel, and suspending and waking fibers.
 - **I/O poller and timers.** epoll, kqueue and IOCP behind one interface, and a hierarchical timing wheel for `sleep` and `within`.
 - **Combinators and groups.** Structured scopes, joins, `firstResult` with loser cancellation, `limit`, and vars captured by value at `start` (§10.2.1).
 - **Cancellation checks.** The compiler-inserted checks, a per-task counter of regions where cancellation waits, and unwinding on the cancel status (§10.4).
@@ -1202,18 +1202,26 @@ What waits:
 
 The scheduler spreads fibers over one worker thread per core and keeps all cores busy. Each worker has its own queue; an idle worker steals work from another's queue (work stealing). The queue is a [Chase–Lev deque](https://dl.acm.org/doi/10.1145/1073970.1073974): the owner pushes and pops at one end without locks, thieves take from the other end with an atomic compare-and-swap. Workers with nothing to do park on the operating system until woken.
 
+The deque follows the memory orderings of [Lê et al.](https://doi.org/10.1145/2442516.2442524) and holds words, fibers the scheduler owns. Its ring doubles when it is full; a thief may still read an old ring, so old rings live as long as the deque. A worker picks from its own deque, then the global queue, then by stealing from the others in turn, and parks when all are empty. Fibers spawned from outside, woken, preempted or yielding go to the global queue; a worker that takes from it takes its share of the rest too, up to 32 fibers, and keeps them on its deque in their order, where idle workers steal them. Child fibers that combinators start will go on the deque of the worker that starts them (§11.7.3). A deque holds at most a batch, so it never keeps its worker from the global queue for long. Parking cannot lose a wake: a worker announces that it parks, passes a fence and looks for work once more; whoever adds work passes a fence and then clears one worker's announcement and unparks it.
+
+A runtime function that waits suspends its fiber: its Rust half calls `suspend`, which records why and hands out a `FiberRef`, and the function, defined with `suspending_fn!`, then leaves a switch frame on the fiber stack and returns into the worker instead of to generated code. When the fiber is resumed it continues in the function, which returns the two words the waker left in the task context. A wake may come from any thread, even before the fiber has left its worker, so the context's `park` word settles the race: `suspend` makes it `SUSPENDING`; the resume, once the fiber has switched out, makes it `PARKED`, unless a wake made it `WOKEN` first, in which case the resume ends `Runnable` and the worker queues the fiber again; a wake of a `PARKED` fiber clears the word and queues the fiber on the global queue. `rt_yield` is the first such function: it suspends and wakes at once, so the fiber goes to the back of the queue; deferred teardown yields between its batches (§11.7.12).
+
+A ticker thread looks at every worker once per time slice, ten milliseconds by default, and preempts a fiber that has been running since its last look, through the sentinel (§11.3.4). The scheduler counts the fibers spawned and not yet stopped; `wait` returns those that finished, trapped or were paused once none is left. A suspended fiber belongs to whoever holds its `FiberRef`; dropping the scheduler frees the fibers it still queues. A metered fiber with a poll is not spawned, since its poll may borrow what only one thread can use.
+
 **Data structures**
 
-- `RunQueue` — a Chase–Lev deque of runnable fibers per worker.
-- `GlobalQueue` — a locked queue for fibers woken from outside any worker, such as by I/O.
-- `Parker` — per worker: sleep and wake on a futex or condition variable.
+- `Deque` and `Stealer` — the owner's and the thieves' ends of the Chase–Lev deque of a worker.
+- `Shared` — what the workers share: the stealers, the global queue, the parkers, the fiber each worker runs for the ticker, the count of live fibers and the stopped ones.
+- `Parker` — per worker: its thread and its announcement that it parks.
+- `WaitReason` — what a suspended fiber waits for; `FiberState::Waiting` carries it. `Yield` so far.
+- `FiberRef` — a suspended fiber, for the one thing that wakes it.
+- `TaskContext::park` and `TaskContext::wake_words` — the suspension's state and the words the waker gives.
 
 **Functions**
 
-- `fn spawn(worker: &Worker, fiber: Box<Fiber>)` — push to the current worker's deque.
-- `fn schedule(worker: &mut Worker) -> Box<Fiber>` — pick the next fiber: own deque, then the global queue, then steal, then park.
-- `fn suspend(ctx: &mut TaskContext, reason: WaitReason)` and `fn wake(fiber: FiberRef)` — the building blocks every waiting operation uses.
-- `fn preempt_tick(workers: &[Worker])` — a timer that requests a stop on fibers running too long (through the sentinel).
+- `fn Scheduler::new(config: SchedulerConfig, types: Arc<Types>, code: Arc<CodeMap>) -> Scheduler` — starts the workers and the ticker; `spawn`, `spawn_all`, `wait` and `stats`.
+- `fn suspend(ctx: &TaskContext, reason: WaitReason) -> FiberRef` and `fn wake(fiber: FiberRef, words: [u64; 2])` — the building blocks every waiting operation uses.
+- `rt_yield(ctx)` — gives the other fibers a turn.
 
 #### 11.7.2 I/O poller and timers
 

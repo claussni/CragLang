@@ -57,6 +57,79 @@ macro_rules! system_stack_fn {
     };
 }
 
+/// Defines a runtime function that runs on the system stack, as
+/// `system_stack_fn!` does, and may suspend the fiber: when its Rust half
+/// has called `sched::suspend`, the function leaves a switch frame on the
+/// fiber stack and returns into the worker instead of to its caller. When
+/// the fiber is woken and resumed, the switch frame continues it here, and
+/// the function returns the two words the waker left in the context.
+macro_rules! suspending_fn {
+    (
+        $(#[$meta:meta])*
+        fn $name:ident($($arg:ident: $ty:ty),*) $(-> $ret:ty)? => $entry:path
+    ) => {
+        $(#[$meta])*
+        ///
+        /// # Safety
+        ///
+        /// Only generated code may call this, on a fiber stack, with the
+        /// fiber's task context.
+        #[unsafe(naked)]
+        pub(crate) unsafe extern "C" fn $name($($arg: $ty),*) $(-> $ret)? {
+            std::arch::naked_asm!(
+                "push rbx",
+                "push r12",
+                "mov r12, rdi",
+                "mov rbx, rsp",
+                "mov rax, [rdi + {worker}]",
+                "mov rsp, [rax]",
+                "and rsp, -16",
+                "call {entry}",
+                "mov rsp, rbx",
+                "cmp qword ptr [r12 + {park}], 0",
+                "jne 3f",
+                "pop r12",
+                "pop rbx",
+                "ret",
+                // Suspend: a switch frame as `switch` leaves one, which
+                // continues at 4, then back into the worker's `switch`.
+                "3:",
+                "lea rax, [rip + 4f]",
+                "push rax",
+                "push rbp",
+                "push rbx",
+                "push r12",
+                "push r13",
+                "push r14",
+                "push r15",
+                "mov [r12 + {saved_sp}], rsp",
+                "mov rax, [r12 + {worker}]",
+                "mov rsp, [rax]",
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop rbx",
+                "pop rbp",
+                "ret",
+                // Woken: the switch restored the registers saved above.
+                "4:",
+                "mov rax, [r12 + {wake0}]",
+                "mov rdx, [r12 + {wake1}]",
+                "pop r12",
+                "pop rbx",
+                "ret",
+                worker = const std::mem::offset_of!($crate::fiber::TaskContext, worker),
+                park = const std::mem::offset_of!($crate::fiber::TaskContext, park),
+                saved_sp = const std::mem::offset_of!($crate::fiber::TaskContext, saved_sp),
+                wake0 = const std::mem::offset_of!($crate::fiber::TaskContext, wake_words),
+                wake1 = const std::mem::offset_of!($crate::fiber::TaskContext, wake_words) + 8,
+                entry = sym $entry,
+            )
+        }
+    };
+}
+
 /// The heap and the type descriptors of the worker running the fiber of
 /// `ctx`, for the Rust half of a runtime function.
 ///

@@ -20,7 +20,8 @@
 //! the context switch, stack growth by copying, the side stack, the sentinel
 //! stop request and the stress harness. M1 adds the allocator, reference
 //! counting, lists and maps, and traps (§11.4.11 to §11.4.14). M3 adds the
-//! metered tier's budgets (§11.6.6), and strings and bytes (§11.6.9).
+//! metered tier's budgets (§11.6.6), and strings and bytes (§11.6.9). M4
+//! adds the scheduler (§11.7.1).
 //!
 //! Runtime discipline (Compiler Architecture §2.1): no thread-locals, no
 //! callbacks into Crag code from the runtime stack, panics abort in images
@@ -42,6 +43,7 @@ compile_error!("the runtime's context switch is written for x86-64 Unix only");
 mod system;
 
 pub mod codec;
+mod deque;
 pub mod fiber;
 pub mod heap;
 pub mod list;
@@ -49,6 +51,7 @@ pub mod map;
 pub mod meter;
 pub mod print;
 pub mod rc;
+pub mod sched;
 pub mod sentinel;
 pub mod side_stack;
 pub mod stack;
@@ -64,6 +67,7 @@ pub use heap::{Heap, alloc_box};
 pub use meter::Meter;
 pub use print::{PrintLimits, print_value, release_value};
 pub use rc::{Disposal, Types, next_disposal, release_box};
+pub use sched::{FiberRef, Scheduler, SchedulerConfig, WaitReason, WorkerStats, wake};
 pub use sentinel::{StopHandle, StopReason, request_stop};
 pub use unwind::{CodeMap, Trap};
 
@@ -87,6 +91,7 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::TextEquals => text::rt_text_equals as *const () as usize,
         RuntimeFn::TextShow => text::rt_text_show as *const () as usize,
         RuntimeFn::Disposal => rc::rt_disposal as *const () as usize,
+        RuntimeFn::Yield => sched::rt_yield as *const () as usize,
     }
 }
 
