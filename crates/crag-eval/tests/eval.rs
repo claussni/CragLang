@@ -245,7 +245,15 @@ fn name(text: Str) -> Name | EmbedError {
   Name(text: "{text}, as a name long enough for a buffer", length: 2)
 }
 
+distinct type Named[T](name: Name, more: List[T])
+  on Embed named
+
+fn named[T](text: Str) -> Named[T] | EmbedError {
+  Named(name: Name(text: text, length: 3), more: [])
+}
+
 embed who: Name from "who.txt"
+embed names: Named[Int] from "who.txt"
 "#;
     let mut p = Project::with(text, &[("who.txt", b"Ada")]);
     // The record's shape, then its fields as the type declares them.
@@ -259,6 +267,19 @@ embed who: Name from "who.txt"
     ]
     .concat();
     assert_eq!(value, expected);
+    // The handler of a generic type, for one of its instances: its box,
+    // the name's box, the name, its length and the empty list.
+    let names = p.bytes("names");
+    assert_eq!(
+        names[8..],
+        [
+            &3u64.to_le_bytes()[..],
+            b"Ada",
+            &3u64.to_le_bytes(),
+            &0u64.to_le_bytes()
+        ]
+        .concat()
+    );
     // The handler's error, released with the rest.
     let resource = p.program.resources(&p.db)[0].2;
     let _old = resource.set_content(&mut p.db).to(Ok(Arc::from(&b""[..])));

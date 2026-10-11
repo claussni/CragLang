@@ -1158,7 +1158,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             return self.trap(TrapKind::Error, Some(expr));
         };
         let handler = lifecycle_handler(db, self.program, ty, "Embed");
-        let param = match handler.map(|h| h.form.kind(db)) {
+        let param = match handler.as_ref().map(|h| h.form.kind(db)) {
             Some(TyKind::Fn { params, .. }) => params[0],
             _ => ty,
         };
@@ -1172,19 +1172,13 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let Some(handler) = handler else {
             return Operand::Const(constant);
         };
-        let Some(result) = result_type(db, self.program, handler.function) else {
+        let Some(result) = handler.result(db, self.program) else {
             return self.trap(TrapKind::Error, Some(expr));
         };
-        let dst = self.temp(result);
-        let target = self.new_block();
-        self.terminate(Terminator::Call {
-            func: InstanceKey::body(db, Owner::Item(handler.function)),
-            args: vec![Operand::Const(constant)],
-            dst,
-            target,
-            site: expr,
-        });
-        self.switch_to(target);
+        let Some(func) = self.callable(expr, &handler.function) else {
+            return self.trap(TrapKind::Error, Some(expr));
+        };
+        let dst = self.call_code(func, vec![Operand::Const(constant)], result, expr);
         let (fits, fail) = (self.new_block(), self.new_block());
         let cases = ty.members(db).into_iter().map(|m| (m, fits)).collect();
         self.terminate(Terminator::Switch {
@@ -1753,7 +1747,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         })
                         .collect::<Option<Vec<_>>>()?;
                     let code = func.with_entry(db, Entry::Default(callee.params.get(i)?.default?));
-                    ops[i] = Some(self.call_code(code, before, params[i].ty, expr));
+                    let local = self.call_code(code, before, params[i].ty, expr);
+                    ops[i] = Some(Operand::Local(local));
                 }
             }
             return ops.into_iter().collect();
@@ -1918,14 +1913,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     }
 
     /// A call of a type: a tag's value, or a record built from arguments.
-    /// Calls code with arguments and gives its result, of type `ty`.
+    /// Calls code with arguments and gives the local of its result, of
+    /// type `ty`.
     fn call_code(
         &mut self,
         func: InstanceKey<'db>,
         args: Vec<Operand<'db>>,
         ty: Ty<'db>,
         site: ExprId,
-    ) -> Operand<'db> {
+    ) -> Local {
         let dst = self.temp(ty);
         let target = self.new_block();
         self.terminate(Terminator::Call {
@@ -1936,7 +1932,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             site,
         });
         self.switch_to(target);
-        Operand::Local(dst)
+        dst
     }
 
     fn construct(
@@ -2135,7 +2131,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     // The type that declares the field last gives it the
                     // type it has here.
                     Some(FieldDefault::Code(code)) => {
-                        self.call_code(code, Vec::new(), field_ty, site)
+                        Operand::Local(self.call_code(code, Vec::new(), field_ty, site))
                     }
                     None => return self.trap(TrapKind::Error, Some(site)),
                 },

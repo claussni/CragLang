@@ -431,12 +431,20 @@ distinct type Clock(n: Int)
 
 distinct type Unknown(n: Int)
 
+// A handler of a generic type fits each of its instances.
+distinct type Narrow[T](n: Int)
+  on Embed parseNarrow
+distinct type Wide[T](n: Int)
+  on Embed parseWide
+
 fn parsePlain(text: Str) -> Plain { Plain(n: 1) }
 fn parseNoKind(text: Str) -> NoKind { NoKind(n: 1) }
 fn parseFaked(text: Str) -> Faked { Faked(n: 1) }
 fn parseMisfit(n: Int) -> Misfit { Misfit(n: n) }
 fn parseTwice(text: Str) -> Twice { Twice(n: 1) }
 fn parseClock(text: Str) -> Clock { Clock(n: now()) }
+fn parseNarrow(text: Str) -> Narrow[Int] { Narrow(n: 1) }
+fn parseWide[T](text: Str) -> Wide[T] { Wide(n: 1) }
 
 embed unknown: Unknown from "x.txt"
 
@@ -466,6 +474,7 @@ fn main() {}
             "no function `parseMisfit` fits the form of `Embed`: ((Bytes) -> EmbedError | Misfit) | ((Str) -> EmbedError | Misfit)",
             "the type already declares a handler of `Embed`",
             "a handler of `Embed` is Pure, and `parseClock` has effects",
+            "no function `parseNarrow` fits the form of `Embed`: ((Bytes) -> EmbedError | Narrow[T]) | ((Str) -> EmbedError | Narrow[T])",
             "an `embed` of `Unknown` needs an `on Embed` handler, which `Unknown` does not declare; an `embed` of `Bytes` or `Str` needs none",
         ],
         "{out}"

@@ -1296,12 +1296,20 @@ fn parse(text: Str) -> Level | EmbedError {
 }
 fn measure(data: Bytes) -> Size { Size(n: 2) }
 
+// The handler of a generic type is instantiated for each of its instances.
+distinct type Pile[T](items: List[T], size: Int)
+  on Embed pile
+fn pile[T](data: Bytes) -> Pile[T] { Pile(items: [], size: 4) }
+
+embed ints: Pile[Int] from "size.bin"
+embed texts: Pile[Str] from "size.bin"
 embed high: Level from "high.txt"
 embed bad: Level from "bad.txt"
 embed size: Size from "size.bin"
 embed raw from "size.bin"
 
 fn levels() -> Int { high.n * 10 + size.n }
+fn piles() -> Int { ints.size + texts.size }
 fn broken() -> Int { bad.n }
 fn bytes() -> Bytes { raw }
 "#,
@@ -1313,6 +1321,7 @@ fn bytes() -> Bytes { raw }
     );
     assert!(m.unsupported.is_empty(), "{:?}", m.unsupported);
     assert_eq!(m.shown("levels"), "32");
+    assert_eq!(m.shown("piles"), "8");
     assert_eq!(m.shown("bytes"), r#"b"\x00\x01""#);
     // A handler's error is a compile error; code that gets one traps.
     let trap = m.run("broken", &[]).unwrap_err();

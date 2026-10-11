@@ -24,23 +24,44 @@
 //! handler names a function, and exactly one of its overloads must fit
 //! exactly one member of the form; a form marked `is Pure` takes only a
 //! function without effects. A type declares at most one handler of a kind.
+//!
+//! The declaring type of a generic type has its own parameters as its
+//! arguments, so a handler fits every instance of it: a generic function
+//! whose type arguments the form fixes, or one that takes no type
+//! arguments and fits whatever the parameters are.
 
 use crag_db::Db;
 use crag_hir::{Expr, ItemId, ItemKind, Owner, Program, Resolution, TypeRef, TypeTarget, hir_body};
 
 use crate::def::{TypeLowerer, prelude_item, signature, type_header};
+use crate::generic::{CallSite, Instance, bind, instantiate};
 use crate::group::{function_effects, result_type};
 use crate::relate::{is_subtype, subst};
 use crate::result::{ErrorKind, Site, TypeError};
 use crate::ty::{Ty, TyKind};
 
 /// A lifecycle handler a type declares: its kind, the function, and the
-/// member of the kind's form the function fits.
+/// member of the kind's form the function fits. In a generic type both
+/// may name the type's parameters.
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
 pub struct Handler<'db> {
     pub kind: ItemId<'db>,
-    pub function: ItemId<'db>,
+    /// The function with its type arguments.
+    pub function: Instance<'db>,
     pub form: Ty<'db>,
+}
+
+impl<'db> Handler<'db> {
+    /// The type of what the function gives, errors and all, with its type
+    /// arguments in place.
+    pub fn result(&self, db: &'db dyn Db, program: Program) -> Option<Ty<'db>> {
+        let function = &self.function;
+        let result = result_type(db, program, function.function)?;
+        Some(match function.args.is_empty() {
+            true => result,
+            false => subst(db, program, result, function.function, &function.args),
+        })
+    }
 }
 
 /// The handlers of a type declaration, and what is wrong with its `on`
@@ -71,14 +92,11 @@ pub fn type_handlers<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) 
             error(Site::Name, ErrorKind::HandlerOnStructural);
             continue;
         }
-        if !type_header(db, program, item).params.is_empty() {
-            error(
-                at,
-                ErrorKind::Unsupported("lifecycle handlers of generic types"),
-            );
-            continue;
-        }
-        let declaring = Ty::new(db, TyKind::Named(item, Vec::new()));
+        let params = (0..type_header(db, program, item).params.len() as u32)
+            .zip(&type_header(db, program, item).params)
+            .map(|(i, &name)| Ty::new(db, TyKind::Param(Some(item), i, name)))
+            .collect();
+        let declaring = Ty::new(db, TyKind::Named(item, params));
         let kind = match body.type_ref(clause.kind) {
             TypeRef::Named {
                 target: TypeTarget::Item(kind),
@@ -120,20 +138,22 @@ pub fn type_handlers<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) 
             }
         };
         let name = *functions[0].name(db);
+        let at_type = CallSite {
+            module: *item.module(db),
+            caller: None,
+        };
         let mut fits = Vec::new();
         for &function in &functions {
-            let Some(ty) = function_type(db, program, function) else {
-                continue;
-            };
             for &member in &form.members {
-                if is_subtype(db, program, ty, member) {
-                    fits.push((function, member));
+                if let Some(instance) = fit(db, program, function, member, at_type) {
+                    fits.push((instance, member));
                 }
             }
         }
-        match fits[..] {
+        match &fits[..] {
             [(function, member)] => {
-                if form.pure && function_effects(db, program, function).has_effects() {
+                let (function, member) = (function.clone(), *member);
+                if form.pure && function_effects(db, program, function.function).has_effects() {
                     error(
                         at,
                         ErrorKind::HandlerNotPure {
@@ -161,7 +181,7 @@ pub fn type_handlers<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) 
                 at,
                 ErrorKind::Ambiguous {
                     name,
-                    candidates: fits.iter().map(|f| f.0).collect(),
+                    candidates: fits.iter().map(|f| f.0.function).collect(),
                 },
             ),
         }
@@ -170,24 +190,83 @@ pub fn type_handlers<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) 
 }
 
 /// The handler of a kind of the prelude, by its name, that a type
-/// declares: none for a type that is not nominal or declares none.
+/// declares, for the type's arguments: none for a type that is not
+/// nominal or declares none.
 pub fn lifecycle_handler<'db>(
     db: &'db dyn Db,
     program: Program,
     ty: Ty<'db>,
     kind: &str,
-) -> Option<&'db Handler<'db>> {
+) -> Option<Handler<'db>> {
     let TyKind::Named(item, args) = ty.kind(db) else {
         return None;
     };
-    if !args.is_empty() {
-        return None;
-    }
     let kind = prelude_item(db, program, kind)?;
-    type_handlers(db, program, *item)
+    let handler = type_handlers(db, program, *item)
         .handlers
         .iter()
-        .find(|h| h.kind == kind)
+        .find(|h| h.kind == kind)?;
+    if args.is_empty() {
+        return Some(handler.clone());
+    }
+    // The fillings of the function's slots depend on its type arguments,
+    // so it is instantiated again.
+    let function = &handler.function;
+    let function_args: Vec<Ty<'db>> = function
+        .args
+        .iter()
+        .map(|&t| subst(db, program, t, *item, args))
+        .collect();
+    let at_type = CallSite {
+        module: *item.module(db),
+        caller: None,
+    };
+    Some(Handler {
+        kind,
+        function: instantiate(db, program, function.function, &function_args, at_type).ok()?,
+        form: subst(db, program, handler.form, *item, args),
+    })
+}
+
+/// The instance of `function` that fits a member of a form, if one does:
+/// a generic function takes the type arguments the member fixes.
+fn fit<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    function: ItemId<'db>,
+    member: Ty<'db>,
+    at: CallSite<'db>,
+) -> Option<Instance<'db>> {
+    let ty = function_type(db, program, function)?;
+    let count = signature(db, program, function).type_params;
+    let mut args = vec![None; count];
+    // The function may give less than the form allows, such as no error
+    // at all, so its result meets each member of the form's.
+    if let (
+        TyKind::Fn { params, result, .. },
+        TyKind::Fn {
+            params: form_params,
+            result: form_result,
+            ..
+        },
+    ) = (ty.kind(db), member.kind(db))
+    {
+        for (&p, &f) in params.iter().zip(form_params) {
+            bind(db, program, function, p, f, &mut args);
+        }
+        for m in form_result.members(db) {
+            bind(db, program, function, *result, m, &mut args);
+        }
+    }
+    let args: Vec<Ty<'db>> = args.into_iter().collect::<Option<_>>()?;
+    let ty = match count {
+        0 => ty,
+        _ => subst(db, program, ty, function, &args),
+    };
+    if !is_subtype(db, program, ty, member) {
+        return None;
+    }
+    instantiate(db, program, function, &args, at).ok()
 }
 
 /// The form of a kind's handlers for a declaring type.
@@ -233,12 +312,9 @@ fn handler_form<'db>(
 }
 
 /// The type of a function as a value, with its whole result, errors and
-/// all; none for a generic function.
+/// all, in its own type parameters.
 fn function_type<'db>(db: &'db dyn Db, program: Program, function: ItemId<'db>) -> Option<Ty<'db>> {
     let sig = signature(db, program, function);
-    if sig.type_params > 0 {
-        return None;
-    }
     let result = result_type(db, program, function)?;
     let params = sig.params.iter().map(|p| p.ty).collect();
     Some(Ty::new(

@@ -58,7 +58,7 @@ use crag_runtime::text::{bytes_of, make_text};
 use crag_runtime::{
     CodeMap, Fiber, FiberConfig, FiberState, Meter, Types, Worker, encode_value, release_value,
 };
-use crag_types::{Ty, TyKind, lifecycle_handler, result_type};
+use crag_types::{Ty, TyKind, lifecycle_handler};
 
 /// The steps an evaluation may take: function entries and loop turns.
 pub const STEP_LIMIT: u64 = 100_000_000;
@@ -175,10 +175,13 @@ pub fn evaluate<'db>(
     if *item.kind(db) == ItemKind::Embed
         && let Some(handler) = lifecycle_handler(db, program, ty, "Embed")
     {
-        let root = InstanceKey::body(db, Owner::Item(handler.function));
+        let root = InstanceKey::of(db, &handler.function);
+        let Some(result) = handler.result(db, program) else {
+            return not("it has errors");
+        };
         return match Evaluation::build(db, program, root) {
             Ok(mut evaluation) => {
-                let result = evaluation.embed(db, program, item, ty, handler.function, meter);
+                let result = evaluation.embed(db, program, item, ty, result, meter);
                 let left = evaluation.finish(db, program);
                 (result, left)
             }
@@ -320,21 +323,20 @@ impl<'db> Evaluation<'db> {
         unsafe { self.encode(&words, &shapes, shape, &words, &shapes, shape) }
     }
 
-    /// Runs the `on Embed` handler `function` of `ty`, the root, on the
-    /// content of the resource of `item` and encodes the value it makes.
-    /// An `EmbedError` it gives is an error.
+    /// Runs the `on Embed` handler of `ty`, the root, which gives a value
+    /// of `result`, on the content of the resource of `item` and encodes
+    /// the value it makes. An `EmbedError` it gives is an error.
     fn embed(
         &mut self,
         db: &'db dyn Db,
         program: Program,
         item: ItemId<'db>,
         ty: Ty<'db>,
-        function: ItemId<'db>,
+        result: Ty<'db>,
         meter: Meter,
     ) -> Result<ConstValue, EvalError> {
         let not = |why: &str| EvalError::NotConstant(why.into());
         let content = embed_content(db, program, item).map_err(|_| not("it has errors"))?;
-        let result = result_type(db, program, function).ok_or_else(|| not("it has errors"))?;
         let (result_shapes, result_shape) = shapes(db, program, result);
         let (shapes, shape) = shapes(db, program, ty);
         // The handler takes the content, as `Str` or `Bytes`: two words.
