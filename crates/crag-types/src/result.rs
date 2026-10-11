@@ -339,6 +339,12 @@ pub enum ErrorKind<'db> {
         name: Name<'db>,
         form: Ty<'db>,
     },
+    /// A closure written as a handler whose type fits no member of its
+    /// kind's form, or several.
+    ClosureDoesNotFit {
+        kind: Name<'db>,
+        form: Ty<'db>,
+    },
     /// The form is `is Pure` and the handler has effects.
     HandlerNotPure {
         kind: Name<'db>,
@@ -552,6 +558,11 @@ impl<'db> ErrorKind<'db> {
             ErrorKind::SecondHandler { kind } => {
                 format!("the type already declares a handler of `{}`", name(kind))
             }
+            ErrorKind::ClosureDoesNotFit { kind, form } => format!(
+                "this closure must fit exactly one member of the form of `{}`: {}",
+                name(kind),
+                form.display(db)
+            ),
             ErrorKind::HandlerDoesNotFit {
                 kind,
                 name: n,

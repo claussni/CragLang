@@ -29,10 +29,18 @@
 //! arguments, so a handler fits every instance of it: a generic function
 //! whose type arguments the form fixes, or one that takes no type
 //! arguments and fits whatever the parameters are.
+//!
+//! A handler may be a closure written in the clause, code of the declaring
+//! type. Inference checks it against the one member of the form its
+//! written parameter types accept, Pure when the form is.
 
 use crag_db::Db;
-use crag_hir::{Expr, ItemId, ItemKind, Owner, Program, Resolution, TypeRef, TypeTarget, hir_body};
+use crag_hir::{
+    Body, Expr, ExprId, HandlerClause, ItemId, ItemKind, Owner, Program, Resolution, TypeRef,
+    TypeTarget, hir_body,
+};
 
+use crate::body_types;
 use crate::def::{TypeLowerer, prelude_item, signature, type_header};
 use crate::generic::{CallSite, Instance, bind, instantiate};
 use crate::group::{function_effects, result_type};
@@ -40,27 +48,39 @@ use crate::relate::{is_subtype, subst};
 use crate::result::{ErrorKind, Site, TypeError};
 use crate::ty::{Ty, TyKind};
 
-/// A lifecycle handler a type declares: its kind, the function, and the
-/// member of the kind's form the function fits. In a generic type both
-/// may name the type's parameters.
+/// A lifecycle handler a type declares: its kind, its code, the member of
+/// the kind's form it fits, and its type as a function value. In a
+/// generic type all may name the type's parameters.
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
 pub struct Handler<'db> {
     pub kind: ItemId<'db>,
-    /// The function with its type arguments.
-    pub function: Instance<'db>,
+    pub code: HandlerCode<'db>,
     pub form: Ty<'db>,
+    /// Its whole result included, errors and all.
+    pub ty: Ty<'db>,
+}
+
+/// What a handler runs.
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub enum HandlerCode<'db> {
+    /// A declared function, with its type arguments.
+    Function(Instance<'db>),
+    /// A closure written in the clause: code of the declaring type, with
+    /// the type's arguments.
+    Closure {
+        item: ItemId<'db>,
+        args: Vec<Ty<'db>>,
+        expr: ExprId,
+    },
 }
 
 impl<'db> Handler<'db> {
-    /// The type of what the function gives, errors and all, with its type
-    /// arguments in place.
-    pub fn result(&self, db: &'db dyn Db, program: Program) -> Option<Ty<'db>> {
-        let function = &self.function;
-        let result = result_type(db, program, function.function)?;
-        Some(match function.args.is_empty() {
-            true => result,
-            false => subst(db, program, result, function.function, &function.args),
-        })
+    /// The type of what the handler gives.
+    pub fn result(&self, db: &'db dyn Db) -> Ty<'db> {
+        match self.ty.kind(db) {
+            TyKind::Fn { result, .. } => *result,
+            _ => Ty::error(db),
+        }
     }
 }
 
@@ -92,24 +112,13 @@ pub fn type_handlers<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) 
             error(Site::Name, ErrorKind::HandlerOnStructural);
             continue;
         }
-        let params = (0..type_header(db, program, item).params.len() as u32)
-            .zip(&type_header(db, program, item).params)
-            .map(|(i, &name)| Ty::new(db, TyKind::Param(Some(item), i, name)))
-            .collect();
-        let declaring = Ty::new(db, TyKind::Named(item, params));
-        let kind = match body.type_ref(clause.kind) {
-            TypeRef::Named {
-                target: TypeTarget::Item(kind),
-                args,
-                ..
-            } if args.is_empty() => *kind,
-            TypeRef::Missing => continue,
-            _ => {
+        let Some(kind) = clause_kind(body, clause) else {
+            if !matches!(body.type_ref(clause.kind), TypeRef::Missing) {
                 error(Site::Type(clause.kind), ErrorKind::NotALifecycleKind);
-                continue;
             }
+            continue;
         };
-        let Some(form) = handler_form(db, program, kind, declaring) else {
+        let Some(form) = handler_form(db, program, kind, declaring(db, program, item)) else {
             error(Site::Type(clause.kind), ErrorKind::NotALifecycleKind);
             continue;
         };
@@ -128,11 +137,52 @@ pub fn type_handlers<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) 
                 item: Some(Resolution::Value { functions, .. }),
                 ..
             } if !functions.is_empty() => functions.clone(),
+            // Inference checked the closure against the member it fits,
+            // and reported what does not.
+            Expr::Closure { .. } => {
+                let types = body_types(db, program, Owner::Item(item));
+                let ty = types.expr(clause.handler);
+                let fits: Vec<Ty<'db>> = form
+                    .members
+                    .iter()
+                    .copied()
+                    .filter(|&m| ty.is_some_and(|t| is_subtype(db, program, t, m)))
+                    .collect();
+                if !types.errors.is_empty() {
+                    continue;
+                }
+                let Some(ty) = ty else {
+                    continue;
+                };
+                if let [member] = fits[..] {
+                    out.handlers.push(Handler {
+                        kind,
+                        code: HandlerCode::Closure {
+                            item,
+                            args: declaring_args(db, program, item),
+                            expr: clause.handler,
+                        },
+                        form: member,
+                        ty,
+                    });
+                } else {
+                    error(
+                        at,
+                        ErrorKind::ClosureDoesNotFit {
+                            kind: *kind.name(db),
+                            form: form.ty,
+                        },
+                    );
+                }
+                continue;
+            }
             Expr::Missing | Expr::Name { item: None, .. } => continue,
             _ => {
                 error(
                     at,
-                    ErrorKind::Unsupported("lifecycle handlers that are not named functions"),
+                    ErrorKind::Unsupported(
+                        "lifecycle handlers that are neither functions nor closures",
+                    ),
                 );
                 continue;
             }
@@ -145,14 +195,14 @@ pub fn type_handlers<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) 
         let mut fits = Vec::new();
         for &function in &functions {
             for &member in &form.members {
-                if let Some(instance) = fit(db, program, function, member, at_type) {
-                    fits.push((instance, member));
+                if let Some(fitted) = fit(db, program, function, member, at_type) {
+                    fits.push((fitted, member));
                 }
             }
         }
         match &fits[..] {
-            [(function, member)] => {
-                let (function, member) = (function.clone(), *member);
+            [((function, ty), member)] => {
+                let (function, ty, member) = (function.clone(), *ty, *member);
                 if form.pure && function_effects(db, program, function.function).has_effects() {
                     error(
                         at,
@@ -165,8 +215,9 @@ pub fn type_handlers<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) 
                 }
                 out.handlers.push(Handler {
                     kind,
-                    function,
+                    code: HandlerCode::Function(function),
                     form: member,
+                    ty,
                 });
             }
             [] => error(
@@ -181,7 +232,7 @@ pub fn type_handlers<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) 
                 at,
                 ErrorKind::Ambiguous {
                     name,
-                    candidates: fits.iter().map(|f| f.0.function).collect(),
+                    candidates: fits.iter().map(|f| f.0.0.function).collect(),
                 },
             ),
         }
@@ -209,34 +260,124 @@ pub fn lifecycle_handler<'db>(
     if args.is_empty() {
         return Some(handler.clone());
     }
-    // The fillings of the function's slots depend on its type arguments,
-    // so it is instantiated again.
-    let function = &handler.function;
-    let function_args: Vec<Ty<'db>> = function
-        .args
-        .iter()
-        .map(|&t| subst(db, program, t, *item, args))
-        .collect();
-    let at_type = CallSite {
-        module: *item.module(db),
-        caller: None,
+    let in_args = |t: Ty<'db>| subst(db, program, t, *item, args);
+    let code = match &handler.code {
+        // The fillings of the function's slots depend on its type
+        // arguments, so it is instantiated again.
+        HandlerCode::Function(function) => {
+            let function_args: Vec<Ty<'db>> = function.args.iter().map(|&t| in_args(t)).collect();
+            let at_type = CallSite {
+                module: *item.module(db),
+                caller: None,
+            };
+            let function =
+                instantiate(db, program, function.function, &function_args, at_type).ok()?;
+            HandlerCode::Function(function)
+        }
+        HandlerCode::Closure { expr, .. } => HandlerCode::Closure {
+            item: *item,
+            args: args.clone(),
+            expr: *expr,
+        },
     };
     Some(Handler {
         kind,
-        function: instantiate(db, program, function.function, &function_args, at_type).ok()?,
-        form: subst(db, program, handler.form, *item, args),
+        code,
+        form: in_args(handler.form),
+        ty: in_args(handler.ty),
     })
 }
 
-/// The instance of `function` that fits a member of a form, if one does:
-/// a generic function takes the type arguments the member fixes.
+/// The type a closure written as the handler of a clause of `item` is
+/// checked against, given the types its parameters are written with: the
+/// one member of the form that takes as many parameters and passes what
+/// the written types accept, Pure when the form is. None when there is no
+/// form, and no type when no member or several fit: the closure is then
+/// inferred alone, and its parameters need their types.
+pub(crate) fn closure_expectation<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    item: ItemId<'db>,
+    clause: &HandlerClause,
+    written: &[Option<Ty<'db>>],
+) -> Option<Option<Ty<'db>>> {
+    let body = hir_body(db, program, Owner::Item(item));
+    let form = handler_form(
+        db,
+        program,
+        clause_kind(body, clause)?,
+        declaring(db, program, item),
+    )?;
+    let fitting: Vec<Ty<'db>> = form
+        .members
+        .iter()
+        .copied()
+        .filter(|m| match m.kind(db) {
+            TyKind::Fn { params, .. } => {
+                params.len() == written.len()
+                    && params
+                        .iter()
+                        .zip(written)
+                        .all(|(&p, w)| w.is_none_or(|w| is_subtype(db, program, p, w)))
+            }
+            _ => false,
+        })
+        .collect();
+    Some(match fitting[..] {
+        [member] => {
+            let TyKind::Fn { params, result, .. } = member.kind(db) else {
+                unreachable!("filtered above");
+            };
+            Some(Ty::new(
+                db,
+                TyKind::Fn {
+                    params: params.clone(),
+                    result: *result,
+                    pure: form.pure,
+                },
+            ))
+        }
+        _ => None,
+    })
+}
+
+/// The kind a clause names, if it names a type without arguments.
+fn clause_kind<'db>(body: &Body<'db>, clause: &HandlerClause) -> Option<ItemId<'db>> {
+    match body.type_ref(clause.kind) {
+        TypeRef::Named {
+            target: TypeTarget::Item(kind),
+            args,
+            ..
+        } if args.is_empty() => Some(*kind),
+        _ => None,
+    }
+}
+
+/// The type parameters of a type as types.
+fn declaring_args<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> Vec<Ty<'db>> {
+    let params = &type_header(db, program, item).params;
+    (0..params.len() as u32)
+        .zip(params)
+        .map(|(i, &name)| Ty::new(db, TyKind::Param(Some(item), i, name)))
+        .collect()
+}
+
+/// A type with its own parameters as its arguments: what its handlers are
+/// declared for.
+fn declaring<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> Ty<'db> {
+    Ty::new(db, TyKind::Named(item, declaring_args(db, program, item)))
+}
+
+/// The instance of `function` that fits a member of a form, if one does,
+/// and its type as a value: a generic function takes the type arguments
+/// the member fixes.
 fn fit<'db>(
     db: &'db dyn Db,
     program: Program,
     function: ItemId<'db>,
     member: Ty<'db>,
     at: CallSite<'db>,
-) -> Option<Instance<'db>> {
+) -> Option<(Instance<'db>, Ty<'db>)> {
     let ty = function_type(db, program, function)?;
     let count = signature(db, program, function).type_params;
     let mut args = vec![None; count];
@@ -266,7 +407,7 @@ fn fit<'db>(
     if !is_subtype(db, program, ty, member) {
         return None;
     }
-    instantiate(db, program, function, &args, at).ok()
+    Some((instantiate(db, program, function, &args, at).ok()?, ty))
 }
 
 /// The form of a kind's handlers for a declaring type.

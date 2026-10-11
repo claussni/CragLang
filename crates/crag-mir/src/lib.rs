@@ -37,7 +37,7 @@ use std::collections::HashSet;
 
 use crag_db::Db;
 use crag_hir::{ExprId, Owner, Program};
-use crag_types::{Filling, Instance, Ty};
+use crag_types::{Filling, Handler, HandlerCode, Instance, Ty};
 
 pub use build::place;
 pub use checks::insert_overflow_checks;
@@ -125,6 +125,21 @@ impl Entry {
     /// Whether the code takes an environment first.
     pub fn takes_env(self) -> bool {
         !matches!(self, Entry::Body | Entry::Default(_))
+    }
+}
+
+/// The code a lifecycle handler runs: a function's body, or the code of a
+/// closure of the declaring type, which takes an environment first.
+pub fn handler_code<'db>(db: &'db dyn Db, handler: &Handler<'db>) -> InstanceKey<'db> {
+    match &handler.code {
+        HandlerCode::Function(function) => InstanceKey::of(db, function),
+        HandlerCode::Closure { item, args, expr } => InstanceKey::new(
+            db,
+            Owner::Item(*item),
+            args.clone(),
+            Vec::new(),
+            Entry::Closure(*expr),
+        ),
     }
 }
 

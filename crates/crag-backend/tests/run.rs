@@ -1301,6 +1301,14 @@ distinct type Pile[T](items: List[T], size: Int)
   on Embed pile
 fn pile[T](data: Bytes) -> Pile[T] { Pile(items: [], size: 4) }
 
+// Closures as handlers, code of the declaring type.
+distinct type Word(text: Str)
+  on Embed { text: Str -> Word(text: "{text}, from a closure long enough") }
+distinct type Heap[T](items: List[T], n: Int)
+  on Embed { data: Bytes -> Heap(items: [], n: 7) }
+
+embed word: Word from "high.txt"
+embed heap: Heap[Str] from "size.bin"
 embed ints: Pile[Int] from "size.bin"
 embed texts: Pile[Str] from "size.bin"
 embed high: Level from "high.txt"
@@ -1310,6 +1318,8 @@ embed raw from "size.bin"
 
 fn levels() -> Int { high.n * 10 + size.n }
 fn piles() -> Int { ints.size + texts.size }
+fn wordText() -> Str { word.text }
+fn heapSize() -> Int { heap.n }
 fn broken() -> Int { bad.n }
 fn bytes() -> Bytes { raw }
 "#,
@@ -1322,6 +1332,8 @@ fn bytes() -> Bytes { raw }
     assert!(m.unsupported.is_empty(), "{:?}", m.unsupported);
     assert_eq!(m.shown("levels"), "32");
     assert_eq!(m.shown("piles"), "8");
+    assert_eq!(m.shown("wordText"), r#""high, from a closure long enough""#);
+    assert_eq!(m.shown("heapSize"), "7");
     assert_eq!(m.shown("bytes"), r#"b"\x00\x01""#);
     // A handler's error is a compile error; code that gets one traps.
     let trap = m.run("broken", &[]).unwrap_err();

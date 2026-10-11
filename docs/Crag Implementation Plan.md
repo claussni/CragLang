@@ -1164,17 +1164,20 @@ An `embed` of a type with a handler is evaluated through the handler: compile-ti
 
 In a generic type the declaring type has the type's own parameters as its arguments, so the handler must fit every instance: a generic function fits when the form fixes its type arguments, which are then in the type's parameters, and its bounds hold for them. The function's result may be narrower than the form's, so it meets each member of the form's result in turn. `lifecycle_handler` gives the handler of a concrete instance, the type's arguments in place and the function instantiated again for them, since the fillings of its slots depend on them.
 
+A handler may be a closure written in the clause, such as `on Embed { text: Str -> Level(n: 1) }`. It is code of the declaring type, an `Entry::Closure` of the type with the type's arguments, and captures nothing. Inference checks it in the type's body against the one member of the form that takes as many parameters and passes what its written types accept, marked Pure when the form is, so a closure with effects is a mismatch. When several members fit, as for `Embed` and a closure whose parameter is not written, it is inferred alone and its parameter needs a type; `type_handlers` then requires the closure's type to fit exactly one member. MIR calls a closure as a function value with an empty environment, and compile-time evaluation passes that environment first.
+
 The prelude declares `LifecycleHandler`, the kind `Embed` and `EmbedError(..Error, message: Str, line: Int = 0, column: Int = 0)`, whose line and column are the place in the resource; the specification leaves its fields open, and a handler writes `EmbedError(message: "…")`.
 
 A default is code of its own, an entry of its owner, `Entry::Default`, that runs where a call or a construction leaves the parameter or field out. A parameter's default is an entry of its function, instance by instance, and takes the parameters before it, which the call passes to it as well; a field's is an entry of the type that declares the field last, with the type's arguments, and takes nothing. Defaults run after the written arguments, in the order of the parameters or fields, and a literal one is a constant. A function's defaults are part of what its calls do, so their effects are the function's, and an `is Pure` function's must have none. A field's default runs in constructions anywhere, an `is Pure` function's among them, so it must have no effects at all.
 
-What waits: handlers that are closures, which need code of their own in the declaring type; `Dispose`, whose handler the runtime would call when a value is removed, and `Encode` and `Decode`, which come with the standard library's codecs.
+What waits: `Dispose`, whose handler the runtime would call when a value is removed, and `Encode` and `Decode`, which come with the standard library's codecs.
 
 **Data structures**
 
 - `TypeDecl::handlers: Vec<HandlerClause { kind, handler }>` and `TypeDecl::form: Option<HandlerForm { ty, pure }>` — in HIR.
-- `Handler { kind, function: Instance, form }` and `Handlers { handlers, errors }` — in `crag-types`: a checked handler, its function with its type arguments, and the member of the form it fits; `Handler::result` is the type of what the function gives.
-- `ErrorKind::HandlerOnStructural`, `NotALifecycleKind`, `SecondHandler`, `HandlerDoesNotFit` and `HandlerNotPure`.
+- `Handler { kind, code, form, ty }` and `Handlers { handlers, errors }` — in `crag-types`: a checked handler, its code, the member of the form it fits and its type as a function value; `Handler::result` is the type of what it gives.
+- `HandlerCode::Function(Instance)` and `HandlerCode::Closure { item, args, expr }` — a declared function with its type arguments, or a closure of the declaring type with the type's arguments.
+- `ErrorKind::HandlerOnStructural`, `NotALifecycleKind`, `SecondHandler`, `HandlerDoesNotFit`, `ClosureDoesNotFit` and `HandlerNotPure`.
 - `Entry::Default(ExprId)` — in MIR: the code of a parameter's or a field's default; `Restriction::Default` — in `crag-types`: a field's default, which has no effects.
 - `Body::defaults()` — in HIR: the defaults of a body's parameters and fields, which the effect and escape walks take as roots of their own.
 
@@ -1182,6 +1185,7 @@ What waits: handlers that are closures, which need code of their own in the decl
 
 - `fn type_handlers(db: &dyn Db, program: Program, item: ItemId) -> &Handlers` — the query: the handlers a type declares, and the errors of its clauses.
 - `fn lifecycle_handler(db: &dyn Db, program: Program, ty: Ty, kind: &str) -> Option<Handler>` — the handler of a prelude kind a type declares, for the type's arguments, which inference, MIR and compile-time evaluation ask for `Embed`.
+- `fn handler_code(db: &dyn Db, handler: &Handler) -> InstanceKey` — in `crag-mir`: the code a handler runs.
 
 ### 11.7 M4 components
 

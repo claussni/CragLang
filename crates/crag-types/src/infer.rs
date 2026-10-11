@@ -106,7 +106,7 @@ pub fn infer_in_group<'db>(
             ItemKind::Function => cx.function(),
             ItemKind::Value | ItemKind::Embed => cx.module_value(),
             ItemKind::Type => {
-                cx.type_defaults();
+                cx.type_defaults(item);
                 None
             }
             _ => None,
@@ -499,9 +499,11 @@ impl<'a, 'db> Infer<'a, 'db> {
         Some(ty)
     }
 
-    /// The defaults of a type's fields, against the fields' types. The
-    /// types themselves are the declaration's, which reports their errors.
-    fn type_defaults(&mut self) {
+    /// The defaults of a type's fields, against the fields' types, and the
+    /// handlers of its `on` clauses that are closures, against the member
+    /// of their kind's form they fit (§11.4). The types themselves are the
+    /// declaration's, which reports their errors.
+    fn type_defaults(&mut self, item: ItemId<'db>) {
         let Some(decl) = &self.body.type_decl else {
             return;
         };
@@ -514,6 +516,27 @@ impl<'a, 'db> Infer<'a, 'db> {
         for (ty, default) in fields {
             if let Some(default) = default {
                 self.check(default, ty);
+            }
+        }
+        for clause in &decl.handlers {
+            let Expr::Closure { params, .. } = self.body.expr(clause.handler) else {
+                continue;
+            };
+            let written: Vec<Option<Ty<'db>>> = params.iter().map(|p| self.written(p.ty)).collect();
+            let expectation =
+                crate::handler::closure_expectation(self.db, self.program, item, clause, &written);
+            match expectation {
+                Some(Some(expected)) => {
+                    self.check(clause.handler, expected);
+                }
+                // `type_handlers` reports a closure that fits no member,
+                // and inference one whose parameters' types it cannot
+                // infer.
+                Some(None) => {
+                    self.synth(clause.handler);
+                }
+                // `type_handlers` reports a clause without a form.
+                None => {}
             }
         }
     }

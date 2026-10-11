@@ -444,6 +444,20 @@ fn parseMisfit(n: Int) -> Misfit { Misfit(n: n) }
 fn parseTwice(text: Str) -> Twice { Twice(n: 1) }
 fn parseClock(text: Str) -> Clock { Clock(n: now()) }
 fn parseNarrow(text: Str) -> Narrow[Int] { Narrow(n: 1) }
+
+// Closures fit one member: the one their written types pick.
+distinct type Unsure(n: Int)
+  on Embed { text -> Unsure(n: 1) }
+distinct type Wrong(n: Int)
+  on Embed { n: Int -> Wrong(n: n) }
+distinct type Loud(n: Int)
+  on Embed { text: Str -> Loud(n: now()) }
+
+// A kind whose form a closure fits twice.
+distinct type Both[T](..LifecycleHandler)
+  where HandlerForm[((Int) -> T | Bool) | ((Int) -> T | EmbedError)]
+distinct type Twofold(n: Int)
+  on Both { n: Int -> Twofold(n: n) }
 fn parseWide[T](text: Str) -> Wide[T] { Wide(n: 1) }
 
 embed unknown: Unknown from "x.txt"
@@ -475,6 +489,10 @@ fn main() {}
             "the type already declares a handler of `Embed`",
             "a handler of `Embed` is Pure, and `parseClock` has effects",
             "no function `parseNarrow` fits the form of `Embed`: ((Bytes) -> EmbedError | Narrow[T]) | ((Str) -> EmbedError | Narrow[T])",
+            "the type cannot be inferred here; write it",
+            "this closure must fit exactly one member of the form of `Embed`: ((Bytes) -> EmbedError | Wrong) | ((Str) -> EmbedError | Wrong)",
+            "expected (Str) -> EmbedError | Loud is Pure, found (Str) -> EmbedError | Loud",
+            "this closure must fit exactly one member of the form of `Both`: ((Int) -> EmbedError | Twofold) | ((Int) -> False | True | Twofold)",
             "an `embed` of `Unknown` needs an `on Embed` handler, which `Unknown` does not declare; an `embed` of `Bytes` or `Str` needs none",
         ],
         "{out}"

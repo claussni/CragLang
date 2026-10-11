@@ -40,10 +40,11 @@ use crag_hir::{
     Name, Owner, PRELUDE, Pat, PatId, Program, Resolution, Stmt, StrPart, hir_body, lower_body,
 };
 use crag_types::{
-    Builtin, Callee, DecisionTree, Dispatch, EscapeLevel, Filling, InferenceResult, Instance,
-    ListLen, Position, SigParam, Signature, Step, Ty, TyKind, TypeDefKind, Value, body_types,
-    decision_tree_with, declared_fields, fields_of, lifecycle_handler, literal_value, prelude_item,
-    result_type, signature, subst, type_def, type_header, value_type,
+    Builtin, Callee, DecisionTree, Dispatch, EscapeLevel, Filling, Handler, HandlerCode,
+    InferenceResult, Instance, ListLen, Position, SigParam, Signature, Step, Ty, TyKind,
+    TypeDefKind, Value, body_types, decision_tree_with, declared_fields, fields_of,
+    lifecycle_handler, literal_value, prelude_item, result_type, signature, subst, type_def,
+    type_header, value_type,
 };
 
 use crate::ir::{
@@ -1172,13 +1173,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let Some(handler) = handler else {
             return Operand::Const(constant);
         };
-        let Some(result) = handler.result(db, self.program) else {
+        let result = handler.result(db);
+        let Some(dst) = self.call_handler(&handler, vec![Operand::Const(constant)], expr) else {
             return self.trap(TrapKind::Error, Some(expr));
         };
-        let Some(func) = self.callable(expr, &handler.function) else {
-            return self.trap(TrapKind::Error, Some(expr));
-        };
-        let dst = self.call_code(func, vec![Operand::Const(constant)], result, expr);
         let (fits, fail) = (self.new_block(), self.new_block());
         let cases = ty.members(db).into_iter().map(|m| (m, fits)).collect();
         self.terminate(Terminator::Switch {
@@ -1192,6 +1190,45 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let value = self.temp(ty);
         self.assign_to(value, Operand::Local(dst), result);
         Operand::Local(value)
+    }
+
+    /// Calls a lifecycle handler and gives the local of its result: a
+    /// function, or a closure of the declaring type, which captures
+    /// nothing. None when it cannot be called, which is recorded.
+    fn call_handler(
+        &mut self,
+        handler: &Handler<'db>,
+        args: Vec<Operand<'db>>,
+        site: ExprId,
+    ) -> Option<Local> {
+        let db = self.db;
+        let result = handler.result(db);
+        match &handler.code {
+            HandlerCode::Function(function) => {
+                let func = self.callable(site, function)?;
+                Some(self.call_code(func, args, result, site))
+            }
+            HandlerCode::Closure { .. } => {
+                let value = Rvalue::Closure {
+                    code: crate::handler_code(db, handler),
+                    env: Ty::unit(db),
+                    captures: Vec::new(),
+                    placement: ClosurePlacement::Heap,
+                };
+                let callee = self.assign(handler.ty, value);
+                let dst = self.temp(result);
+                let target = self.new_block();
+                self.terminate(Terminator::CallValue {
+                    callee,
+                    args,
+                    dst,
+                    target,
+                    site,
+                });
+                self.switch_to(target);
+                Some(dst)
+            }
+        }
     }
 
     /// The value of a module-level `let`: a call of the code that computes

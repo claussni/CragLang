@@ -254,6 +254,10 @@ fn named[T](text: Str) -> Named[T] | EmbedError {
 
 embed who: Name from "who.txt"
 embed names: Named[Int] from "who.txt"
+
+distinct type Shout(text: Str)
+  on Embed { text: Str -> Shout(text: "{text}!") }
+embed shout: Shout from "who.txt"
 "#;
     let mut p = Project::with(text, &[("who.txt", b"Ada")]);
     // The record's shape, then its fields as the type declares them.
@@ -279,6 +283,11 @@ embed names: Named[Int] from "who.txt"
             &0u64.to_le_bytes()
         ]
         .concat()
+    );
+    // A closure as the handler.
+    assert_eq!(
+        p.bytes("shout")[4..],
+        [&4u64.to_le_bytes()[..], b"Ada!"].concat()
     );
     // The handler's error, released with the rest.
     let resource = p.program.resources(&p.db)[0].2;
