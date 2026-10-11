@@ -70,6 +70,18 @@ pub fn embed_sources(db: &dyn Db, module: ModuleId) -> Vec<String> {
         .collect()
 }
 
+/// The source an `embed` names, as written, or why it names none.
+pub fn embed_source(db: &dyn Db, item: ItemId<'_>) -> Result<String, String> {
+    let signature = item_tree(db, *item.module(db))
+        .items
+        .iter()
+        .find(|i| i.id == item)
+        .map(|i| i.signature.clone())
+        .ok_or("no such `embed`")?;
+    let (source, _) = source_of(&SyntaxNode::new_root(signature)).ok_or("no source")?;
+    source
+}
+
 /// The content of the resource an `embed` names, as the driver read it,
 /// or why there is none.
 pub fn embed_content<'db>(
@@ -77,16 +89,8 @@ pub fn embed_content<'db>(
     program: Program,
     item: ItemId<'db>,
 ) -> Result<&'db Arc<[u8]>, String> {
-    let module = *item.module(db);
-    let signature = item_tree(db, module)
-        .items
-        .iter()
-        .find(|i| i.id == item)
-        .map(|i| i.signature.clone())
-        .ok_or("no such `embed`")?;
-    let (source, _) = source_of(&SyntaxNode::new_root(signature)).ok_or("no source")?;
-    let source = source?;
-    content(db, program, module, &source)
+    let source = embed_source(db, item)?;
+    content(db, program, *item.module(db), &source)
 }
 
 /// What the driver read for a source of a module.

@@ -41,7 +41,7 @@ mod scope;
 mod shadow;
 
 pub use body::{LoweredBody, Owner, hir_body, lower_body, owners, prefixes};
-pub use embed::{embed_content, embed_sources};
+pub use embed::{embed_content, embed_source, embed_sources};
 pub use hir::*;
 pub use input::{ModuleId, Parse, Program, Resource, SourceFile, parse};
 pub use items::{

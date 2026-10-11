@@ -24,7 +24,7 @@ Oct 3, 2026 · @Ralf Claußnitzer
   - [11.5 M2 components](#115-m2-components)
     - [11.5.1 Unions and narrowing](#1151-unions-and-narrowing) · [11.5.2 Error inference over recursive groups](#1152-error-inference-over-recursive-groups) · [11.5.3 Generics and forms](#1153-generics-and-forms) · [11.5.4 Overload resolution and UFCS](#1154-overload-resolution-and-ufcs) · [11.5.5 Union lifting](#1155-union-lifting) · [11.5.6 Recursive-group diagnostic](#1156-recursive-group-diagnostic) · [11.5.7 Effects](#1157-effects) · [11.5.8 Escape and bindings-only analysis](#1158-escape-and-bindings-only-analysis) · [11.5.9 Closure conversion](#1159-closure-conversion) · [11.5.10 Monomorphization](#11510-monomorphization) · [11.5.11 Tail calls](#11511-tail-calls)
   - [11.6 M3 components](#116-m3-components)
-    - [11.6.1 Session manager](#1161-session-manager) · [11.6.2 REPL](#1162-repl) · [11.6.3 Code shipping](#1163-code-shipping) · [11.6.4 Slot tables](#1164-slot-tables) · [11.6.5 Value printing](#1165-value-printing) · [11.6.6 Metered tier](#1166-metered-tier) · [11.6.7 Compile-time evaluation](#1167-compile-time-evaluation) · [11.6.8 Solid value codec](#1168-solid-value-codec) · [11.6.9 Strings and bytes](#1169-strings-and-bytes) · [11.6.10 Embedded resources](#11610-embedded-resources)
+    - [11.6.1 Session manager](#1161-session-manager) · [11.6.2 REPL](#1162-repl) · [11.6.3 Code shipping](#1163-code-shipping) · [11.6.4 Slot tables](#1164-slot-tables) · [11.6.5 Value printing](#1165-value-printing) · [11.6.6 Metered tier](#1166-metered-tier) · [11.6.7 Compile-time evaluation](#1167-compile-time-evaluation) · [11.6.8 Solid value codec](#1168-solid-value-codec) · [11.6.9 Strings and bytes](#1169-strings-and-bytes) · [11.6.10 Embedded resources](#11610-embedded-resources) · [11.6.11 Lifecycle handlers](#11611-lifecycle-handlers)
   - [11.7 M4 components](#117-m4-components)
     - [11.7.1 Scheduler](#1171-scheduler) · [11.7.2 I/O poller and timers](#1172-io-poller-and-timers) · [11.7.3 Combinators and groups](#1173-combinators-and-groups) · [11.7.4 Cancellation checks](#1174-cancellation-checks) · [11.7.5 Streams and hubs](#1175-streams-and-hubs) · [11.7.6 Refs](#1176-refs) · [11.7.7 STM](#1177-stm) · [11.7.8 Commutative updates](#1178-commutative-updates) · [11.7.9 ext](#1179-ext) · [11.7.10 Signals](#11710-signals) · [11.7.11 Lazy cells](#11711-lazy-cells) · [11.7.12 Deferred teardown](#11712-deferred-teardown) · [11.7.13 Verification](#11713-verification)
   - [11.8 M5 components](#118-m5-components)
@@ -132,7 +132,8 @@ The REPL and compile-time evaluation share the metered tier: both run code the h
 - **Compile-time evaluation.** `const_eval(site)` queries compile `is Pure` MIR in the host, run it under the step limit (§18.4), and store results as hashed Solid values, also in type positions for type functions.
 - **Solid value codec.** Serialization of Solid values, so results can be hashed, cached and embedded in code objects.
 - **Strings and bytes.** Two-word values, their bytes inline or in a buffer: literals, interpolation, equality, string keys, printing and encoding, which constants and `embed` need.
-- **Embedded resources.** `embed` declarations whose files are query inputs, as `Bytes` or `Str` constants; `on Embed` handlers wait for lifecycle handlers.
+- **Embedded resources.** `embed` declarations whose files are query inputs, as `Bytes` or `Str` constants, or values of a type with an `on Embed` handler.
+- **Lifecycle handlers.** `on` clauses on nominal types, checked against the forms their kinds prescribe; `Embed` is the kind the compiler runs so far.
 
 **Exit:** daily work happens in the REPL; dogfooding starts here.
 
@@ -544,7 +545,7 @@ The test splits the values of a column into constructors that each pattern cover
 
 MIR is the form code generation consumes: a control-flow graph per instance, with every operation explicit. `case` becomes a decision tree that tests each position at most once ([Compiling pattern matching to good decision trees](https://doi.org/10.1145/1411304.1411311)). Reference-count increments and decrements are inserted from a [liveness analysis](https://en.wikipedia.org/wiki/Live-variable_analysis): a value is released right after its last use. Overflow checks and drops become explicit operations. For `Float` a run of operations shares one check of the sticky overflow flag, and division checks for a zero divisor first (Specification §3.1.4).
 
-The builder evaluates each expression into an operand of the current block; `if`, `case`, `and`, `or` and `for` add blocks, and a `for` polls on its back-edge. A call in tail position whose result needs no conversion is a tail call. The operators of the prelude on numbers are operations rather than calls, and a negated literal is a constant, so `Int8.min` can be written. Where a value meets a type it fits but is not, such as a member passed for a union, an explicit conversion changes its representation. A body with type errors traps where it starts. What the builder does not lower yet, such as `lazy` and default arguments, traps where it is reached and is listed in the body. Closures and local functions came with closure conversion (§11.5.9), calls of generic functions and slots with monomorphization (§11.5.10).
+The builder evaluates each expression into an operand of the current block; `if`, `case`, `and`, `or` and `for` add blocks, and a `for` polls on its back-edge. A call in tail position whose result needs no conversion is a tail call. The operators of the prelude on numbers are operations rather than calls, and a negated literal is a constant, so `Int8.min` can be written. Where a value meets a type it fits but is not, such as a member passed for a union, an explicit conversion changes its representation. A body with type errors traps where it starts. A field left out of a construction takes its default when that is a literal (§11.6.11). What the builder does not lower yet, such as `lazy`, default arguments and other field defaults, traps where it is reached and is listed in the body. Closures and local functions came with closure conversion (§11.5.9), calls of generic functions and slots with monomorphization (§11.5.10).
 
 Decision trees are built in `crag-types` from the pattern matrix of `case` checking, sharing its constructors. A node tests the first position the first row looks into. A position of several types is first switched on its runtime type, a finer type before the types it is part of; one of a single type is then tested against intervals, literals or list lengths, or, as a record, opened into its fields. A guarded leaf goes on to the rest of the tree when its guard fails. A `let` destructures with the tree of its one pattern, and a typed `let … else` tests the type first.
 
@@ -1135,16 +1136,17 @@ What waits: the functions of the standard library on strings and bytes, such as 
 
 `embed name: T from "path"` binds a module-level value to the content of a file of the package (Specification §18.4.1). The source is a string literal, so parsing alone finds every resource: `embed_sources` reads them from the item tree, and the driver resolves each against the directory of its module's file, reads it and gives the database what it read, or why it could not, as a `Resource` input of the program. Compile-time code never reads a file. A path that is absolute, or leaves the package by `..` or through a link, is refused, and a resource that cannot be read is a compile error at its source, as is a source that is no plain string literal.
 
-An `embed` is a module value whose body is the content of its resource, an `Expr::Embed` that holds no bytes, so the body stays equal when the file changes. Inference gives it its written type: `Bytes` without one, and `Str` only when the content is UTF-8, else an error that names the first byte that is not. Any other type needs an `on Embed` handler. The MIR of the body is the content as a constant of the type, so the value is computed, encoded and placed in its cell like any constant (§11.6.7–11.6.8), and the code that reads it finds it there; a literal longer than 15 bytes is static data of the value's code (§11.6.9).
+An `embed` is a module value whose body is the content of its resource, an `Expr::Embed` that holds no bytes, so the body stays equal when the file changes. Inference gives it its written type: `Bytes` without one, and `Str` only when the content is UTF-8, else an error that names the first byte that is not. Any other type needs an `on Embed` handler (§11.6.11), which makes the value of the content. The MIR of the body is the content as a constant of the type, or a call of the handler on it, so the value is computed, encoded and placed in its cell like any constant (§11.6.7–11.6.8), and the code that reads it finds it there; a literal longer than 15 bytes is static data of the value's code (§11.6.9).
 
 The driver reads the resources when it loads the project, and the REPL again before each input, so an edit of the file is seen by the next input; a resource whose content did not change keeps its input, and only what reads a changed one is redone: the value's types and MIR, its constant, and the constants and code that read it. A watch of the files while nothing is typed waits for the language server (§11.8.1). Resources are kept whole in the database and in the code of their values; release builds place them in static data (§11.10.3).
 
-What waits: `on Embed` handlers, which turn a resource into a value of another type at compile time, such as `embed cfg: Toml from "limits.toml"`. They need lifecycle handlers (`on` clauses, Specification §11.4), which no component builds yet: `on` clauses are parsed but not lowered or checked. A handler would be evaluated as a constant is, on the content as `Bytes` or `Str`, and an `EmbedError` it returns would be a compile error at the `embed`, with the line and column it carries. Sources other than package files, such as URLs with a pinned hash, are deferred by the specification.
+An `embed` of a type with a handler is evaluated through the handler: compile-time evaluation runs the handler's function on the content, as a `Str` when its form takes one and so only after the content was checked as UTF-8, or as `Bytes`, under the meter. A value it makes is the constant; an `EmbedError`, or an error of a type spreading it, is a compile error at the `embed`, such as ``error: `level` cannot be embedded: expected low or high, at level.txt:1:1``, the line and column shown when they are not zero; a trap is a compile error as for any constant. The value's code calls the handler too, and traps if it gives an error, which only code that did not get the constant could reach. Sources other than package files, such as URLs with a pinned hash, are deferred by the specification.
 
 **Data structures**
 
 - `Resource { content: Result<Arc<[u8]>, String> }` — an input: what the driver read for a source; `Program::resources` lists them by module and source as written.
-- `ItemKind::Embed`, with `ItemKind::is_value`; `Expr::Embed`; `LowerError::Embed`; `ErrorKind::NotUtf8 { at }` and `ErrorKind::EmbedHandler { ty }`.
+- `ItemKind::Embed`, with `ItemKind::is_value`; `Expr::Embed`; `LowerError::Embed`; `ErrorKind::NotUtf8 { ty, at }` and `ErrorKind::EmbedHandler { ty }`.
+- `EvalError::Embed { message, line, column }` — a handler's error, a compile error.
 - `ModuleFile::dir` and `Project::root` — in the driver: where sources resolve.
 
 **Functions**
@@ -1152,6 +1154,28 @@ What waits: `on Embed` handlers, which turn a resource into a value of another t
 - `fn embed_sources(db: &dyn Db, module: ModuleId) -> Vec<String>` — the sources a module's `embed`s name, from the item tree.
 - `fn embed_content(db: &dyn Db, program: Program, item: ItemId) -> Result<&Arc<[u8]>, String>` — the content of an `embed`'s resource, which inference and MIR read.
 - `Project::read_resources(&mut self)` — reads the resources and sets the inputs that changed.
+- `fn embed_source(db: &dyn Db, item: ItemId) -> Result<String, String>` — the source an `embed` names, as written.
+
+#### 11.6.11 Lifecycle handlers
+
+`on H f` attaches a lifecycle handler to a type (Specification §11.4): the runtime or the compiler calls `f` at a point of the value's life, or of its making, as `Embed` does. HIR lowers a type declaration's `on` clauses, each its kind as a written type and its handler as an expression, and a kind's `where HandlerForm[F, is Pure]`, which the compiler knows by name; the parser reads a parenthesized function type among bracket arguments as a type, so `HandlerForm[((Bytes) -> T | EmbedError) | ((Str) -> T | EmbedError), is Pure]` parses.
+
+`type_handlers` checks the clauses of a type. The type must be `distinct` or `opaque`, since structural types merge. The kind is named without type arguments: its one type parameter is the declaring type. It must spread the prelude's `LifecycleHandler` and have a form, a function type or a union of them, in which the declaring type takes the parameter's place. The handler names a function, and exactly one of its overloads must fit exactly one member of the form, its parameters and its whole result, errors included; a form marked `is Pure` takes only a function without effects, as compile-time evaluation needs. A type declares one handler of a kind. Each failure is an error at the clause.
+
+The prelude declares `LifecycleHandler`, the kind `Embed` and `EmbedError(..Error, message: Str, line: Int = 0, column: Int = 0)`, whose line and column are the place in the resource; the specification leaves its fields open. A field left out of a construction takes its default when the default is a literal, so a handler can write `EmbedError(message: "…")`.
+
+What waits: handlers that are closures, which need code of their own in the declaring type; handlers of generic types; `Dispose`, whose handler the runtime would call when a value is removed, and `Encode` and `Decode`, which come with the standard library's codecs. Other field defaults wait for code that evaluates them where the record is built.
+
+**Data structures**
+
+- `TypeDecl::handlers: Vec<HandlerClause { kind, handler }>` and `TypeDecl::form: Option<HandlerForm { ty, pure }>` — in HIR.
+- `Handler { kind, function, form }` and `Handlers { handlers, errors }` — in `crag-types`: a checked handler and the member of the form it fits.
+- `ErrorKind::HandlerOnStructural`, `NotALifecycleKind`, `SecondHandler`, `HandlerDoesNotFit` and `HandlerNotPure`.
+
+**Functions**
+
+- `fn type_handlers(db: &dyn Db, program: Program, item: ItemId) -> &Handlers` — the query: the handlers a type declares, and the errors of its clauses.
+- `fn lifecycle_handler(db: &dyn Db, program: Program, ty: Ty, kind: &str) -> Option<&Handler>` — the handler of a prelude kind a type declares, which inference, MIR and compile-time evaluation ask for `Embed`.
 
 ### 11.7 M4 components
 

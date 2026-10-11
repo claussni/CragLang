@@ -380,15 +380,16 @@ fn label_ahead(p: &Parser) -> bool {
 }
 
 /// An argument of bracket application, which may be a type or an
-/// expression (§6.5). Function types, unions and `is` clauses are parsed
-/// as types; anything else as an expression, which name resolution
-/// reinterprets where it names a type.
+/// expression (§6.5). Function types, parenthesized ones among them,
+/// unions and `is` clauses are parsed as types; anything else as an
+/// expression, which name resolution reinterprets where it names a type.
 fn bracket_arg(p: &mut Parser) -> bool {
     if p.at(T::Is) {
         is_clause(p);
         return false;
     }
-    if p.at(T::LParen) && p.nth(p.skip_balanced(0)) == T::Arrow {
+    let function = |n: usize| p.nth(n) == T::LParen && p.nth(p.skip_balanced(n)) == T::Arrow;
+    if p.at(T::LParen) && (function(0) || function(1)) {
         ty(p);
         return false;
     }

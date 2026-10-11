@@ -35,7 +35,9 @@
 //! do, from Rust, after the fiber has stopped.
 //!
 //! An `embed` is a value too, whose body is the content of its resource
-//! (§11.6.10).
+//! (§11.6.10). An `embed` of a type with an `on Embed` handler runs the
+//! handler on the content, and an `EmbedError` it gives is a compile error
+//! (§11.6.11).
 //!
 //! Not built yet: conditions with known inputs and type functions, which
 //! wait for conditions and `Type` values in the checker.
@@ -45,17 +47,18 @@ extern crate crag_db as salsa;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use crag_abi::{CELL_FULL, CELL_VALUE_OFFSET, FuncId, RuntimeFn, SlotKey, TrapKind};
-use crag_backend::{code, func_id, shapes};
+use crag_abi::{CELL_FULL, CELL_VALUE_OFFSET, FuncId, RuntimeFn, Shapes, SlotKey, TrapKind};
+use crag_backend::{Layout, code, func_id, layout, record_layout, shapes, type_index};
 use crag_codegen::{CodegenSettings, OptLevel, Target, compile_entry_stub, target_for};
 use crag_db::{Db, catch_cancelled, check_cancelled};
-use crag_hir::{ItemId, ModuleId, Owner, Program};
+use crag_hir::{ItemId, ItemKind, ModuleId, Owner, Program, embed_content};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{Entry, InstanceKey, Tier, collect_instances, mir};
+use crag_runtime::text::{bytes_of, make_text};
 use crag_runtime::{
     CodeMap, Fiber, FiberConfig, FiberState, Meter, Types, Worker, encode_value, release_value,
 };
-use crag_types::Ty;
+use crag_types::{Ty, TyKind, lifecycle_handler, result_type};
 
 /// The steps an evaluation may take: function entries and loop turns.
 pub const STEP_LIMIT: u64 = 100_000_000;
@@ -97,6 +100,14 @@ pub enum EvalError {
         /// The functions of the frames, the trapping one first.
         stack: Vec<String>,
     },
+    /// An `embed` handler gave an `EmbedError`: a compile error at the
+    /// `embed`, at the line and column of the resource the error names,
+    /// when not zero (Specification §18.4.1).
+    Embed {
+        message: String,
+        line: i64,
+        column: i64,
+    },
     /// The site is not a constant, for this reason; it is computed when
     /// the program runs.
     NotConstant(String),
@@ -124,7 +135,9 @@ pub fn eval_errors<'db>(
         if !item.id.kind(db).is_value() {
             continue;
         }
-        if let Err(e @ EvalError::Trap { .. }) = const_eval(db, program, EvalSite::Value(item.id)) {
+        if let Err(e @ (EvalError::Trap { .. } | EvalError::Embed { .. })) =
+            const_eval(db, program, EvalSite::Value(item.id))
+        {
             out.push((item.id, e.clone()));
         }
     }
@@ -157,6 +170,21 @@ pub fn evaluate<'db>(
     else {
         return not("it has no body");
     };
+    // An `embed` of a type with a handler is the handler's value of the
+    // resource, which it makes here (§18.4.1).
+    if *item.kind(db) == ItemKind::Embed
+        && let Some(handler) = lifecycle_handler(db, program, ty, "Embed")
+    {
+        let root = InstanceKey::body(db, Owner::Item(handler.function));
+        return match Evaluation::build(db, program, root) {
+            Ok(mut evaluation) => {
+                let result = evaluation.embed(db, program, item, ty, handler.function, meter);
+                let left = evaluation.finish(db, program);
+                (result, left)
+            }
+            Err(why) => not(&why),
+        };
+    }
     match Evaluation::build(db, program, root) {
         Ok(mut evaluation) => {
             let result = evaluation.run(db, program, ty, meter);
@@ -165,6 +193,32 @@ pub fn evaluate<'db>(
         }
         Err(why) => not(&why),
     }
+}
+
+/// The error a box of `EmbedError` at `ptr` says.
+///
+/// # Safety
+///
+/// `ptr` points at a live box of `EmbedError` or of a type spreading it.
+unsafe fn embed_error(db: &dyn Db, program: Program, ptr: u64) -> Option<EvalError> {
+    let error = crag_types::prelude_item(db, program, "EmbedError")?;
+    let error = Ty::new(db, TyKind::Named(error, Vec::new()));
+    let (slots, _) = record_layout(db, program, error)?;
+    let field = |name: &str| slots.iter().find(|s| s.name.text(db) == name);
+    let at = |offset: u32, k: u32| {
+        // SAFETY: as the caller promises; the field is inside the box.
+        unsafe { ((ptr as *const u8).add((offset + 8 * k) as usize) as *const u64).read() }
+    };
+    let message = field("message")?;
+    let words = [at(message.offset, 0), at(message.offset, 1)];
+    // SAFETY: the field holds a live string.
+    let message = unsafe { String::from_utf8_lossy(bytes_of(&words)).into_owned() };
+    let number = |name: &str| field(name).map_or(0, |s| at(s.offset, 0) as i64);
+    Some(EvalError::Embed {
+        message,
+        line: number("line"),
+        column: number("column"),
+    })
 }
 
 /// The host's target.
@@ -259,18 +313,124 @@ impl<'db> Evaluation<'db> {
         meter: Meter,
     ) -> Result<ConstValue, EvalError> {
         let (shapes, shape) = shapes(db, program, ty);
-        let returns = shapes.shapes[shape as usize].words();
+        let words = self.call(db, &[], shapes.shapes[shape as usize].words(), meter)?;
+        // SAFETY: the words are the root's result, of type `ty`, which the
+        // fiber left to us.
+        unsafe { self.encode(&words, &shapes, shape, &words, &shapes, shape) }
+    }
+
+    /// Runs the `on Embed` handler `function` of `ty`, the root, on the
+    /// content of the resource of `item` and encodes the value it makes.
+    /// An `EmbedError` it gives is an error.
+    fn embed(
+        &mut self,
+        db: &'db dyn Db,
+        program: Program,
+        item: ItemId<'db>,
+        ty: Ty<'db>,
+        function: ItemId<'db>,
+        meter: Meter,
+    ) -> Result<ConstValue, EvalError> {
+        let not = |why: &str| EvalError::NotConstant(why.into());
+        let content = embed_content(db, program, item).map_err(|_| not("it has errors"))?;
+        let result = result_type(db, program, function).ok_or_else(|| not("it has errors"))?;
+        let (result_shapes, result_shape) = shapes(db, program, result);
+        let (shapes, shape) = shapes(db, program, ty);
+        // The handler takes the content, as `Str` or `Bytes`: two words.
+        let args = make_text(self.worker.heap(), &[content]);
+        let returns = result_shapes.shapes[result_shape as usize].words();
+        let words = self.call(db, &args, returns, meter)?;
+        let release = |this: &mut Self| {
+            let types = this.worker.types();
+            // SAFETY: the words are the handler's result, which the fiber
+            // left to us.
+            unsafe {
+                release_value(
+                    this.worker.heap(),
+                    &types,
+                    &words,
+                    &result_shapes,
+                    result_shape,
+                )
+            }
+        };
+        let value = match layout(db, program, result) {
+            _ if result == ty => words.clone(),
+            Some(Layout::Union) if words[0] == type_index(ty) as u64 => {
+                match layout(db, program, ty) {
+                    Some(Layout::Zero) => Vec::new(),
+                    Some(Layout::Imm(_) | Layout::Box) => vec![words[1]],
+                    _ => {
+                        release(self);
+                        return Err(not("its handler makes a value an `embed` cannot keep yet"));
+                    }
+                }
+            }
+            Some(Layout::Union) => {
+                // A box of `EmbedError`, or of a type spreading it, which
+                // keeps its fields where they are.
+                // SAFETY: the payload of the error is a live box.
+                let error = unsafe { embed_error(db, program, words[1]) };
+                release(self);
+                return Err(error.unwrap_or_else(|| not("its handler gives no `EmbedError`")));
+            }
+            _ => {
+                release(self);
+                return Err(not("its handler makes a value an `embed` cannot keep yet"));
+            }
+        };
+        // SAFETY: the value is the handler's, or part of it.
+        unsafe { self.encode(&value, &shapes, shape, &words, &result_shapes, result_shape) }
+    }
+
+    /// Encodes `words` of the shape, and then releases `owned`, the value
+    /// they are or are part of.
+    ///
+    /// # Safety
+    ///
+    /// `owned` is a live value of its shape, which the caller gives up, and
+    /// `words` a live value of theirs while it lives.
+    unsafe fn encode(
+        &mut self,
+        words: &[u64],
+        shapes: &Shapes,
+        shape: u32,
+        owned: &[u64],
+        owned_shapes: &Shapes,
+        owned_shape: u32,
+    ) -> Result<ConstValue, EvalError> {
+        let types = self.worker.types();
+        // SAFETY: as the caller promises.
+        unsafe {
+            let bytes = encode_value(words, shapes, shape, &types);
+            release_value(self.worker.heap(), &types, owned, owned_shapes, owned_shape);
+            let bytes = bytes.map_err(|e| EvalError::NotConstant(format!("it holds {}", e.0)))?;
+            let hash = *blake3::hash(&bytes).as_bytes();
+            Ok(ConstValue { bytes, hash })
+        }
+    }
+
+    /// Runs the root on the arguments under the meter, and gives its
+    /// result's words, which the caller owns.
+    fn call(
+        &mut self,
+        db: &'db dyn Db,
+        args: &[u64],
+        returns: u32,
+        meter: Meter,
+    ) -> Result<Vec<u64>, EvalError> {
         let settings = CodegenSettings {
             target: host().clone(),
             opt: OptLevel::None,
             metered: false,
         };
-        let stub = compile_entry_stub(0, returns, &settings).expect("the stub compiles");
+        let stub =
+            compile_entry_stub(args.len() as u32, returns, &settings).expect("the stub compiles");
         let stub = load(&mut self.arena, &self.symbols, &stub).expect("the stub loads");
         let entry = self.functions[&func_id(self.root)].0;
         // SAFETY: the stub was compiled for the root's words, and both stay
         // loaded while the evaluation exists, which outlives the fiber.
-        let mut fiber = unsafe { Fiber::new(stub.addr(), entry, &[], FiberConfig::default()) }
+        let mut fiber = unsafe { Fiber::new(stub.addr(), entry, args, FiberConfig::default()) }
             .map_err(|e| EvalError::NotConstant(format!("no memory for a stack: {e}")))?;
         fiber.set_meter(meter);
         let poll = move || catch_cancelled(|| check_cancelled(db)).is_err();
@@ -312,17 +472,7 @@ impl<'db> Evaluation<'db> {
             }
             state => unreachable!("a fiber nothing stops ended {state:?}"),
         }
-        let words = fiber.results().expect("finished")[..returns as usize].to_vec();
-        let types = self.worker.types();
-        // SAFETY: the words are the root's result, of type `ty`, which the
-        // fiber left to us; it is released once encoded.
-        unsafe {
-            let bytes = encode_value(&words, &shapes, shape, &types);
-            release_value(self.worker.heap(), &types, &words, &shapes, shape);
-            let bytes = bytes.map_err(|e| EvalError::NotConstant(format!("it holds {}", e.0)))?;
-            let hash = *blake3::hash(&bytes).as_bytes();
-            Ok(ConstValue { bytes, hash })
-        }
+        Ok(fiber.results().expect("finished")[..returns as usize].to_vec())
     }
 
     /// Releases what the cells of the values hold and returns the boxes

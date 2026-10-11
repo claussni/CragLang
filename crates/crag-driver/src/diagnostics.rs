@@ -79,10 +79,29 @@ pub fn check(project: &Project) -> Vec<Diagnostic> {
         // Constants are evaluated at compile time (Specification §18.4),
         // and an evaluation that fails is an error at the value.
         for (item, error) in crag_eval::eval_errors(db, program, module) {
-            let EvalError::Trap { kind, stack, .. } = error else {
-                continue;
-            };
             let name = item.name(db).text(db);
+            let range = decl_range(db, module, item_decl(db, item));
+            let (kind, stack) = match error {
+                EvalError::Trap { kind, stack, .. } => (kind, stack),
+                // An `embed` handler's error, at the line and column of
+                // the resource it names (§18.4.1).
+                EvalError::Embed {
+                    message,
+                    line,
+                    column,
+                } => {
+                    let source = crag_hir::embed_source(db, item).unwrap_or_default();
+                    let place = match (line, column) {
+                        (0, _) => String::new(),
+                        (line, 0) => format!(", at {source}:{line}"),
+                        (line, column) => format!(", at {source}:{line}:{column}"),
+                    };
+                    let message = format!("`{name}` cannot be embedded: {message}{place}");
+                    out.push(at(range, message));
+                    continue;
+                }
+                EvalError::NotConstant(_) => continue,
+            };
             let mut message = format!(
                 "`{name}` cannot be computed at compile time: it {}",
                 trap_verb(kind)
@@ -90,7 +109,7 @@ pub fn check(project: &Project) -> Vec<Diagnostic> {
             if let Some(inner) = stack.first().filter(|f| *f != name) {
                 message += &format!(" in {inner}");
             }
-            out.push(at(decl_range(db, module, item_decl(db, item)), message));
+            out.push(at(range, message));
         }
     }
     for cycle in &import_graph(db, program).cycles {

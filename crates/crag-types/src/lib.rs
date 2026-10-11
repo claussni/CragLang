@@ -34,6 +34,7 @@ mod effect;
 mod escape;
 mod generic;
 mod group;
+mod handler;
 mod infer;
 mod overload;
 mod relate;
@@ -59,6 +60,7 @@ pub use group::{
     Group, GroupMember, callees, error_members, error_type, function_effects, group_errors,
     group_of, param_escapes, recursion_errors, result_type, success_members,
 };
+pub use handler::{Handler, Handlers, lifecycle_handler, type_handlers};
 pub use infer::constant as literal_value;
 pub use overload::{Ranked, Specificity, compare_param, most_specific, overload_errors};
 pub use relate::{declared_fields, fields_of, is_subtype, join, normalize, parent, subst};
@@ -94,6 +96,8 @@ pub fn module_type_errors<'db>(
         {
             let def = type_def(db, program, item);
             errors.extend(def.errors.iter().map(|e| (owner, e.clone())));
+            let handlers = type_handlers(db, program, item);
+            errors.extend(handlers.errors.iter().map(|e| (owner, e.clone())));
         }
         if let Owner::Item(item) = owner {
             let found = match *item.kind(db) {

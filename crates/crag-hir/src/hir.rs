@@ -103,7 +103,9 @@ pub struct SlotDecl<'db> {
     pub generic: bool,
 }
 
-/// A type declaration (§3.2–3.9). Its clauses are not lowered yet.
+/// A type declaration (§3.2–3.9), with its lifecycle handlers and, for a
+/// lifecycle kind, the form of their functions (§11.4). Its conditions and
+/// markers are not lowered yet.
 #[derive(Clone, Debug, Default, PartialEq, Eq, crag_db::SalsaValue)]
 pub struct TypeDecl<'db> {
     /// Whether it has a field list; a tag has none (§3.2).
@@ -115,6 +117,26 @@ pub struct TypeDecl<'db> {
     pub alias: Option<TypeRefId>,
     pub distinct: bool,
     pub opaque: bool,
+    /// Its `on` clauses.
+    pub handlers: Vec<HandlerClause>,
+    /// A lifecycle kind's `where HandlerForm[…]`.
+    pub form: Option<HandlerForm>,
+}
+
+/// `on H f`: the lifecycle kind and the handler (§11.4).
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct HandlerClause {
+    pub kind: TypeRefId,
+    pub handler: ExprId,
+}
+
+/// `HandlerForm[F, is Pure]` in a lifecycle kind's `where` clause: the
+/// type its handlers fit, a function type or a union of them, and whether
+/// they must be Pure (§11.4).
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct HandlerForm {
+    pub ty: TypeRefId,
+    pub pure: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]

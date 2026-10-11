@@ -42,8 +42,8 @@ use crag_hir::{
 use crag_types::{
     Builtin, Callee, DecisionTree, Dispatch, EscapeLevel, Filling, InferenceResult, Instance,
     ListLen, Position, SigParam, Signature, Step, Ty, TyKind, TypeDefKind, Value, body_types,
-    decision_tree_with, declared_fields, fields_of, literal_value, prelude_item, result_type,
-    signature, subst, type_def, value_type,
+    decision_tree_with, declared_fields, fields_of, lifecycle_handler, literal_value, prelude_item,
+    result_type, signature, subst, type_def, value_type,
 };
 
 use crate::ir::{
@@ -210,6 +210,8 @@ struct Slot<'db> {
     ty: Ty<'db>,
     given: Option<ExprId>,
     spread: Option<ExprId>,
+    /// The field's default, when it is a literal.
+    default: Option<Constant<'db>>,
 }
 
 /// The state of lowering one decision tree.
@@ -1118,7 +1120,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     }
 
     /// The content of an `embed`'s resource as a constant of its type,
-    /// which inference made `Bytes` or a `Str` that is UTF-8 (§18.4.1).
+    /// which inference made `Bytes` or a `Str` that is UTF-8, or the value
+    /// the type's `on Embed` handler makes of it (§18.4.1). A handler's
+    /// error is a compile error, so the code never gets one.
     fn embed(&mut self, expr: ExprId, ty: Ty<'db>) -> Operand<'db> {
         let db = self.db;
         let Owner::Item(item) = *self.instance.owner(db) else {
@@ -1127,14 +1131,47 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let Ok(content) = crag_hir::embed_content(db, self.program, item) else {
             return self.trap(TrapKind::Error, Some(expr));
         };
-        let constant = match ty.as_builtin(db) {
+        let handler = lifecycle_handler(db, self.program, ty, "Embed");
+        let param = match handler.map(|h| h.form.kind(db)) {
+            Some(TyKind::Fn { params, .. }) => params[0],
+            _ => ty,
+        };
+        let constant = match param.as_builtin(db) {
             Some((Builtin::Str, _)) => match std::str::from_utf8(content) {
                 Ok(text) => Constant::Str(text.to_string()),
                 Err(_) => return self.trap(TrapKind::Error, Some(expr)),
             },
             _ => Constant::Bytes(content.to_vec()),
         };
-        Operand::Const(constant)
+        let Some(handler) = handler else {
+            return Operand::Const(constant);
+        };
+        let Some(result) = result_type(db, self.program, handler.function) else {
+            return self.trap(TrapKind::Error, Some(expr));
+        };
+        let dst = self.temp(result);
+        let target = self.new_block();
+        self.terminate(Terminator::Call {
+            func: InstanceKey::body(db, Owner::Item(handler.function)),
+            args: vec![Operand::Const(constant)],
+            dst,
+            target,
+            site: expr,
+        });
+        self.switch_to(target);
+        let (fits, fail) = (self.new_block(), self.new_block());
+        let cases = ty.members(db).into_iter().map(|m| (m, fits)).collect();
+        self.terminate(Terminator::Switch {
+            place: Place::local(dst),
+            cases,
+            otherwise: fail,
+        });
+        self.switch_to(fail);
+        self.trap(TrapKind::Error, Some(expr));
+        self.switch_to(fits);
+        let value = self.temp(ty);
+        self.assign_to(value, Operand::Local(dst), result);
+        Operand::Local(value)
     }
 
     /// The value of a module-level `let`: a call of the code that computes
@@ -1860,7 +1897,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             return self.unsupported(expr, "field paths");
         }
         if !self.record_fits(ty, positional, fields) {
-            return self.unsupported(expr, "field defaults");
+            return self.unsupported(expr, "field defaults other than literals");
         }
         self.record_value(Some(expr), ty, positional, fields)
     }
@@ -1899,11 +1936,13 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     .then_some(*e),
                 _ => None,
             });
+            let default = self.default_constant(ty, name, field_ty);
             slots.push(Slot {
                 name,
                 ty: field_ty,
                 given,
                 spread,
+                default,
             });
         }
         Some(slots)
@@ -1914,8 +1953,41 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             .is_some_and(|slots| {
                 slots
                     .iter()
-                    .all(|s| s.given.is_some() || s.spread.is_some())
+                    .all(|s| s.given.is_some() || s.spread.is_some() || s.default.is_some())
             })
+    }
+
+    /// The default of a field of a named record type, as the type that
+    /// declares the field last gives it, when it is a literal; other
+    /// defaults are not built yet.
+    fn default_constant(
+        &self,
+        ty: Ty<'db>,
+        name: crag_hir::Name<'db>,
+        field_ty: Ty<'db>,
+    ) -> Option<Constant<'db>> {
+        let db = self.db;
+        let mut current = Some(ty);
+        while let Some(t) = current {
+            let TyKind::Named(item, _) = t.kind(db) else {
+                return None;
+            };
+            let body = hir_body(db, self.program, Owner::Item(*item));
+            if let Some(field) = body
+                .type_decl
+                .as_ref()?
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+            {
+                return match body.expr(field.default?) {
+                    Expr::Literal(literal) => Some(self.literal(literal, field_ty, false)),
+                    _ => None,
+                };
+            }
+            current = crag_types::parent(db, self.program, t);
+        }
+        None
     }
 
     /// Builds a record that `record_fits`: the written values in their
@@ -1948,6 +2020,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             ty: field_ty,
             given,
             spread,
+            default,
         } in slots
         {
             let op = match (given, spread) {
@@ -1974,7 +2047,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     let op = self.assign(from, Rvalue::Read(place));
                     self.coerce(op, from, field_ty)
                 }
-                (None, None) => return self.trap(TrapKind::Error, site),
+                (None, None) => match default {
+                    Some(constant) => Operand::Const(constant),
+                    None => return self.trap(TrapKind::Error, site),
+                },
             };
             out.push((name, op));
         }

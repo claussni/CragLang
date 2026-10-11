@@ -51,6 +51,17 @@ pub type Ordering = Less | Equal | Greater
 // The parent of every error type (§8.1).
 pub distinct type Error
 
+// Lifecycle handlers (§11.4): the parent of their kinds, and the kinds the
+// compiler runs so far.
+pub distinct type LifecycleHandler
+pub distinct type Embed[T](..LifecycleHandler)
+  where HandlerForm[((Bytes) -> T | EmbedError) | ((Str) -> T | EmbedError), is Pure]
+
+// A resource an `embed` handler cannot turn into a value: a compile error
+// at the `embed`, at the line and column of the resource, when not zero
+// (§18.4.1).
+pub type EmbedError(..Error, message: Str, line: Int = 0, column: Int = 0)
+
 // The type functions of error unions and the type mapping functions over
 // them (§8.4).
 pub type Oks[X]

@@ -769,32 +769,39 @@ impl<'a, 'db> Infer<'a, 'db> {
     /// The type of a literal, from the context when it gives one (§2.6).
     /// The content of an `embed`'s resource, of its written type: `Bytes`
     /// without one, and `Str` only when it is UTF-8 (§18.4.1). Any other
-    /// type needs an `on Embed` handler, which is not built yet.
+    /// type needs an `on Embed` handler, which turns the resource into a
+    /// value of it, from the content as `Str` when its form says so.
     fn embed(&mut self, id: ExprId, expected: Option<Ty<'db>>) -> Ty<'db> {
         let db = self.db;
         let bytes = self.builtin(Builtin::Bytes);
         let Some(expected) = expected else {
             return bytes;
         };
-        match expected.as_builtin(db) {
-            _ if expected.is_error(db) => {}
-            Some((Builtin::Bytes, _)) => {}
-            Some((Builtin::Str, _)) => {
-                let content = self
-                    .embed
-                    .map(|e| crag_hir::embed_content(db, self.program, e));
-                // A resource that cannot be read was reported.
-                if let Some(Ok(content)) = content
-                    && let Err(e) = std::str::from_utf8(content)
-                {
-                    let at = e.valid_up_to();
-                    self.error(Site::Expr(id), ErrorKind::NotUtf8 { at });
+        let handler = crate::handler::lifecycle_handler(db, self.program, expected, "Embed");
+        let text = match expected.as_builtin(db) {
+            _ if expected.is_error(db) => false,
+            Some((Builtin::Bytes, _)) => false,
+            Some((Builtin::Str, _)) => true,
+            _ => match handler.map(|h| h.form.kind(db)) {
+                Some(TyKind::Fn { params, .. }) => {
+                    params.first() == Some(&self.builtin(Builtin::Str))
                 }
-            }
-            _ => {
-                self.error(Site::Expr(id), ErrorKind::EmbedHandler { ty: expected });
-                return self.err_ty();
-            }
+                _ => {
+                    self.error(Site::Expr(id), ErrorKind::EmbedHandler { ty: expected });
+                    return self.err_ty();
+                }
+            },
+        };
+        let content = self
+            .embed
+            .map(|e| crag_hir::embed_content(db, self.program, e));
+        // A resource that cannot be read was reported.
+        if text
+            && let Some(Ok(content)) = content
+            && let Err(e) = std::str::from_utf8(content)
+        {
+            let at = e.valid_up_to();
+            self.error(Site::Expr(id), ErrorKind::NotUtf8 { ty: expected, at });
         }
         expected
     }

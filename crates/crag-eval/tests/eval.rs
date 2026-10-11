@@ -44,6 +44,12 @@ pub fn multiply(a: Int, b: Int) -> Int
 pub fn divide(a: Int, b: Int) -> Int
 pub fn equals(a: Int, b: Int) -> Bool
 pub fn lessThan(a: Int, b: Int) -> Bool
+pub fn equals(a: Str, b: Str) -> Bool
+pub distinct type Error
+pub distinct type LifecycleHandler
+pub distinct type Embed[T](..LifecycleHandler)
+  where HandlerForm[((Bytes) -> T | EmbedError) | ((Str) -> T | EmbedError), is Pure]
+pub type EmbedError(..Error, message: Str, line: Int = 0, column: Int = 0)
 "#;
 
 struct Project {
@@ -219,6 +225,47 @@ let loud = "{note}!"
         p.eval("note"),
         Err(EvalError::NotConstant("it has errors".into()))
     );
+}
+
+#[test]
+fn embed_handlers_run_at_compile_time() {
+    let text = r#"distinct type Name(text: Str, length: Int)
+  on Embed name
+
+fn name(text: Str) -> Name | EmbedError {
+  if text == "" {
+    return EmbedError(message: "the name of a {"long"} file is empty", line: 2)
+  }
+  Name(text: "{text}, as a name long enough for a buffer", length: 2)
+}
+
+embed who: Name from "who.txt"
+"#;
+    let mut p = Project::with(text, &[("who.txt", b"Ada")]);
+    // The record's shape, then its fields as the type declares them.
+    let value = p.bytes("who");
+    let text = "Ada, as a name long enough for a buffer";
+    let expected = [
+        &value[..4],
+        &(text.len() as u64).to_le_bytes()[..],
+        text.as_bytes(),
+        &2u64.to_le_bytes()[..],
+    ]
+    .concat();
+    assert_eq!(value, expected);
+    // The handler's error, released with the rest.
+    let resource = p.program.resources(&p.db)[0].2;
+    let _old = resource.set_content(&mut p.db).to(Ok(Arc::from(&b""[..])));
+    assert_eq!(
+        p.eval("who"),
+        Err(EvalError::Embed {
+            message: "the name of a long file is empty".into(),
+            line: 2,
+            column: 0,
+        })
+    );
+    let errors = eval_errors(&p.db, p.program, p.module);
+    assert_eq!(errors.len(), 1);
 }
 
 #[test]

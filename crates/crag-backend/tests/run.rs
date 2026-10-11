@@ -39,7 +39,7 @@ use crag_codegen::{
     CodeObject, CodegenSettings, OptLevel, SlotKey, compile_entry_stub, target_for,
 };
 use crag_db::RootDatabase;
-use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, lower_body, owners};
+use crag_hir::{ItemKind, ModuleId, Owner, Program, Resource, SourceFile, lower_body, owners};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{InstanceKey, Tier, collect_instances};
 use crag_runtime::text::TextWords;
@@ -64,6 +64,10 @@ pub type Bool = True | False
 pub type Empty[T]
 pub type Option[T] = T | Empty[T]
 pub distinct type Error
+pub distinct type LifecycleHandler
+pub distinct type Embed[T](..LifecycleHandler)
+  where HandlerForm[((Bytes) -> T | EmbedError) | ((Str) -> T | EmbedError), is Pure]
+pub type EmbedError(..Error, message: Str, line: Int = 0, column: Int = 0)
 pub type Range[T](first: T, last: T)
 pub type List[T]
 pub type Map[K, V]
@@ -222,11 +226,20 @@ impl Module {
         Module::compiled(text, Tier::Baseline)
     }
 
+    /// A module whose `embed`s may name the resources.
+    fn with_resources(text: &str, resources: &[(&str, &[u8])]) -> Module {
+        Module::compiled_with(text, Tier::Baseline, resources)
+    }
+
     fn metered(text: &str) -> Module {
         Module::compiled(text, Tier::Metered)
     }
 
     fn compiled(text: &str, tier: Tier) -> Module {
+        Module::compiled_with(text, tier, &[])
+    }
+
+    fn compiled_with(text: &str, tier: Tier, resources: &[(&str, &[u8])]) -> Module {
         let db = RootDatabase::new();
         let core = ModuleId::new(
             &db,
@@ -238,7 +251,14 @@ impl Module {
             "app".to_string(),
             SourceFile::new(&db, text.to_string()),
         );
-        let program = Program::new(&db, vec![core, module], Vec::new());
+        let resources = resources
+            .iter()
+            .map(|(source, bytes)| {
+                let content = Ok(std::sync::Arc::from(*bytes));
+                (module, source.to_string(), Resource::new(&db, content))
+            })
+            .collect();
+        let program = Program::new(&db, vec![core, module], resources);
         let syntax = &crag_hir::parse(&db, *module.file(&db)).errors;
         assert!(syntax.is_empty(), "{syntax:?}");
         let lowering: Vec<_> = owners(&db, module)
@@ -1150,6 +1170,81 @@ fn calls() -> Int {
         assert_eq!(m.shown(name), shown, "{name}");
         assert_eq!(m.heap.live_blocks(), 0, "{name}");
     }
+}
+
+#[test]
+fn fields_left_out_take_their_literal_defaults() {
+    let mut m = Module::new(
+        r#"type Options(size: Int, scale: Float = 1.5, label: Str = "a default long enough for a buffer")
+type Wide(..Options, width: Int = 80)
+type Computed(n: Int = add(1, 2))
+
+fn plain() -> Options { Options(size: 1) }
+fn given() -> Options { Options(size: 2, label: "x") }
+fn wide() -> Wide { Wide(size: 3) }
+fn computed() -> Computed { Computed() }
+"#,
+    );
+    assert_eq!(
+        m.unsupported,
+        ["computed: field defaults other than literals"]
+    );
+    let expected = [
+        (
+            "plain",
+            r#"Options(size: 1, scale: 1.5, label: "a default long enough for a buffer")"#,
+        ),
+        ("given", r#"Options(size: 2, scale: 1.5, label: "x")"#),
+        (
+            "wide",
+            r#"Wide(size: 3, scale: 1.5, label: "a default long enough for a buffer", width: 80)"#,
+        ),
+    ];
+    for (name, shown) in expected {
+        assert_eq!(m.shown(name), shown, "{name}");
+        assert_eq!(m.heap.live_blocks(), 0, "{name}");
+    }
+}
+
+#[test]
+fn embeds_run_their_handlers_when_read() {
+    // Here nothing computes the values at compile time, so their code runs
+    // the handlers when they are first read.
+    let mut m = Module::with_resources(
+        r#"distinct type Level(n: Int)
+  on Embed parse
+distinct type Size(n: Int)
+  on Embed measure
+
+fn parse(text: Str) -> Level | EmbedError {
+  case text {
+    "high" -> Level(n: 3)
+    _ -> EmbedError(message: "neither")
+  }
+}
+fn measure(data: Bytes) -> Size { Size(n: 2) }
+
+embed high: Level from "high.txt"
+embed bad: Level from "bad.txt"
+embed size: Size from "size.bin"
+embed raw from "size.bin"
+
+fn levels() -> Int { high.n * 10 + size.n }
+fn broken() -> Int { bad.n }
+fn bytes() -> Bytes { raw }
+"#,
+        &[
+            ("high.txt", b"high"),
+            ("bad.txt", b"low"),
+            ("size.bin", b"\x00\x01"),
+        ],
+    );
+    assert!(m.unsupported.is_empty(), "{:?}", m.unsupported);
+    assert_eq!(m.shown("levels"), "32");
+    assert_eq!(m.shown("bytes"), r#"b"\x00\x01""#);
+    // A handler's error is a compile error; code that gets one traps.
+    let trap = m.run("broken", &[]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::Error);
 }
 
 #[test]

@@ -204,6 +204,19 @@ fn comparisons_and_ranges_do_not_chain() {
 }
 
 #[test]
+fn bracket_arguments_may_be_parenthesized_function_types() {
+    assert_eq!(
+        expr("HandlerForm[((Bytes) -> T | E) | ((Str) -> T | E), is Pure]"),
+        "(BracketExpr (NameRef HandlerForm) (ArgList [ (UnionType (ParenType ( (FnType (FnTypeParams ( (NamedType Bytes) )) -> (UnionType (NamedType T) | (NamedType E))) )) | (ParenType ( (FnType (FnTypeParams ( (NamedType Str) )) -> (UnionType (NamedType T) | (NamedType E))) ))) , (IsClause is (Marker (NamedType Pure))) ]))"
+    );
+    // A parenthesized expression stays one.
+    assert_eq!(
+        expr("xs[(i)]"),
+        "(BracketExpr (NameRef xs) (ArgList [ (ParenExpr (ArgList ( (NameRef i) ))) ]))"
+    );
+}
+
+#[test]
 fn a_brace_is_a_closure_only_before_an_arrow() {
     assert_eq!(
         expr("xs.map { x -> x }"),

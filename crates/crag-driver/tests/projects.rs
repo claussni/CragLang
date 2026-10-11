@@ -327,7 +327,7 @@ fn main() {}
             "`../outside.txt` is outside the package",
             "`/etc/hostname` is absolute; an `embed` names a file relative to its module",
             "an `embed` of `Str` needs UTF-8, which the resource is not at byte 2",
-            "an `embed` of `Int` needs an `on Embed` handler, which the compiler does not support yet; an `embed` of `Bytes` or `Str` needs none",
+            "an `embed` of `Int` needs an `on Embed` handler, which `Int` does not declare; an `embed` of `Bytes` or `Str` needs none",
             "the source of an `embed` is a string literal, never computed",
             "`link.txt` is outside the package",
         ][..messages.len().min(7)],
@@ -336,6 +336,138 @@ fn main() {}
     assert_eq!(messages.len(), 7, "{out}");
     assert!(
         out.contains(" --> app.crag:4:19\n  |\n4 | embed d: Str from \"bad.bin\"\n  |                   ^^^^^^^^^\n"),
+        "{out}"
+    );
+}
+
+#[test]
+fn embed_handlers_make_values_of_their_types() {
+    let app = r#"pub distinct type Level(n: Int)
+  on Embed parseLevel
+
+opaque type Size(n: Int)
+  on Embed measure
+
+fn parseLevel(text: Str) -> Level | EmbedError {
+  case text {
+    "low\n" -> Level(n: 1)
+    "high\n" -> Level(n: 3)
+    _ -> EmbedError(message: "expected low or high", line: 1, column: 1)
+  }
+}
+
+fn measure(data: Bytes) -> Size {
+  if data == b"\x00\x01" { Size(n: 20) } else { Size(n: 0) }
+}
+
+embed level: Level from "level.txt"
+embed size: Size from "size.bin"
+
+fn main() -> ExitCode {
+  ExitCode(code: level.n + size.n)
+}
+"#;
+    let root = project(
+        "embed-handlers",
+        &[
+            ("package.crag", MANIFEST),
+            ("app.crag", app),
+            ("level.txt", "high\n"),
+        ],
+    );
+    fs::write(root.join("size.bin"), [0u8, 1]).unwrap();
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 23, "{}", text(out));
+    // An `EmbedError` is a compile error at the `embed`.
+    fs::write(root.join("level.txt"), "medium\n").unwrap();
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 1);
+    let out = text(out);
+    assert!(
+        out.starts_with(
+            "error: `level` cannot be embedded: expected low or high, at level.txt:1:1\n  --> app.crag:19:1\n"
+        ),
+        "{out}"
+    );
+    // A `Str` handler takes only UTF-8.
+    fs::write(root.join("level.txt"), [0xffu8]).unwrap();
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 1);
+    let out = text(out);
+    assert!(
+        out.starts_with(
+            "error: an `embed` of `Level` needs UTF-8, which the resource is not at byte 0\n"
+        ),
+        "{out}"
+    );
+}
+
+#[test]
+fn on_clauses_are_checked_against_their_kinds() {
+    let app = r#"import cLib("m").{ now() -> Int }
+
+type Plain(n: Int)
+  on Embed parsePlain
+
+distinct type NoKind(n: Int)
+  on Int parseNoKind
+
+// A form, but no lifecycle kind.
+distinct type Fake[T]
+  where HandlerForm[(Str) -> T]
+
+distinct type Faked(n: Int)
+  on Fake parseFaked
+
+distinct type Misfit(n: Int)
+  on Embed parseMisfit
+
+distinct type Twice(n: Int)
+  on Embed parseTwice
+  on Embed parseTwice
+
+distinct type Clock(n: Int)
+  on Embed parseClock
+
+distinct type Unknown(n: Int)
+
+fn parsePlain(text: Str) -> Plain { Plain(n: 1) }
+fn parseNoKind(text: Str) -> NoKind { NoKind(n: 1) }
+fn parseFaked(text: Str) -> Faked { Faked(n: 1) }
+fn parseMisfit(n: Int) -> Misfit { Misfit(n: n) }
+fn parseTwice(text: Str) -> Twice { Twice(n: 1) }
+fn parseClock(text: Str) -> Clock { Clock(n: now()) }
+
+embed unknown: Unknown from "x.txt"
+
+fn main() {}
+"#;
+    let root = project(
+        "on-clauses",
+        &[
+            ("package.crag", MANIFEST),
+            ("app.crag", app),
+            ("x.txt", "x"),
+        ],
+    );
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 1);
+    let out = text(out);
+    let messages: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("error: "))
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "a lifecycle handler needs a nominal type: declare it `distinct` or `opaque`",
+            "this is no lifecycle kind: a type spreading `LifecycleHandler` with a handler form",
+            "this is no lifecycle kind: a type spreading `LifecycleHandler` with a handler form",
+            "no function `parseMisfit` fits the form of `Embed`: ((Bytes) -> EmbedError | Misfit) | ((Str) -> EmbedError | Misfit)",
+            "the type already declares a handler of `Embed`",
+            "a handler of `Embed` is Pure, and `parseClock` has effects",
+            "an `embed` of `Unknown` needs an `on Embed` handler, which `Unknown` does not declare; an `embed` of `Bytes` or `Str` needs none",
+        ],
         "{out}"
     );
 }

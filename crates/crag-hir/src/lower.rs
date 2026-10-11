@@ -478,6 +478,34 @@ impl<'a, 'db> Lowerer<'a, 'db> {
                 .find(|n| !matches!(n.kind(), S::TypeParams) && !is_clause(n.kind()))
                 .map(|t| self.type_node(&t));
         }
+        for clause in node.children() {
+            match clause.kind() {
+                S::OnClause => {
+                    let mut parts = clause.children();
+                    let kind = self.type_or_missing(parts.next(), &clause);
+                    let handler = self.boundary_or_missing(parts.next().as_ref(), &clause);
+                    decl.handlers.push(HandlerClause { kind, handler });
+                }
+                // The kind's form is the compiler's to know, by name
+                // (§11.4); other entries are conditions.
+                S::WhereClause => {
+                    for entry in clause.children() {
+                        let form = entry.kind() == S::BracketExpr
+                            && entry.children().next().is_some_and(|n| {
+                                n.kind() == S::NameRef && n.text() == "HandlerForm"
+                            });
+                        let Some(args) = child(&entry, S::ArgList).filter(|_| form) else {
+                            continue;
+                        };
+                        let ty = args.children().find(|n| n.kind() != S::IsClause);
+                        let ty = self.type_or_missing(ty, &entry);
+                        let pure = self.pure_marker(&args);
+                        decl.form = Some(HandlerForm { ty, pure });
+                    }
+                }
+                _ => {}
+            }
+        }
         decl
     }
 

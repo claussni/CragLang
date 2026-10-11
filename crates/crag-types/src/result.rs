@@ -324,8 +324,29 @@ pub enum ErrorKind<'db> {
     SecondRef,
     /// An `ext` accessed in an `ext` closure (§9.6).
     NestedExt,
+    /// An `on` clause on a structural type (§11.4).
+    HandlerOnStructural,
+    /// An `on` clause whose kind is no type spreading `LifecycleHandler`
+    /// with a handler form.
+    NotALifecycleKind,
+    /// A second handler of a kind.
+    SecondHandler {
+        kind: Name<'db>,
+    },
+    /// No function of the name fits a member of the kind's form.
+    HandlerDoesNotFit {
+        kind: Name<'db>,
+        name: Name<'db>,
+        form: Ty<'db>,
+    },
+    /// The form is `is Pure` and the handler has effects.
+    HandlerNotPure {
+        kind: Name<'db>,
+        name: Name<'db>,
+    },
     /// A `Str` resource that is not UTF-8 from this byte on (§18.4.1).
     NotUtf8 {
+        ty: Ty<'db>,
         at: usize,
     },
     /// An `embed` of a type other than `Bytes` and `Str`, which needs an
@@ -520,12 +541,39 @@ impl<'db> ErrorKind<'db> {
             ErrorKind::NestedExt => {
                 "an `ext` closure accesses no other `ext`, so that locks never nest".into()
             }
-            ErrorKind::NotUtf8 { at } => {
-                format!("an `embed` of `Str` needs UTF-8, which the resource is not at byte {at}")
+            ErrorKind::HandlerOnStructural => {
+                "a lifecycle handler needs a nominal type: declare it `distinct` or `opaque`".into()
             }
+            ErrorKind::NotALifecycleKind => {
+                "this is no lifecycle kind: a type spreading `LifecycleHandler` with a handler form"
+                    .into()
+            }
+            ErrorKind::SecondHandler { kind } => {
+                format!("the type already declares a handler of `{}`", name(kind))
+            }
+            ErrorKind::HandlerDoesNotFit {
+                kind,
+                name: n,
+                form,
+            } => format!(
+                "no function `{}` fits the form of `{}`: {}",
+                name(n),
+                name(kind),
+                form.display(db)
+            ),
+            ErrorKind::HandlerNotPure { kind, name: n } => format!(
+                "a handler of `{}` is Pure, and `{}` has effects",
+                name(kind),
+                name(n)
+            ),
+            ErrorKind::NotUtf8 { ty, at } => format!(
+                "an `embed` of `{}` needs UTF-8, which the resource is not at byte {at}",
+                ty.display(db)
+            ),
             ErrorKind::EmbedHandler { ty } => format!(
-                "an `embed` of `{}` needs an `on Embed` handler, which the compiler does not \
-                 support yet; an `embed` of `Bytes` or `Str` needs none",
+                "an `embed` of `{}` needs an `on Embed` handler, which `{}` does not declare; an \
+                 `embed` of `Bytes` or `Str` needs none",
+                ty.display(db),
                 ty.display(db)
             ),
             ErrorKind::Unsupported(what) => format!("{what} are not supported yet"),
