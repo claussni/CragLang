@@ -118,12 +118,13 @@ pub fn infer_in_group<'db>(
             None
         }
     };
-    // Effects matter for what runs: functions, tests, and module-level
-    // values, which compile-time evaluation runs only without them (§3.14,
-    // §18.4).
+    // Effects matter for what runs: functions, tests, module-level values,
+    // which compile-time evaluation runs only without them (§3.14, §18.4),
+    // and the defaults of fields, which must have none.
     let effects = match owner {
         Owner::Item(item)
-            if !matches!(*item.kind(db), ItemKind::Function) && !item.kind(db).is_value() =>
+            if !matches!(*item.kind(db), ItemKind::Function | ItemKind::Type)
+                && !item.kind(db).is_value() =>
         {
             EffectSet::NONE
         }
@@ -144,7 +145,9 @@ pub fn infer_in_group<'db>(
         }
     };
     let escapes = match owner {
-        Owner::Item(item) if *item.kind(db) != ItemKind::Function => Escapes::default(),
+        Owner::Item(item) if !matches!(*item.kind(db), ItemKind::Function | ItemKind::Type) => {
+            Escapes::default()
+        }
         _ => {
             let summary_of = |f: ItemId<'db>| cx.escapes_of(f);
             let names_of = |f: ItemId<'db>| -> Vec<Option<Name<'db>>> {

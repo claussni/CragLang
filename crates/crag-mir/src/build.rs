@@ -43,7 +43,7 @@ use crag_types::{
     Builtin, Callee, DecisionTree, Dispatch, EscapeLevel, Filling, InferenceResult, Instance,
     ListLen, Position, SigParam, Signature, Step, Ty, TyKind, TypeDefKind, Value, body_types,
     decision_tree_with, declared_fields, fields_of, lifecycle_handler, literal_value, prelude_item,
-    result_type, signature, subst, type_def, value_type,
+    result_type, signature, subst, type_def, type_header, value_type,
 };
 
 use crate::ir::{
@@ -65,24 +65,26 @@ pub fn build<'db>(
 ) -> Option<MirBody<'db>> {
     let (owner, entry) = (*instance.owner(db), *instance.entry(db));
     if let Owner::Item(item) = owner {
-        if *item.kind(db) != ItemKind::Function && !item.kind(db).is_value() {
-            return None;
-        }
-        if *item.kind(db) == ItemKind::Function
-            && signature(db, program, item).type_params != instance.args(db).len()
-        {
+        let params = match *item.kind(db) {
+            ItemKind::Function => signature(db, program, item).type_params,
+            // A type has code only for what its declaration holds.
+            ItemKind::Type if entry != Entry::Body => type_header(db, program, item).params.len(),
+            kind if kind.is_value() => 0,
+            _ => return None,
+        };
+        if params != instance.args(db).len() {
             return None;
         }
     }
     let lowered = lower_body(db, program, owner);
-    let root = lowered.body.root?;
     let types = body_types(db, program, owner);
     let mut b = MirBuilder::new(db, program, instance, &lowered.body, types);
     let ok = lowered.errors.is_empty() && types.errors.is_empty();
     let start = match entry {
-        Entry::Body => b.body_entry(root),
+        Entry::Body => b.body_entry(lowered.body.root?),
         Entry::Closure(frame) => b.closure_entry(frame),
         Entry::Function(expr) => b.function_entry(expr),
+        Entry::Default(expr) => b.default_entry(expr),
     };
     match start {
         Some(start) if ok => start(&mut b),
@@ -210,8 +212,14 @@ struct Slot<'db> {
     ty: Ty<'db>,
     given: Option<ExprId>,
     spread: Option<ExprId>,
-    /// The field's default, when it is a literal.
-    default: Option<Constant<'db>>,
+    default: Option<FieldDefault<'db>>,
+}
+
+/// The default of a field: a literal, or code of the type that declares
+/// the field.
+enum FieldDefault<'db> {
+    Constant(Constant<'db>),
+    Code(InstanceKey<'db>),
 }
 
 /// The state of lowering one decision tree.
@@ -419,6 +427,24 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             }
             b.eval(inner, Dest::Return)
         }))
+    }
+
+    /// The code of a default: the parameters before it, when it is a
+    /// parameter's, then the default's value.
+    fn default_entry(&mut self, default: ExprId) -> Option<Start<'a, 'db>> {
+        let body = self.body;
+        let field = |f: &&crag_hir::FieldDecl<'db>| f.default == Some(default);
+        self.result = match body.params.iter().position(|p| p.default == Some(default)) {
+            Some(i) => {
+                for param in &body.params[..i] {
+                    self.binding(param.binding);
+                }
+                self.binding_ty(body.params[i].binding)?
+            }
+            None => self.type_ref(body.type_decl.as_ref()?.fields.iter().find(field)?.ty)?,
+        };
+        self.params = self.locals.len();
+        Some(Box::new(move |b| b.eval(default, Dest::Return)))
     }
 
     /// The code of a declared function used as a value at `expr`: an empty
@@ -1263,7 +1289,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     TypeDefKind::Record { .. }
                 ) =>
             {
-                self.record_value(Some(expr), self.ty(expr), &[], &[])
+                self.record_value(expr, self.ty(expr), &[], &[])
             }
             Some(Resolution::Type(_)) => Operand::Const(Constant::Tag(self.ty(expr))),
             _ => self.trap(TrapKind::Error, Some(expr)),
@@ -1625,8 +1651,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             return self.unit();
         };
         let sig = self.instance_signature(instance);
-        let Some(args) = self.arguments(&sig, positional, fields) else {
-            return self.unsupported(expr, "default arguments");
+        let Some(args) = self.arguments(expr, func, &sig, positional, fields) else {
+            return self.trap(TrapKind::Error, Some(expr));
         };
         let ty = self.ty(expr);
         if tail && ty == self.result {
@@ -1650,12 +1676,16 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         Operand::Local(dst)
     }
 
-    /// The arguments for the parameters, in the order they are written:
-    /// positional, then named, or named arguments building the last
-    /// parameter, a record (§5.6.2). None when a parameter takes its
-    /// default.
+    /// The arguments for the parameters of the code `func`, in the order
+    /// they are written: positional, then named, or named arguments
+    /// building the last parameter, a record (§5.6.2). A parameter left out
+    /// takes its default, computed by the default's code from the
+    /// parameters before it, after the written arguments. None when the
+    /// arguments do not fit, which inference reported.
     fn arguments(
         &mut self,
+        expr: ExprId,
+        func: InstanceKey<'db>,
         sig: &Signature<'db>,
         positional: &[ExprId],
         fields: Option<&[FieldArg<'db>]>,
@@ -1688,7 +1718,12 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 None => fits = false,
             }
         }
-        if fits && slots.iter().all(Option::is_some) {
+        if fits
+            && slots
+                .iter()
+                .zip(params)
+                .all(|(s, p)| s.is_some() || p.default)
+        {
             let mut ops: Vec<Option<Operand<'db>>> = vec![None; params.len()];
             let order = positional
                 .iter()
@@ -1697,6 +1732,29 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 let i = slots.iter().position(|s| *s == Some(arg))?;
                 let op = self.expr(arg);
                 ops[i] = Some(self.coerce(op, self.ty(arg), params[i].ty));
+            }
+            if ops.iter().any(Option::is_none) {
+                let Owner::Item(function) = *func.owner(db) else {
+                    return None;
+                };
+                let callee = hir_body(db, self.program, Owner::Item(function));
+                for i in 0..params.len() {
+                    if ops[i].is_some() {
+                        continue;
+                    }
+                    // The default and the call each take the parameters
+                    // before it.
+                    let before = (0..i)
+                        .map(|k| {
+                            let op = ops[k].clone()?;
+                            let local = self.materialize(op, params[k].ty);
+                            ops[k] = Some(Operand::Local(local));
+                            Some(Operand::Local(local))
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    let code = func.with_entry(db, Entry::Default(callee.params.get(i)?.default?));
+                    ops[i] = Some(self.call_code(code, before, params[i].ty, expr));
+                }
             }
             return ops.into_iter().collect();
         }
@@ -1712,8 +1770,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             let op = self.expr(arg);
             ops.push(self.coerce(op, self.ty(arg), param.ty));
         }
-        let site = positional.first().copied();
-        ops.push(self.record_value(site, last.ty, &[], fields.unwrap_or(&[])));
+        ops.push(self.record_value(expr, last.ty, &[], fields.unwrap_or(&[])));
         Some(ops)
     }
 
@@ -1861,6 +1918,27 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     }
 
     /// A call of a type: a tag's value, or a record built from arguments.
+    /// Calls code with arguments and gives its result, of type `ty`.
+    fn call_code(
+        &mut self,
+        func: InstanceKey<'db>,
+        args: Vec<Operand<'db>>,
+        ty: Ty<'db>,
+        site: ExprId,
+    ) -> Operand<'db> {
+        let dst = self.temp(ty);
+        let target = self.new_block();
+        self.terminate(Terminator::Call {
+            func,
+            args,
+            dst,
+            target,
+            site,
+        });
+        self.switch_to(target);
+        Operand::Local(dst)
+    }
+
     fn construct(
         &mut self,
         expr: ExprId,
@@ -1896,10 +1974,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         {
             return self.unsupported(expr, "field paths");
         }
-        if !self.record_fits(ty, positional, fields) {
-            return self.unsupported(expr, "field defaults other than literals");
-        }
-        self.record_value(Some(expr), ty, positional, fields)
+        self.record_value(expr, ty, positional, fields)
     }
 
     /// The fields of a record in the order of `fields_of`, each written,
@@ -1936,7 +2011,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     .then_some(*e),
                 _ => None,
             });
-            let default = self.default_constant(ty, name, field_ty);
+            let default = self.field_default(ty, name, field_ty);
             slots.push(Slot {
                 name,
                 ty: field_ty,
@@ -1958,18 +2033,17 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     }
 
     /// The default of a field of a named record type, as the type that
-    /// declares the field last gives it, when it is a literal; other
-    /// defaults are not built yet.
-    fn default_constant(
+    /// declares the field last gives it.
+    fn field_default(
         &self,
         ty: Ty<'db>,
         name: crag_hir::Name<'db>,
         field_ty: Ty<'db>,
-    ) -> Option<Constant<'db>> {
+    ) -> Option<FieldDefault<'db>> {
         let db = self.db;
         let mut current = Some(ty);
         while let Some(t) = current {
-            let TyKind::Named(item, _) = t.kind(db) else {
+            let TyKind::Named(item, args) = t.kind(db) else {
                 return None;
             };
             let body = hir_body(db, self.program, Owner::Item(*item));
@@ -1980,27 +2054,36 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 .iter()
                 .find(|f| f.name == name)
             {
-                return match body.expr(field.default?) {
-                    Expr::Literal(literal) => Some(self.literal(literal, field_ty, false)),
-                    _ => None,
-                };
+                let default = field.default?;
+                if let Expr::Literal(literal) = body.expr(default) {
+                    let constant = self.literal(literal, field_ty, false);
+                    return Some(FieldDefault::Constant(constant));
+                }
+                let code = InstanceKey::new(
+                    db,
+                    Owner::Item(*item),
+                    args.clone(),
+                    Vec::new(),
+                    Entry::Default(default),
+                );
+                return Some(FieldDefault::Code(code));
             }
             current = crag_types::parent(db, self.program, t);
         }
         None
     }
 
-    /// Builds a record that `record_fits`: the written values in their
-    /// order, then the fields spreads give.
+    /// Builds a record: the written values in their order, then the
+    /// fields spreads give, then the defaults of the rest.
     fn record_value(
         &mut self,
-        site: Option<ExprId>,
+        site: ExprId,
         ty: Ty<'db>,
         positional: &[ExprId],
         fields: &[FieldArg<'db>],
     ) -> Operand<'db> {
         let Some(slots) = self.record_slots(ty, positional, fields) else {
-            return self.trap(TrapKind::Error, site);
+            return self.trap(TrapKind::Error, Some(site));
         };
         let written = positional
             .iter()
@@ -2048,8 +2131,13 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     self.coerce(op, from, field_ty)
                 }
                 (None, None) => match default {
-                    Some(constant) => Operand::Const(constant),
-                    None => return self.trap(TrapKind::Error, site),
+                    Some(FieldDefault::Constant(constant)) => Operand::Const(constant),
+                    // The type that declares the field last gives it the
+                    // type it has here.
+                    Some(FieldDefault::Code(code)) => {
+                        self.call_code(code, Vec::new(), field_ty, site)
+                    }
+                    None => return self.trap(TrapKind::Error, Some(site)),
                 },
             };
             out.push((name, op));

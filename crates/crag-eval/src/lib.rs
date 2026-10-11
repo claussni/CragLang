@@ -265,6 +265,7 @@ impl<'db> Evaluation<'db> {
                 Entry::Body => name,
                 Entry::Closure(_) => format!("a closure in {name}"),
                 Entry::Function(_) => format!("a function value in {name}"),
+                Entry::Default(_) => format!("a default in {name}"),
             };
             let value = matches!(owner, Owner::Item(i) if i.kind(db).is_value());
             if value && *instance.entry(db) == Entry::Body {

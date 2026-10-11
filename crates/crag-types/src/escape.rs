@@ -187,21 +187,33 @@ impl<'a, 'db> EscapeWalker<'a, 'db> {
     /// The levels of the body, grown until nothing changes, and then the
     /// errors of its bindings-only values.
     pub fn walk_body(mut self) -> Walked<'db> {
-        let Some(root) = self.body.root else {
+        // Defaults are code of their own, whose values go to the callee or
+        // into the record.
+        let roots: Vec<ExprId> = self
+            .body
+            .root
+            .into_iter()
+            .chain(self.body.defaults())
+            .collect();
+        if roots.is_empty() {
             return Walked {
                 escapes: Escapes::default(),
                 errors: Vec::new(),
             };
-        };
+        }
         loop {
             self.changed = false;
-            self.walk(root, EscapeLevel::Escaping);
+            for &root in &roots {
+                self.walk(root, EscapeLevel::Escaping);
+            }
             if !self.changed {
                 break;
             }
         }
         self.report = Some(Vec::new());
-        self.walk(root, EscapeLevel::Escaping);
+        for &root in &roots {
+            self.walk(root, EscapeLevel::Escaping);
+        }
         let mut errors = self.report.take().unwrap_or_default();
         // An escaping closure captures no `var` (§6.4.1).
         let mut frames: Vec<ExprId> = self.declared.keys().copied().collect();

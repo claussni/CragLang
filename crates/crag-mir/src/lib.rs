@@ -103,8 +103,8 @@ impl<'db> InstanceKey<'db> {
 }
 
 /// Which code of an owner an instance is (§11.5.9). Every entry but the
-/// body is called as a function value: its first parameter is the
-/// environment, a box or null.
+/// body and a default is called as a function value: its first parameter
+/// is the environment, a box or null.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
 pub enum Entry {
     Body,
@@ -115,12 +115,16 @@ pub enum Entry {
     /// it: it calls the function with its arguments, split by the members
     /// of union parameters when the value is lifted (§11.5.5).
     Function(ExprId),
+    /// The default of a parameter or a field, by its expression: called
+    /// with the parameters before it where a call or a construction
+    /// leaves it out.
+    Default(ExprId),
 }
 
 impl Entry {
     /// Whether the code takes an environment first.
     pub fn takes_env(self) -> bool {
-        self != Entry::Body
+        !matches!(self, Entry::Body | Entry::Default(_))
     }
 }
 

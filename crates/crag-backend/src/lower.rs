@@ -53,8 +53,8 @@ use crag_db::Db;
 use crag_db::plumbing::AsId;
 use crag_hir::{Owner, Program, hir_body, lower_body};
 use crag_mir::{
-    BinOp, BlockId, ClosurePlacement, CmpOp, Constant, InstanceKey, Local, MirBody, Operand, Place,
-    Rvalue, Statement, Terminator, TrapKind,
+    BinOp, BlockId, ClosurePlacement, CmpOp, Constant, Entry, InstanceKey, Local, MirBody, Operand,
+    Place, Rvalue, Statement, Terminator, TrapKind,
 };
 use crag_types::{Builtin, Step, Ty, TyKind, prelude_item, signature};
 
@@ -1592,7 +1592,9 @@ impl<'a, 'db> Lower<'a, 'db> {
     }
 
     /// The words of a call's arguments, laid out for the callee's
-    /// parameters. A builtin of the prelude has no code yet.
+    /// parameters. A builtin of the prelude has no code yet. The code of a
+    /// default takes the parameters before it, so its arguments are the
+    /// first of its function's; a field's takes none.
     fn arguments(
         &mut self,
         func: InstanceKey<'db>,
@@ -1602,12 +1604,17 @@ impl<'a, 'db> Lower<'a, 'db> {
         let Owner::Item(item) = *func.owner(db) else {
             return Err("calls of tests");
         };
-        if hir_body(db, self.program, Owner::Item(item)).root.is_none() {
+        if *func.entry(db) == Entry::Body
+            && hir_body(db, self.program, Owner::Item(item)).root.is_none()
+        {
             return Err("builtin functions");
         }
-        let sig = signature(db, self.program, item);
+        let params = match args.is_empty() {
+            true => &[][..],
+            false => &signature(db, self.program, item).params[..],
+        };
         let mut words = Vec::new();
-        for (arg, param) in args.iter().zip(&sig.params) {
+        for (arg, param) in args.iter().zip(params) {
             // An instance's parameters have its type arguments in place.
             let ty = match func.args(db).is_empty() {
                 true => param.ty,

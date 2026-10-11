@@ -702,6 +702,7 @@ fn func_name<'db>(db: &'db dyn Db, func: InstanceKey<'db>) -> String {
     match *func.entry(db) {
         Entry::Body => owner,
         Entry::Closure(e) | Entry::Function(e) => format!("{owner}#{}", e.index()),
+        Entry::Default(e) => format!("{owner}#default{}", e.index()),
     }
 }
 

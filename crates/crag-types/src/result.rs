@@ -502,6 +502,7 @@ impl<'db> ErrorKind<'db> {
                     Restriction::Pure => "an `is Pure` function",
                     Restriction::Atomic => "an `atomic` block",
                     Restriction::Update => "an `update` closure",
+                    Restriction::Default => "a field default",
                 };
                 if *ext {
                     format!("this accesses an `ext`, which {context} does not allow")

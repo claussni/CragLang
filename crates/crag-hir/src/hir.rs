@@ -163,6 +163,18 @@ impl<'db> Body<'db> {
         &self.bindings[id.index()]
     }
 
+    /// The defaults of the parameters and of the fields the body declares,
+    /// each code of its own that runs where a call or a construction
+    /// leaves the parameter or field out.
+    pub fn defaults(&self) -> Vec<ExprId> {
+        let fields = self.type_decl.iter().flat_map(|d| &d.fields);
+        self.params
+            .iter()
+            .filter_map(|p| p.default)
+            .chain(fields.filter_map(|f| f.default))
+            .collect()
+    }
+
     /// The expressions directly inside `expr`, those of its statements,
     /// closures and local functions included.
     pub fn children(&self, expr: ExprId) -> Vec<ExprId> {

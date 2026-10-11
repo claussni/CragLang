@@ -137,9 +137,10 @@ fn words(words: &[u64]) -> Vec<u8> {
 fn constants_are_computed_and_encoded() {
     let p = Project::new(
         r#"type Point(x: Int, y: Int)
-type Point3(..Point, z: Int)
+type Point3(..Point, z: Int = double(4))
 
 fn double(n: Int) -> Int { n * 2 }
+fn scale(n: Int, by: Int = n + 1) -> Int { n * by }
 
 let base = 20
 let answer = double(base) + 2
@@ -153,6 +154,8 @@ let none: Option[Int] = Empty
 let looped = sum(10)
 let greeting = "Hello, {base}!"
 let long = "a long constant, {base} times as long as {greeting}"
+let defaulted = Point3(x: 1, y: 2)
+let scaled = scale(3)
 
 fn sum(n: Int) -> Int {
   var t = 0
@@ -167,6 +170,9 @@ fn sum(n: Int) -> Int {
     assert_eq!(answer.bytes, words(&[42]));
     assert_eq!(answer.hash, *blake3::hash(&answer.bytes).as_bytes());
     assert_eq!(p.bytes("looped"), words(&[55]));
+    // Defaults run at compile time like any code.
+    assert_eq!(p.bytes("defaulted")[4..], words(&[1, 2, 8]));
+    assert_eq!(p.bytes("scaled"), words(&[12]));
     // A record: the shape of its box's type, then its fields.
     let origin = p.bytes("origin");
     assert_eq!(origin[4..], words(&[1, 2]));

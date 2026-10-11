@@ -211,6 +211,8 @@ pub enum Restriction {
     Pure,
     Atomic,
     Update,
+    /// A field's default, which a construction anywhere runs.
+    Default,
 }
 
 /// The effects of a function without a body: a C function does `io`
@@ -369,17 +371,29 @@ impl<'a, 'db> Walker<'a, 'db> {
     /// The effects of the whole body, `is Pure` checked if it is marked
     /// so, and of every closure and local function in it, checked once.
     pub fn walk_body(mut self, pure: bool) -> Walked<'db> {
-        let mut effects = EffectSet::NONE;
+        let mut found = Vec::new();
         if let Some(root) = self.body.root {
-            let mut found = Vec::new();
             self.walk(root, &mut found);
-            if pure {
-                self.restrict(&found, Restriction::Pure);
-            }
-            effects = found
-                .iter()
-                .fold(EffectSet::NONE, |e, o| e.union(o.effects));
         }
+        // A function's defaults run for its calls, so their effects are
+        // the function's; a field's default runs for constructions anywhere,
+        // so it has none.
+        for default in self.body.params.iter().filter_map(|p| p.default) {
+            self.walk(default, &mut found);
+        }
+        if pure {
+            self.restrict(&found, Restriction::Pure);
+        }
+        for field in self.body.type_decl.iter().flat_map(|d| &d.fields) {
+            if let Some(default) = field.default {
+                let mut own = Vec::new();
+                self.walk(default, &mut own);
+                self.restrict(&own, Restriction::Default);
+            }
+        }
+        let effects = found
+            .iter()
+            .fold(EffectSet::NONE, |e, o| e.union(o.effects));
         for (i, expr) in self.body.exprs.iter().enumerate() {
             if let Expr::Closure { .. } = expr {
                 self.closure(ExprId(i as u32));
@@ -819,21 +833,22 @@ impl<'a, 'db> Walker<'a, 'db> {
     fn restrict(&mut self, found: &[Occurrence], restriction: Restriction) {
         for o in found {
             let disallowed = match restriction {
-                Restriction::Pure => o.effects.has_effects(),
+                Restriction::Pure | Restriction::Default => o.effects.has_effects(),
                 Restriction::Atomic | Restriction::Update => o.effects.has_io(),
             };
             if !disallowed {
                 continue;
             }
             let effects = match restriction {
-                Restriction::Pure => o.effects,
+                Restriction::Pure | Restriction::Default => o.effects,
                 _ => EffectSet::io(),
             };
             self.errors.push(TypeError {
                 site: Site::Expr(o.site),
                 kind: ErrorKind::Effect {
                     effects,
-                    ext: o.effects.has_ext() && restriction != Restriction::Pure,
+                    ext: o.effects.has_ext()
+                        && matches!(restriction, Restriction::Atomic | Restriction::Update),
                     restriction,
                 },
             });

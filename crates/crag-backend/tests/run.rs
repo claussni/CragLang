@@ -1173,22 +1173,33 @@ fn calls() -> Int {
 }
 
 #[test]
-fn fields_left_out_take_their_literal_defaults() {
+fn fields_left_out_take_their_defaults() {
     let mut m = Module::new(
         r#"type Options(size: Int, scale: Float = 1.5, label: Str = "a default long enough for a buffer")
 type Wide(..Options, width: Int = 80)
-type Computed(n: Int = add(1, 2))
+type Computed(n: Int = add(1, 2), label: Str = name())
+type Op(f: (Int) -> Int = { x -> add(x, 1) })
+type Bag[T](items: List[T] = [])
+type Wrapped(..Computed, m: Int = multiply(2, 3))
+type Maybe(v: Option[Int] = multiply(2, 2))
 
+fn name() -> Str { "made by a function, long enough for a buffer" }
 fn plain() -> Options { Options(size: 1) }
 fn given() -> Options { Options(size: 2, label: "x") }
 fn wide() -> Wide { Wide(size: 3) }
 fn computed() -> Computed { Computed() }
+fn named() -> Computed { Computed(n: 4) }
+fn wrapped() -> Wrapped { Wrapped(n: 5) }
+fn applied() -> Int {
+  let op = Op()
+  let f = op.f
+  f(2)
+}
+fn bag() -> Bag[Int] { Bag() }
+fn maybe() -> Maybe { Maybe() }
 "#,
     );
-    assert_eq!(
-        m.unsupported,
-        ["computed: field defaults other than literals"]
-    );
+    assert!(m.unsupported.is_empty(), "{:?}", m.unsupported);
     let expected = [
         (
             "plain",
@@ -1199,6 +1210,67 @@ fn computed() -> Computed { Computed() }
             "wide",
             r#"Wide(size: 3, scale: 1.5, label: "a default long enough for a buffer", width: 80)"#,
         ),
+        (
+            "computed",
+            r#"Computed(n: 3, label: "made by a function, long enough for a buffer")"#,
+        ),
+        (
+            "named",
+            r#"Computed(n: 4, label: "made by a function, long enough for a buffer")"#,
+        ),
+        (
+            "wrapped",
+            r#"Wrapped(n: 5, label: "made by a function, long enough for a buffer", m: 6)"#,
+        ),
+        ("bag", "Bag(items: [])"),
+        ("maybe", "Maybe(v: 4)"),
+    ];
+    for (name, shown) in expected {
+        assert_eq!(m.shown(name), shown, "{name}");
+        assert_eq!(m.heap.live_blocks(), 0, "{name}");
+    }
+    assert_eq!(m.int("applied", &[]), 3);
+    assert_eq!(m.heap.live_blocks(), 0);
+}
+
+#[test]
+fn parameters_left_out_take_their_defaults() {
+    let mut m = Module::new(
+        r#"fn scaled(x: Int, by: Int = add(x, 1)) -> Int { multiply(x, by) }
+fn both(a: Int = 2, b: Int = multiply(a, 10)) -> Int { add(a, b) }
+fn wrap[T](x: T, xs: List[T] = [x, x]) -> List[T] { xs }
+fn label(s: Str, t: Str = s) -> Str { t }
+fn adder(x: Int, f: (Int) -> Int = { y -> add(x, y) }) -> Int { f(10) }
+fn sum(a: Int, b: Int, c: Int = add(a, b)) -> Int { multiply(c, 2) }
+
+fn defaulted(x: Int) -> Int { scaled(x) }
+fn given(x: Int) -> Int { scaled(x, by: 2) }
+fn neither() -> Int { both() }
+fn first() -> Int { both(a: 3) }
+fn second() -> Int { both(b: 1) }
+fn wrapped() -> List[Int] { wrap(5) }
+fn texts() -> List[Str] { wrap("a string long enough for a buffer") }
+fn same() -> Str { label("passed on to the default, long enough") }
+fn adding(x: Int) -> Int { adder(x) }
+fn summed() -> Int { sum(3, 4) }
+"#,
+    );
+    assert!(m.unsupported.is_empty(), "{:?}", m.unsupported);
+    assert_eq!(m.int("defaulted", &[3]), 12);
+    assert_eq!(m.int("given", &[3]), 6);
+    assert_eq!(m.int("neither", &[]), 22);
+    assert_eq!(m.int("first", &[]), 33);
+    assert_eq!(m.int("second", &[]), 3);
+    assert_eq!(m.int("adding", &[5]), 15);
+    assert_eq!(m.int("summed", &[]), 14);
+    assert_eq!(m.heap.live_blocks(), 0);
+    let expected = [
+        ("wrapped", "[5, 5]"),
+        (
+            "texts",
+            r#"["a string long enough for a buffer", "a string long enough for a buffer"]"#,
+        ),
+        ("same", r#""passed on to the default, long enough""#),
     ];
     for (name, shown) in expected {
         assert_eq!(m.shown(name), shown, "{name}");

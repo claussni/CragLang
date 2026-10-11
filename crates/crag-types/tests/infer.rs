@@ -1574,6 +1574,27 @@ fn u() {
     );
 }
 
+#[test]
+fn defaults_run_where_they_are_left_out() {
+    // A function's defaults are part of what its calls do; a field's
+    // default runs in constructions anywhere, so it has no effects.
+    let text = "import cLib(\"m\").{ now() -> Int }
+type Stamp(at: Int = now(), n: Int = 1 + 2)
+fn stamped(at: Int = now()) -> Int { at }
+fn calm(at: Int = 1) -> Int { at }
+fn p(at: Int = now()) -> Int is Pure { at }";
+    assert_eq!(
+        errors(text),
+        [
+            "`now()`: this has the effect `io`, which a field default does not allow",
+            "`now()`: this has the effect `io`, which an `is Pure` function does not allow",
+        ]
+    );
+    let effects = effects(text);
+    assert!(effects.contains(&"stamped: io".to_string()), "{effects:?}");
+    assert!(effects.contains(&"calm: none".to_string()), "{effects:?}");
+}
+
 /// Each function of the module with the escape level of each parameter
 /// (§11.5.8).
 fn summaries(text: &str) -> Vec<String> {
