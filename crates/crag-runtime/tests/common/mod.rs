@@ -34,8 +34,9 @@ pub struct Image {
     arena: CodeArena,
     symbols: SymbolTable,
     pub settings: CodegenSettings,
-    /// The entry stubs loaded so far, by the number of arguments.
-    stubs: std::collections::HashMap<usize, usize>,
+    /// The entry stubs loaded so far, by the numbers of arguments and
+    /// results.
+    stubs: std::collections::HashMap<(usize, u32), usize>,
 }
 
 impl Image {
@@ -88,18 +89,31 @@ impl Image {
     /// A fiber that will call function `func` with `args`, expecting one
     /// result.
     pub fn fiber(&mut self, func: usize, args: &[u64], config: FiberConfig) -> Box<Fiber> {
-        let stub = match self.stubs.get(&args.len()) {
+        self.fiber_returning(func, args, 1, config)
+    }
+
+    /// A fiber that will call function `func` with `args`, expecting
+    /// `results` results.
+    pub fn fiber_returning(
+        &mut self,
+        func: usize,
+        args: &[u64],
+        results: u32,
+        config: FiberConfig,
+    ) -> Box<Fiber> {
+        let key = (args.len(), results);
+        let stub = match self.stubs.get(&key) {
             Some(&stub) => stub,
             None => {
-                let stub = compile_entry_stub(args.len() as u32, 1, &self.settings).unwrap();
+                let stub = compile_entry_stub(args.len() as u32, results, &self.settings).unwrap();
                 let stub = load(&mut self.arena, &self.symbols, &stub).unwrap().addr();
-                self.stubs.insert(args.len(), stub);
+                self.stubs.insert(key, stub);
                 stub
             }
         };
-        // SAFETY: the stub was compiled for this argument count and one
-        // result, like every function in these tests, and the image outlives
-        // the fiber in each test.
+        // SAFETY: the stub was compiled for this argument count and number
+        // of results, which the caller promises the function has, and the
+        // image outlives the fiber in each test.
         unsafe { Fiber::new(stub, self.functions[func], args, config).unwrap() }
     }
 }

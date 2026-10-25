@@ -146,7 +146,7 @@ Concurrency grows from the M0 fiber runtime into the full set of Chapters 9 to 1
 **Components and algorithms**
 
 - **Scheduler.** Per-worker run queues with work stealing (Chase–Lev deques), parking idle workers, preemption through the sentinel, and suspending and waking fibers.
-- **I/O poller and timers.** epoll, kqueue and IOCP behind one interface, and a hierarchical timing wheel for `sleep` and `within`.
+- **I/O poller and timers.** A reactor thread with epoll behind one interface, where kqueue and IOCP come with their targets, and a hierarchical timing wheel for `sleep` and `within`; reads, writes, accepts and connects that suspend the fiber until they can go through.
 - **Combinators and groups.** Structured scopes, joins, `firstResult` with loser cancellation, `limit`, and vars captured by value at `start` (§10.2.1).
 - **Cancellation checks.** The compiler-inserted checks, a per-task counter of regions where cancellation waits, and unwinding on the cancel status (§10.4).
 - **Streams and hubs.** Bounded queues with suspending `put` and `next`, stream ends disposed so the other side reads `Abandoned`, and both hub kinds, `FanOut` and `Broadcast`.
@@ -1213,7 +1213,7 @@ A ticker thread looks at every worker once per time slice, ten milliseconds by d
 - `Deque` and `Stealer` — the owner's and the thieves' ends of the Chase–Lev deque of a worker.
 - `Shared` — what the workers share: the stealers, the global queue, the parkers, the fiber each worker runs for the ticker, the count of live fibers and the stopped ones.
 - `Parker` — per worker: its thread and its announcement that it parks.
-- `WaitReason` — what a suspended fiber waits for; `FiberState::Waiting` carries it. `Yield` so far.
+- `WaitReason` — what a suspended fiber waits for; `FiberState::Waiting` carries it: `Yield`, and `Sleep` and `Io` (§11.7.2).
 - `FiberRef` — a suspended fiber, for the one thing that wakes it.
 - `TaskContext::park` and `TaskContext::wake_words` — the suspension's state and the words the waker gives.
 
@@ -1227,16 +1227,24 @@ A ticker thread looks at every worker once per time slice, ten milliseconds by d
 
 I/O must never block a worker thread. Sockets and files are set non-blocking; an operation that would block registers interest with the operating system's readiness interface (epoll on Linux, kqueue on BSD and macOS, IOCP on Windows) and suspends the fiber. Timers for `sleep` and `within` live in a [hierarchical timing wheel](https://blog.acolyer.org/2015/11/23/hashed-and-hierarchical-timing-wheels/), which inserts and cancels in constant time.
 
+Each scheduler has a reactor thread that waits on the poller until the wheel's next deadline. A runtime function that waits first tries its operation, and returns at once unless it would block. Otherwise the fiber suspends (§11.7.1) and leaves its `FiberRef` in the wheel or, with the operation, in the waits of its file descriptor. When the descriptor becomes ready, the reactor tries each waiting operation that can now go on, in the order they came, and wakes the fibers whose operations went through, with their results: the count, the new socket or zero, and an error number. An operation that would still block keeps waiting. The fiber does not run meanwhile, so the reactor may fill its buffer. Registrations are level-triggered, and the reactor narrows or removes one as its waits finish; an eventfd lets a worker interrupt the wait when it adds a timer earlier than the one the reactor waits for. Regular files never block in this sense, so they are read and written at once. A fiber that no scheduler runs has no reactor and blocks its thread instead, sleeping or polling its descriptor. Dropping the scheduler frees the fibers that still wait in its reactor.
+
+The wheel counts ticks of a millisecond in six levels of 64 slots. A timer goes to the lowest level at which its tick and the current tick agree in all higher digits, so the occupied slots of a level all lie ahead; reaching a slot of a higher level moves its timers down. Deadlines are rounded up and the time down, so no timer fires early. A deadline beyond the wheel's span of about two years waits in the top level and is moved again when the wheel gets there. A cancelled timer leaves a stale entry, told from a later timer in the same place by its generation. Only epoll exists so far, since the runtime targets x86-64 Linux alone. Cancelling a wait, which `within` and task cancellation need, comes with them (§11.7.3, §11.7.4); closing a descriptor that a fiber waits on leaves the fiber waiting.
+
 **Data structures**
 
-- `Poller` — the operating-system handle plus a map from registration to waiting fiber.
-- `TimerWheel` — levels of slot arrays, each level coarser than the one below.
+- `Poller` — the epoll instance and its eventfd; `Interest` and `Event`.
+- `TimerWheel<T>` — levels of slot arrays, each level coarser than the one below, over a slab of timers; `TimerId` is a timer's place and generation.
+- `Reactor` — the poller, the wheel of waiting fibers and the waits of each file descriptor.
+- `IoOp` — a read, write, accept or connect that a fiber waits on, with its buffer.
+- `WaitReason::Sleep` and `WaitReason::Io`.
 
 **Functions**
 
-- `fn register(poller: &Poller, fd: RawFd, interest: Interest, fiber: FiberRef) -> io::Result<()>` and `fn poll(poller: &Poller, timeout: Option<Duration>) -> Vec<FiberRef>`.
-- `fn timer_add(wheel: &mut TimerWheel, deadline: Instant, fiber: FiberRef) -> TimerId`, `fn timer_cancel(wheel: &mut TimerWheel, id: TimerId)`, `fn timer_advance(wheel: &mut TimerWheel, now: Instant) -> Vec<FiberRef>`.
-- `fn io_read(ctx: &mut TaskContext, fd: RawFd, buf: &mut [u8]) -> io::Result<usize>`, and likewise `io_write`, `io_accept`, `io_connect` — try the operation, register and suspend on "would block", retry when woken.
+- `fn Poller::set(&self, fd: RawFd, interest: Interest, registered: bool) -> io::Result<()>`, `remove`, `fn wait(&self, timeout: Option<Duration>, events: &mut Vec<Event>) -> io::Result<()>` and `notify`.
+- `fn TimerWheel::add(&mut self, deadline: Instant, value: T) -> TimerId`, `fn cancel(&mut self, id: TimerId) -> Option<T>`, `fn advance(&mut self, now: Instant) -> Vec<T>` and `next_deadline`.
+- `fn Reactor::sleep_until(&self, deadline: Instant, fiber: FiberRef)` and `fn wait_io(&self, op: IoOp, fiber: FiberRef)` — leave a suspended fiber to the reactor thread, `Reactor::run`.
+- `rt_sleep(ctx, nanos)`, `rt_io_read(ctx, fd, buf, len) -> (n, errno)`, and likewise `rt_io_write`, `rt_io_accept` and `rt_io_connect` — try the operation, and suspend while it would block.
 
 #### 11.7.3 Combinators and groups
 

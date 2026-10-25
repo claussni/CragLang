@@ -47,6 +47,7 @@ use std::time::Duration;
 use crate::deque::{Deque, Steal, Stealer};
 use crate::fiber::{Fiber, FiberState, TaskContext, Worker};
 use crate::rc::Types;
+use crate::reactor::Reactor;
 use crate::sentinel::{StopHandle, StopReason};
 use crate::unwind::CodeMap;
 
@@ -64,6 +65,10 @@ pub(crate) const PARK_PARKED: usize = 3;
 pub enum WaitReason {
     /// Its turn again, after giving the other fibers theirs.
     Yield,
+    /// A deadline.
+    Sleep,
+    /// An I/O operation that would have blocked.
+    Io,
 }
 
 /// How a scheduler runs.
@@ -93,7 +98,7 @@ type FiberPtr = usize;
 pub const BATCH: usize = 32;
 
 /// What the workers share.
-struct Shared {
+pub(crate) struct Shared {
     stealers: Vec<Stealer>,
     global: Mutex<VecDeque<FiberPtr>>,
     parkers: Vec<Parker>,
@@ -107,6 +112,8 @@ struct Shared {
     stopped: Mutex<Vec<FiberPtr>>,
     shutdown: AtomicBool,
     stats: Vec<Counters>,
+    /// Where fibers wait for time and I/O.
+    pub(crate) reactor: Reactor,
 }
 
 // SAFETY: the fibers behind the words in the queues are owned by the
@@ -148,11 +155,12 @@ pub struct Scheduler {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
     ticker: Option<JoinHandle<()>>,
+    reactor: Option<JoinHandle<()>>,
 }
 
 impl Scheduler {
     /// Starts the workers, which free boxes by `types` and unwind by
-    /// `code`, and the ticker if the configuration preempts.
+    /// `code`, the reactor, and the ticker if the configuration preempts.
     pub fn new(config: SchedulerConfig, types: Arc<Types>, code: Arc<CodeMap>) -> Scheduler {
         let n = config.workers.max(1);
         let (deques, stealers): (Vec<Deque>, Vec<Stealer>) = (0..n).map(|_| Deque::new()).unzip();
@@ -180,10 +188,18 @@ impl Scheduler {
                 .spawn(move || ticker_main(&shared, slice))
                 .expect("the ticker starts")
         });
+        let reactor = {
+            let shared = shared.clone();
+            std::thread::Builder::new()
+                .name("crag-reactor".into())
+                .spawn(move || shared.reactor.run())
+                .expect("the reactor starts")
+        };
         Scheduler {
             shared,
             threads,
             ticker,
+            reactor: Some(reactor),
         }
     }
 
@@ -247,8 +263,8 @@ impl Scheduler {
 
 impl Drop for Scheduler {
     /// Stops the workers once they are between fibers. Fibers still queued
-    /// or stopped are freed; a suspended fiber belongs to whoever would
-    /// wake it.
+    /// or stopped are freed, and so are those waiting in the reactor; any
+    /// other suspended fiber belongs to whoever would wake it.
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::SeqCst);
         for parker in &self.shared.parkers {
@@ -262,6 +278,15 @@ impl Drop for Scheduler {
         }
         for thread in self.threads.drain(..) {
             let _ = thread.join();
+        }
+        self.shared.reactor.stop();
+        if let Some(reactor) = self.reactor.take() {
+            let _ = reactor.join();
+        }
+        // Woken, they go to the global queue, which no worker takes from
+        // any more.
+        for fiber in self.shared.reactor.drain() {
+            wake(fiber, [0, 0]);
         }
         let mut left: Vec<FiberPtr> = self.shared.global.lock().unwrap().drain(..).collect();
         for stealer in &self.shared.stealers {
@@ -299,6 +324,7 @@ impl Shared {
             stopped: Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
             stats: (0..n).map(|_| Counters::default()).collect(),
+            reactor: Reactor::new().expect("the poller starts"),
         }
     }
 
@@ -524,6 +550,21 @@ pub(crate) unsafe fn suspend(ctx: &TaskContext, reason: WaitReason) -> FiberRef 
         let shared = (*worker).sched.as_ref().map(|l| l.shared.clone());
         ctx.park.store(PARK_SUSPENDING, Ordering::SeqCst);
         FiberRef { fiber, shared }
+    }
+}
+
+/// The scheduler of the fiber running on `ctx`, none for a fiber a worker
+/// resumes by hand.
+///
+/// # Safety
+///
+/// Called on the system stack by the Rust half of a runtime function, for
+/// the fiber it was called on.
+pub(crate) unsafe fn scheduler_of(ctx: &TaskContext) -> Option<Arc<Shared>> {
+    // SAFETY: as the caller promises, a worker runs the fiber of `ctx`.
+    unsafe {
+        let worker = ctx.worker.load(Ordering::Relaxed);
+        (*worker).sched.as_ref().map(|l| l.shared.clone())
     }
 }
 

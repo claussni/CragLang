@@ -21,7 +21,7 @@
 //! stop request and the stress harness. M1 adds the allocator, reference
 //! counting, lists and maps, and traps (§11.4.11 to §11.4.14). M3 adds the
 //! metered tier's budgets (§11.6.6), and strings and bytes (§11.6.9). M4
-//! adds the scheduler (§11.7.1).
+//! adds the scheduler (§11.7.1), and the poller and timers (§11.7.2).
 //!
 //! Runtime discipline (Compiler Architecture §2.1): no thread-locals, no
 //! callbacks into Crag code from the runtime stack, panics abort in images
@@ -36,8 +36,8 @@
 //! code never runs on a fiber stack; the assembly routines switch to the
 //! worker's system stack before they call into Rust.
 
-#[cfg(not(all(target_arch = "x86_64", unix)))]
-compile_error!("the runtime's context switch is written for x86-64 Unix only");
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+compile_error!("the runtime is written for x86-64 Linux only: its context switch and epoll");
 
 #[macro_use]
 mod system;
@@ -46,11 +46,14 @@ pub mod codec;
 mod deque;
 pub mod fiber;
 pub mod heap;
+mod io;
 pub mod list;
 pub mod map;
 pub mod meter;
+pub mod poll;
 pub mod print;
 pub mod rc;
+mod reactor;
 pub mod sched;
 pub mod sentinel;
 pub mod side_stack;
@@ -59,6 +62,7 @@ pub mod stress;
 #[cfg(test)]
 mod testing;
 pub mod text;
+pub mod timer;
 pub mod unwind;
 
 pub use codec::{DecodeError, NotSolid, decode_value, encode_value};
@@ -69,6 +73,7 @@ pub use print::{PrintLimits, print_value, release_value};
 pub use rc::{Disposal, Types, next_disposal, release_box};
 pub use sched::{FiberRef, Scheduler, SchedulerConfig, WaitReason, WorkerStats, wake};
 pub use sentinel::{StopHandle, StopReason, request_stop};
+pub use timer::{TimerId, TimerWheel};
 pub use unwind::{CodeMap, Trap};
 
 use crag_abi::RuntimeFn;
@@ -92,6 +97,11 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::TextShow => text::rt_text_show as *const () as usize,
         RuntimeFn::Disposal => rc::rt_disposal as *const () as usize,
         RuntimeFn::Yield => sched::rt_yield as *const () as usize,
+        RuntimeFn::Sleep => io::rt_sleep as *const () as usize,
+        RuntimeFn::IoRead => io::rt_io_read as *const () as usize,
+        RuntimeFn::IoWrite => io::rt_io_write as *const () as usize,
+        RuntimeFn::IoAccept => io::rt_io_accept as *const () as usize,
+        RuntimeFn::IoConnect => io::rt_io_connect as *const () as usize,
     }
 }
 

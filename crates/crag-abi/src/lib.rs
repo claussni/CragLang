@@ -265,11 +265,48 @@ pub enum RuntimeFn {
     /// suspend, it returns on the fiber stack it was called on, possibly
     /// on another thread.
     Yield = 15,
+
+    /// `rt_sleep(ctx, nanos)`.
+    ///
+    /// Suspends the fiber for at least `nanos` nanoseconds (Implementation
+    /// Plan §11.7.2). The other fibers run meanwhile; a fiber that no
+    /// scheduler runs blocks its thread.
+    Sleep = 16,
+
+    /// `rt_io_read(ctx, fd, buf, len) -> (n, errno)`.
+    ///
+    /// Reads at most `len` bytes from the non-blocking file descriptor `fd`
+    /// into `buf`, suspending the fiber until some are there. Gives the
+    /// count and zero, zero at the end of the input, or zero and the
+    /// error number (Implementation Plan §11.7.2). `buf` must stay where it
+    /// is until the call returns.
+    IoRead = 17,
+
+    /// `rt_io_write(ctx, fd, buf, len) -> (n, errno)`.
+    ///
+    /// Writes at most `len` bytes of `buf` to `fd`, suspending the fiber
+    /// until some can go; gives the count written, or zero and the error
+    /// number, as `IoRead` does.
+    IoWrite = 18,
+
+    /// `rt_io_accept(ctx, fd) -> (fd, errno)`.
+    ///
+    /// Accepts a connection on the listening socket `fd`, suspending the
+    /// fiber until one comes. The new socket is non-blocking and closed on
+    /// exec.
+    IoAccept = 19,
+
+    /// `rt_io_connect(ctx, fd, addr, len) -> (0, errno)`.
+    ///
+    /// Connects the non-blocking socket `fd` to the socket address of
+    /// `len` bytes at `addr`, suspending the fiber until the connection is
+    /// made or fails.
+    IoConnect = 20,
 }
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 16] = [
+    pub const ALL: [RuntimeFn; 21] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -286,6 +323,11 @@ impl RuntimeFn {
         RuntimeFn::TextShow,
         RuntimeFn::Disposal,
         RuntimeFn::Yield,
+        RuntimeFn::Sleep,
+        RuntimeFn::IoRead,
+        RuntimeFn::IoWrite,
+        RuntimeFn::IoAccept,
+        RuntimeFn::IoConnect,
     ];
 
     /// The symbol the loader looks up.
@@ -307,6 +349,11 @@ impl RuntimeFn {
             RuntimeFn::TextShow => "rt_text_show",
             RuntimeFn::Disposal => "rt_disposal",
             RuntimeFn::Yield => "rt_yield",
+            RuntimeFn::Sleep => "rt_sleep",
+            RuntimeFn::IoRead => "rt_io_read",
+            RuntimeFn::IoWrite => "rt_io_write",
+            RuntimeFn::IoAccept => "rt_io_accept",
+            RuntimeFn::IoConnect => "rt_io_connect",
         }
     }
 
