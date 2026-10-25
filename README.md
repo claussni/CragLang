@@ -2,9 +2,13 @@
 
 Compiler, host and runtime for the Crag language, written in Rust.
 
-- `docs/Specification.md` defines the language.
-- `docs/Crag Compiler Architecture.md` records how the toolchain is built.
-- `docs/Crag Implementation Plan.md` lists the milestones and components.
+- [The Crag Language Specification](https://claude.ai/artifact/F6igCJwVvKV8YEpCjbAeYt)
+  defines the language; its second tab, Compiler architecture, records how
+  the toolchain is built.
+- [The Crag Implementation Plan](https://claude.ai/artifact/8pd9u6ieT65wez3S2hiU5N)
+  lists the milestones and components.
+
+The documents live as Claude Docs documents and are edited there.
 
 ## Layout
 
@@ -54,7 +58,7 @@ directory if there is one. `:help` lists its commands.
 
 Crag is designed and implemented with the help of
 [Claude Code](https://claude.com/claude-code), Anthropic's coding agent. This
-covers the documents in `docs/` as well as the code in `crates/`. Ralf
+covers the specification documents as well as the code in `crates/`. Ralf
 Claussnitzer directs the work, reviews the results and is responsible for
 them.
 
