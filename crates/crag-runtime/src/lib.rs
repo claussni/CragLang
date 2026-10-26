@@ -141,6 +141,7 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::TxCommit => stm::rt_tx_commit as *const () as usize,
         RuntimeFn::TxAbort => stm::rt_tx_abort as *const () as usize,
         RuntimeFn::TxRetry => stm::rt_tx_retry as *const () as usize,
+        RuntimeFn::RefApply => refs::rt_ref_apply as *const () as usize,
     }
 }
 

@@ -16,7 +16,9 @@
 
 //! Refs (Plan §11.7.6): updates that race lose nothing, a stale commit
 //! conflicts, an unchanged value is not written, and a value a write
-//! replaces keeps its reference until no task borrows it.
+//! replaces keeps its reference until no task borrows it. Commutative
+//! updates (§11.7.8) race with the others and lose nothing, and one that
+//! overflows changes nothing.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -26,7 +28,8 @@ mod common;
 
 use common::{Image, r};
 use crag_abi::{
-    CountedField, ElementLayout, REF_COMMITTED, REF_CONFLICT, RuntimeFn, TypeDescriptor,
+    CountedField, ElementLayout, REF_ADD, REF_AND, REF_COMMITTED, REF_CONFLICT, REF_MAX, REF_MIN,
+    REF_MUL, REF_OR, REF_OVERFLOW, REF_SUB, REF_UNSIGNED, REF_XOR, RuntimeFn, TypeDescriptor,
 };
 use crag_codegen::{BinOp, Block, BlockId, Cond, Inst, LirFunction, Term, VReg};
 use crag_runtime::{FiberConfig, FiberState, Scheduler, SchedulerConfig, Types, Worker};
@@ -38,6 +41,8 @@ const COMMIT: usize = 3;
 const SWAP: usize = 4;
 const SWAPPER: usize = 5;
 const READER: usize = 6;
+const APPLY: usize = 7;
+const ADDER: usize = 8;
 
 /// The list type whose elements the values are laid out as: one word.
 const INTS: u64 = 1;
@@ -255,6 +260,24 @@ fn reader() -> LirFunction {
     )
 }
 
+/// `adder(cell, n) = n`: adds one to the ref `n` times, as a commutative
+/// update does.
+fn adder() -> LirFunction {
+    let cell = r(0);
+    let (op, ty, one, status) = (r(5), r(6), r(7), r(8));
+    repeat(
+        2,
+        9,
+        vec![
+            konst(op, REF_ADD as i64),
+            konst(ty, 64),
+            konst(one, 1),
+            runtime(RuntimeFn::RefApply, vec![cell, op, ty, one], vec![status]),
+        ],
+        r(1),
+    )
+}
+
 fn types() -> Arc<Types> {
     let list = |counted| TypeDescriptor::List {
         element: ElementLayout { words: 1, counted },
@@ -293,6 +316,8 @@ impl Setup {
                 calling(RuntimeFn::RefSwap, 4, 2),
                 swapper(),
                 reader(),
+                calling(RuntimeFn::RefApply, 4, 1),
+                adder(),
             ]),
             types,
             worker,
@@ -496,4 +521,113 @@ fn borrowed_reads_racing_writes_keep_every_reference() {
     let total: u64 = boxes.iter().map(|b| b.count()).sum();
     assert_eq!(total, 3_000 + 2);
     assert!(out[0] == addr(&*boxes[0]) || out[0] == addr(&*boxes[1]) || out[0] == addr(&*boxes[2]));
+}
+
+#[test]
+fn commutative_updates_that_race_with_others_lose_nothing() {
+    let _serial = serial();
+    const EACH: u64 = 5_000;
+    let mut setup = Setup::new();
+    let cell = cell(0);
+    let mut outs = [[0u64; 2]; 4];
+    let mut fibers: Vec<_> = outs
+        .iter_mut()
+        .map(|out| {
+            let args = [addr(&*cell), EACH, out.as_mut_ptr() as u64];
+            setup
+                .image
+                .fiber_returning(INCREMENT, &args, 1, FiberConfig::default())
+        })
+        .collect();
+    fibers.extend((0..4).map(|_| {
+        setup
+            .image
+            .fiber_returning(ADDER, &[addr(&*cell), EACH], 1, FiberConfig::default())
+    }));
+    let scheduler = setup.scheduler();
+    scheduler.spawn_all(fibers);
+    for fiber in scheduler.wait() {
+        assert_eq!(fiber.state(), FiberState::Finished, "{:?}", fiber.trap());
+    }
+    assert_eq!(cell[1].load(Ordering::SeqCst), 8 * EACH);
+}
+
+#[test]
+fn a_commutative_update_applies_its_operation() {
+    let _serial = serial();
+    let mut setup = Setup::new();
+    let u = REF_UNSIGNED;
+    let minus = |x: i64| x as u64;
+    // (operation, type, value, k, result)
+    let cases = [
+        (REF_ADD, 64, 5, 3, 8),
+        (REF_SUB, 64, 5, 7, minus(-2)),
+        (REF_MUL, 64, minus(-4), 3, minus(-12)),
+        (REF_AND, 64, 0b1100, 0b1010, 0b1000),
+        (REF_OR, 64, 0b1100, 0b1010, 0b1110),
+        (REF_XOR, 64, 0b1100, 0b1010, 0b0110),
+        (REF_MIN, 64, minus(-1), 1, minus(-1)),
+        (REF_MAX, 64, minus(-1), 1, 1),
+        (REF_MIN, 64 | u, u64::MAX, 1, 1),
+        (REF_MAX, 64 | u, u64::MAX, 1, u64::MAX),
+        (REF_ADD, 64 | u, u64::MAX - 1, 1, u64::MAX),
+        (REF_ADD, 8, 126, 1, 127),
+        (REF_SUB, 8, minus(-127), 1, minus(-128)),
+        (REF_ADD, 8 | u, 254, 1, 255),
+        (REF_MUL, 32 | u, 65_536, 65_535, 4_294_901_760),
+    ];
+    for (op, ty, value, k, result) in cases {
+        let cell = cell(value);
+        let [status, _] = setup.call(APPLY, &[addr(&*cell), op, ty, k], 1);
+        assert_eq!(status, REF_COMMITTED, "{op} {ty:#x} {value} {k}");
+        assert_eq!(
+            cell[1].load(Ordering::SeqCst),
+            result,
+            "{op} {ty:#x} {value} {k}"
+        );
+        assert_eq!(cell[0].load(Ordering::SeqCst) % 2, 0);
+        assert!(cell[0].load(Ordering::SeqCst) > 0);
+    }
+}
+
+#[test]
+fn a_commutative_update_that_overflows_changes_nothing() {
+    let _serial = serial();
+    let mut setup = Setup::new();
+    let u = REF_UNSIGNED;
+    let minus = |x: i64| x as u64;
+    let cases = [
+        (REF_ADD, 64, i64::MAX as u64, 1),
+        (REF_SUB, 64, minus(i64::MIN), 1),
+        (REF_MUL, 64, 1 << 62, 2),
+        (REF_ADD, 64 | u, u64::MAX, 1),
+        (REF_SUB, 64 | u, 0, 1),
+        (REF_MUL, 64 | u, u64::MAX, u64::MAX),
+        (REF_ADD, 8, 127, 1),
+        (REF_SUB, 8, minus(-128), 1),
+        (REF_ADD, 8 | u, 255, 1),
+        (REF_SUB, 16 | u, 3, 4),
+        (REF_MUL, 32, 65_536, 32_768),
+    ];
+    for (op, ty, value, k) in cases {
+        let cell = cell(value);
+        let [status, _] = setup.call(APPLY, &[addr(&*cell), op, ty, k], 1);
+        assert_eq!(status, REF_OVERFLOW, "{op} {ty:#x} {value} {k}");
+        assert_eq!(cell[1].load(Ordering::SeqCst), value);
+        assert_eq!(cell[0].load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn a_commit_after_a_commutative_update_conflicts() {
+    let _serial = serial();
+    let mut setup = Setup::new();
+    let cell = cell(5);
+    let mut out = [0u64; 2];
+    let [version, _] = setup.call(READ, &[addr(&*cell), out.as_mut_ptr() as u64], 1);
+    let [status, _] = setup.call(APPLY, &[addr(&*cell), REF_ADD, 64, 1], 1);
+    assert_eq!(status, REF_COMMITTED);
+    let [status, _] = setup.call(COMMIT, &[addr(&*cell), version, INTS, 10, 0], 1);
+    assert_eq!(status, REF_CONFLICT);
+    assert_eq!(cell[1].load(Ordering::SeqCst), 6);
 }

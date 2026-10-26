@@ -35,6 +35,10 @@
 //! versions of all cells are ordered, as transactions need (§11.7.7). It
 //! takes it while it holds the lock and before it stores, so that a write
 //! that finds a transaction running alone can back out unseen.
+//!
+//! An update whose closure is `v ⊕ k` on an integer, as a counter's, gives
+//! the same result in any order, so `rt_ref_apply` does it under the lock
+//! instead of reading and committing, and it never reruns (§11.7.8).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering, fence};
@@ -328,4 +332,76 @@ unsafe extern "C" fn swap_entry(
     unsafe { retain_value(old.as_mut_ptr().cast(), types.element_of(list)) };
     retire(heap, types, old, list);
     Words(old[0], old[1])
+}
+
+/// `v ⊕ k` for an integer of type `ty` (see `crag_abi::RuntimeFn::RefApply`),
+/// or `None` when it is outside the type.
+fn apply(op: u64, ty: u64, v: u64, k: u64) -> Option<u64> {
+    let unsigned = ty & crag_abi::REF_UNSIGNED != 0;
+    let bits = ty & !crag_abi::REF_UNSIGNED;
+    // A value is kept in 64 bits, sign- or zero-extended from its width.
+    let widen = |x: u64| -> i128 {
+        if unsigned {
+            x.into()
+        } else {
+            (x as i64).into()
+        }
+    };
+    let (a, b) = (widen(v), widen(k));
+    let result = match op {
+        crag_abi::REF_ADD => a + b,
+        crag_abi::REF_SUB => a - b,
+        crag_abi::REF_MUL => a.checked_mul(b)?,
+        crag_abi::REF_AND => a & b,
+        crag_abi::REF_OR => a | b,
+        crag_abi::REF_XOR => a ^ b,
+        crag_abi::REF_MIN => a.min(b),
+        crag_abi::REF_MAX => a.max(b),
+        _ => unreachable!("no operation {op}"),
+    };
+    let (least, greatest) = if unsigned {
+        (0, (1i128 << bits) - 1)
+    } else {
+        (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+    };
+    (least..=greatest)
+        .contains(&result)
+        .then_some(result as u64)
+}
+
+system_stack_fn! {
+    /// `rt_ref_apply(ctx, cell, op, ty, k) -> status`: see
+    /// `crag_abi::RuntimeFn::RefApply`.
+    fn rt_ref_apply(ctx: *const TaskContext, cell: *const Cell, op: u64, ty: u64, k: u64) -> u64 => apply_entry
+}
+
+/// The Rust half of `rt_ref_apply`.
+///
+/// # Safety
+///
+/// Called only by `rt_ref_apply`, with a live cell holding an integer of
+/// type `ty`.
+unsafe extern "C" fn apply_entry(
+    _ctx: *const TaskContext,
+    cell: *const Cell,
+    op: u64,
+    ty: u64,
+    k: u64,
+) -> u64 {
+    // SAFETY: as the caller promises.
+    let cell = unsafe { &*cell };
+    loop {
+        // An integer holds no references, so nothing is borrowed or
+        // retired, and no task needs to be pinned.
+        let version = cell.lock_any();
+        let words = cell.value.each_ref().map(|w| w.load(Ordering::Relaxed));
+        let Some(result) = apply(op, ty, words[0], k) else {
+            cell.unlock(version);
+            return crag_abi::REF_OVERFLOW;
+        };
+        if cell.replace(version, [result, words[1]]).is_some() {
+            return crag_abi::REF_COMMITTED;
+        }
+        wait_alone();
+    }
 }

@@ -513,6 +513,17 @@ pub enum RuntimeFn {
     /// and starts the outermost block's next attempt, after which the
     /// block's code runs again from its start.
     TxRetry = 50,
+
+    /// `rt_ref_apply(ctx, cell, op, ty, k) -> status`.
+    ///
+    /// Applies `v ⊕ k` to the integer in a ref cell under the cell's lock,
+    /// as the compiler lowers an update whose closure has that shape, so
+    /// it never reruns (Implementation Plan §11.7.8). `op` is one of
+    /// [`REF_ADD`] to [`REF_MAX`]; `ty` is the integer's width in bits, 8,
+    /// 16, 32 or 64, with [`REF_UNSIGNED`] for an unsigned one. Gives
+    /// [`REF_COMMITTED`], or [`REF_OVERFLOW`] when the result is outside
+    /// the type, and then the cell is unchanged and the caller traps.
+    RefApply = 51,
 }
 
 /// A status of the stream functions: sent, or a value taken.
@@ -544,6 +555,22 @@ pub const REF_COMMITTED: u64 = 0;
 /// The cell changed since the read: the update reruns.
 pub const REF_CONFLICT: u64 = 1;
 
+/// The result of `rt_ref_apply` is outside the integer type.
+pub const REF_OVERFLOW: u64 = 2;
+
+/// The operations of `rt_ref_apply`.
+pub const REF_ADD: u64 = 0;
+pub const REF_SUB: u64 = 1;
+pub const REF_MUL: u64 = 2;
+pub const REF_AND: u64 = 3;
+pub const REF_OR: u64 = 4;
+pub const REF_XOR: u64 = 5;
+pub const REF_MIN: u64 = 6;
+pub const REF_MAX: u64 = 7;
+
+/// The flag of `rt_ref_apply`'s type for an unsigned integer.
+pub const REF_UNSIGNED: u64 = 1 << 8;
+
 /// A status of the transaction functions: the read gave a value, or the
 /// block committed.
 pub const TX_OK: u64 = 0;
@@ -569,7 +596,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 51] = [
+    pub const ALL: [RuntimeFn; 52] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -621,6 +648,7 @@ impl RuntimeFn {
         RuntimeFn::TxCommit,
         RuntimeFn::TxAbort,
         RuntimeFn::TxRetry,
+        RuntimeFn::RefApply,
     ];
 
     /// The symbol the loader looks up.
@@ -677,6 +705,7 @@ impl RuntimeFn {
             RuntimeFn::TxCommit => "rt_tx_commit",
             RuntimeFn::TxAbort => "rt_tx_abort",
             RuntimeFn::TxRetry => "rt_tx_retry",
+            RuntimeFn::RefApply => "rt_ref_apply",
         }
     }
 
