@@ -549,6 +549,26 @@ pub enum RuntimeFn {
     /// Frees the lock when the binding's scope ends, which no task holds
     /// or waits for any more (§10.1).
     ExtFree = 55,
+
+    /// `rt_signal_emit(ctx, qualifier, list, w0, w1)`.
+    ///
+    /// Emits a signal in an `atomic` block or an update closure
+    /// (Specification §11.2), laid out as the elements of the list type
+    /// with index `list`, with its references. `qualifier` is one of
+    /// [`SIGNAL_PLAIN`], [`SIGNAL_OK`], [`SIGNAL_FAIL`] and
+    /// [`SIGNAL_RETRY`]. The signal is held until the block's outcome
+    /// decides whether it is delivered (Implementation Plan §11.7.10).
+    /// Outside a block, generated code delivers a signal itself.
+    SignalEmit = 56,
+
+    /// `rt_signal_next(ctx, out) -> list`.
+    ///
+    /// Takes the next signal an outcome made deliverable: its list type,
+    /// with its two words at `out` and its references, or [`SIGNAL_NONE`].
+    /// Generated code calls it after `TxCommit`, `TxAbort`, `TxRetry`,
+    /// `RefCommit` and `RefDone` until there is none, and runs the
+    /// handlers.
+    SignalNext = 57,
 }
 
 /// A status of the stream functions: sent, or a value taken.
@@ -603,6 +623,17 @@ pub const TX_OK: u64 = 0;
 /// The transaction saw a change by another: its outermost block reruns.
 pub const TX_CONFLICT: u64 = 1;
 
+/// The qualifiers of `rt_signal_emit`: delivered when the block commits,
+/// as `emit` and `emit ok` are, when it fails, or when its attempt is
+/// rerun.
+pub const SIGNAL_PLAIN: u64 = 0;
+pub const SIGNAL_OK: u64 = 1;
+pub const SIGNAL_FAIL: u64 = 2;
+pub const SIGNAL_RETRY: u64 = 3;
+
+/// What `rt_signal_next` gives when no signal is left to deliver.
+pub const SIGNAL_NONE: u64 = u64::MAX;
+
 /// The flag of `rt_scope_start` for a task outside the scope's limit, such
 /// as the body of a group.
 pub const START_EXEMPT: u64 = 1 << 2;
@@ -621,7 +652,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 56] = [
+    pub const ALL: [RuntimeFn; 58] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -678,6 +709,8 @@ impl RuntimeFn {
         RuntimeFn::ExtLock,
         RuntimeFn::ExtUnlock,
         RuntimeFn::ExtFree,
+        RuntimeFn::SignalEmit,
+        RuntimeFn::SignalNext,
     ];
 
     /// The symbol the loader looks up.
@@ -739,6 +772,8 @@ impl RuntimeFn {
             RuntimeFn::ExtLock => "rt_ext_lock",
             RuntimeFn::ExtUnlock => "rt_ext_unlock",
             RuntimeFn::ExtFree => "rt_ext_free",
+            RuntimeFn::SignalEmit => "rt_signal_emit",
+            RuntimeFn::SignalNext => "rt_signal_next",
         }
     }
 

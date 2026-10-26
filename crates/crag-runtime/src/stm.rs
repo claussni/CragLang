@@ -54,6 +54,7 @@ use crate::heap::Heap;
 use crate::rc::{Types, release_value};
 use crate::refs::{Cell, back_off, clock, enter_alone, leave_alone, tick, tick_alone, wait_alone};
 use crate::sentinel::{StopReason, request};
+use crate::signals::signals_of;
 
 /// The reruns after which a block runs alone.
 pub(crate) const ALONE_AFTER: u32 = 8;
@@ -225,7 +226,8 @@ system_stack_fn! {
 /// Called only by `rt_tx_begin`.
 unsafe extern "C" fn begin_entry(ctx: *const TaskContext) {
     // SAFETY: as the caller promises.
-    let (ctx, log) = unsafe { (&*ctx, log_of(&*ctx)) };
+    let (ctx, log, signals) = unsafe { (&*ctx, log_of(&*ctx), signals_of(&*ctx)) };
+    signals.open();
     if log.depth == 0 {
         log.start(ctx);
     } else {
@@ -336,6 +338,16 @@ system_stack_fn! {
 unsafe extern "C" fn commit_entry(ctx: *const TaskContext) -> u64 {
     // SAFETY: as the caller promises.
     let (ctx, log, (heap, types)) = unsafe { (&*ctx, log_of(&*ctx), parts(&*ctx)) };
+    let status = commit(ctx, log, heap, types);
+    if status == TX_OK {
+        // SAFETY: as the caller promises.
+        unsafe { signals_of(ctx) }.commit(heap, types);
+    }
+    status
+}
+
+/// Commits the innermost block.
+fn commit(ctx: &TaskContext, log: &mut TxLog, heap: &mut Heap, types: &Arc<Types>) -> u64 {
     if log.depth > 1 {
         log.savepoints.pop();
         log.depth -= 1;
@@ -436,6 +448,8 @@ system_stack_fn! {
 unsafe extern "C" fn abort_entry(ctx: *const TaskContext) {
     // SAFETY: as the caller promises.
     let (ctx, log, (heap, types)) = unsafe { (&*ctx, log_of(&*ctx), parts(&*ctx)) };
+    // SAFETY: as the caller promises.
+    unsafe { signals_of(ctx) }.fail(heap, types);
     match log.savepoints.pop() {
         Some(from) => {
             log.drop_writes(from, heap, types);
@@ -458,6 +472,8 @@ system_stack_fn! {
 unsafe extern "C" fn retry_entry(ctx: *const TaskContext) {
     // SAFETY: as the caller promises.
     let (ctx, log, (heap, types)) = unsafe { (&*ctx, log_of(&*ctx), parts(&*ctx)) };
+    // SAFETY: as the caller promises.
+    unsafe { signals_of(ctx) }.conflict(true, heap, types);
     log.clear(ctx, heap, types);
     log.attempts += 1;
     if log.attempts >= ALONE_AFTER {

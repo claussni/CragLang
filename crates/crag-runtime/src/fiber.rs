@@ -200,6 +200,8 @@ pub struct Fiber {
     pub(crate) tx: Option<Box<TxLog>>,
     /// The `ext` lock it holds or waits for (Plan §11.7.9).
     pub(crate) ext: Option<crate::ext::Held>,
+    /// The signals of the blocks it runs in (Plan §11.7.10).
+    pub(crate) signals: crate::signals::Signals,
 }
 
 impl Fiber {
@@ -290,6 +292,7 @@ impl Fiber {
             task: None,
             tx: None,
             ext: None,
+            signals: Default::default(),
         }))
     }
 
@@ -500,9 +503,11 @@ impl Worker {
             let status = (*ctx).status.load(Ordering::Relaxed);
             if status != 0 {
                 // A task that stops borrows no value any more, its block,
-                // if it stopped in one, ends, and it holds no lock.
+                // if it stopped in one, ends with its signals, and it holds
+                // no lock.
                 crate::stm::stopped(&mut *fiber, &*ctx, &mut (*worker).heap, &(*worker).types);
                 crate::ext::stopped(&mut *fiber);
+                crate::signals::stopped(&mut *fiber, &mut (*worker).heap, &(*worker).types);
                 crate::epoch::unpin(&*ctx, &mut (*worker).heap);
             }
             match status {

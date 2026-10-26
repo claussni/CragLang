@@ -50,6 +50,7 @@ use crate::fiber::{TaskContext, Worker};
 use crate::heap::Heap;
 use crate::io::Words;
 use crate::rc::{Types, release_value, retain_value};
+use crate::signals::signals_of;
 
 /// A ref cell, as generated code lays it out.
 #[repr(C)]
@@ -224,6 +225,7 @@ unsafe extern "C" fn read_entry(ctx: *const TaskContext, cell: *const Cell, out:
     // SAFETY: as the caller promises.
     unsafe {
         pin(&*ctx);
+        signals_of(&*ctx).open();
         let (version, words) = (*cell).read();
         out.cast::<[u64; 2]>().write_unaligned(words);
         version
@@ -279,6 +281,13 @@ unsafe extern "C" fn commit_entry(
             wait_alone();
         }
     };
+    // SAFETY: as the caller promises.
+    let signals = unsafe { signals_of(ctx) };
+    if status == crag_abi::REF_COMMITTED {
+        signals.commit(heap, types);
+    } else {
+        signals.conflict(false, heap, types);
+    }
     unpin(ctx, heap);
     status
 }
@@ -295,7 +304,11 @@ system_stack_fn! {
 /// Called only by `rt_ref_done`.
 unsafe extern "C" fn done_entry(ctx: *const TaskContext) {
     // SAFETY: as the caller promises.
-    unsafe { unpin(&*ctx, parts(&*ctx).0) }
+    unsafe {
+        let (heap, types) = parts(&*ctx);
+        signals_of(&*ctx).fail(heap, types);
+        unpin(&*ctx, heap);
+    }
 }
 
 system_stack_fn! {
