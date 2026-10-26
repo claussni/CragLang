@@ -906,6 +906,25 @@ impl<'a, 'db> Lower<'a, 'db> {
         }
     }
 
+    /// A box of type `ty`, a `RuntimeStream` or `RuntimeHub`, holding a
+    /// handle of the runtime.
+    fn handle_box(&mut self, ty: Ty<'db>, handle: VReg) -> Result<Vec<VReg>, Unsupported> {
+        self.describe(ty)?;
+        let ptr = self.alloc(HEADER_SIZE + 8, type_index(ty));
+        self.push(Inst::Store {
+            src: handle,
+            addr: ptr,
+            offset: HEADER_SIZE as i32,
+        });
+        Ok(vec![ptr])
+    }
+
+    /// The runtime handle in the box of a `RuntimeStream` or `RuntimeHub`.
+    fn handle_of(&mut self, handle: &Operand<'db>) -> Result<VReg, Unsupported> {
+        let ptr = self.box_of(handle)?;
+        Ok(self.load(ptr, HEADER_SIZE as i32))
+    }
+
     /// The box a local of a `Ref` or an `Ext` holds.
     fn box_of(&mut self, cell: &Operand<'db>) -> Result<VReg, Unsupported> {
         let Operand::Local(local) = cell else {
@@ -948,7 +967,7 @@ impl<'a, 'db> Lower<'a, 'db> {
     /// the result's type.
     fn intrinsic(
         &mut self,
-        intrinsic: Intrinsic,
+        intrinsic: Intrinsic<'db>,
         args: &[Operand<'db>],
         ty: Ty<'db>,
     ) -> Result<Vec<VReg>, Unsupported> {
@@ -1150,6 +1169,106 @@ impl<'a, 'db> Lower<'a, 'db> {
                 self.push(Inst::CallRuntime {
                     func: RuntimeFn::Trap,
                     args: vec![kind, position],
+                    dsts: Vec::new(),
+                });
+                Ok(Vec::new())
+            }
+            (Intrinsic::StreamNew { value }, [capacity]) => {
+                let capacity = word(&self.operand(capacity, int)?)?;
+                let list = self.cell_list(value)?;
+                let ends = self.runtime2(RuntimeFn::StreamNew, vec![capacity, list]);
+                // The source waits in the scratch words for `StreamPeer`.
+                let out = self.scratch();
+                self.push(Inst::Store {
+                    src: ends[1],
+                    addr: out,
+                    offset: 0,
+                });
+                self.handle_box(ty, ends[0])
+            }
+            (Intrinsic::StreamPeer, []) => {
+                let out = self.scratch();
+                let source = self.load(out, 0);
+                self.handle_box(ty, source)
+            }
+            (Intrinsic::StreamPut { wait }, [end, value]) => {
+                let value_ty = self.operand_ty(value, ty);
+                let value_layout = layout(self.db, self.program, value_ty);
+                let end = self.handle_of(end)?;
+                let words = self.operand(value, value_ty)?;
+                // The value's references go with it once it is sent; those
+                // taken for it are given back otherwise.
+                self.count_words(value_layout, value_ty, &words, Self::retain)?;
+                let [w0, w1] = self.pad(words.clone());
+                let func = if wait {
+                    RuntimeFn::StreamPut
+                } else {
+                    RuntimeFn::StreamTryPut
+                };
+                let status = self.runtime(func, vec![end, w0, w1]);
+                let (unsent, done) = (self.new_block(), self.new_block());
+                self.end(
+                    Term::Branch {
+                        cond: status,
+                        then: unsent,
+                        otherwise: done,
+                    },
+                    Some(unsent),
+                );
+                self.count_words(value_layout, value_ty, &words, Self::release)?;
+                self.end(Term::Jump(done), Some(done));
+                Ok(vec![status])
+            }
+            (Intrinsic::StreamNext, [end]) => {
+                let end = self.handle_of(end)?;
+                let out = self.scratch();
+                Ok(vec![self.runtime(RuntimeFn::StreamNext, vec![end, out])])
+            }
+            (Intrinsic::StreamValue, []) => {
+                let out = self.scratch();
+                let words = layout(self.db, self.program, ty)
+                    .ok_or("values of this type")?
+                    .words();
+                Ok((0..words).map(|k| self.load(out, 8 * k as i32)).collect())
+            }
+            (
+                Intrinsic::StreamClose
+                | Intrinsic::HubSeal
+                | Intrinsic::HubSink
+                | Intrinsic::HubSource,
+                [handle],
+            ) => {
+                let handle = self.handle_of(handle)?;
+                let func = match intrinsic {
+                    Intrinsic::StreamClose => RuntimeFn::StreamClose,
+                    Intrinsic::HubSeal => RuntimeFn::HubSeal,
+                    Intrinsic::HubSink => RuntimeFn::HubSink,
+                    _ => RuntimeFn::HubSource,
+                };
+                if matches!(intrinsic, Intrinsic::StreamClose | Intrinsic::HubSeal) {
+                    self.push(Inst::CallRuntime {
+                        func,
+                        args: vec![handle],
+                        dsts: Vec::new(),
+                    });
+                    return Ok(Vec::new());
+                }
+                let end = self.runtime(func, vec![handle]);
+                self.handle_box(ty, end)
+            }
+            (Intrinsic::HubNew { value }, [capacity, kind]) => {
+                let capacity = word(&self.operand(capacity, int)?)?;
+                let kind = word(&self.operand(kind, int)?)?;
+                let list = self.cell_list(value)?;
+                let hub = self.runtime(RuntimeFn::HubNew, vec![capacity, list, kind]);
+                self.handle_box(ty, hub)
+            }
+            (Intrinsic::HubRelease, [hub, n]) => {
+                let hub = self.handle_of(hub)?;
+                let n = word(&self.operand(n, int)?)?;
+                self.push(Inst::CallRuntime {
+                    func: RuntimeFn::HubRelease,
+                    args: vec![hub, n],
                     dsts: Vec::new(),
                 });
                 Ok(Vec::new())

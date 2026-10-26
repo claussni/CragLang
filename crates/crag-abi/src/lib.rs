@@ -984,6 +984,12 @@ pub enum CountedField {
     /// The cell of a lazy value at this offset, from `LazyNew`, which the
     /// runtime frees with the box, giving up the value it holds.
     Lazy(u32),
+    /// An end of a stream at this offset, which the runtime disposes of
+    /// with the box: the other side reads `Abandoned` unless it was closed.
+    Stream(u32),
+    /// A hub at this offset, whose handle the runtime gives up with the
+    /// box.
+    Hub(u32),
 }
 
 /// The words of a value inside a collection: at most two, with the fields

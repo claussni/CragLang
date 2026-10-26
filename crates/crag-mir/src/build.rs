@@ -168,6 +168,8 @@ pub(crate) fn counted<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bo
                 | Builtin::Ref
                 | Builtin::Ext
                 | Builtin::Lazy
+                | Builtin::RuntimeStream
+                | Builtin::RuntimeHub
                 | Builtin::Oks
                 | Builtin::Errs
         ),
@@ -1399,7 +1401,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
 
     /// The runtime operation a function of the standard library without a
     /// body stands for, if it is one.
-    fn intrinsic(&self, instance: &Instance<'db>) -> Option<Intrinsic> {
+    fn intrinsic(&self, instance: &Instance<'db>) -> Option<Intrinsic<'db>> {
         let db = self.db;
         let function = instance.function;
         if hir_body(db, self.program, Owner::Item(function))
@@ -1418,6 +1420,22 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 ("std.task", "scopeResult") => Intrinsic::ScopeResult,
                 ("std.task", "scopeCancel") => Intrinsic::ScopeCancel,
                 ("std.task", "scopeEnd") => Intrinsic::ScopeEnd,
+                ("std.stream", "streamNew") => Intrinsic::StreamNew {
+                    value: *instance.args.first()?,
+                },
+                ("std.stream", "streamPeer") => Intrinsic::StreamPeer,
+                ("std.stream", "streamPut") => Intrinsic::StreamPut { wait: true },
+                ("std.stream", "streamTryPut") => Intrinsic::StreamPut { wait: false },
+                ("std.stream", "streamNext") => Intrinsic::StreamNext,
+                ("std.stream", "streamValue") => Intrinsic::StreamValue,
+                ("std.stream", "streamClose") => Intrinsic::StreamClose,
+                ("std.stream", "hubNew") => Intrinsic::HubNew {
+                    value: *instance.args.first()?,
+                },
+                ("std.stream", "hubSink") => Intrinsic::HubSink,
+                ("std.stream", "hubSource") => Intrinsic::HubSource,
+                ("std.stream", "hubSeal") => Intrinsic::HubSeal,
+                ("std.stream", "hubRelease") => Intrinsic::HubRelease,
                 _ => return None,
             },
         )
@@ -3189,11 +3207,48 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         self.matched(pat, Operand::Local(narrowed), test, Some(otherwise));
     }
 
+    /// `for` over a source of a stream: takes each value until the stream
+    /// ends (§10.5).
+    fn source_loop(&mut self, pat: PatId, iterable: ExprId, element: Ty<'db>, body: ExprId) {
+        let db = self.db;
+        let source = self.place_of(iterable);
+        let end_ty = Ty::builtin(db, Builtin::RuntimeStream);
+        let end = Place {
+            local: source,
+            path: vec![Step::Field(crag_hir::Name::new(db, "end".to_string()))],
+        };
+        let end = self.assign(end_ty, Rvalue::Read(end));
+        let (head, inside, exit) = (self.new_block(), self.new_block(), self.new_block());
+        self.terminate(Terminator::Jump(head));
+        self.switch_to(head);
+        let int = self.int();
+        let status = self.assign(int, Rvalue::Intrinsic(Intrinsic::StreamNext, vec![end]));
+        let more = self.is_zero(status);
+        self.terminate(Terminator::Branch {
+            cond: more,
+            then: inside,
+            otherwise: exit,
+        });
+        self.switch_to(inside);
+        let value = self.assign(
+            element,
+            Rvalue::Intrinsic(Intrinsic::StreamValue, Vec::new()),
+        );
+        self.matched(pat, value, element, None);
+        self.eval(body, Dest::Discard);
+        self.push(Statement::Poll);
+        self.terminate(Terminator::Jump(head));
+        self.switch_to(exit);
+    }
+
     fn for_loop(&mut self, pat: PatId, iterable: ExprId, body: ExprId) {
         let db = self.db;
         let ty = self.ty(iterable);
         let range = |name: &str| prelude_item(db, self.program, name);
         let (kind, element) = match ty.kind(db) {
+            TyKind::Named(item, args) if crag_types::is_source(db, *item) => {
+                return self.source_loop(pat, iterable, args[0], body);
+            }
             TyKind::Builtin(Builtin::List, args) => ("list", args[0]),
             TyKind::Named(item, args) if Some(*item) == range("Range") => ("range", args[0]),
             TyKind::Named(item, args) if Some(*item) == range("RangeFrom") => ("from", args[0]),

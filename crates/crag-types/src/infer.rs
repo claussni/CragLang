@@ -3766,7 +3766,8 @@ impl<'a, 'db> Infer<'a, 'db> {
         }
     }
 
-    /// The element type of what `for` iterates (§7.3).
+    /// The element type of what `for` iterates (§7.3): also of a source of a
+    /// stream (§10.5).
     fn iterable(&mut self, iterable: ExprId) -> Ty<'db> {
         let db = self.db;
         let ty = self.synth(iterable);
@@ -3780,6 +3781,8 @@ impl<'a, 'db> Infer<'a, 'db> {
                 let value = Name::new(db, "value".to_string());
                 Ty::record(db, vec![(key, args[0]), (value, args[1])], false)
             }
+            // Every source of a stream fits `Iterable` (§10.5).
+            TyKind::Named(item, args) if is_source(db, *item) => args[0],
             TyKind::Error => ty,
             _ => {
                 self.error(Site::Expr(iterable), ErrorKind::NotIterable { ty });
@@ -4188,4 +4191,14 @@ fn fixed_value(text: &str, scale: u32) -> Option<i128> {
     }
     let digits = format!("{whole}{fraction:0<width$}", width = scale as usize);
     digits.parse::<i128>().ok()
+}
+
+/// Whether a type is one of the sources of `std.stream`, which `for`
+/// iterates until the stream ends (§10.5).
+pub fn is_source(db: &dyn Db, item: ItemId<'_>) -> bool {
+    item.module(db).path(db) == "std.stream"
+        && matches!(
+            item.name(db).text(db).as_str(),
+            "Source" | "Finite" | "Infinite"
+        )
 }

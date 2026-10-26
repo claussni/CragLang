@@ -562,6 +562,14 @@ impl Writer {
                 w.u8(3);
                 w.u32(*offset);
             }
+            CountedField::Stream(offset) => {
+                w.u8(4);
+                w.u32(*offset);
+            }
+            CountedField::Hub(offset) => {
+                w.u8(5);
+                w.u32(*offset);
+            }
         });
     }
 }
@@ -791,6 +799,8 @@ impl Reader<'_> {
                 },
                 2 => CountedField::Ext(r.u32()?),
                 3 => CountedField::Lazy(r.u32()?),
+                4 => CountedField::Stream(r.u32()?),
+                5 => CountedField::Hub(r.u32()?),
                 tag => return Err(invalid(format!("a counted field with the tag {tag}"))),
             })
         })

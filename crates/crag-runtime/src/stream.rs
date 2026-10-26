@@ -626,8 +626,22 @@ system_stack_fn! {
 ///
 /// Called only by `rt_stream_dispose`, once for each end.
 unsafe extern "C" fn dispose_entry(ctx: *const TaskContext, end: *mut End) {
+    // SAFETY: as the caller promises.
+    unsafe {
+        let (heap, types) = worker_of(ctx);
+        dispose(end as u64, heap, types);
+    }
+}
+
+/// Disposes of an end, as `rt_stream_dispose` does: for the box of a
+/// `RuntimeStream` being freed.
+///
+/// # Safety
+///
+/// `end` came from the runtime and is disposed of once.
+pub(crate) unsafe fn dispose(end: u64, heap: &mut Heap, types: &Types) {
     // SAFETY: as the caller promises; the end's word ends here.
-    let (end, (heap, types)) = unsafe { (Box::from_raw(end), worker_of(ctx)) };
+    let end = unsafe { Box::from_raw(end as *mut End) };
     if !end.closed {
         end.chan.leave(&end.role, false, heap, types);
     }
@@ -797,8 +811,22 @@ system_stack_fn! {
 ///
 /// Called only by `rt_hub_drop`, once for the word `rt_hub_new` gave.
 unsafe extern "C" fn hub_drop_entry(ctx: *const TaskContext, ptr: *const Channel) {
+    // SAFETY: as the caller promises.
+    unsafe {
+        let (heap, types) = worker_of(ctx);
+        drop_hub(ptr as u64, heap, types);
+    }
+}
+
+/// Gives up a hub's handle, as `rt_hub_drop` does: for the box of a
+/// `RuntimeHub` being freed.
+///
+/// # Safety
+///
+/// `hub` came from `rt_hub_new` and is given up once.
+pub(crate) unsafe fn drop_hub(hub: u64, heap: &mut Heap, types: &Types) {
     // SAFETY: as the caller promises; the hub's word ends here.
-    let (chan, (heap, types)) = unsafe { (Arc::from_raw(ptr), worker_of(ctx)) };
+    let chan = unsafe { Arc::from_raw(hub as *const Channel) };
     let mut wakes = Wakes::new();
     let mut state = chan.state.lock().unwrap();
     state.joinable = false;

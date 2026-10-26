@@ -49,7 +49,8 @@ pub enum HeaderKind {
 
 /// A type declaration of the prelude stands for a builtin when it has the
 /// builtin's name and number of type parameters, and neither fields nor an
-/// alias target.
+/// alias target; so does one of the runtime's handles in `std.stream`
+/// (§19.2).
 #[crag_db::tracked(returns(ref))]
 pub fn type_header<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> TypeHeader<'db> {
     let body = hir_body(db, program, Owner::Item(item));
@@ -63,7 +64,12 @@ pub fn type_header<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) ->
     let decl = body.type_decl.clone().unwrap_or_default();
     let builtin = Builtin::from_name(item.name(db).text(db))
         .filter(|&(_, arity)| arity == params.len())
-        .filter(|_| item.module(db).path(db) == PRELUDE && !decl.record && decl.alias.is_none());
+        .filter(|&(b, _)| {
+            let module = item.module(db).path(db);
+            let handle = matches!(b, Builtin::RuntimeStream | Builtin::RuntimeHub);
+            let owner = if handle { "std.stream" } else { PRELUDE };
+            module == owner && !decl.record && decl.alias.is_none()
+        });
     let kind = match (builtin, decl.alias) {
         (Some((builtin, _)), _) => HeaderKind::Builtin(builtin),
         (None, Some(_)) => HeaderKind::Alias,

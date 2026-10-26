@@ -1,0 +1,174 @@
+// This file is part of Crag.
+//
+// Copyright (C) 2026 Ralf Claussnitzer
+//
+// Crag is free software: you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the Free Software
+// Foundation, either version 3 of the License, or (at your option) any later
+// version.
+//
+// Crag is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+// A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// Crag. If not, see <https://www.gnu.org/licenses/>.
+
+// Streams and hubs (Specification §10.5, §10.6), as far as M4 reaches.
+// An end of a stream or a hub is a box of the runtime's handle: when the
+// last reference to an end goes, the runtime disposes of it, and the other
+// side reads `Abandoned` unless it was closed (Implementation Plan
+// §11.7.5).
+
+type RuntimeStream
+type RuntimeHub
+
+pub opaque type Sink[T](end: RuntimeStream)
+pub opaque type FiniteSink[T](..Sink[T])
+pub opaque type Source[T](end: RuntimeStream)
+pub opaque type Finite[T](..Source[T])
+pub opaque type Infinite[T](..Source[T])
+
+pub distinct type Sent
+pub distinct type Full
+pub distinct type Closed
+pub type Abandoned(..Closed)
+
+// A stream whose sink can end it.
+pub fn stream[T](capacity: Int) -> (sink: FiniteSink[T], source: Finite[T]) {
+  let sink = streamNew[T](capacity)
+  let source = streamPeer()
+  (sink: FiniteSink(end: sink), source: Finite(end: source))
+}
+
+// A stream that only its consumer can end, or the producer's going.
+pub fn infiniteStream[T](capacity: Int) -> (sink: Sink[T], source: Infinite[T]) {
+  let sink = streamNew[T](capacity)
+  let source = streamPeer()
+  (sink: Sink(end: sink), source: Infinite(end: source))
+}
+
+// Puts a value, waiting while the buffer is full.
+pub fn put[T](s: Sink[T], v: T) -> Sent | Closed {
+  sent(streamPut(s.end, v))
+}
+
+// Puts a value if there is room.
+pub fn tryPut[T](s: Sink[T], v: T) -> Sent | Full | Closed {
+  let code = streamTryPut(s.end, v)
+  if code == 1 {
+    return Full
+  }
+  sent(code)
+}
+
+// Puts every item, stopping early when the stream is closed, and closes
+// the sink.
+pub fn putAll[T](s: FiniteSink[T], items: List[T]) -> () {
+  putEach(s, items)
+  close(s)
+}
+
+fn putEach[T](s: Sink[T], items: List[T]) -> () {
+  for item in items {
+    if put(s, item) is Closed {
+      return
+    }
+  }
+}
+
+// The next value, waiting while there is none, or how the stream ended.
+pub fn next[T](s: Source[T]) -> T | Closed {
+  let code = streamNext(s.end)
+  if code == 0 {
+    let v: T = streamValue()
+    return v
+  }
+  if code == 3 {
+    return Abandoned
+  }
+  Closed
+}
+
+// Ends the stream from either side: the other reads `Closed`.
+pub fn close[T](s: FiniteSink[T]) -> () {
+  streamClose(s.end)
+}
+
+pub fn close[T](s: Source[T]) -> () {
+  streamClose(s.end)
+}
+
+// A union keeps which member a value is, so `Abandoned` stays itself in
+// the result.
+fn sent(code: Int) -> Sent | Closed {
+  if code == 0 {
+    return Sent
+  }
+  if code == 3 {
+    return Abandoned
+  }
+  Closed
+}
+
+// Hubs: each value goes to one consumer of a fan-out, and to every
+// consumer of a broadcast.
+
+pub opaque type FanOut[T](hub: RuntimeHub)
+pub opaque type Broadcast[T](hub: RuntimeHub)
+
+pub fn fanOut[T](capacity: Int) -> FanOut[T] {
+  FanOut(hub: hubNew[T](capacity, 0))
+}
+
+pub fn broadcast[T](capacity: Int) -> Broadcast[T] {
+  Broadcast(hub: hubNew[T](capacity, 1))
+}
+
+// Joins as a producer, until the hub is sealed.
+pub fn sink[T](h: FanOut[T]) -> FiniteSink[T] {
+  FiniteSink(end: hubSink(h.hub))
+}
+
+pub fn sink[T](h: Broadcast[T]) -> FiniteSink[T] {
+  FiniteSink(end: hubSink(h.hub))
+}
+
+// Joins as a consumer.
+pub fn source[T](h: FanOut[T]) -> Finite[T] {
+  Finite(end: hubSource(h.hub))
+}
+
+pub fn source[T](h: Broadcast[T]) -> Finite[T] {
+  Finite(end: hubSource(h.hub))
+}
+
+// Admits no further producers.
+pub fn seal[T](h: FanOut[T]) -> () {
+  hubSeal(h.hub)
+}
+
+pub fn seal[T](h: Broadcast[T]) -> () {
+  hubSeal(h.hub)
+}
+
+// Makes `n` consumers of the fan-out read `Closed`.
+pub fn release[T](h: FanOut[T], n: Int) -> () {
+  hubRelease(h.hub, n)
+}
+
+// The runtime's streams and hubs (Implementation Plan §11.7.5).
+fn streamNew[T](capacity: Int) -> RuntimeStream
+fn streamPeer() -> RuntimeStream
+// 0 once sent, 1 for a full buffer, 2 closed, 3 abandoned.
+fn streamPut[T](end: RuntimeStream, value: T) -> Int
+fn streamTryPut[T](end: RuntimeStream, value: T) -> Int
+// 0 with a value for `streamValue`, else 2 closed or 3 abandoned.
+fn streamNext(end: RuntimeStream) -> Int
+fn streamValue[T]() -> T
+fn streamClose(end: RuntimeStream) -> ()
+fn hubNew[T](capacity: Int, kind: Int) -> RuntimeHub
+fn hubSink(hub: RuntimeHub) -> RuntimeStream
+fn hubSource(hub: RuntimeHub) -> RuntimeStream
+fn hubSeal(hub: RuntimeHub) -> ()
+fn hubRelease(hub: RuntimeHub, n: Int) -> ()

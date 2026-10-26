@@ -28,7 +28,7 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-driver` | The `crag` command: `run` and `test`, diagnostics (M1) |
 | `crates/crag-session` | Session manager: image processes, their protocol and supervision (M3) |
 | `crates/crag-eval` | Compile-time evaluation of constants, `embed`s among them, in the metered tier (M3) |
-| `std` | The standard library: the prelude `std.core` (M1), `std.time` and `std.task` (M4) |
+| `std` | The standard library: the prelude `std.core` (M1), `std.time`, `std.task` and `std.stream` (M4) |
 
 ## Build
 

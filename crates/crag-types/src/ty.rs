@@ -87,6 +87,10 @@ pub enum Builtin {
     /// The locking ref of an `ext` binding (§9.6).
     Ext,
     Lazy,
+    /// The runtime's handles of an end of a stream and of a hub, which only
+    /// `std.stream` declares and uses (§19.2).
+    RuntimeStream,
+    RuntimeHub,
     /// The type functions `Oks[X]` and `Errs[X]`, the members of `X` that
     /// are not errors and those that are (§8.1). They stay applied only to
     /// what names type parameters.
@@ -119,6 +123,8 @@ impl Builtin {
             "Ref" => (Builtin::Ref, 1),
             "Ext" => (Builtin::Ext, 1),
             "Lazy" => (Builtin::Lazy, 1),
+            "RuntimeStream" => (Builtin::RuntimeStream, 0),
+            "RuntimeHub" => (Builtin::RuntimeHub, 0),
             "Oks" => (Builtin::Oks, 1),
             "Errs" => (Builtin::Errs, 1),
             _ => return None,
@@ -147,6 +153,8 @@ impl Builtin {
             Builtin::Ref => "Ref",
             Builtin::Ext => "Ext",
             Builtin::Lazy => "Lazy",
+            Builtin::RuntimeStream => "RuntimeStream",
+            Builtin::RuntimeHub => "RuntimeHub",
             Builtin::Oks => "Oks",
             Builtin::Errs => "Errs",
         }

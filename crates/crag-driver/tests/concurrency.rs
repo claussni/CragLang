@@ -422,3 +422,94 @@ fn a_lazy_value_that_traps_traps_its_readers() {
     assert_eq!(code, 70, "{out}");
     assert!(out.starts_with("trap: division by zero"), "{out}");
 }
+
+#[test]
+fn a_stream_carries_values_from_a_producer_to_a_consumer() {
+    let (code, out) = run(
+        "stream",
+        r#"import std.stream
+import std.task
+
+fn main() -> ExitCode {
+  let ends = stream[Str](capacity: 2)
+  let sink = ends.sink
+  let source = ends.source
+  ref total = 0
+  all { g ->
+    g.start { -> sink.putAll(["a", "a string too long to be inline", "bc"]) }
+    g.start { ->
+      for s in source {
+        if s == "a string too long to be inline" {
+          total.update { n -> n + 30 }
+        } else {
+          total.update { n -> n + 1 }
+        }
+      }
+    }
+  }
+  ExitCode(code: total.use())
+}
+"#,
+    );
+    assert_eq!(code, 32, "{out}");
+}
+
+#[test]
+fn a_consumer_reads_abandoned_when_the_producer_goes_without_closing() {
+    let (code, out) = run(
+        "stream-abandoned",
+        r#"import std.stream
+import std.task
+
+fn main() -> ExitCode {
+  let ends = infiniteStream[Int](capacity: 0)
+  let sink = ends.sink
+  let source = ends.source
+  ref seen = 0
+  all { g ->
+    g.start { -> let sent = sink.put(7) }
+    g.start { ->
+      let first = source.next()
+      let second = source.next()
+      let k = case first {
+        n: Int -> case second {
+          Abandoned -> n
+          _ -> 1
+        }
+        _ -> 2
+      }
+      seen.update { _ -> k }
+    }
+  }
+  ExitCode(code: seen.use())
+}
+"#,
+    );
+    assert_eq!(code, 7, "{out}");
+}
+
+#[test]
+fn a_fan_out_hub_hands_each_value_to_one_worker() {
+    let (code, out) = run(
+        "hub",
+        r#"import std.stream
+import std.task
+
+fn main() -> ExitCode {
+  let jobs = fanOut[Int](capacity: 4)
+  ref sum = 0
+  all { g ->
+    let feed = jobs.sink()
+    g.start { -> feed.putAll([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) }
+    jobs.seal()
+    for w in 1..3 {
+      let src = jobs.source()
+      g.start { -> for job in src { sum.update { n -> n + job } } }
+    }
+  }
+  ExitCode(code: sum.use())
+}
+"#,
+    );
+    assert_eq!(code, 55, "{out}");
+}

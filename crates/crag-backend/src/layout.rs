@@ -78,7 +78,9 @@ pub fn layout<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Lay
             | Builtin::Grid
             | Builtin::Ref
             | Builtin::Ext
-            | Builtin::Lazy => Layout::Box,
+            | Builtin::Lazy
+            | Builtin::RuntimeStream
+            | Builtin::RuntimeHub => Layout::Box,
             b => Layout::Imm(*b),
         },
         TyKind::Named(item, _) => match type_def(db, program, *item).kind {
@@ -340,6 +342,19 @@ pub fn type_descriptor<'db>(
         }
         Some((Builtin::Map, [key, value])) => return map(*key, Some(*value)),
         Some((Builtin::Set, [key])) => return map(*key, None),
+        // The box of an end of a stream or of a hub: its runtime handle.
+        Some((Builtin::RuntimeStream, [])) => {
+            return Some(TypeDescriptor::Record {
+                counted: vec![CountedField::Stream(HEADER_SIZE)],
+                dispose: None,
+            });
+        }
+        Some((Builtin::RuntimeHub, [])) => {
+            return Some(TypeDescriptor::Record {
+                counted: vec![CountedField::Hub(HEADER_SIZE)],
+                dispose: None,
+            });
+        }
         // A lazy value's box: the runtime's cell, which holds the value,
         // then the function value that computes it.
         Some((Builtin::Lazy, [_])) => {
@@ -366,7 +381,7 @@ pub fn type_descriptor<'db>(
                         boxed,
                     },
                     CountedField::Ext(offset) => CountedField::Ext(base + offset),
-                    CountedField::Lazy(offset) => CountedField::Lazy(base + offset),
+                    field => field,
                 })
                 .collect();
             if b == Builtin::Ext {

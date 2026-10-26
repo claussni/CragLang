@@ -127,8 +127,8 @@ pub fn compile<'a>(
             Entry::Default(_) => format!("a default in {}", owner_name(project, owner)),
             Entry::Dispose => format!("the dispose code of {}", owner_name(project, owner)),
         };
-        // `CRAG_MIR=1` shows the MIR of what is compiled, for debugging
-        // the compiler.
+        // `CRAG_MIR=1` shows the MIR of what is compiled and what code
+        // generation does not support, for debugging the compiler.
         if std::env::var_os("CRAG_MIR").is_some()
             && let Some(body) = mir(db, program, instance, Tier::Baseline)
         {
@@ -140,6 +140,12 @@ pub fn compile<'a>(
             Some(Err(e)) => return Err(format!("cannot compile {name}: {e}")),
             None => return Err(format!("{name} has no body to compile")),
         };
+        if std::env::var_os("CRAG_MIR").is_some() && !code.unsupported.is_empty() {
+            eprintln!(
+                "{name}: code generation does not support {:?}",
+                code.unsupported
+            );
+        }
         compiled.objects.push((code.slot, &code.object));
         if let Owner::Item(item) = owner
             && value

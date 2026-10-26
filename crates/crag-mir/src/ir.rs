@@ -228,12 +228,12 @@ pub enum Rvalue<'db> {
     /// library without a body or a binding stands for (Plan §11.7.14). It
     /// consumes the operands `Intrinsic::consumes` says, and borrows the
     /// others.
-    Intrinsic(Intrinsic, Vec<Operand<'db>>),
+    Intrinsic(Intrinsic<'db>, Vec<Operand<'db>>),
 }
 
 /// The operations of the runtime that MIR names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
-pub enum Intrinsic {
+pub enum Intrinsic<'db> {
     /// Suspends the task for a number of nanoseconds, an `Int` above
     /// zero: `std.time.sleepNanos`.
     Sleep,
@@ -324,9 +324,41 @@ pub enum Intrinsic {
     /// Traps as the computation that the last `LazyGet` found did; it does
     /// not return.
     LazyTrap,
+    /// A stream of values of the type with a buffer of the capacity, an
+    /// `Int`: its sink, a `RuntimeStream` (§10.5); `StreamPeer` gives the
+    /// source.
+    StreamNew {
+        value: Ty<'db>,
+    },
+    /// The source of the stream the last `StreamNew` of the code made.
+    StreamPeer,
+    /// Puts the value, suspending while the buffer is full, or without
+    /// waiting when `wait` is false: 0 once sent, else 1 for a full buffer
+    /// or 2 and 3 for a closed or abandoned stream.
+    StreamPut {
+        wait: bool,
+    },
+    /// Takes the next value, suspending while there is none: 0 when there
+    /// is one for `StreamValue`, else 2 or 3 as for `StreamPut`.
+    StreamNext,
+    /// The value the last `StreamNext` of the code took, with its
+    /// references.
+    StreamValue,
+    StreamClose,
+    /// A hub of values of the type, a fan-out for kind 0 and a broadcast
+    /// for 1, with the capacity: a `RuntimeHub` (§10.6).
+    HubNew {
+        value: Ty<'db>,
+    },
+    /// A new end of the hub, a `RuntimeStream`: a sink or a source.
+    HubSink,
+    HubSource,
+    HubSeal,
+    /// Makes that many consumers of a fan-out read `Closed`.
+    HubRelease,
 }
 
-impl Intrinsic {
+impl Intrinsic<'_> {
     /// Whether the operation consumes its operand at `index`.
     pub fn consumes(self, index: usize) -> bool {
         match self {
