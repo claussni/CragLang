@@ -524,6 +524,31 @@ pub enum RuntimeFn {
     /// [`REF_COMMITTED`], or [`REF_OVERFLOW`] when the result is outside
     /// the type, and then the cell is unchanged and the caller traps.
     RefApply = 51,
+
+    /// `rt_ext_new(ctx) -> ext`.
+    ///
+    /// Makes the lock of an `ext` binding (Specification §9.6), whose value
+    /// generated code keeps and touches only while it holds the lock.
+    ExtNew = 52,
+
+    /// `rt_ext_lock(ctx, ext)`.
+    ///
+    /// Takes the lock before an access closure runs, suspending while
+    /// another task holds it; a point where a cancelled task traps. A task
+    /// holds at most one lock, and one that stops gives it up.
+    ExtLock = 53,
+
+    /// `rt_ext_unlock(ctx, ext)`.
+    ///
+    /// Gives the lock up after the closure, to the task that waited
+    /// longest.
+    ExtUnlock = 54,
+
+    /// `rt_ext_free(ctx, ext)`.
+    ///
+    /// Frees the lock when the binding's scope ends, which no task holds
+    /// or waits for any more (§10.1).
+    ExtFree = 55,
 }
 
 /// A status of the stream functions: sent, or a value taken.
@@ -596,7 +621,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 52] = [
+    pub const ALL: [RuntimeFn; 56] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -649,6 +674,10 @@ impl RuntimeFn {
         RuntimeFn::TxAbort,
         RuntimeFn::TxRetry,
         RuntimeFn::RefApply,
+        RuntimeFn::ExtNew,
+        RuntimeFn::ExtLock,
+        RuntimeFn::ExtUnlock,
+        RuntimeFn::ExtFree,
     ];
 
     /// The symbol the loader looks up.
@@ -706,6 +735,10 @@ impl RuntimeFn {
             RuntimeFn::TxAbort => "rt_tx_abort",
             RuntimeFn::TxRetry => "rt_tx_retry",
             RuntimeFn::RefApply => "rt_ref_apply",
+            RuntimeFn::ExtNew => "rt_ext_new",
+            RuntimeFn::ExtLock => "rt_ext_lock",
+            RuntimeFn::ExtUnlock => "rt_ext_unlock",
+            RuntimeFn::ExtFree => "rt_ext_free",
         }
     }
 

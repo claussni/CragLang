@@ -23,7 +23,8 @@
 //! metered tier's budgets (§11.6.6), and strings and bytes (§11.6.9). M4
 //! adds the scheduler (§11.7.1), the poller and timers (§11.7.2), scopes
 //! (§11.7.3), cancellation (§11.7.4), streams and hubs (§11.7.5), refs
-//! (§11.7.6) and transactions (§11.7.7).
+//! (§11.7.6), transactions (§11.7.7), commutative updates (§11.7.8) and
+//! `ext` locks (§11.7.9).
 //!
 //! Runtime discipline (Compiler Architecture §2.1): no thread-locals, no
 //! callbacks into Crag code from the runtime stack, panics abort in images
@@ -48,6 +49,7 @@ mod cancel;
 pub mod codec;
 mod deque;
 mod epoch;
+mod ext;
 pub mod fiber;
 pub mod heap;
 mod io;
@@ -142,6 +144,10 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::TxAbort => stm::rt_tx_abort as *const () as usize,
         RuntimeFn::TxRetry => stm::rt_tx_retry as *const () as usize,
         RuntimeFn::RefApply => refs::rt_ref_apply as *const () as usize,
+        RuntimeFn::ExtNew => ext::rt_ext_new as *const () as usize,
+        RuntimeFn::ExtLock => ext::rt_ext_lock as *const () as usize,
+        RuntimeFn::ExtUnlock => ext::rt_ext_unlock as *const () as usize,
+        RuntimeFn::ExtFree => ext::rt_ext_free as *const () as usize,
     }
 }
 

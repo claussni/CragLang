@@ -23,8 +23,8 @@
 //! waits for is called off and the fiber woken, and the suspending runtime
 //! function traps instead of returning. Each such function also traps when
 //! it is called on a cancelled task, so every suspension point is a stop:
-//! sleeps, I/O, starts under a scope's limit, and puts and takes of
-//! streams (§11.7.5).
+//! sleeps, I/O, starts under a scope's limit, puts and takes of streams
+//! (§11.7.5) and the locks of `ext` (§11.7.9).
 //!
 //! Inside a region where cancellation waits, `no_cancel` counts the depth,
 //! and the stack checks and waits go on; leaving the last region traps.
@@ -40,6 +40,7 @@ use std::sync::atomic::Ordering;
 
 use crag_abi::{NO_POSITION, TrapKind};
 
+use crate::ext::ExtLock;
 use crate::fiber::{Fiber, TaskContext};
 use crate::sched::{Shared, wake};
 use crate::scope::Scope;
@@ -66,6 +67,8 @@ pub(crate) enum Waiting {
     /// A put or a take of a stream or a hub, told from the others by its
     /// token.
     Stream { chan: Arc<Channel>, token: u64 },
+    /// The lock of an `ext`, told from the other waits by its token.
+    Ext { lock: Arc<ExtLock>, token: u64 },
 }
 
 /// Cancels a task from any thread.
@@ -156,6 +159,7 @@ fn call_off(ctx: &TaskContext) {
         Some(Waiting::Io { shared, fd, token }) => shared.reactor.cancel_io(fd, token),
         Some(Waiting::Start { scope, index }) => scope.call_off_start(index),
         Some(Waiting::Stream { chan, token }) => chan.call_off(token),
+        Some(Waiting::Ext { lock, token }) => lock.call_off(token),
         Some(Waiting::Tasks(_)) | None => None,
     };
     if let Some(fiber) = fiber {

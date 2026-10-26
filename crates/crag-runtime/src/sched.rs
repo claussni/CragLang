@@ -76,6 +76,8 @@ pub enum WaitReason {
     /// Room in a stream or a hub to put a value, or a value to take
     /// (§11.7.5).
     Stream,
+    /// The lock of an `ext` (§11.7.9).
+    Ext,
 }
 
 /// How a scheduler runs.

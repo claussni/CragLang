@@ -198,6 +198,8 @@ pub struct Fiber {
     /// Its transaction log, once it has run an `atomic` block (Plan
     /// §11.7.7).
     pub(crate) tx: Option<Box<TxLog>>,
+    /// The `ext` lock it holds or waits for (Plan §11.7.9).
+    pub(crate) ext: Option<crate::ext::Held>,
 }
 
 impl Fiber {
@@ -287,6 +289,7 @@ impl Fiber {
             wait: WaitReason::Yield,
             task: None,
             tx: None,
+            ext: None,
         }))
     }
 
@@ -496,9 +499,10 @@ impl Worker {
             (*ctx).fiber.store(std::ptr::null_mut(), Ordering::Relaxed);
             let status = (*ctx).status.load(Ordering::Relaxed);
             if status != 0 {
-                // A task that stops borrows no value any more, and its
-                // block, if it stopped in one, ends.
+                // A task that stops borrows no value any more, its block,
+                // if it stopped in one, ends, and it holds no lock.
                 crate::stm::stopped(&mut *fiber, &*ctx, &mut (*worker).heap, &(*worker).types);
+                crate::ext::stopped(&mut *fiber);
                 crate::epoch::unpin(&*ctx, &mut (*worker).heap);
             }
             match status {
