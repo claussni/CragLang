@@ -471,6 +471,48 @@ pub enum RuntimeFn {
     /// Places a value, laid out as for `RefCommit`, with its references,
     /// and gives the old one with references of its own.
     RefSwap = 44,
+
+    /// `rt_tx_begin(ctx)`.
+    ///
+    /// Opens an `atomic` block (Specification §9.5): the outermost starts
+    /// an attempt of a transaction, an inner one takes a savepoint
+    /// (Implementation Plan §11.7.7). The block is a region where
+    /// cancellation waits, and nothing in it may suspend.
+    TxBegin = 45,
+
+    /// `rt_tx_read(ctx, cell, out) -> status`.
+    ///
+    /// Reads a ref cell in the block: [`TX_OK`] with the value's two words
+    /// at `out`, borrowed, which is what the block wrote to it if it did,
+    /// else [`TX_CONFLICT`], and the outermost block must rerun.
+    TxRead = 46,
+
+    /// `rt_tx_write(ctx, cell, list, w0, w1)`.
+    ///
+    /// Writes a value, laid out as for `RefCommit`, with its references, to
+    /// a ref cell at the commit. One identical to what the block sees is
+    /// not written, and its references are given up.
+    TxWrite = 47,
+
+    /// `rt_tx_commit(ctx) -> status`.
+    ///
+    /// Closes the block: an inner one keeps its writes for the outermost,
+    /// which writes them all at once, [`TX_OK`], or [`TX_CONFLICT`] and it
+    /// must rerun.
+    TxCommit = 48,
+
+    /// `rt_tx_abort(ctx)`.
+    ///
+    /// Closes a block whose value is an error: its writes are dropped, and
+    /// those of the blocks around it stay (Specification §9.5.1).
+    TxAbort = 49,
+
+    /// `rt_tx_retry(ctx)`.
+    ///
+    /// After a conflict, drops the attempt's reads and writes, backs off
+    /// and starts the outermost block's next attempt, after which the
+    /// block's code runs again from its start.
+    TxRetry = 50,
 }
 
 /// A status of the stream functions: sent, or a value taken.
@@ -502,6 +544,13 @@ pub const REF_COMMITTED: u64 = 0;
 /// The cell changed since the read: the update reruns.
 pub const REF_CONFLICT: u64 = 1;
 
+/// A status of the transaction functions: the read gave a value, or the
+/// block committed.
+pub const TX_OK: u64 = 0;
+
+/// The transaction saw a change by another: its outermost block reruns.
+pub const TX_CONFLICT: u64 = 1;
+
 /// The flag of `rt_scope_start` for a task outside the scope's limit, such
 /// as the body of a group.
 pub const START_EXEMPT: u64 = 1 << 2;
@@ -520,7 +569,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 45] = [
+    pub const ALL: [RuntimeFn; 51] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -566,6 +615,12 @@ impl RuntimeFn {
         RuntimeFn::RefCommit,
         RuntimeFn::RefDone,
         RuntimeFn::RefSwap,
+        RuntimeFn::TxBegin,
+        RuntimeFn::TxRead,
+        RuntimeFn::TxWrite,
+        RuntimeFn::TxCommit,
+        RuntimeFn::TxAbort,
+        RuntimeFn::TxRetry,
     ];
 
     /// The symbol the loader looks up.
@@ -616,6 +671,12 @@ impl RuntimeFn {
             RuntimeFn::RefCommit => "rt_ref_commit",
             RuntimeFn::RefDone => "rt_ref_done",
             RuntimeFn::RefSwap => "rt_ref_swap",
+            RuntimeFn::TxBegin => "rt_tx_begin",
+            RuntimeFn::TxRead => "rt_tx_read",
+            RuntimeFn::TxWrite => "rt_tx_write",
+            RuntimeFn::TxCommit => "rt_tx_commit",
+            RuntimeFn::TxAbort => "rt_tx_abort",
+            RuntimeFn::TxRetry => "rt_tx_retry",
         }
     }
 

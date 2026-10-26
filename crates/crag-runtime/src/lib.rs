@@ -22,8 +22,8 @@
 //! counting, lists and maps, and traps (§11.4.11 to §11.4.14). M3 adds the
 //! metered tier's budgets (§11.6.6), and strings and bytes (§11.6.9). M4
 //! adds the scheduler (§11.7.1), the poller and timers (§11.7.2), scopes
-//! (§11.7.3), cancellation (§11.7.4), streams and hubs (§11.7.5), and refs
-//! (§11.7.6).
+//! (§11.7.3), cancellation (§11.7.4), streams and hubs (§11.7.5), refs
+//! (§11.7.6) and transactions (§11.7.7).
 //!
 //! Runtime discipline (Compiler Architecture §2.1): no thread-locals, no
 //! callbacks into Crag code from the runtime stack, panics abort in images
@@ -64,6 +64,7 @@ mod scope;
 pub mod sentinel;
 pub mod side_stack;
 pub mod stack;
+mod stm;
 mod stream;
 pub mod stress;
 #[cfg(test)]
@@ -134,6 +135,12 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::RefCommit => refs::rt_ref_commit as *const () as usize,
         RuntimeFn::RefDone => refs::rt_ref_done as *const () as usize,
         RuntimeFn::RefSwap => refs::rt_ref_swap as *const () as usize,
+        RuntimeFn::TxBegin => stm::rt_tx_begin as *const () as usize,
+        RuntimeFn::TxRead => stm::rt_tx_read as *const () as usize,
+        RuntimeFn::TxWrite => stm::rt_tx_write as *const () as usize,
+        RuntimeFn::TxCommit => stm::rt_tx_commit as *const () as usize,
+        RuntimeFn::TxAbort => stm::rt_tx_abort as *const () as usize,
+        RuntimeFn::TxRetry => stm::rt_tx_retry as *const () as usize,
     }
 }
 

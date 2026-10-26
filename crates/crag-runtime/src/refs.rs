@@ -32,7 +32,9 @@
 //! epochs decide (`epoch`).
 //!
 //! A write takes its version from a clock the whole process shares, so the
-//! versions of all cells are ordered, as transactions will need (§11.7.7).
+//! versions of all cells are ordered, as transactions need (§11.7.7). It
+//! takes it while it holds the lock and before it stores, so that a write
+//! that finds a transaction running alone can back out unseen.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering, fence};
@@ -54,11 +56,56 @@ pub(crate) struct Cell {
 
 const _: () = assert!(size_of::<Cell>() == REF_CELL_SIZE as usize);
 
-/// The last version a write gave a cell.
+/// The last version a write gave a cell, with [`ALONE`] while a task
+/// runs alone.
 static CLOCK: AtomicU64 = AtomicU64::new(0);
 
+/// The bit of the clock that is set while a transaction runs alone
+/// (§11.7.7): every other write backs out until it is clear.
+const ALONE: u64 = 1 << 63;
+
+/// The clock, as a transaction reads it when it starts.
+pub(crate) fn clock() -> u64 {
+    CLOCK.load(Ordering::SeqCst) & !ALONE
+}
+
+/// Takes a new version for a write, which holds its cells' locks: none
+/// while another task runs alone.
+pub(crate) fn tick() -> Option<u64> {
+    let before = CLOCK.fetch_add(2, Ordering::SeqCst);
+    (before & ALONE == 0).then_some(before + 2)
+}
+
+/// Takes a new version for the write of the task that runs alone.
+pub(crate) fn tick_alone() -> u64 {
+    (CLOCK.fetch_add(2, Ordering::SeqCst) & !ALONE) + 2
+}
+
+/// Waits until no task runs alone. The task that does is never preempted
+/// or suspended, so it is running on some worker and ends soon.
+pub(crate) fn wait_alone() {
+    let mut spins = 0;
+    while CLOCK.load(Ordering::SeqCst) & ALONE != 0 {
+        back_off(&mut spins);
+    }
+}
+
+/// Makes the calling task the one that runs alone, once no other does.
+pub(crate) fn enter_alone() {
+    loop {
+        wait_alone();
+        if CLOCK.fetch_or(ALONE, Ordering::SeqCst) & ALONE == 0 {
+            return;
+        }
+    }
+}
+
+pub(crate) fn leave_alone() {
+    CLOCK.fetch_and(!ALONE, Ordering::SeqCst);
+}
+
 /// Waits a little longer each time a cell is locked.
-fn back_off(spins: &mut u32) {
+pub(crate) fn back_off(spins: &mut u32) {
     if *spins < 64 {
         *spins += 1;
         std::hint::spin_loop();
@@ -69,23 +116,34 @@ fn back_off(spins: &mut u32) {
 
 impl Cell {
     /// The version and the value, once no write is under way.
-    fn read(&self) -> (u64, [u64; 2]) {
+    pub(crate) fn read(&self) -> (u64, [u64; 2]) {
         let mut spins = 0;
         loop {
-            let version = self.version.load(Ordering::Acquire);
-            if version & 1 == 0 {
-                let words = self.value.each_ref().map(|w| w.load(Ordering::Relaxed));
-                fence(Ordering::Acquire);
-                if self.version.load(Ordering::Relaxed) == version {
-                    return (version, words);
-                }
+            if let Some(read) = self.try_read() {
+                return read;
             }
             back_off(&mut spins);
         }
     }
 
+    /// The version and the value, unless a write is under way.
+    pub(crate) fn try_read(&self) -> Option<(u64, [u64; 2])> {
+        let version = self.version.load(Ordering::Acquire);
+        if version & 1 != 0 {
+            return None;
+        }
+        let words = self.value.each_ref().map(|w| w.load(Ordering::Relaxed));
+        fence(Ordering::Acquire);
+        (self.version.load(Ordering::Relaxed) == version).then_some((version, words))
+    }
+
+    /// The version, with the lock bit.
+    pub(crate) fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
     /// Locks the cell if it still holds `version`.
-    fn lock(&self, version: u64) -> bool {
+    pub(crate) fn lock(&self, version: u64) -> bool {
         let locked = self
             .version
             .compare_exchange(version, version | 1, Ordering::Acquire, Ordering::Relaxed)
@@ -107,16 +165,31 @@ impl Cell {
         }
     }
 
-    /// Replaces the value of the locked cell and unlocks it with a new
-    /// version: the old value.
-    fn replace(&self, words: [u64; 2]) -> [u64; 2] {
+    /// Stores a value in the locked cell: the old one.
+    pub(crate) fn store(&self, words: [u64; 2]) -> [u64; 2] {
         let old = self.value.each_ref().map(|w| w.load(Ordering::Relaxed));
         for (w, word) in self.value.iter().zip(words) {
             w.store(word, Ordering::Relaxed);
         }
-        let version = CLOCK.fetch_add(2, Ordering::SeqCst) + 2;
-        self.version.store(version, Ordering::Release);
         old
+    }
+
+    /// Unlocks the cell with `version`.
+    pub(crate) fn unlock(&self, version: u64) {
+        self.version.store(version, Ordering::Release);
+    }
+
+    /// Replaces the value of the cell, locked from `version`, and unlocks
+    /// it with a new version: the old value. While another task runs
+    /// alone, nothing changes and the cell is unlocked as it was.
+    fn replace(&self, version: u64, words: [u64; 2]) -> Option<[u64; 2]> {
+        let Some(new) = tick() else {
+            self.unlock(version);
+            return None;
+        };
+        let old = self.store(words);
+        self.unlock(new);
+        Some(old)
     }
 }
 
@@ -190,12 +263,17 @@ unsafe extern "C" fn commit_entry(
             );
         }
         crag_abi::REF_COMMITTED
-    } else if cell.lock(version) {
-        let old = cell.replace(words);
-        retire(heap, types, old, list);
-        crag_abi::REF_COMMITTED
     } else {
-        crag_abi::REF_CONFLICT
+        loop {
+            if !cell.lock(version) {
+                break crag_abi::REF_CONFLICT;
+            }
+            if let Some(old) = cell.replace(version, words) {
+                retire(heap, types, old, list);
+                break crag_abi::REF_COMMITTED;
+            }
+            wait_alone();
+        }
     };
     unpin(ctx, heap);
     status
@@ -237,8 +315,13 @@ unsafe extern "C" fn swap_entry(
 ) -> Words {
     // SAFETY: as the caller promises.
     let (cell, (heap, types)) = unsafe { (&*cell, parts(&*ctx)) };
-    cell.lock_any();
-    let mut old = cell.replace([w0, w1]);
+    let mut old = loop {
+        let version = cell.lock_any();
+        if let Some(old) = cell.replace(version, [w0, w1]) {
+            break old;
+        }
+        wait_alone();
+    };
     // The caller gets references of its own: the cell's go when no
     // borrowed read can still hold the value.
     // SAFETY: the cell's reference keeps the value alive until retired.

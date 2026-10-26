@@ -40,6 +40,7 @@ use crate::sched::{Local, PARK_NONE, WaitReason, settle};
 use crate::scope::Member;
 use crate::side_stack::SideStack;
 use crate::stack::StackMemory;
+use crate::stm::TxLog;
 use crate::unwind::{CodeMap, Trap};
 
 /// The per-task record generated code receives as its implicit first
@@ -194,6 +195,9 @@ pub struct Fiber {
     pub(crate) wait: WaitReason,
     /// The scope it is a task of, if a scope started it.
     pub(crate) task: Option<Member>,
+    /// Its transaction log, once it has run an `atomic` block (Plan
+    /// §11.7.7).
+    pub(crate) tx: Option<Box<TxLog>>,
 }
 
 impl Fiber {
@@ -282,6 +286,7 @@ impl Fiber {
             metering: None,
             wait: WaitReason::Yield,
             task: None,
+            tx: None,
         }))
     }
 
@@ -491,7 +496,9 @@ impl Worker {
             (*ctx).fiber.store(std::ptr::null_mut(), Ordering::Relaxed);
             let status = (*ctx).status.load(Ordering::Relaxed);
             if status != 0 {
-                // A task that stops borrows no value any more.
+                // A task that stops borrows no value any more, and its
+                // block, if it stopped in one, ends.
+                crate::stm::stopped(&mut *fiber, &*ctx, &mut (*worker).heap, &(*worker).types);
                 crate::epoch::unpin(&*ctx, &mut (*worker).heap);
             }
             match status {

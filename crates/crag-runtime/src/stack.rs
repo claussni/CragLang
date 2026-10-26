@@ -278,8 +278,16 @@ unsafe extern "C" fn morestack_slow(ctx: *const TaskContext, needed: usize, sp: 
 
         // The sentinel may come from the cancellation, or a stop may meet
         // a cancellation that waited for its region to end.
+        // A block that runs alone keeps its worker (Plan §11.7.7): a
+        // preemption is dropped and a pause waits for the block's end.
+        let alone = crate::stm::runs_alone(fiber);
+        if alone && pending & StopReason::Pause as usize != 0 {
+            crate::stm::defer_pause(fiber);
+        }
         let stop = if crate::cancel::due(ctx) {
             UNWIND
+        } else if alone {
+            0
         } else if pending & StopReason::Pause as usize != 0 {
             fiber.state = FiberState::Paused;
             1
