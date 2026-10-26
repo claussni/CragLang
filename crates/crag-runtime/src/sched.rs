@@ -78,6 +78,8 @@ pub enum WaitReason {
     Stream,
     /// The lock of an `ext` (§11.7.9).
     Ext,
+    /// A lazy value another task computes (§11.7.11).
+    Lazy,
 }
 
 /// How a scheduler runs.

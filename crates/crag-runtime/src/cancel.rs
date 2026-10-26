@@ -24,7 +24,7 @@
 //! function traps instead of returning. Each such function also traps when
 //! it is called on a cancelled task, so every suspension point is a stop:
 //! sleeps, I/O, starts under a scope's limit, puts and takes of streams
-//! (§11.7.5) and the locks of `ext` (§11.7.9).
+//! (§11.7.5), the locks of `ext` (§11.7.9) and lazy values (§11.7.11).
 //!
 //! Inside a region where cancellation waits, `no_cancel` counts the depth,
 //! and the stack checks and waits go on; leaving the last region traps.
@@ -42,6 +42,7 @@ use crag_abi::{NO_POSITION, TrapKind};
 
 use crate::ext::ExtLock;
 use crate::fiber::{Fiber, TaskContext};
+use crate::lazy::LazyCell;
 use crate::sched::{Shared, wake};
 use crate::scope::Scope;
 use crate::sentinel::{StopReason, request};
@@ -69,6 +70,9 @@ pub(crate) enum Waiting {
     Stream { chan: Arc<Channel>, token: u64 },
     /// The lock of an `ext`, told from the other waits by its token.
     Ext { lock: Arc<ExtLock>, token: u64 },
+    /// A lazy value another task computes, told from the other reads by
+    /// its token.
+    Lazy { cell: Arc<LazyCell>, token: u64 },
 }
 
 /// Cancels a task from any thread.
@@ -160,6 +164,7 @@ fn call_off(ctx: &TaskContext) {
         Some(Waiting::Start { scope, index }) => scope.call_off_start(index),
         Some(Waiting::Stream { chan, token }) => chan.call_off(token),
         Some(Waiting::Ext { lock, token }) => lock.call_off(token),
+        Some(Waiting::Lazy { cell, token }) => cell.call_off(token),
         Some(Waiting::Tasks(_)) | None => None,
     };
     if let Some(fiber) = fiber {

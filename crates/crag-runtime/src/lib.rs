@@ -24,7 +24,8 @@
 //! adds the scheduler (§11.7.1), the poller and timers (§11.7.2), scopes
 //! (§11.7.3), cancellation (§11.7.4), streams and hubs (§11.7.5), refs
 //! (§11.7.6), transactions (§11.7.7), commutative updates (§11.7.8),
-//! `ext` locks (§11.7.9) and the signals of blocks (§11.7.10).
+//! `ext` locks (§11.7.9), the signals of blocks (§11.7.10) and lazy cells
+//! (§11.7.11).
 //!
 //! Runtime discipline (Compiler Architecture §2.1): no thread-locals, no
 //! callbacks into Crag code from the runtime stack, panics abort in images
@@ -53,6 +54,7 @@ mod ext;
 pub mod fiber;
 pub mod heap;
 mod io;
+mod lazy;
 pub mod list;
 pub mod map;
 pub mod meter;
@@ -151,6 +153,10 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::ExtFree => ext::rt_ext_free as *const () as usize,
         RuntimeFn::SignalEmit => signals::rt_signal_emit as *const () as usize,
         RuntimeFn::SignalNext => signals::rt_signal_next as *const () as usize,
+        RuntimeFn::LazyNew => lazy::rt_lazy_new as *const () as usize,
+        RuntimeFn::LazyGet => lazy::rt_lazy_get as *const () as usize,
+        RuntimeFn::LazySet => lazy::rt_lazy_set as *const () as usize,
+        RuntimeFn::LazyFree => lazy::rt_lazy_free as *const () as usize,
     }
 }
 

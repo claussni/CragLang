@@ -192,6 +192,7 @@ pub fn trap_message(kind: TrapKind) -> &'static str {
         TrapKind::OutOfSteps => "ran out of steps",
         TrapKind::OutOfMemory => "ran out of memory",
         TrapKind::Cancelled => "was cancelled",
+        TrapKind::Cycle => "a lazy value needed itself",
     }
 }
 

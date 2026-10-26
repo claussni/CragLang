@@ -98,6 +98,8 @@ pub struct TaskContext {
     /// ref's value, zero when it is not pinned (Plan §11.7.6). Only the
     /// task's worker changes it.
     pub(crate) pinned: AtomicU64,
+    /// The lazy values the task computes, innermost last (Plan §11.7.11).
+    pub(crate) lazy: Mutex<Vec<Arc<crate::lazy::LazyCell>>>,
 }
 
 const _: () = assert!(offset_of!(TaskContext, stack_limit) == STACK_LIMIT_OFFSET as usize);
@@ -245,6 +247,7 @@ impl Fiber {
             raise_position: AtomicU64::new(0),
             waiting: Mutex::new(None),
             pinned: AtomicU64::new(0),
+            lazy: Mutex::new(Vec::new()),
         });
 
         // The first switch into the fiber pops six registers and returns, so
@@ -503,10 +506,11 @@ impl Worker {
             let status = (*ctx).status.load(Ordering::Relaxed);
             if status != 0 {
                 // A task that stops borrows no value any more, its block,
-                // if it stopped in one, ends with its signals, and it holds
-                // no lock.
+                // if it stopped in one, ends with its signals, it holds no
+                // lock, and others compute the lazy values it computed.
                 crate::stm::stopped(&mut *fiber, &*ctx, &mut (*worker).heap, &(*worker).types);
                 crate::ext::stopped(&mut *fiber);
+                crate::lazy::stopped(&*ctx, (*fiber).trap.as_ref().map(|t| t.kind));
                 crate::signals::stopped(&mut *fiber, &mut (*worker).heap, &(*worker).types);
                 crate::epoch::unpin(&*ctx, &mut (*worker).heap);
             }

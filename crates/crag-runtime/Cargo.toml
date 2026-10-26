@@ -1,6 +1,6 @@
 [package]
 name = "crag-runtime"
-description = "Crag runtime: fibers, growable stacks, side stack, allocator, reference counting, lists and maps, traps, scheduler, I/O poller and timers, scopes and cancellation, streams and hubs, refs, transactions, ext locks and signals of blocks"
+description = "Crag runtime: fibers, growable stacks, side stack, allocator, reference counting, lists and maps, traps, scheduler, I/O poller and timers, scopes and cancellation, streams and hubs, refs, transactions, ext locks, signals of blocks and lazy cells"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

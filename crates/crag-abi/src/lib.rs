@@ -569,6 +569,33 @@ pub enum RuntimeFn {
     /// `RefCommit` and `RefDone` until there is none, and runs the
     /// handlers.
     SignalNext = 57,
+
+    /// `rt_lazy_new(ctx, list) -> lazy`.
+    ///
+    /// Makes a lazy cell (Specification §6.10) for a value laid out as the
+    /// elements of the list type with index `list`.
+    LazyNew = 58,
+
+    /// `rt_lazy_get(ctx, lazy, out) -> status`.
+    ///
+    /// Reads a lazy cell (Implementation Plan §11.7.11): [`LAZY_DONE`] with
+    /// the value's two words at `out` and references of its own;
+    /// [`LAZY_RUN`] when the caller must compute the value and store it
+    /// with `LazySet`; or [`LAZY_TRAPPED`] with the kind of the trap at
+    /// `out`, at which the caller traps. Suspends while another task
+    /// computes the value; a point where a cancelled task traps.
+    LazyGet = 59,
+
+    /// `rt_lazy_set(ctx, lazy, w0, w1)`.
+    ///
+    /// Stores the value the caller computed, with its references, and
+    /// hands it to the reads that wait.
+    LazySet = 60,
+
+    /// `rt_lazy_free(ctx, lazy)`.
+    ///
+    /// Frees the cell, which no task reads any more, with its value.
+    LazyFree = 61,
 }
 
 /// A status of the stream functions: sent, or a value taken.
@@ -634,6 +661,12 @@ pub const SIGNAL_RETRY: u64 = 3;
 /// What `rt_signal_next` gives when no signal is left to deliver.
 pub const SIGNAL_NONE: u64 = u64::MAX;
 
+/// The statuses of `rt_lazy_get`: the value is there, the caller computes
+/// it, or its computation trapped.
+pub const LAZY_DONE: u64 = 0;
+pub const LAZY_RUN: u64 = 1;
+pub const LAZY_TRAPPED: u64 = 2;
+
 /// The flag of `rt_scope_start` for a task outside the scope's limit, such
 /// as the body of a group.
 pub const START_EXEMPT: u64 = 1 << 2;
@@ -652,7 +685,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 58] = [
+    pub const ALL: [RuntimeFn; 62] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -711,6 +744,10 @@ impl RuntimeFn {
         RuntimeFn::ExtFree,
         RuntimeFn::SignalEmit,
         RuntimeFn::SignalNext,
+        RuntimeFn::LazyNew,
+        RuntimeFn::LazyGet,
+        RuntimeFn::LazySet,
+        RuntimeFn::LazyFree,
     ];
 
     /// The symbol the loader looks up.
@@ -774,6 +811,10 @@ impl RuntimeFn {
             RuntimeFn::ExtFree => "rt_ext_free",
             RuntimeFn::SignalEmit => "rt_signal_emit",
             RuntimeFn::SignalNext => "rt_signal_next",
+            RuntimeFn::LazyNew => "rt_lazy_new",
+            RuntimeFn::LazyGet => "rt_lazy_get",
+            RuntimeFn::LazySet => "rt_lazy_set",
+            RuntimeFn::LazyFree => "rt_lazy_free",
         }
     }
 
@@ -807,10 +848,12 @@ pub enum TrapKind {
     /// at a refill asked metered code to stop, as the host does when an
     /// edit cancels a compile-time evaluation.
     Cancelled = 9,
+    /// A lazy value's computation read the value itself.
+    Cycle = 10,
 }
 
 impl TrapKind {
-    pub const ALL: [TrapKind; 10] = [
+    pub const ALL: [TrapKind; 11] = [
         TrapKind::Overflow,
         TrapKind::DivideByZero,
         TrapKind::Index,
@@ -821,6 +864,7 @@ impl TrapKind {
         TrapKind::OutOfSteps,
         TrapKind::OutOfMemory,
         TrapKind::Cancelled,
+        TrapKind::Cycle,
     ];
 
     /// The kind with this discriminant, if any.
