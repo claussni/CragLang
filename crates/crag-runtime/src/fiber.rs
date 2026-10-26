@@ -452,8 +452,9 @@ impl Worker {
             match (*ctx).status.load(Ordering::Relaxed) {
                 STATUS_FINISHED => (*fiber).state = FiberState::Finished,
                 STATUS_TRAPPED => (*fiber).state = FiberState::Trapped,
+                // Once parked, the fiber is its waker's: no more use here.
                 _ if (*ctx).park.load(Ordering::Acquire) != PARK_NONE => {
-                    (*fiber).state = settle(&*ctx, (*fiber).wait);
+                    return settle(&*ctx, fiber);
                 }
                 _ => {}
             }

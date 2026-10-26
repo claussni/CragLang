@@ -485,20 +485,31 @@ fn worker_main(mut local: Local, types: Arc<Types>, code: Arc<CodeMap>) {
     }
 }
 
-/// The state of a fiber that suspended, once it has left its worker:
-/// waiting, and from now on a wake queues it, or runnable when a wake came
-/// first.
-pub(crate) fn settle(ctx: &TaskContext, reason: WaitReason) -> FiberState {
-    match ctx.park.compare_exchange(
-        PARK_SUSPENDING,
-        PARK_PARKED,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    ) {
-        Ok(_) => FiberState::Waiting(reason),
-        Err(_) => {
-            ctx.park.store(PARK_NONE, Ordering::Release);
-            FiberState::Runnable
+/// Settles the state of a fiber that suspended, once it has left its
+/// worker, and gives it: waiting, and from now on a wake queues it, or
+/// runnable when a wake came first. A waiting fiber belongs to its waker
+/// from the moment it is parked, so the state is written before.
+///
+/// # Safety
+///
+/// `fiber` is the fiber of `ctx`, and only the worker it left uses it.
+pub(crate) unsafe fn settle(ctx: &TaskContext, fiber: *mut Fiber) -> FiberState {
+    // SAFETY: as the caller promises, until the fiber is parked.
+    unsafe {
+        let waiting = FiberState::Waiting((*fiber).wait);
+        (*fiber).state = waiting;
+        match ctx.park.compare_exchange(
+            PARK_SUSPENDING,
+            PARK_PARKED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => waiting,
+            Err(_) => {
+                ctx.park.store(PARK_NONE, Ordering::Release);
+                (*fiber).state = FiberState::Runnable;
+                FiberState::Runnable
+            }
         }
     }
 }
@@ -650,7 +661,10 @@ mod tests {
         f.ctx.park.store(PARK_SUSPENDING, Ordering::SeqCst);
         wake(reference(&mut f, None), [7, 8]);
         assert_eq!(f.ctx.park.load(Ordering::SeqCst), PARK_WOKEN);
-        assert_eq!(settle(&f.ctx, WaitReason::Yield), FiberState::Runnable);
+        let ctx = f.ctx.clone();
+        // SAFETY: the fiber is not running.
+        assert_eq!(unsafe { settle(&ctx, &raw mut *f) }, FiberState::Runnable);
+        assert_eq!(f.state, FiberState::Runnable);
         assert_eq!(f.ctx.park.load(Ordering::SeqCst), PARK_NONE);
         let words = f
             .ctx
@@ -666,8 +680,11 @@ mod tests {
         let shared = Arc::new(Shared::new(vec![stealer]));
         let mut f = fiber();
         f.ctx.park.store(PARK_SUSPENDING, Ordering::SeqCst);
-        f.state = settle(&f.ctx, WaitReason::Yield);
-        assert_eq!(f.state, FiberState::Waiting(WaitReason::Yield));
+        let ctx = f.ctx.clone();
+        // SAFETY: the fiber is not running.
+        let state = unsafe { settle(&ctx, &raw mut *f) };
+        assert_eq!(state, FiberState::Waiting(WaitReason::Yield));
+        assert_eq!(f.state, state);
         assert_eq!(f.ctx.park.load(Ordering::SeqCst), PARK_PARKED);
         let ptr: *mut Fiber = &raw mut *f;
         wake(reference(&mut f, Some(shared.clone())), [1, 2]);
@@ -685,15 +702,18 @@ mod tests {
     #[test]
     fn wakes_racing_the_worker_lose_no_fiber() {
         // The waker and the worker race on the word; the fiber ends up
-        // queued exactly once either way.
+        // queued exactly once either way, and runnable.
         for _ in 0..10_000 {
             let (_deque, stealer) = Deque::new();
             let shared = Arc::new(Shared::new(vec![stealer]));
             let mut f = fiber();
             f.ctx.park.store(PARK_SUSPENDING, Ordering::SeqCst);
+            let ptr: *mut Fiber = &raw mut *f;
             let r = reference(&mut f, Some(shared.clone()));
             let waker = std::thread::spawn(move || wake(r, [0, 0]));
-            let state = settle(&f.ctx, WaitReason::Yield);
+            let ctx = f.ctx.clone();
+            // SAFETY: the fiber is not running.
+            let state = unsafe { settle(&ctx, ptr) };
             waker.join().unwrap();
             let queued = shared.global.lock().unwrap().len();
             match state {
@@ -701,6 +721,7 @@ mod tests {
                 _ => assert_eq!(queued, 1),
             }
             assert_eq!(f.ctx.park.load(Ordering::SeqCst), PARK_NONE);
+            assert_eq!(f.state, FiberState::Runnable);
         }
     }
 }
