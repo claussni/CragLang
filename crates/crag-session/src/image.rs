@@ -20,32 +20,35 @@
 //! The image only loads code; the host compiles it, entry stubs included.
 //! Shipped functions are loaded with the M0 loader, the descriptors of
 //! their types join the worker's, and their stack maps join the code map
-//! that unwinding reads. A function is run on a fiber of its own through
-//! the stub for its words.
+//! that unwinding reads. A function is run through the stub for its words
+//! as the root task of a scheduler, which the run starts and stops, so its
+//! tasks run on the scheduler's workers.
 //!
 //! A function shipped again replaces the code it had (§11.6.4): the new
 //! code fills its slot, so every later call reaches it, while frames
 //! still running the old code finish there. The old code stays loaded and
 //! in the code map.
 //!
-//! SIGINT interrupts a run (§11.6.2): the image asks the running fiber to
-//! pause at its next safepoint, a function entry or a loop's back-edge, and
-//! answers `Interrupted`. The fiber is dropped; what its frames held is
-//! not released yet. The terminal sends SIGINT to the image together with
-//! the host, which ignores it while the REPL runs.
+//! SIGINT interrupts a run (§11.6.2): the image cancels the root task,
+//! which stops at its next safepoint, a function entry, a loop's back-edge
+//! or a wait, and passes the cancellation to the tasks it started (Plan
+//! §11.7.4). The run answers `Interrupted` once they all stopped. The
+//! terminal sends SIGINT to the image together with the host, which
+//! ignores it while the REPL runs.
 
 use std::collections::HashMap;
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crag_abi::{CodeObject, FuncId, RuntimeFn, Shapes, SlotKey, TypeDescriptor};
 use crag_loader::{CodeArena, SymbolTable, load, replace_group};
 use crag_runtime::{
-    CodeMap, Fiber, FiberConfig, FiberState, PrintLimits, StopHandle, StopReason, Types, Worker,
-    decode_value, print_value, release_value,
+    CodeMap, Fiber, FiberConfig, FiberState, PrintLimits, Scheduler, SchedulerConfig, Types,
+    Worker, decode_value, print_value, release_value,
 };
 
 use crate::host::ImageKind;
@@ -56,21 +59,18 @@ use crate::protocol::{
 /// The address range reserved for an image's code.
 const ARENA: usize = 1 << 30;
 
-/// The stop handle of the fiber running now, for the SIGINT handler; null
-/// between runs. The image has one thread, so the handler never runs while
-/// the handle is replaced.
-static RUNNING: AtomicPtr<StopHandle> = AtomicPtr::new(std::ptr::null_mut());
+/// Set by SIGINT. A cancellation takes locks, which a signal handler must
+/// not, so the thread that waits for the run cancels it.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// How often the waiting thread looks for an interrupt.
+const INTERRUPT_POLL: Duration = Duration::from_millis(20);
 
 extern "C" fn on_interrupt(_signal: libc::c_int) {
-    let handle = RUNNING.load(Ordering::SeqCst);
-    if !handle.is_null() {
-        // SAFETY: the handle lives while it is published; requesting a stop
-        // only stores atomically, which a signal handler may do.
-        unsafe { (*handle).request_stop(StopReason::Pause) };
-    }
+    INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
-/// Has SIGINT pause the running fiber. The handler runs on the alternate
+/// Has SIGINT interrupt the run. The handler runs on the alternate
 /// signal stack the standard library sets up, not on the fiber's, whose
 /// margin is small.
 fn handle_interrupts() -> io::Result<()> {
@@ -98,6 +98,11 @@ pub struct Image {
     types: Vec<(u32, TypeDescriptor)>,
     /// Every function loaded, with its entry, for the code map.
     code: Vec<(FuncId, usize, CodeObject)>,
+    /// The code map of everything loaded, with the task entries once the
+    /// host shipped their stubs.
+    code_map: Arc<CodeMap>,
+    /// The worker whose heap holds the values the compiler computed and
+    /// the results the image shows.
     worker: Worker,
 }
 
@@ -114,6 +119,7 @@ impl Image {
             stubs: HashMap::new(),
             types: Vec::new(),
             code: Vec::new(),
+            code_map: Arc::new(CodeMap::new()),
             worker: Worker::new(),
         })
     }
@@ -220,7 +226,13 @@ impl Image {
         for (func, entry, object) in &self.code {
             map.add(*func, *entry, object);
         }
-        self.worker.set_code_map(Arc::new(map));
+        // Tasks start in the stubs for one argument, the task's closure.
+        if let [Some(&none), Some(&one), Some(&two)] = [0, 1, 2].map(|r| self.stubs.get(&(1, r))) {
+            // SAFETY: the stubs stay loaded as long as the image.
+            unsafe { map.set_task_entries([none, one, two]) };
+        }
+        self.code_map = Arc::new(map);
+        self.worker.set_code_map(self.code_map.clone());
         Ok(())
     }
 
@@ -250,8 +262,9 @@ impl Image {
         Message::Shown(text)
     }
 
-    /// Runs a loaded function without parameters on a fiber of its own:
-    /// its result words, or the answer that tells how it ended otherwise.
+    /// Runs a loaded function without parameters as the root task of a
+    /// scheduler: its result words, or the answer that tells how it ended
+    /// otherwise.
     fn run(&mut self, func: FuncId) -> Result<Vec<u64>, Message> {
         let Some(&(entry, params, returns)) = self.functions.get(&func) else {
             return Err(Message::Failed(format!(
@@ -273,20 +286,32 @@ impl Image {
         // SAFETY: the host compiled the stub for the function's words, and
         // both stay loaded while the image exists, which outlives the fiber.
         let fiber = unsafe { Fiber::new(stub, entry, &[], FiberConfig::default()) };
-        let mut fiber = match fiber {
+        let fiber = match fiber {
             Ok(fiber) => fiber,
             Err(e) => return Err(Message::Failed(format!("cannot map a fiber's stack: {e}"))),
         };
-        let handle = Box::new(fiber.stop_handle());
-        RUNNING.store(
-            &*handle as *const StopHandle as *mut StopHandle,
-            Ordering::SeqCst,
+        let cancel = fiber.cancel_handle();
+        let scheduler = Scheduler::new(
+            SchedulerConfig::default(),
+            self.worker.types(),
+            self.code_map.clone(),
         );
-        let state = self.worker.resume(&mut fiber);
-        RUNNING.store(std::ptr::null_mut(), Ordering::SeqCst);
-        drop(handle);
-        Err(match state {
-            FiberState::Paused => Message::Interrupted,
+        INTERRUPTED.store(false, Ordering::SeqCst);
+        scheduler.spawn(fiber);
+        let mut interrupted = false;
+        let mut stopped = loop {
+            if let Some(stopped) = scheduler.wait_timeout(INTERRUPT_POLL) {
+                break stopped;
+            }
+            if INTERRUPTED.swap(false, Ordering::SeqCst) {
+                interrupted = true;
+                cancel.cancel();
+            }
+        };
+        drop(scheduler);
+        let fiber = stopped.pop().expect("the root task stops");
+        Err(match fiber.state() {
+            FiberState::Trapped if interrupted => Message::Interrupted,
             FiberState::Finished => {
                 return Ok(fiber.results().expect("finished")[..returns as usize].to_vec());
             }

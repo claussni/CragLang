@@ -170,7 +170,7 @@ fn statement_uses(body: &MirBody<'_>, holds: &[LocalSet], statement: &Statement<
                         uses.operand(v, true);
                     }
                 }
-                Rvalue::Concat(parts) => {
+                Rvalue::Concat(parts) | Rvalue::Intrinsic(_, parts) => {
                     for o in parts {
                         uses.operand(o, false);
                     }

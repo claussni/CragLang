@@ -257,6 +257,28 @@ impl Scheduler {
             live = self.shared.idle.wait(live).unwrap();
         }
         drop(live);
+        self.take_stopped()
+    }
+
+    /// Waits as `wait` does, but at most `timeout`: none if fibers are
+    /// still live then.
+    pub fn wait_timeout(&self, timeout: Duration) -> Option<Vec<Box<Fiber>>> {
+        let live = self.shared.live.lock().unwrap();
+        let (live, _) = self
+            .shared
+            .idle
+            .wait_timeout_while(live, timeout, |live| *live > 0)
+            .unwrap();
+        if *live > 0 {
+            return None;
+        }
+        drop(live);
+        Some(self.take_stopped())
+    }
+
+    /// The fibers that stopped since the last wait.
+    #[expect(clippy::vec_box, reason = "the waits hand out boxed fibers")]
+    fn take_stopped(&self) -> Vec<Box<Fiber>> {
         let stopped = std::mem::take(&mut *self.shared.stopped.lock().unwrap());
         stopped
             .into_iter()

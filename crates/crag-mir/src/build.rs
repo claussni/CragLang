@@ -48,8 +48,8 @@ use crag_types::{
 };
 
 use crate::ir::{
-    BinOp, Block, BlockId, ClosurePlacement, CmpOp, Constant, Local, LocalDecl, MirBody, Operand,
-    Place, Rvalue, Statement, Terminator, TrapKind,
+    BinOp, Block, BlockId, ClosurePlacement, CmpOp, Constant, Intrinsic, Local, LocalDecl, MirBody,
+    Operand, Place, Rvalue, Statement, Terminator, TrapKind,
 };
 use crate::{Entry, InstanceKey};
 
@@ -699,6 +699,25 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 .result
                 .or_else(|| result_type(db, program, instance.function))
                 .map(ty),
+        }
+    }
+
+    /// The runtime operation a function of the standard library without a
+    /// body stands for, if it is one.
+    fn intrinsic(&self, instance: &Instance<'db>) -> Option<Intrinsic> {
+        let db = self.db;
+        let function = instance.function;
+        if !instance.args.is_empty()
+            || hir_body(db, self.program, Owner::Item(function))
+                .root
+                .is_some()
+        {
+            return None;
+        }
+        let module = function.module(db).path(db);
+        match (module.as_str(), function.name(db).text(db).as_str()) {
+            ("std.time", "sleepNanos") => Some(Intrinsic::Sleep),
+            _ => None,
         }
     }
 
@@ -1730,6 +1749,12 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             && let Some(primitive) = self.primitive_of(instance)
         {
             return self.primitive_call(expr, primitive, positional);
+        }
+        if fields.is_none()
+            && let Some(intrinsic) = self.intrinsic(instance)
+        {
+            let ops = positional.iter().map(|&arg| self.expr(arg)).collect();
+            return self.assign(self.ty(expr), Rvalue::Intrinsic(intrinsic, ops));
         }
         let Some(func) = self.callable(expr, instance) else {
             return self.unit();

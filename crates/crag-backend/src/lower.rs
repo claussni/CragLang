@@ -53,8 +53,8 @@ use crag_db::Db;
 use crag_db::plumbing::AsId;
 use crag_hir::{Owner, Program, hir_body, lower_body};
 use crag_mir::{
-    BinOp, BlockId, ClosurePlacement, CmpOp, Constant, Entry, InstanceKey, Local, MirBody, Operand,
-    Place, Rvalue, Statement, Terminator, TrapKind,
+    BinOp, BlockId, ClosurePlacement, CmpOp, Constant, Entry, InstanceKey, Intrinsic, Local,
+    MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,
 };
 use crag_types::{Builtin, Step, Ty, TyKind, prelude_item, signature};
 
@@ -876,6 +876,28 @@ impl<'a, 'db> Lower<'a, 'db> {
                 };
                 Ok(vec![addr, word(&env)?])
             }
+            Rvalue::Intrinsic(intrinsic, args) => self.intrinsic(*intrinsic, args),
+        }
+    }
+
+    /// The runtime call of an intrinsic, and its result's words.
+    fn intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        args: &[Operand<'db>],
+    ) -> Result<Vec<VReg>, Unsupported> {
+        let int = Ty::builtin(self.db, Builtin::Int);
+        match (intrinsic, args) {
+            (Intrinsic::Sleep, [nanos]) => {
+                let nanos = word(&self.operand(nanos, int)?)?;
+                self.push(Inst::CallRuntime {
+                    func: RuntimeFn::Sleep,
+                    args: vec![nanos],
+                    dsts: Vec::new(),
+                });
+                Ok(Vec::new())
+            }
+            _ => Err("this operation of the runtime"),
         }
     }
 

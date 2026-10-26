@@ -224,6 +224,18 @@ pub enum Rvalue<'db> {
         code: InstanceKey<'db>,
         env: Operand<'db>,
     },
+    /// An operation of the runtime that a function of the standard library
+    /// without a body stands for, on borrowed operands (Plan §11.7.14).
+    Intrinsic(Intrinsic, Vec<Operand<'db>>),
+}
+
+/// The runtime operations of the standard library's functions without a
+/// body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
+pub enum Intrinsic {
+    /// Suspends the task for a number of nanoseconds, an `Int` above
+    /// zero: `std.time.sleepNanos`.
+    Sleep,
 }
 
 /// Where a closure's environment lives, by its escape level (§11.5.8).
@@ -385,7 +397,7 @@ impl<'db> Rvalue<'db> {
             Rvalue::Record { fields, .. } => {
                 out.extend(fields.iter_mut().filter_map(|(_, o)| o.locals_mut()))
             }
-            Rvalue::List(items) | Rvalue::Concat(items) => {
+            Rvalue::List(items) | Rvalue::Concat(items) | Rvalue::Intrinsic(_, items) => {
                 out.extend(items.iter_mut().filter_map(Operand::locals_mut))
             }
             Rvalue::Map(entries) => {
@@ -605,6 +617,7 @@ fn rvalue_text<'db>(db: &'db dyn Db, rvalue: &Rvalue<'db>) -> String {
                 .join(", ")
         ),
         Rvalue::Concat(parts) => format!("concat({})", ops(parts)),
+        Rvalue::Intrinsic(intrinsic, args) => format!("{intrinsic:?}({})", ops(args)),
         Rvalue::Len(p) => format!("len {}", place(p)),
         Rvalue::Index { list, index } => format!("{}[{}]", place(list), op(index)),
         Rvalue::MapGet { map, key, .. } => format!("get {}[{}]", place(map), op(key)),

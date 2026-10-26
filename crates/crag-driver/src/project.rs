@@ -34,8 +34,12 @@ use std::sync::Arc;
 use crag_db::{RootDatabase, Setter};
 use crag_hir::{ModuleId, PRELUDE, Program, Resource, SourceFile, embed_sources};
 
-/// The prelude, bundled with the tool (Specification §19.4).
-const CORE: &str = include_str!("../../../std/core.crag");
+/// The modules of `std` bundled with the tool, the prelude first
+/// (Specification §19.4).
+const STD: &[(&str, &str)] = &[
+    (PRELUDE, include_str!("../../../std/core.crag")),
+    ("std.time", include_str!("../../../std/time.crag")),
+];
 
 /// A module's file, where diagnostics name it.
 #[derive(Clone, Debug)]
@@ -56,7 +60,8 @@ pub struct Project {
     pub package: String,
     /// The entry module the manifest names.
     pub main: Option<String>,
-    /// The prelude first, then the project's modules by path.
+    /// The modules of `std`, the prelude first, then the project's modules
+    /// by path.
     pub files: Vec<ModuleFile>,
     /// The project's root; none outside a project, where `embed` sources
     /// resolve against the working directory.
@@ -113,20 +118,22 @@ impl Project {
         Ok(project)
     }
 
-    /// A program of the prelude alone, as the REPL has outside a project.
+    /// A program of `std` alone, as the REPL has outside a project.
     pub fn bare() -> Project {
         let db = RootDatabase::new();
-        let core = ModuleId::new(
-            &db,
-            PRELUDE.to_string(),
-            SourceFile::new(&db, CORE.to_string()),
-        );
-        let files = vec![ModuleFile {
-            module: core,
-            shown: format!("{PRELUDE} (bundled)"),
-            dir: PathBuf::new(),
-        }];
-        let program = Program::new(&db, vec![core], Vec::new());
+        let files: Vec<ModuleFile> = STD
+            .iter()
+            .map(|(name, text)| ModuleFile {
+                module: ModuleId::new(
+                    &db,
+                    name.to_string(),
+                    SourceFile::new(&db, text.to_string()),
+                ),
+                shown: format!("{name} (bundled)"),
+                dir: PathBuf::new(),
+            })
+            .collect();
+        let program = Program::new(&db, files.iter().map(|f| f.module).collect(), Vec::new());
         Project {
             db,
             program,
@@ -151,9 +158,9 @@ impl Project {
         module
     }
 
-    /// The modules of the project itself, without the prelude.
+    /// The modules of the project itself, without `std`.
     pub fn own(&self) -> &[ModuleFile] {
-        &self.files[1..]
+        &self.files[STD.len()..]
     }
 
     pub fn file(&self, module: ModuleId) -> &ModuleFile {

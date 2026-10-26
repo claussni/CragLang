@@ -26,7 +26,10 @@ use crag_eval::{EvalSite, const_eval};
 use crag_hir::{ItemId, ModuleId, Owner};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{Entry, InstanceKey, Tier, collect_instances, mir};
-use crag_runtime::{CodeMap, Fiber, FiberConfig, FiberState, Trap, Types, Worker, decode_value};
+use crag_runtime::{
+    CodeMap, Fiber, FiberConfig, FiberState, Scheduler, SchedulerConfig, Trap, Types, Worker,
+    decode_value,
+};
 use crag_session::Fill;
 
 use crate::diagnostics::render_at;
@@ -40,7 +43,11 @@ pub struct Image {
     functions: HashMap<FuncId, Function>,
     /// Each function's entry.
     entries: HashMap<FuncId, usize>,
-    worker: Worker,
+    /// The worker whose heap holds the values the compiler computed, kept
+    /// as long as they are.
+    _worker: Worker,
+    /// Runs the fibers of the image's programs and their tasks.
+    scheduler: Scheduler,
     /// The values the compiler computed, whose cells were filled.
     constants: usize,
 }
@@ -257,10 +264,23 @@ impl Image {
             map.add(slot.func, entry.addr(), object);
             addrs.insert(slot.func, entry.addr());
         }
+        let settings = stub_settings()?;
+        // Tasks start in the stubs for one argument, the task's closure.
+        let task_entries = [0, 1, 2].map(|results| {
+            let stub = compile_entry_stub(1, results, &settings).expect("the stub compiles");
+            load(&mut arena, &symbols, &stub)
+                .expect("the stub loads")
+                .addr()
+        });
+        // SAFETY: the stubs stay loaded while the image exists, which
+        // outlives its scheduler's fibers.
+        unsafe { map.set_task_entries(task_entries) };
         let mut worker = Worker::new();
         let types = Arc::new(Types::new(types));
+        let code = Arc::new(map);
         worker.set_types(types.clone());
-        worker.set_code_map(Arc::new(map));
+        worker.set_code_map(code.clone());
+        let scheduler = Scheduler::new(SchedulerConfig::default(), types.clone(), code);
         // The constants are in their cells before any code runs.
         for fill in constants(project, &values) {
             // SAFETY: the shapes describe the layouts the code was compiled
@@ -279,16 +299,17 @@ impl Image {
         Ok(Image {
             arena,
             symbols,
-            settings: stub_settings()?,
+            settings,
             functions,
             entries: addrs,
-            worker,
+            _worker: worker,
+            scheduler,
             constants,
         })
     }
 
-    /// Runs a function without parameters on a fiber of its own: its result
-    /// words, or the trap that ended it.
+    /// Runs a function without parameters as the root task of the
+    /// scheduler: its result words, or the trap that ended it.
     pub fn run(&mut self, func: FuncId) -> Result<Vec<u64>, Trap> {
         let f = &self.functions[&func];
         assert_eq!(f.params, 0, "an entry point takes no parameters");
@@ -298,9 +319,13 @@ impl Image {
         // SAFETY: the stub was compiled for the function's words, and both
         // stay loaded while the image exists, which outlives the fiber.
         let entry = self.entries[&func];
-        let mut fiber = unsafe { Fiber::new(stub.addr(), entry, &[], FiberConfig::default()) }
+        let fiber = unsafe { Fiber::new(stub.addr(), entry, &[], FiberConfig::default()) }
             .expect("a fiber's stack can be mapped");
-        match self.worker.resume(&mut fiber) {
+        self.scheduler.spawn(fiber);
+        let mut stopped = self.scheduler.wait();
+        assert_eq!(stopped.len(), 1, "only the root task stops on its own");
+        let fiber = stopped.pop().expect("one");
+        match fiber.state() {
             FiberState::Finished => {
                 Ok(fiber.results().expect("finished")[..returns as usize].to_vec())
             }
@@ -318,10 +343,5 @@ impl Image {
     /// values the compiler computed.
     pub fn constants(&self) -> usize {
         self.constants
-    }
-
-    /// The heap the image's fibers allocate from.
-    pub fn live_blocks(&mut self) -> usize {
-        self.worker.heap().live_blocks()
     }
 }
