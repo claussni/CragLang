@@ -20,13 +20,14 @@
 //! saves every register on the fiber stack, moves to the system stack and
 //! calls `morestack_slow`, which handles stop requests and grows the stack by
 //! copying it. Then it continues the fiber where the check failed, on the new
-//! stack, or hands control to the worker if the fiber was asked to stop.
+//! stack, hands control to the worker if the fiber was asked to stop, or
+//! unwinds it if it was cancelled.
 
 use std::io;
 use std::mem::offset_of;
 use std::sync::atomic::Ordering;
 
-use crag_abi::{RUNTIME_RESERVE, STACK_MARGIN};
+use crag_abi::{NO_POSITION, RUNTIME_RESERVE, STACK_MARGIN, TrapKind};
 
 use crate::die;
 use crate::fiber::{Fiber, FiberState, TaskContext};
@@ -165,9 +166,13 @@ const _: () = assert!(SAVE_BYTES + SWITCH_FRAME_BYTES <= RUNTIME_RESERVE as usiz
 struct Resume {
     /// The save area's address, which changes when the stack moves.
     sp: usize,
-    /// Not zero if the fiber must stop instead of continuing.
+    /// Zero to continue, [`UNWIND`] to trap with `Cancelled`, anything else
+    /// to stop.
     stop: usize,
 }
+
+/// The `stop` of a cancelled fiber.
+const UNWIND: usize = 2;
 
 /// `rt_morestack(ctx, needed)`: see `crag_abi::RuntimeFn::Morestack`.
 ///
@@ -195,6 +200,8 @@ pub(crate) unsafe extern "C" fn rt_morestack(ctx: *const TaskContext, needed: us
         "mov rsp, rax",
         "test rdx, rdx",
         "jz 2f",
+        "cmp rdx, {unwind}",
+        "je 3f",
         // Stop: leave a switch frame that continues at label 2, record the
         // stack pointer and return into the worker's `switch` call.
         "mov rdi, [rsp + {rdi_slot}]",
@@ -215,10 +222,26 @@ pub(crate) unsafe extern "C" fn rt_morestack(ctx: *const TaskContext, needed: us
         "2:",
         restore_registers!(),
         "ret",
+        // Cancelled: trap as `rt_refuel` does, from the call's return
+        // address, with the frame pointer of the frame that checked, which
+        // the save area holds at its address on the new stack.
+        "3:",
+        "mov rdi, [rsp + {rdi_slot}]",
+        "mov rbp, [rsp + {rbp_slot}]",
+        "add rsp, {save}",
+        "mov esi, {cancelled}",
+        "mov rdx, {no_position}",
+        "jmp {trap}",
         rdi_slot = const RDI_SLOT,
+        rbp_slot = const RBP_SLOT,
         worker = const offset_of!(TaskContext, worker),
         saved_sp = const offset_of!(TaskContext, saved_sp),
         slow = sym morestack_slow,
+        unwind = const UNWIND,
+        save = const SAVE_BYTES - 8,
+        cancelled = const TrapKind::Cancelled as u32,
+        no_position = const NO_POSITION,
+        trap = sym crate::unwind::rt_trap,
     )
 }
 
@@ -253,7 +276,11 @@ unsafe extern "C" fn morestack_slow(ctx: *const TaskContext, needed: usize, sp: 
         }
         finish_check(ctx, fiber.limit);
 
-        let stop = if pending & StopReason::Pause as usize != 0 {
+        // The sentinel may come from the cancellation, or a stop may meet
+        // a cancellation that waited for its region to end.
+        let stop = if crate::cancel::due(ctx) {
+            UNWIND
+        } else if pending & StopReason::Pause as usize != 0 {
             fiber.state = FiberState::Paused;
             1
         } else if pending & StopReason::Preempt as usize != 0 {

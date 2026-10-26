@@ -69,6 +69,10 @@ pub enum WaitReason {
     Sleep,
     /// An I/O operation that would have blocked.
     Io,
+    /// A free place under the limit of a scope, to start a task (§11.7.3).
+    Start,
+    /// The next task of a scope to finish.
+    Tasks,
 }
 
 /// How a scheduler runs.
@@ -328,6 +332,30 @@ impl Shared {
         }
     }
 
+    /// Hands a new fiber, a task of a scope, to the workers: to the deque
+    /// of `local`'s worker while it holds less than a batch, else to the
+    /// global queue.
+    pub(crate) fn launch(&self, fiber: Box<Fiber>, local: Option<&mut Local>) {
+        *self.live.lock().unwrap() += 1;
+        let ptr = Box::into_raw(fiber) as FiberPtr;
+        match local {
+            Some(local) if local.deque.len() < BATCH => {
+                local.deque.push(ptr);
+                self.notify();
+            }
+            _ => self.push_global(ptr),
+        }
+    }
+
+    /// Counts off a fiber that stopped and that its scope took.
+    pub(crate) fn retire(&self) {
+        let mut live = self.live.lock().unwrap();
+        *live -= 1;
+        if *live == 0 {
+            self.idle.notify_all();
+        }
+    }
+
     /// Queues a fiber on the global queue and wakes a parked worker.
     fn push_global(&self, fiber: FiberPtr) {
         self.global.lock().unwrap().push_back(fiber);
@@ -479,6 +507,13 @@ fn worker_main(mut local: Local, types: Arc<Types>, code: Arc<CodeMap>) {
             FiberState::Runnable => shared.push_global(ptr),
             // Its wake queues it.
             FiberState::Waiting(_) => {}
+            // A task goes to its scope.
+            FiberState::Finished | FiberState::Trapped if fiber.task.is_some() => {
+                // SAFETY: as above; no queue holds the fiber any more.
+                let fiber = unsafe { Box::from_raw(ptr as *mut Fiber) };
+                crate::scope::finished(fiber, &mut local);
+                shared.retire();
+            }
             FiberState::Finished | FiberState::Trapped | FiberState::Paused => shared.stop(ptr),
             FiberState::Running => unreachable!("a resume returns when the fiber stops"),
         }
@@ -564,6 +599,21 @@ pub(crate) unsafe fn suspend(ctx: &TaskContext, reason: WaitReason) -> FiberRef 
     }
 }
 
+/// The part of the scheduler of the worker running the fiber of `ctx`,
+/// none for a fiber a worker resumes by hand.
+///
+/// # Safety
+///
+/// Called on the system stack by the Rust half of a runtime function, for
+/// the fiber it was called on; nothing else uses the part meanwhile.
+pub(crate) unsafe fn local_of<'a>(ctx: &TaskContext) -> Option<&'a mut Local> {
+    // SAFETY: as the caller promises, a worker runs the fiber of `ctx`.
+    unsafe {
+        let worker = ctx.worker.load(Ordering::Relaxed);
+        (*worker).sched.as_mut()
+    }
+}
+
 /// The scheduler of the fiber running on `ctx`, none for a fiber a worker
 /// resumes by hand.
 ///
@@ -632,6 +682,9 @@ suspending_fn! {
 unsafe extern "C" fn yield_entry(ctx: *const TaskContext) {
     // SAFETY: as the caller promises.
     unsafe {
+        if crate::cancel::stop_if_due(&*ctx) {
+            return;
+        }
         let fiber = suspend(&*ctx, WaitReason::Yield);
         wake(fiber, [0, 0]);
     }

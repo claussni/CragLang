@@ -37,6 +37,9 @@ pub enum StopReason {
     Preempt = 1,
     /// Stop until resumed explicitly, as the debugger does.
     Pause = 2,
+    /// The task was cancelled: unwind it, unless it is in a region where
+    /// cancellation waits (Plan §11.7.4).
+    Cancel = 4,
 }
 
 /// Requests a stop. May be called while the fiber runs.
@@ -60,7 +63,7 @@ impl Fiber {
     }
 }
 
-fn request(ctx: &TaskContext, reason: StopReason) {
+pub(crate) fn request(ctx: &TaskContext, reason: StopReason) {
     // The reason first, then the sentinel: `finish_check` relies on this
     // order to never lose a request.
     ctx.pending.fetch_or(reason as usize, Ordering::SeqCst);

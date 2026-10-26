@@ -21,7 +21,8 @@
 //! stop request and the stress harness. M1 adds the allocator, reference
 //! counting, lists and maps, and traps (§11.4.11 to §11.4.14). M3 adds the
 //! metered tier's budgets (§11.6.6), and strings and bytes (§11.6.9). M4
-//! adds the scheduler (§11.7.1), and the poller and timers (§11.7.2).
+//! adds the scheduler (§11.7.1), the poller and timers (§11.7.2), scopes
+//! (§11.7.3), and cancellation (§11.7.4).
 //!
 //! Runtime discipline (Compiler Architecture §2.1): no thread-locals, no
 //! callbacks into Crag code from the runtime stack, panics abort in images
@@ -42,6 +43,7 @@ compile_error!("the runtime is written for x86-64 Linux only: its context switch
 #[macro_use]
 mod system;
 
+mod cancel;
 pub mod codec;
 mod deque;
 pub mod fiber;
@@ -55,6 +57,7 @@ pub mod print;
 pub mod rc;
 mod reactor;
 pub mod sched;
+mod scope;
 pub mod sentinel;
 pub mod side_stack;
 pub mod stack;
@@ -65,6 +68,7 @@ pub mod text;
 pub mod timer;
 pub mod unwind;
 
+pub use cancel::CancelHandle;
 pub use codec::{DecodeError, NotSolid, decode_value, encode_value};
 pub use fiber::{Fiber, FiberConfig, FiberState, TaskContext, Worker};
 pub use heap::{Heap, alloc_box};
@@ -102,6 +106,14 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::IoWrite => io::rt_io_write as *const () as usize,
         RuntimeFn::IoAccept => io::rt_io_accept as *const () as usize,
         RuntimeFn::IoConnect => io::rt_io_connect as *const () as usize,
+        RuntimeFn::ScopeNew => scope::rt_scope_new as *const () as usize,
+        RuntimeFn::ScopeStart => scope::rt_scope_start as *const () as usize,
+        RuntimeFn::ScopeNext => scope::rt_scope_next as *const () as usize,
+        RuntimeFn::ScopeResult => scope::rt_scope_result as *const () as usize,
+        RuntimeFn::ScopeCancel => scope::rt_scope_cancel as *const () as usize,
+        RuntimeFn::ScopeEnd => scope::rt_scope_end as *const () as usize,
+        RuntimeFn::EnterNoCancel => cancel::rt_enter_no_cancel as *const () as usize,
+        RuntimeFn::ExitNoCancel => cancel::rt_exit_no_cancel as *const () as usize,
     }
 }
 

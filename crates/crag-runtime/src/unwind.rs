@@ -24,7 +24,8 @@
 //! records the trap and ends the fiber.
 //!
 //! Crag has no trap handlers yet (Specification §8.3), so a trap always ends
-//! its task.
+//! its task. Cancellation ends a task the same way, with a `Cancelled` trap
+//! (§11.7.4).
 
 use std::sync::atomic::Ordering;
 
@@ -43,6 +44,9 @@ pub struct CodeMap {
     safepoints: Vec<(usize, Box<[u32]>)>,
     /// The start and end of each function's code, sorted.
     functions: Vec<(usize, usize, FuncId)>,
+    /// The entry stubs a task of a scope starts in, which call a function
+    /// value's code with its environment: by the code's number of results.
+    task_entries: Option<[usize; 3]>,
 }
 
 impl CodeMap {
@@ -60,6 +64,20 @@ impl CodeMap {
             self.safepoints.push((ret, map.slots.clone().into()));
         }
         self.safepoints.sort_unstable_by_key(|s| s.0);
+    }
+
+    /// Gives the entry stubs of tasks: from `compile_entry_stub` with one
+    /// parameter and zero, one and two results.
+    ///
+    /// # Safety
+    ///
+    /// The stubs stay loaded while fibers run with this map.
+    pub unsafe fn set_task_entries(&mut self, stubs: [usize; 3]) {
+        self.task_entries = Some(stubs);
+    }
+
+    pub(crate) fn task_entries(&self) -> Option<[usize; 3]> {
+        self.task_entries
     }
 
     /// The function whose code holds `pc`.

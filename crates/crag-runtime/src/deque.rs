@@ -154,8 +154,8 @@ impl Deque {
         won.then_some(word)
     }
 
-    #[cfg(test)]
-    fn len(&self) -> usize {
+    /// How many words it holds, as far as thieves let it know.
+    pub fn len(&self) -> usize {
         let b = self.inner.bottom.load(Ordering::Relaxed);
         let t = self.inner.top.load(Ordering::Relaxed);
         (b - t).max(0) as usize

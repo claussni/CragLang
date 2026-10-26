@@ -263,7 +263,8 @@ pub enum RuntimeFn {
     /// of a run queue and continues when a worker picks it again
     /// (Implementation Plan §11.7.1). Like every runtime function that may
     /// suspend, it returns on the fiber stack it was called on, possibly
-    /// on another thread.
+    /// on another thread, and it is a point where a cancelled task traps
+    /// with `Cancelled` instead of returning (§11.7.4).
     Yield = 15,
 
     /// `rt_sleep(ctx, nanos)`.
@@ -302,11 +303,87 @@ pub enum RuntimeFn {
     /// `len` bytes at `addr`, suspending the fiber until the connection is
     /// made or fails.
     IoConnect = 20,
+
+    /// `rt_scope_new(ctx, limit) -> scope`.
+    ///
+    /// A scope for the tasks a combinator or group starts (Implementation
+    /// Plan §11.7.3): at most `limit` of them run at once, any number for
+    /// zero. The fiber that creates it is its parent; cancellation waits
+    /// until the scope ends (`ScopeEnd`). Traps with `Unsupported` on a
+    /// fiber that no scheduler runs.
+    ScopeNew = 21,
+
+    /// `rt_scope_start(ctx, scope, code, env, flags) -> index`.
+    ///
+    /// Starts a task of the scope that calls `code(ctx, env)`, the code and
+    /// environment of a function value, which it takes. The low two bits of
+    /// `flags` are the code's number of results; with [`START_EXEMPT`] the
+    /// task does not count towards the limit. Suspends while the limit is
+    /// reached. Gives the task's index, from zero in the order of starts.
+    /// The parent and the scope's own tasks may start tasks.
+    ScopeStart = 22,
+
+    /// `rt_scope_next(ctx, scope) -> (index, status)`.
+    ///
+    /// The next task of the scope to finish, as [`TASK_RETURNED`],
+    /// [`TASK_CANCELLED`] or [`TASK_TRAPPED`], suspending until one does;
+    /// [`SCOPE_DONE`] when every task has been given. A task that traps
+    /// cancels the others, and once all are given the scope ends and the
+    /// parent traps with its kind. Only the parent calls it; a cancelled
+    /// parent cancels the tasks and goes on giving them.
+    ScopeNext = 23,
+
+    /// `rt_scope_result(ctx, scope, index) -> (w0, w1)`.
+    ///
+    /// The results of a task that returned, taken once, with their
+    /// references.
+    ScopeResult = 24,
+
+    /// `rt_scope_cancel(ctx, scope)`.
+    ///
+    /// Cancels every task of the scope that has not finished, and the tasks
+    /// started later (Implementation Plan §11.7.4).
+    ScopeCancel = 25,
+
+    /// `rt_scope_end(ctx, scope)`.
+    ///
+    /// Frees a scope whose tasks have all been given. Traps with
+    /// `Cancelled` if the parent was cancelled meanwhile.
+    ScopeEnd = 26,
+
+    /// `rt_enter_no_cancel(ctx)`.
+    ///
+    /// Opens a region where cancellation waits (Specification §10.4):
+    /// atomic blocks, update and `ext` closures, foreign calls, drop and
+    /// dispose handlers. Regions nest.
+    EnterNoCancel = 27,
+
+    /// `rt_exit_no_cancel(ctx)`.
+    ///
+    /// Closes the innermost such region; when it was the last and the task
+    /// was cancelled meanwhile, traps with `Cancelled`.
+    ExitNoCancel = 28,
 }
+
+/// The flag of `rt_scope_start` for a task outside the scope's limit, such
+/// as the body of a group.
+pub const START_EXEMPT: u64 = 1 << 2;
+
+/// The index `rt_scope_next` gives once every task has been given.
+pub const SCOPE_DONE: u64 = u64::MAX;
+
+/// A task that returned: its results wait in the scope.
+pub const TASK_RETURNED: u64 = 0;
+
+/// A task that was cancelled.
+pub const TASK_CANCELLED: u64 = 1;
+
+/// A task that trapped.
+pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 21] = [
+    pub const ALL: [RuntimeFn; 29] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -328,6 +405,14 @@ impl RuntimeFn {
         RuntimeFn::IoWrite,
         RuntimeFn::IoAccept,
         RuntimeFn::IoConnect,
+        RuntimeFn::ScopeNew,
+        RuntimeFn::ScopeStart,
+        RuntimeFn::ScopeNext,
+        RuntimeFn::ScopeResult,
+        RuntimeFn::ScopeCancel,
+        RuntimeFn::ScopeEnd,
+        RuntimeFn::EnterNoCancel,
+        RuntimeFn::ExitNoCancel,
     ];
 
     /// The symbol the loader looks up.
@@ -354,6 +439,14 @@ impl RuntimeFn {
             RuntimeFn::IoWrite => "rt_io_write",
             RuntimeFn::IoAccept => "rt_io_accept",
             RuntimeFn::IoConnect => "rt_io_connect",
+            RuntimeFn::ScopeNew => "rt_scope_new",
+            RuntimeFn::ScopeStart => "rt_scope_start",
+            RuntimeFn::ScopeNext => "rt_scope_next",
+            RuntimeFn::ScopeResult => "rt_scope_result",
+            RuntimeFn::ScopeCancel => "rt_scope_cancel",
+            RuntimeFn::ScopeEnd => "rt_scope_end",
+            RuntimeFn::EnterNoCancel => "rt_enter_no_cancel",
+            RuntimeFn::ExitNoCancel => "rt_exit_no_cancel",
         }
     }
 
@@ -383,8 +476,9 @@ pub enum TrapKind {
     OutOfSteps = 7,
     /// Metered code used up its memory budget.
     OutOfMemory = 8,
-    /// The runtime's poll at a refill asked metered code to stop, as the
-    /// host does when an edit cancels a compile-time evaluation.
+    /// The task was cancelled (Specification §10.4), or the runtime's poll
+    /// at a refill asked metered code to stop, as the host does when an
+    /// edit cancels a compile-time evaluation.
     Cancelled = 9,
 }
 

@@ -63,6 +63,12 @@ macro_rules! system_stack_fn {
 /// fiber stack and returns into the worker instead of to its caller. When
 /// the fiber is woken and resumed, the switch frame continues it here, and
 /// the function returns the two words the waker left in the context.
+///
+/// Either way, when the context's `raise` word is set, by the Rust half or
+/// by whoever woke the fiber, the function traps instead of returning: it
+/// jumps to `rt_trap` with the stack as the call left it, as `rt_refuel`
+/// does, so the call's stack map releases what the caller holds. That is
+/// how a cancelled task stops at a suspension point (Plan §11.7.4).
 macro_rules! suspending_fn {
     (
         $(#[$meta:meta])*
@@ -88,6 +94,8 @@ macro_rules! suspending_fn {
                 "mov rsp, rbx",
                 "cmp qword ptr [r12 + {park}], 0",
                 "jne 3f",
+                "cmp qword ptr [r12 + {raise}], 0",
+                "jne 5f",
                 "pop r12",
                 "pop rbx",
                 "ret",
@@ -114,12 +122,26 @@ macro_rules! suspending_fn {
                 "ret",
                 // Woken: the switch restored the registers saved above.
                 "4:",
+                "cmp qword ptr [r12 + {raise}], 0",
+                "jne 5f",
                 "mov rax, [r12 + {wake0}]",
                 "mov rdx, [r12 + {wake1}]",
                 "pop r12",
                 "pop rbx",
                 "ret",
+                // Trap: the kind is one less than the word.
+                "5:",
+                "mov rdi, r12",
+                "mov rsi, [r12 + {raise}]",
+                "dec rsi",
+                "mov rdx, [r12 + {raise_position}]",
+                "pop r12",
+                "pop rbx",
+                "jmp {trap}",
                 worker = const std::mem::offset_of!($crate::fiber::TaskContext, worker),
+                raise = const std::mem::offset_of!($crate::fiber::TaskContext, raise),
+                raise_position = const std::mem::offset_of!($crate::fiber::TaskContext, raise_position),
+                trap = sym $crate::unwind::rt_trap,
                 park = const std::mem::offset_of!($crate::fiber::TaskContext, park),
                 saved_sp = const std::mem::offset_of!($crate::fiber::TaskContext, saved_sp),
                 wake0 = const std::mem::offset_of!($crate::fiber::TaskContext, wake_words),

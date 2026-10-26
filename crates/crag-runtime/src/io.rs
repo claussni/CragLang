@@ -24,16 +24,21 @@
 //! The file descriptors are non-blocking, as the library that opens them
 //! makes them; on a blocking one an operation blocks its worker. Regular
 //! files never block in that sense, so they are read and written at once.
+//!
+//! A cancelled task's call traps with `Cancelled` instead of starting the
+//! operation, and one that waits is called off and woken to trap
+//! (§11.7.4); a blocked thread finishes its wait first.
 
 use std::time::{Duration, Instant};
 
+use crate::cancel::{Waiting, stop_if_due, wait_for};
 use crate::fiber::TaskContext;
 use crate::reactor::{IoOp, IoResult};
 use crate::sched::{WaitReason, scheduler_of, suspend, wake};
 
 /// Two words in `rax` and `rdx`.
 #[repr(C)]
-pub(crate) struct Words(u64, u64);
+pub(crate) struct Words(pub(crate) u64, pub(crate) u64);
 
 suspending_fn! {
     /// `rt_sleep(ctx, nanos)`: see `crag_abi::RuntimeFn::Sleep`.
@@ -46,7 +51,8 @@ suspending_fn! {
 ///
 /// Called only by `rt_sleep`.
 unsafe extern "C" fn sleep_entry(ctx: *const TaskContext, nanos: u64) {
-    if nanos == 0 {
+    // SAFETY: as the caller promises.
+    if stop_if_due(unsafe { &*ctx }) || nanos == 0 {
         return;
     }
     let duration = Duration::from_nanos(nanos);
@@ -60,10 +66,12 @@ unsafe extern "C" fn sleep_entry(ctx: *const TaskContext, nanos: u64) {
         let ctx = &*ctx;
         let Some(shared) = scheduler_of(ctx) else {
             std::thread::sleep(duration);
+            stop_if_due(ctx);
             return;
         };
         let fiber = suspend(ctx, WaitReason::Sleep);
-        shared.reactor.sleep_until(deadline, fiber);
+        let id = shared.reactor.sleep_until(deadline, fiber);
+        wait_for(ctx, Waiting::Timer { shared, id });
     }
 }
 
@@ -76,18 +84,26 @@ unsafe extern "C" fn sleep_entry(ctx: *const TaskContext, nanos: u64) {
 /// the fiber continues.
 unsafe fn perform(ctx: *const TaskContext, op: IoOp) -> Words {
     let words = |[a, b]: IoResult| Words(a, b);
+    // SAFETY: as the caller promises.
+    let ctx = unsafe { &*ctx };
+    if stop_if_due(ctx) {
+        return Words(0, 0);
+    }
     if let Some(result) = op.attempt() {
         return words(result);
     }
     // SAFETY: as the caller promises.
     unsafe {
-        let ctx = &*ctx;
         let Some(shared) = scheduler_of(ctx) else {
             return words(op.block());
         };
         let fiber = suspend(ctx, WaitReason::Io);
-        if let Err((fiber, errno)) = shared.reactor.wait_io(op, fiber) {
-            wake(fiber, [0, errno]);
+        match shared.reactor.wait_io(op, fiber) {
+            Ok(token) => {
+                let fd = op.fd();
+                wait_for(ctx, Waiting::Io { shared, fd, token });
+            }
+            Err((fiber, errno)) => wake(fiber, [0, errno]),
         }
     }
     // The fiber suspends, and continues with the words of its wake.
@@ -175,6 +191,10 @@ unsafe extern "C" fn connect_entry(
     addr: *const u8,
     len: u64,
 ) -> Words {
+    // SAFETY: as the caller promises.
+    if stop_if_due(unsafe { &*ctx }) {
+        return Words(0, 0);
+    }
     let fd = fd as i32;
     // SAFETY: generated code passes a socket address of `len` bytes.
     let started = unsafe { libc::connect(fd, addr.cast(), len as libc::socklen_t) };

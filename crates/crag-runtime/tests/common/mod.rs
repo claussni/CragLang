@@ -101,20 +101,30 @@ impl Image {
         results: u32,
         config: FiberConfig,
     ) -> Box<Fiber> {
-        let key = (args.len(), results);
-        let stub = match self.stubs.get(&key) {
-            Some(&stub) => stub,
-            None => {
-                let stub = compile_entry_stub(args.len() as u32, results, &self.settings).unwrap();
-                let stub = load(&mut self.arena, &self.symbols, &stub).unwrap().addr();
-                self.stubs.insert(key, stub);
-                stub
-            }
-        };
+        let stub = self.stub(args.len(), results);
         // SAFETY: the stub was compiled for this argument count and number
         // of results, which the caller promises the function has, and the
         // image outlives the fiber in each test.
         unsafe { Fiber::new(stub, self.functions[func], args, config).unwrap() }
+    }
+
+    /// The loaded entry stub for `params` arguments and `results` results.
+    fn stub(&mut self, params: usize, results: u32) -> usize {
+        let key = (params, results);
+        if let Some(&stub) = self.stubs.get(&key) {
+            return stub;
+        }
+        let stub = compile_entry_stub(params as u32, results, &self.settings).unwrap();
+        let stub = load(&mut self.arena, &self.symbols, &stub).unwrap().addr();
+        self.stubs.insert(key, stub);
+        stub
+    }
+
+    /// Gives the code map the entry stubs that tasks of scopes start in.
+    pub fn with_task_entries(&mut self) {
+        let stubs = [0, 1, 2].map(|results| self.stub(1, results));
+        // SAFETY: the stubs stay loaded as long as the image.
+        unsafe { self.code.set_task_entries(stubs) };
     }
 }
 

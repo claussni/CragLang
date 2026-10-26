@@ -28,7 +28,9 @@
 //!
 //! The reactor thread waits on the poller until the wheel's next deadline.
 //! A timer that comes before it notifies the poller, so the thread waits
-//! anew.
+//! anew. A cancelled task's sleep or operation is called off: taken out of
+//! the wheel or its descriptor's waits, which gives its fiber back
+//! (§11.7.4).
 
 use std::collections::HashMap;
 use std::io;
@@ -39,7 +41,7 @@ use std::time::Instant;
 
 use crate::poll::{Event, Interest, Poller};
 use crate::sched::{FiberRef, wake};
-use crate::timer::TimerWheel;
+use crate::timer::{TimerId, TimerWheel};
 
 /// An I/O operation a fiber waits to complete. Its result is two words,
 /// what the operation gives and zero, or zero and the error number.
@@ -195,6 +197,8 @@ fn connected(fd: RawFd) -> Option<IoResult> {
 struct Wait {
     op: IoOp,
     fiber: FiberRef,
+    /// Tells the wait from the others, for a cancellation to call it off.
+    token: u64,
 }
 
 struct State {
@@ -204,6 +208,8 @@ struct State {
     /// The deadline the reactor thread waits until; none when it waits
     /// for I/O alone.
     waiting_until: Option<Instant>,
+    /// The token of the next I/O wait.
+    next_token: u64,
 }
 
 /// Timers and I/O waits, and the poller that watches the latter.
@@ -221,15 +227,16 @@ impl Reactor {
                 timers: TimerWheel::new(Instant::now()),
                 fds: HashMap::new(),
                 waiting_until: None,
+                next_token: 0,
             }),
             shutdown: AtomicBool::new(false),
         })
     }
 
     /// Wakes `fiber` once the time reaches `deadline`.
-    pub(crate) fn sleep_until(&self, deadline: Instant, fiber: FiberRef) {
+    pub(crate) fn sleep_until(&self, deadline: Instant, fiber: FiberRef) -> TimerId {
         let mut state = self.state.lock().unwrap();
-        state.timers.add(deadline, fiber);
+        let id = state.timers.add(deadline, fiber);
         if let Some(next) = state.timers.next_deadline()
             && state.waiting_until.is_none_or(|until| next < until)
         {
@@ -237,12 +244,19 @@ impl Reactor {
             state.waiting_until = Some(next);
             self.poller.notify();
         }
+        id
     }
 
-    /// Wakes `fiber` with the result of `op` once it goes through. Gives
-    /// the fiber back with the error number when the poller refuses the
-    /// file descriptor.
-    pub(crate) fn wait_io(&self, op: IoOp, fiber: FiberRef) -> Result<(), (FiberRef, u64)> {
+    /// Calls off a sleep that has not ended: gives its fiber back. The
+    /// thread may wake for the deadline all the same, and finds nothing.
+    pub(crate) fn cancel_sleep(&self, id: TimerId) -> Option<FiberRef> {
+        self.state.lock().unwrap().timers.cancel(id)
+    }
+
+    /// Wakes `fiber` with the result of `op` once it goes through, and
+    /// gives the wait's token. Gives the fiber back with the error number
+    /// when the poller refuses the file descriptor.
+    pub(crate) fn wait_io(&self, op: IoOp, fiber: FiberRef) -> Result<u64, (FiberRef, u64)> {
         let fd = op.fd();
         let mut state = self.state.lock().unwrap();
         let waits = state.fds.entry(fd).or_default();
@@ -257,12 +271,35 @@ impl Reactor {
             let errno = error.raw_os_error().unwrap_or(libc::EIO);
             return Err((fiber, errno as u64));
         }
+        let token = state.next_token;
+        state.next_token += 1;
         state
             .fds
             .get_mut(&fd)
             .expect("entered")
-            .push(Wait { op, fiber });
-        Ok(())
+            .push(Wait { op, fiber, token });
+        Ok(token)
+    }
+
+    /// Calls off an I/O wait that has not ended: gives its fiber back, and
+    /// narrows the registration to what the other waits need.
+    pub(crate) fn cancel_io(&self, fd: RawFd, token: u64) -> Option<FiberRef> {
+        let mut state = self.state.lock().unwrap();
+        let waits = state.fds.get_mut(&fd)?;
+        let i = waits.iter().position(|w| w.token == token)?;
+        let wait = waits.remove(i);
+        let interest = waits
+            .iter()
+            .fold(Interest::default(), |i, w| i.union(w.op.interest()));
+        if interest.is_empty() {
+            state.fds.remove(&fd);
+            self.poller.remove(fd);
+        } else {
+            // A descriptor closed meanwhile fails, and its other waits
+            // learn it from their next event.
+            let _ = self.poller.set(fd, interest, true);
+        }
+        Some(wait.fiber)
     }
 
     /// The reactor thread: waits for the poller and the timers, and wakes

@@ -25,17 +25,19 @@
 use std::collections::VecDeque;
 use std::io;
 use std::mem::offset_of;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crag_abi::{
     FUEL_OFFSET, HEAP_OFFSET, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET, STACK_MARGIN,
 };
 
+use crate::cancel::Waiting;
 use crate::heap::Heap;
 use crate::meter::{Meter, Metering};
 use crate::rc::Types;
 use crate::sched::{Local, PARK_NONE, WaitReason, settle};
+use crate::scope::Member;
 use crate::side_stack::SideStack;
 use crate::stack::StackMemory;
 use crate::unwind::{CodeMap, Trap};
@@ -78,6 +80,19 @@ pub struct TaskContext {
     /// The words a suspending runtime function returns when the fiber is
     /// woken, which the waker leaves here.
     pub(crate) wake_words: [AtomicU64; 2],
+    /// Not zero once the task is cancelled (Plan §11.7.4).
+    pub(crate) cancel: AtomicUsize,
+    /// How many regions where cancellation waits the fiber is in. Only the
+    /// fiber itself changes it.
+    pub(crate) no_cancel: AtomicUsize,
+    /// One more than the kind of the trap a suspending runtime function
+    /// raises instead of returning, zero for none, and the trap's source
+    /// position.
+    pub(crate) raise: AtomicU64,
+    pub(crate) raise_position: AtomicU64,
+    /// What the suspended fiber waits for, as far as a cancellation can
+    /// call it off or must pass it on.
+    pub(crate) waiting: Mutex<Option<Waiting>>,
 }
 
 const _: () = assert!(offset_of!(TaskContext, stack_limit) == STACK_LIMIT_OFFSET as usize);
@@ -173,6 +188,8 @@ pub struct Fiber {
     pub(crate) metering: Option<Metering>,
     /// What it waits for while it is suspended.
     pub(crate) wait: WaitReason,
+    /// The scope it is a task of, if a scope started it.
+    pub(crate) task: Option<Member>,
 }
 
 impl Fiber {
@@ -210,6 +227,11 @@ impl Fiber {
             fiber: AtomicPtr::new(std::ptr::null_mut()),
             park: AtomicUsize::new(0),
             wake_words: [AtomicU64::new(0), AtomicU64::new(0)],
+            cancel: AtomicUsize::new(0),
+            no_cancel: AtomicUsize::new(0),
+            raise: AtomicU64::new(0),
+            raise_position: AtomicU64::new(0),
+            waiting: Mutex::new(None),
         });
 
         // The first switch into the fiber pops six registers and returns, so
@@ -254,6 +276,7 @@ impl Fiber {
             trap: None,
             metering: None,
             wait: WaitReason::Yield,
+            task: None,
         }))
     }
 
