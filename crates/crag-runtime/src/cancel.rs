@@ -23,7 +23,8 @@
 //! waits for is called off and the fiber woken, and the suspending runtime
 //! function traps instead of returning. Each such function also traps when
 //! it is called on a cancelled task, so every suspension point is a stop:
-//! sleeps, I/O and starts under a scope's limit.
+//! sleeps, I/O, starts under a scope's limit, and puts and takes of
+//! streams (§11.7.5).
 //!
 //! Inside a region where cancellation waits, `no_cancel` counts the depth,
 //! and the stack checks and waits go on; leaving the last region traps.
@@ -43,6 +44,7 @@ use crate::fiber::{Fiber, TaskContext};
 use crate::sched::{Shared, wake};
 use crate::scope::Scope;
 use crate::sentinel::{StopReason, request};
+use crate::stream::Channel;
 use crate::timer::TimerId;
 
 /// What a suspended fiber waits for, as a cancellation sees it.
@@ -61,6 +63,9 @@ pub(crate) enum Waiting {
     /// The tasks of a scope the fiber is the parent of: not called off,
     /// but cancelled in turn.
     Tasks(Arc<Scope>),
+    /// A put or a take of a stream or a hub, told from the others by its
+    /// token.
+    Stream { chan: Arc<Channel>, token: u64 },
 }
 
 /// Cancels a task from any thread.
@@ -150,6 +155,7 @@ fn call_off(ctx: &TaskContext) {
         Some(Waiting::Timer { shared, id }) => shared.reactor.cancel_sleep(id),
         Some(Waiting::Io { shared, fd, token }) => shared.reactor.cancel_io(fd, token),
         Some(Waiting::Start { scope, index }) => scope.call_off_start(index),
+        Some(Waiting::Stream { chan, token }) => chan.call_off(token),
         Some(Waiting::Tasks(_)) | None => None,
     };
     if let Some(fiber) = fiber {

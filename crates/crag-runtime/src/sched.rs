@@ -73,6 +73,9 @@ pub enum WaitReason {
     Start,
     /// The next task of a scope to finish.
     Tasks,
+    /// Room in a stream or a hub to put a value, or a value to take
+    /// (§11.7.5).
+    Stream,
 }
 
 /// How a scheduler runs.

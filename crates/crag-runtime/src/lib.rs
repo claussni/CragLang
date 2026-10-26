@@ -22,7 +22,7 @@
 //! counting, lists and maps, and traps (§11.4.11 to §11.4.14). M3 adds the
 //! metered tier's budgets (§11.6.6), and strings and bytes (§11.6.9). M4
 //! adds the scheduler (§11.7.1), the poller and timers (§11.7.2), scopes
-//! (§11.7.3), and cancellation (§11.7.4).
+//! (§11.7.3), cancellation (§11.7.4), and streams and hubs (§11.7.5).
 //!
 //! Runtime discipline (Compiler Architecture §2.1): no thread-locals, no
 //! callbacks into Crag code from the runtime stack, panics abort in images
@@ -61,6 +61,7 @@ mod scope;
 pub mod sentinel;
 pub mod side_stack;
 pub mod stack;
+mod stream;
 pub mod stress;
 #[cfg(test)]
 mod testing;
@@ -114,6 +115,18 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::ScopeEnd => scope::rt_scope_end as *const () as usize,
         RuntimeFn::EnterNoCancel => cancel::rt_enter_no_cancel as *const () as usize,
         RuntimeFn::ExitNoCancel => cancel::rt_exit_no_cancel as *const () as usize,
+        RuntimeFn::StreamNew => stream::rt_stream_new as *const () as usize,
+        RuntimeFn::StreamPut => stream::rt_stream_put as *const () as usize,
+        RuntimeFn::StreamTryPut => stream::rt_stream_try_put as *const () as usize,
+        RuntimeFn::StreamNext => stream::rt_stream_next as *const () as usize,
+        RuntimeFn::StreamClose => stream::rt_stream_close as *const () as usize,
+        RuntimeFn::StreamDispose => stream::rt_stream_dispose as *const () as usize,
+        RuntimeFn::HubNew => stream::rt_hub_new as *const () as usize,
+        RuntimeFn::HubSink => stream::rt_hub_sink as *const () as usize,
+        RuntimeFn::HubSource => stream::rt_hub_source as *const () as usize,
+        RuntimeFn::HubSeal => stream::rt_hub_seal as *const () as usize,
+        RuntimeFn::HubRelease => stream::rt_hub_release as *const () as usize,
+        RuntimeFn::HubDrop => stream::rt_hub_drop as *const () as usize,
     }
 }
 

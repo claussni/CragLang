@@ -363,7 +363,102 @@ pub enum RuntimeFn {
     /// Closes the innermost such region; when it was the last and the task
     /// was cancelled meanwhile, traps with `Cancelled`.
     ExitNoCancel = 28,
+
+    /// `rt_stream_new(ctx, capacity, list) -> (sink, source)`.
+    ///
+    /// A stream with a buffer of `capacity` values, zero for a hand-off
+    /// (Specification §10.5), and its two ends. Its values are laid out as
+    /// the elements of the list type with index `list`, which the runtime
+    /// needs to release those left in the buffer (Implementation Plan
+    /// §11.7.5). Each end is closed at most once and disposed exactly once.
+    StreamNew = 29,
+
+    /// `rt_stream_put(ctx, sink, w0, w1) -> status`.
+    ///
+    /// Puts a value, suspending while the buffer is full: [`STREAM_OK`]
+    /// once it is sent, else [`STREAM_CLOSED`] or [`STREAM_ABANDONED`].
+    /// The value's references go with it only when it is sent. Cancellation
+    /// takes effect here (§11.7.4).
+    StreamPut = 30,
+
+    /// `rt_stream_try_put(ctx, sink, w0, w1) -> status`.
+    ///
+    /// As `StreamPut`, but [`STREAM_FULL`] instead of waiting.
+    StreamTryPut = 31,
+
+    /// `rt_stream_next(ctx, source, out) -> status`.
+    ///
+    /// Takes the next value, suspending while there is none: [`STREAM_OK`]
+    /// with the value's words, and references, at `out`, else
+    /// [`STREAM_CLOSED`] or [`STREAM_ABANDONED`] once the producers are
+    /// gone and the buffer is empty. `out` must stay where it is until the
+    /// call returns. Cancellation takes effect here.
+    StreamNext = 32,
+
+    /// `rt_stream_close(ctx, end)`.
+    ///
+    /// Ends a stream deliberately from either end, or leaves a hub: the
+    /// other side reads `Closed` (Specification §10.5.2).
+    StreamClose = 33,
+
+    /// `rt_stream_dispose(ctx, end)`.
+    ///
+    /// Frees an end. One that was not closed is abandoned: the other side
+    /// reads `Abandoned`.
+    StreamDispose = 34,
+
+    /// `rt_hub_new(ctx, capacity, list, kind) -> hub`.
+    ///
+    /// A hub of [`HUB_FAN_OUT`] or [`HUB_BROADCAST`], with values laid out
+    /// as for `StreamNew` (Specification §10.6). Its ends are those of
+    /// streams.
+    HubNew = 35,
+
+    /// `rt_hub_sink(ctx, hub) -> sink`.
+    ///
+    /// Joins as a producer; after `HubSeal` the sink starts closed.
+    HubSink = 36,
+
+    /// `rt_hub_source(ctx, hub) -> source`.
+    ///
+    /// Joins as a consumer, from the values put from now on.
+    HubSource = 37,
+
+    /// `rt_hub_seal(ctx, hub)`.
+    ///
+    /// Admits no further producers: once every producer has left, the
+    /// consumers read `Closed`, or `Abandoned` if one left without closing.
+    HubSeal = 38,
+
+    /// `rt_hub_release(ctx, hub, n)`.
+    ///
+    /// Makes `n` consumers of a fan-out read `Closed`: those waiting now,
+    /// and the rest at their next `StreamNext`.
+    HubRelease = 39,
+
+    /// `rt_hub_drop(ctx, hub)`.
+    ///
+    /// Gives up the hub's handle, which seals it.
+    HubDrop = 40,
 }
+
+/// A status of the stream functions: sent, or a value taken.
+pub const STREAM_OK: u64 = 0;
+
+/// `rt_stream_try_put` found the buffer full.
+pub const STREAM_FULL: u64 = 1;
+
+/// The other side closed the stream, or this end was closed.
+pub const STREAM_CLOSED: u64 = 2;
+
+/// The other side went without closing.
+pub const STREAM_ABANDONED: u64 = 3;
+
+/// A hub that hands each value to one consumer.
+pub const HUB_FAN_OUT: u64 = 0;
+
+/// A hub that hands each value to every consumer.
+pub const HUB_BROADCAST: u64 = 1;
 
 /// The flag of `rt_scope_start` for a task outside the scope's limit, such
 /// as the body of a group.
@@ -383,7 +478,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 29] = [
+    pub const ALL: [RuntimeFn; 41] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -413,6 +508,18 @@ impl RuntimeFn {
         RuntimeFn::ScopeEnd,
         RuntimeFn::EnterNoCancel,
         RuntimeFn::ExitNoCancel,
+        RuntimeFn::StreamNew,
+        RuntimeFn::StreamPut,
+        RuntimeFn::StreamTryPut,
+        RuntimeFn::StreamNext,
+        RuntimeFn::StreamClose,
+        RuntimeFn::StreamDispose,
+        RuntimeFn::HubNew,
+        RuntimeFn::HubSink,
+        RuntimeFn::HubSource,
+        RuntimeFn::HubSeal,
+        RuntimeFn::HubRelease,
+        RuntimeFn::HubDrop,
     ];
 
     /// The symbol the loader looks up.
@@ -447,6 +554,18 @@ impl RuntimeFn {
             RuntimeFn::ScopeEnd => "rt_scope_end",
             RuntimeFn::EnterNoCancel => "rt_enter_no_cancel",
             RuntimeFn::ExitNoCancel => "rt_exit_no_cancel",
+            RuntimeFn::StreamNew => "rt_stream_new",
+            RuntimeFn::StreamPut => "rt_stream_put",
+            RuntimeFn::StreamTryPut => "rt_stream_try_put",
+            RuntimeFn::StreamNext => "rt_stream_next",
+            RuntimeFn::StreamClose => "rt_stream_close",
+            RuntimeFn::StreamDispose => "rt_stream_dispose",
+            RuntimeFn::HubNew => "rt_hub_new",
+            RuntimeFn::HubSink => "rt_hub_sink",
+            RuntimeFn::HubSource => "rt_hub_source",
+            RuntimeFn::HubSeal => "rt_hub_seal",
+            RuntimeFn::HubRelease => "rt_hub_release",
+            RuntimeFn::HubDrop => "rt_hub_drop",
         }
     }
 

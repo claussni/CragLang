@@ -202,12 +202,22 @@ impl CellTable {
 
 /// What relocations resolve against: the runtime functions, the loaded
 /// Crag functions, their slots and the cells of values.
-#[derive(Default)]
 pub struct SymbolTable {
     runtime: [Option<usize>; RuntimeFn::ALL.len()],
     functions: HashMap<FuncId, CodeAddr>,
     slots: SlotTable,
     cells: CellTable,
+}
+
+impl Default for SymbolTable {
+    fn default() -> SymbolTable {
+        SymbolTable {
+            runtime: [None; RuntimeFn::ALL.len()],
+            functions: HashMap::default(),
+            slots: SlotTable::default(),
+            cells: CellTable::default(),
+        }
+    }
 }
 
 impl SymbolTable {
