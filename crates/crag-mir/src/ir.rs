@@ -295,15 +295,27 @@ pub enum Intrinsic {
     ScopeResult,
     ScopeCancel,
     ScopeEnd,
+    /// A new `ext` holding the value, an `Ext[T]` (Specification §9.6).
+    ExtNew,
+    /// Takes the lock of the `ext`, suspending while another task holds
+    /// it, and opens a region where cancellation waits.
+    ExtLock,
+    /// Gives the lock up and closes the region.
+    ExtUnlock,
+    /// The value of the `ext`, borrowed from it, which only its lock's
+    /// holder reads.
+    ExtValue,
+    /// Places the value in the `ext`, giving up the one it held.
+    ExtStore,
 }
 
 impl Intrinsic {
     /// Whether the operation consumes its operand at `index`.
     pub fn consumes(self, index: usize) -> bool {
         match self {
-            Intrinsic::RefNew => index == 0,
             Intrinsic::RefCommit => index == 2,
-            Intrinsic::RefSwap | Intrinsic::ScopeStart => index == 1,
+            Intrinsic::RefSwap | Intrinsic::ScopeStart | Intrinsic::ExtStore => index == 1,
+            Intrinsic::RefNew | Intrinsic::ExtNew => index == 0,
             _ => false,
         }
     }

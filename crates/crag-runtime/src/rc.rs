@@ -197,6 +197,7 @@ pub(crate) unsafe fn boxes_in(base: *mut u8, fields: &[CountedField], mut f: imp
                         f(at.add(1).cast::<*mut u8>().read());
                     }
                 }
+                CountedField::Ext(_) => {}
             }
         }
     }
@@ -314,7 +315,14 @@ pub(crate) unsafe fn free_chain(
                     dispose(heap, ptr);
                     continue;
                 }
-                TypeDescriptor::Record { counted, .. } => boxes_in(ptr, counted, &mut dead),
+                TypeDescriptor::Record { counted, .. } => {
+                    boxes_in(ptr, counted, &mut dead);
+                    for field in counted {
+                        if let CountedField::Ext(at) = field {
+                            crate::ext::free(ptr.add(*at as usize).cast::<u64>().read());
+                        }
+                    }
+                }
                 TypeDescriptor::List { element } => list::boxes_of(ptr, kind, element, &mut dead),
                 TypeDescriptor::Map { key, value, .. } => {
                     map::boxes_of(ptr, kind, key, value, &mut dead)

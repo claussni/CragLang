@@ -746,7 +746,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         }
         let sig = self.instance_signature(instance);
         let first = sig.params.first()?.ty;
-        if !matches!(first.as_builtin(db), Some((Builtin::Ref, _))) {
+        if !matches!(first.as_builtin(db), Some((Builtin::Ref | Builtin::Ext, _))) {
             return None;
         }
         Some(
@@ -773,7 +773,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let db = self.db;
         let sig = self.instance_signature(instance);
         let cell_ty = sig.params[0].ty;
-        let Some((Builtin::Ref, &[ty])) = cell_ty.as_builtin(db) else {
+        let Some((builtin @ (Builtin::Ref | Builtin::Ext), &[ty])) = cell_ty.as_builtin(db) else {
             return self.trap(TrapKind::Error, Some(expr));
         };
         if positional.len() != sig.params.len() {
@@ -781,6 +781,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         }
         let cell = self.expr(positional[0]);
         let cell = Operand::Local(self.materialize(cell, cell_ty));
+        if builtin == Builtin::Ext {
+            return self.ext_access(expr, access, cell, ty, positional);
+        }
         match access {
             Access::Get => self.ref_get(cell, ty),
             Access::Use => {
@@ -964,6 +967,126 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 b: Operand::Const(Constant::Int(0)),
             },
         )
+    }
+
+    /// A call of an access function of an `ext`: its closure runs once,
+    /// while the task holds the lock (§9.6).
+    fn ext_access(
+        &mut self,
+        expr: ExprId,
+        access: Access,
+        cell: Operand<'db>,
+        ty: Ty<'db>,
+        positional: &[ExprId],
+    ) -> Operand<'db> {
+        let (db, program) = (self.db, self.program);
+        let unit = Ty::unit(db);
+        let call = |b: &mut Self, f: Operand<'db>, result: Ty<'db>, arg: Operand<'db>| {
+            let dst = b.temp(result);
+            let target = b.new_block();
+            b.terminate(Terminator::CallValue {
+                callee: f,
+                args: vec![arg],
+                dst,
+                target,
+                site: expr,
+                unwind: None,
+            });
+            b.switch_to(target);
+            dst
+        };
+        let closure = |b: &mut Self| {
+            let f = b.expr(positional[1]);
+            let f_ty = b.ty(positional[1]);
+            let result = match f_ty.kind(db) {
+                TyKind::Fn { result, .. } => Some(*result),
+                _ => None,
+            };
+            (b.typed(f, f_ty), result)
+        };
+        self.assign(
+            unit,
+            Rvalue::Intrinsic(Intrinsic::ExtLock, vec![cell.clone()]),
+        );
+        let value = |b: &mut Self| {
+            b.assign(
+                ty,
+                Rvalue::Intrinsic(Intrinsic::ExtValue, vec![cell.clone()]),
+            )
+        };
+        let result = match access {
+            Access::Get => value(self),
+            Access::Use => {
+                let (f, result) = closure(self);
+                let Some(result) = result else {
+                    return self.trap(TrapKind::Error, Some(expr));
+                };
+                let v = value(self);
+                Operand::Local(call(self, f, result, v))
+            }
+            Access::Swap | Access::Empty => {
+                let new = match access {
+                    Access::Swap => {
+                        let new = self.expr(positional[1]);
+                        self.coerce(new, self.ty(positional[1]), ty)
+                    }
+                    _ => {
+                        let empty_item = prelude_item(db, program, "Empty");
+                        let Some(empty) = ty.members(db).into_iter().find(|m| {
+                            matches!(m.kind(db), TyKind::Named(item, _) if Some(*item) == empty_item)
+                        }) else {
+                            return self.trap(TrapKind::Error, Some(expr));
+                        };
+                        self.coerce(Operand::Const(Constant::Tag(empty)), empty, ty)
+                    }
+                };
+                let old = value(self);
+                self.assign(
+                    unit,
+                    Rvalue::Intrinsic(Intrinsic::ExtStore, vec![cell.clone(), new]),
+                );
+                old
+            }
+            Access::Update => {
+                let (f, result) = closure(self);
+                let Some(result_ty) = result else {
+                    return self.trap(TrapKind::Error, Some(expr));
+                };
+                let out = self.temp(self.ty(expr));
+                let v = value(self);
+                let new = call(self, f, result_ty, v);
+                let join = self.new_block();
+                let errors = crag_types::error_members(db, program, result_ty);
+                if !errors.is_never(db) {
+                    let (failed, fits) = (self.new_block(), self.new_block());
+                    let cases = errors
+                        .members(db)
+                        .into_iter()
+                        .map(|m| (m, failed))
+                        .collect();
+                    self.terminate(Terminator::Switch {
+                        place: Place::local(new),
+                        cases,
+                        otherwise: fits,
+                    });
+                    self.switch_to(failed);
+                    self.assign_to(out, Operand::Local(new), result_ty);
+                    self.terminate(Terminator::Jump(join));
+                    self.switch_to(fits);
+                }
+                let new = self.coerce(Operand::Local(new), result_ty, ty);
+                self.assign(
+                    unit,
+                    Rvalue::Intrinsic(Intrinsic::ExtStore, vec![cell.clone(), new]),
+                );
+                self.assign_to(out, self.unit(), unit);
+                self.terminate(Terminator::Jump(join));
+                self.switch_to(join);
+                Operand::Local(out)
+            }
+        };
+        self.assign(unit, Rvalue::Intrinsic(Intrinsic::ExtUnlock, vec![cell]));
+        result
     }
 
     /// The current value of a ref cell, with a reference of its own.
@@ -1230,12 +1353,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let (captures, env) = self.environment(frame, own);
         let mut ops = Vec::new();
         for &binding in &captures {
-            match self.body.binding(binding).kind {
-                // A closure reads a `var` as it is when it runs, which
-                // needs the variable on the side stack.
-                BindingKind::Var => return self.unsupported(frame, "closures capturing a `var`"),
-                BindingKind::Ext => return self.unsupported(frame, "`ext` bindings"),
-                _ => {}
+            // A closure reads a `var` as it is when it runs, which needs
+            // the variable on the side stack.
+            if self.body.binding(binding).kind == BindingKind::Var {
+                return self.unsupported(frame, "closures capturing a `var`");
             }
             ops.push(Operand::Local(self.binding(binding)));
         }
@@ -2801,21 +2922,23 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         let op = self.expr(*value);
                         self.assign_to(local, op, self.ty(*value));
                     }
-                    BindingKind::Ref => {
+                    kind @ (BindingKind::Ref | BindingKind::Ext) => {
                         let cell = self.locals[local.index()].ty;
-                        let Some((Builtin::Ref, &[ty])) = cell.as_builtin(self.db) else {
+                        let Some((Builtin::Ref | Builtin::Ext, &[ty])) = cell.as_builtin(self.db)
+                        else {
                             self.trap(TrapKind::Error, Some(*value));
                             return;
                         };
                         let op = self.expr(*value);
                         let op = self.coerce(op, self.ty(*value), ty);
-                        self.push(Statement::Assign(
-                            local,
-                            Rvalue::Intrinsic(Intrinsic::RefNew, vec![op]),
-                        ));
+                        let new = match kind {
+                            BindingKind::Ref => Intrinsic::RefNew,
+                            _ => Intrinsic::ExtNew,
+                        };
+                        self.push(Statement::Assign(local, Rvalue::Intrinsic(new, vec![op])));
                     }
                     _ => {
-                        self.unsupported(*value, "`ext` bindings");
+                        self.trap(TrapKind::Error, Some(*value));
                     }
                 }
             }

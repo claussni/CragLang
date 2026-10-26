@@ -977,6 +977,10 @@ pub enum CountedField {
     /// A union at this offset: its type index, then its payload, which is a
     /// box pointer when the index is one of `boxed`, sorted.
     Union { offset: u32, boxed: Vec<u32> },
+    /// The lock of an `ext` binding at this offset, from `ExtNew`, which
+    /// the runtime frees with the box (Implementation Plan §11.7.14). No
+    /// reference: it is never counted.
+    Ext(u32),
 }
 
 /// The words of a value inside a collection: at most two, with the fields

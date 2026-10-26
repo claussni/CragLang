@@ -554,6 +554,10 @@ impl Writer {
                 w.u32(*offset);
                 w.seq(boxed, |w, b| w.u32(*b));
             }
+            CountedField::Ext(offset) => {
+                w.u8(2);
+                w.u32(*offset);
+            }
         });
     }
 }
@@ -781,6 +785,7 @@ impl Reader<'_> {
                     offset: r.u32()?,
                     boxed: r.seq(Reader::u32)?,
                 },
+                2 => CountedField::Ext(r.u32()?),
                 tag => return Err(invalid(format!("a counted field with the tag {tag}"))),
             })
         })

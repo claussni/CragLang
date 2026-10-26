@@ -201,6 +201,17 @@ system_stack_fn! {
 ///
 /// Called only by `rt_ext_free`, once, with a lock no fiber holds or
 /// waits for.
+/// Frees the lock of an `ext` box being freed, which no task holds or
+/// waits for any more.
+///
+/// # Safety
+///
+/// `ext` came from `rt_ext_new` and is freed once.
+pub(crate) unsafe fn free(ext: u64) {
+    // SAFETY: as the caller promises.
+    drop(unsafe { Arc::from_raw(ext as *const ExtLock) });
+}
+
 unsafe extern "C" fn free_entry(_ctx: *const TaskContext, ext: *const ExtLock) {
     // SAFETY: as the caller promises.
     drop(unsafe { Arc::from_raw(ext) });

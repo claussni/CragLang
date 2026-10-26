@@ -341,10 +341,11 @@ pub fn type_descriptor<'db>(
         Some((Builtin::Map, [key, value])) => return map(*key, Some(*value)),
         Some((Builtin::Set, [key])) => return map(*key, None),
         // A ref cell's box: the cell's version word, then the value laid
-        // out as in a collection (`crag_abi::REF_CELL_SIZE`).
-        Some((Builtin::Ref, [value])) => {
+        // out as in a collection (`crag_abi::REF_CELL_SIZE`); an `ext`'s:
+        // the lock, then the value.
+        Some((b @ (Builtin::Ref | Builtin::Ext), [value])) => {
             let base = HEADER_SIZE + 8;
-            let counted = element_layout(db, program, *value)?
+            let mut counted: Vec<CountedField> = element_layout(db, program, *value)?
                 .counted
                 .into_iter()
                 .map(|field| match field {
@@ -353,8 +354,12 @@ pub fn type_descriptor<'db>(
                         offset: base + offset,
                         boxed,
                     },
+                    CountedField::Ext(offset) => CountedField::Ext(base + offset),
                 })
                 .collect();
+            if b == Builtin::Ext {
+                counted.push(CountedField::Ext(HEADER_SIZE));
+            }
             return Some(TypeDescriptor::Record {
                 counted,
                 dispose: None,

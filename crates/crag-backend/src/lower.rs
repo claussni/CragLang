@@ -898,12 +898,20 @@ impl<'a, 'db> Lower<'a, 'db> {
         }
     }
 
-    /// The type of the value a ref cell of type `cell` holds.
+    /// The type of the value a ref cell or an `ext` of type `cell` holds.
     fn cell_value_ty(&self, cell: Ty<'db>) -> Result<Ty<'db>, Unsupported> {
         match cell.as_builtin(self.db) {
-            Some((Builtin::Ref, &[value])) => Ok(value),
+            Some((Builtin::Ref | Builtin::Ext, &[value])) => Ok(value),
             _ => Err("cells of this type"),
         }
+    }
+
+    /// The box a local of a `Ref` or an `Ext` holds.
+    fn box_of(&mut self, cell: &Operand<'db>) -> Result<VReg, Unsupported> {
+        let Operand::Local(local) = cell else {
+            return Err("cells of this type");
+        };
+        word(&self.locals[local.index()].clone())
     }
 
     /// The address of the cell in the box a local of a `Ref` holds.
@@ -999,6 +1007,81 @@ impl<'a, 'db> Lower<'a, 'db> {
                     RuntimeFn::RefCommit,
                     vec![cell, version, list, w0, w1],
                 )])
+            }
+            (Intrinsic::ExtNew, [value]) => {
+                let value_ty = self.cell_value_ty(ty)?;
+                self.describe(ty)?;
+                let words = self.operand(value, value_ty)?;
+                let ptr = self.alloc(HEADER_SIZE + 24, type_index(ty));
+                let lock = self.runtime(RuntimeFn::ExtNew, Vec::new());
+                let header = HEADER_SIZE as i32;
+                self.push(Inst::Store {
+                    src: lock,
+                    addr: ptr,
+                    offset: header,
+                });
+                for (k, src) in self.pad(words).into_iter().enumerate() {
+                    self.push(Inst::Store {
+                        src,
+                        addr: ptr,
+                        offset: header + 8 + 8 * k as i32,
+                    });
+                }
+                Ok(vec![ptr])
+            }
+            (Intrinsic::ExtLock | Intrinsic::ExtUnlock, [cell]) => {
+                let ptr = self.box_of(cell)?;
+                let lock = self.load(ptr, HEADER_SIZE as i32);
+                let (func, region) = match intrinsic {
+                    Intrinsic::ExtLock => (RuntimeFn::ExtLock, RuntimeFn::EnterNoCancel),
+                    _ => (RuntimeFn::ExtUnlock, RuntimeFn::ExitNoCancel),
+                };
+                // The lock is where a cancelled task stops; the closure
+                // runs where cancellation waits.
+                self.push(Inst::CallRuntime {
+                    func,
+                    args: vec![lock],
+                    dsts: Vec::new(),
+                });
+                self.push(Inst::CallRuntime {
+                    func: region,
+                    args: Vec::new(),
+                    dsts: Vec::new(),
+                });
+                Ok(Vec::new())
+            }
+            (Intrinsic::ExtValue, [cell]) => {
+                let ptr = self.box_of(cell)?;
+                let words = layout(self.db, self.program, ty)
+                    .ok_or("values of this type")?
+                    .words();
+                let at = HEADER_SIZE as i32 + 8;
+                Ok((0..words)
+                    .map(|k| self.load(ptr, at + 8 * k as i32))
+                    .collect())
+            }
+            (Intrinsic::ExtStore, [cell, value]) => {
+                let cell_ty = self.operand_ty(cell, ty);
+                let Some((Builtin::Ext, &[value_ty])) = cell_ty.as_builtin(self.db) else {
+                    return Err("cells of this type");
+                };
+                let value_layout = layout(self.db, self.program, value_ty);
+                let words = value_layout.ok_or("values of this type")?.words();
+                let ptr = self.box_of(cell)?;
+                let new = self.operand(value, value_ty)?;
+                let at = HEADER_SIZE as i32 + 8;
+                let old: Vec<VReg> = (0..words)
+                    .map(|k| self.load(ptr, at + 8 * k as i32))
+                    .collect();
+                for (k, &src) in new.iter().enumerate() {
+                    self.push(Inst::Store {
+                        src,
+                        addr: ptr,
+                        offset: at + 8 * k as i32,
+                    });
+                }
+                self.count_words(value_layout, value_ty, &old, Self::release)?;
+                Ok(Vec::new())
             }
             (Intrinsic::ScopeNew, [limit]) => {
                 let limit = word(&self.operand(limit, int)?)?;

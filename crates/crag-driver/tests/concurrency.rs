@@ -348,3 +348,31 @@ fn main() -> ExitCode {
         assert_eq!(code, 0, "{out}");
     }
 }
+
+#[test]
+fn ext_runs_each_closure_once_under_its_lock() {
+    let (code, out) = run(
+        "ext",
+        r#"import std.task
+
+fn main() -> ExitCode {
+  ext log = ""
+  ext n = 0
+  all(limit: 8) { g ->
+    for i in 1..50 {
+      g.start { -> n.update { v -> v + 1 } }
+    }
+  }
+  log.update { s -> "{s} and a text too long to be inline" }
+  let old = log.swap("short")
+  let k = n.use { v -> v * 2 }
+  if old == " and a text too long to be inline" and log.use() == "short" {
+    ExitCode(code: k - n.use())
+  } else {
+    ExitCode(code: 1)
+  }
+}
+"#,
+    );
+    assert_eq!(code, 50, "{out}");
+}
