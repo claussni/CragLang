@@ -68,8 +68,8 @@ impl Types {
         self.descriptors.get(index as usize)?.as_ref()
     }
 
-    /// The layout of the elements of list type `list`, which a stream
-    /// gives for the layout of its values.
+    /// The layout of the elements of list type `list`, which a stream or
+    /// a ref gives for the layout of its values.
     pub(crate) fn element_of(&self, list: u64) -> &ElementLayout {
         match u32::try_from(list).ok().and_then(|i| self.get(i)) {
             Some(TypeDescriptor::List { element }) => element,

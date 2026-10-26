@@ -440,6 +440,37 @@ pub enum RuntimeFn {
     ///
     /// Gives up the hub's handle, which seals it.
     HubDrop = 40,
+
+    /// `rt_ref_read(ctx, cell, out) -> version`.
+    ///
+    /// Reads the ref cell at `cell` (see [`REF_CELL_SIZE`]): its value's
+    /// two words to `out`, borrowed, and the version they belong to. The
+    /// task stays pinned until `RefCommit` or `RefDone`, so a value a
+    /// write replaces meanwhile is not released (Implementation Plan
+    /// §11.7.6). Nothing between may suspend.
+    RefRead = 41,
+
+    /// `rt_ref_commit(ctx, cell, version, list, w0, w1) -> status`.
+    ///
+    /// Ends an update begun by `RefRead`: [`REF_COMMITTED`] when the cell
+    /// still holds `version`, else [`REF_CONFLICT`] and the update must
+    /// rerun. The value is laid out as the elements of the list type with
+    /// index `list`. A committed value's references go to the cell; one
+    /// identical to the value read is not written and its references are
+    /// given up (Specification §9.3). Unpins the task.
+    RefCommit = 42,
+
+    /// `rt_ref_done(ctx)`.
+    ///
+    /// Ends a read that writes nothing, as `use` or an update whose closure
+    /// gave an error: unpins the task.
+    RefDone = 43,
+
+    /// `rt_ref_swap(ctx, cell, list, w0, w1) -> (w0, w1)`.
+    ///
+    /// Places a value, laid out as for `RefCommit`, with its references,
+    /// and gives the old one with references of its own.
+    RefSwap = 44,
 }
 
 /// A status of the stream functions: sent, or a value taken.
@@ -460,6 +491,17 @@ pub const HUB_FAN_OUT: u64 = 0;
 /// A hub that hands each value to every consumer.
 pub const HUB_BROADCAST: u64 = 1;
 
+/// The size of a ref cell, which generated code places on the side stack:
+/// a version word at offset 0, whose lowest bit is the lock, and the two
+/// words of the value at offsets 8 and 16. A new cell has version 0.
+pub const REF_CELL_SIZE: u64 = 24;
+
+/// A status of `rt_ref_commit`: the value was written, or was the one read.
+pub const REF_COMMITTED: u64 = 0;
+
+/// The cell changed since the read: the update reruns.
+pub const REF_CONFLICT: u64 = 1;
+
 /// The flag of `rt_scope_start` for a task outside the scope's limit, such
 /// as the body of a group.
 pub const START_EXEMPT: u64 = 1 << 2;
@@ -478,7 +520,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 41] = [
+    pub const ALL: [RuntimeFn; 45] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -520,6 +562,10 @@ impl RuntimeFn {
         RuntimeFn::HubSeal,
         RuntimeFn::HubRelease,
         RuntimeFn::HubDrop,
+        RuntimeFn::RefRead,
+        RuntimeFn::RefCommit,
+        RuntimeFn::RefDone,
+        RuntimeFn::RefSwap,
     ];
 
     /// The symbol the loader looks up.
@@ -566,6 +612,10 @@ impl RuntimeFn {
             RuntimeFn::HubSeal => "rt_hub_seal",
             RuntimeFn::HubRelease => "rt_hub_release",
             RuntimeFn::HubDrop => "rt_hub_drop",
+            RuntimeFn::RefRead => "rt_ref_read",
+            RuntimeFn::RefCommit => "rt_ref_commit",
+            RuntimeFn::RefDone => "rt_ref_done",
+            RuntimeFn::RefSwap => "rt_ref_swap",
         }
     }
 

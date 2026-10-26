@@ -93,6 +93,10 @@ pub struct TaskContext {
     /// What the suspended fiber waits for, as far as a cancellation can
     /// call it off or must pass it on.
     pub(crate) waiting: Mutex<Option<Waiting>>,
+    /// One more than the epoch the task is pinned to while it borrows a
+    /// ref's value, zero when it is not pinned (Plan §11.7.6). Only the
+    /// task's worker changes it.
+    pub(crate) pinned: AtomicU64,
 }
 
 const _: () = assert!(offset_of!(TaskContext, stack_limit) == STACK_LIMIT_OFFSET as usize);
@@ -232,6 +236,7 @@ impl Fiber {
             raise: AtomicU64::new(0),
             raise_position: AtomicU64::new(0),
             waiting: Mutex::new(None),
+            pinned: AtomicU64::new(0),
         });
 
         // The first switch into the fiber pops six registers and returns, so
@@ -429,6 +434,18 @@ impl Worker {
         unsafe { (&mut (*worker).heap, &*(*worker).types) }
     }
 
+    /// The heap and the type descriptors, shared.
+    ///
+    /// # Safety
+    ///
+    /// As for `heap_and_types`.
+    pub(crate) unsafe fn heap_and_shared_types<'a>(
+        worker: *mut Worker,
+    ) -> (&'a mut Heap, &'a Arc<Types>) {
+        // SAFETY: as the caller promises; the fields are disjoint.
+        unsafe { (&mut (*worker).heap, &(*worker).types) }
+    }
+
     /// Runs the fiber until it finishes or stops, and returns its new state:
     /// `Finished`, `Trapped`, `Paused`, `Runnable` after a preemption or
     /// when it was woken while it suspended, or `Waiting` when it suspended
@@ -472,7 +489,12 @@ impl Worker {
             (*ctx).worker.store(std::ptr::null_mut(), Ordering::Relaxed);
             (*ctx).heap.store(std::ptr::null_mut(), Ordering::Relaxed);
             (*ctx).fiber.store(std::ptr::null_mut(), Ordering::Relaxed);
-            match (*ctx).status.load(Ordering::Relaxed) {
+            let status = (*ctx).status.load(Ordering::Relaxed);
+            if status != 0 {
+                // A task that stops borrows no value any more.
+                crate::epoch::unpin(&*ctx, &mut (*worker).heap);
+            }
+            match status {
                 STATUS_FINISHED => (*fiber).state = FiberState::Finished,
                 STATUS_TRAPPED => (*fiber).state = FiberState::Trapped,
                 // Once parked, the fiber is its waker's: no more use here.
