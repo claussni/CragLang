@@ -59,6 +59,9 @@ directory with a `package.crag` naming the package and its `main` module:
     /path/to/target/debug/crag run
     /path/to/target/debug/crag test [filter]
 
+With `CRAG_MIR=1`, `crag` also writes the MIR of what it compiles to
+standard error, with what code generation does not support yet.
+
 Without arguments, `crag` opens the REPL, in the project of the current
 directory if there is one. `:help` lists its commands.
 
