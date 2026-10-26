@@ -195,6 +195,18 @@ enum Dest {
     Return,
 }
 
+/// An access function of a ref (Specification §9.3).
+#[derive(Clone, Copy)]
+enum Access {
+    /// `use()`: the current value.
+    Get,
+    /// `use(f)`: what the closure computes from the current value.
+    Use,
+    Update,
+    Swap,
+    Empty,
+}
+
 /// An operator of the prelude that is an operation on numbers.
 #[derive(Clone, Copy)]
 enum Primitive {
@@ -702,6 +714,292 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         }
     }
 
+    /// The access function of a ref that a call of the prelude names, if
+    /// it is one (Specification §9.3).
+    fn cell_access(&self, instance: &Instance<'db>) -> Option<Access> {
+        let db = self.db;
+        let function = instance.function;
+        if function.module(db).path(db) != PRELUDE
+            || hir_body(db, self.program, Owner::Item(function))
+                .root
+                .is_some()
+        {
+            return None;
+        }
+        let sig = self.instance_signature(instance);
+        let first = sig.params.first()?.ty;
+        if !matches!(first.as_builtin(db), Some((Builtin::Ref, _))) {
+            return None;
+        }
+        Some(
+            match (function.name(db).text(db).as_str(), sig.params.len()) {
+                ("use", 1) => Access::Get,
+                ("use", 2) => Access::Use,
+                ("update", 2) => Access::Update,
+                ("swap", 2) => Access::Swap,
+                ("empty", 1) => Access::Empty,
+                _ => return None,
+            },
+        )
+    }
+
+    /// A call of an access function of a ref: the read, the update or the
+    /// swap of its cell.
+    fn ref_access(
+        &mut self,
+        expr: ExprId,
+        access: Access,
+        instance: &Instance<'db>,
+        positional: &[ExprId],
+    ) -> Operand<'db> {
+        let db = self.db;
+        let sig = self.instance_signature(instance);
+        let cell_ty = sig.params[0].ty;
+        let Some((Builtin::Ref, &[ty])) = cell_ty.as_builtin(db) else {
+            return self.trap(TrapKind::Error, Some(expr));
+        };
+        if positional.len() != sig.params.len() {
+            return self.trap(TrapKind::Error, Some(expr));
+        }
+        let cell = self.expr(positional[0]);
+        let cell = Operand::Local(self.materialize(cell, cell_ty));
+        match access {
+            Access::Get => self.ref_get(cell, ty),
+            Access::Use => {
+                let value = self.ref_get(cell, ty);
+                let f = self.expr(positional[1]);
+                let f_ty = self.ty(positional[1]);
+                let f = self.typed(f, f_ty);
+                let TyKind::Fn { result, .. } = f_ty.kind(db) else {
+                    return self.trap(TrapKind::Error, Some(expr));
+                };
+                let dst = self.temp(*result);
+                let target = self.new_block();
+                self.terminate(Terminator::CallValue {
+                    callee: f,
+                    args: vec![value],
+                    dst,
+                    target,
+                    site: expr,
+                });
+                self.switch_to(target);
+                Operand::Local(dst)
+            }
+            Access::Swap => {
+                let new = self.expr(positional[1]);
+                let new = self.coerce(new, self.ty(positional[1]), ty);
+                self.assign(ty, Rvalue::Intrinsic(Intrinsic::RefSwap, vec![cell, new]))
+            }
+            Access::Empty => {
+                let empty_item = prelude_item(db, self.program, "Empty");
+                let Some(empty) = ty.members(db).into_iter().find(
+                    |m| matches!(m.kind(db), TyKind::Named(item, _) if Some(*item) == empty_item),
+                ) else {
+                    return self.trap(TrapKind::Error, Some(expr));
+                };
+                let new = self.coerce(Operand::Const(Constant::Tag(empty)), empty, ty);
+                self.assign(ty, Rvalue::Intrinsic(Intrinsic::RefSwap, vec![cell, new]))
+            }
+            Access::Update => self.ref_update(expr, cell, ty, positional[1]),
+        }
+    }
+
+    /// The current value of a ref cell, with a reference of its own.
+    fn ref_get(&mut self, cell: Operand<'db>, ty: Ty<'db>) -> Operand<'db> {
+        let int = self.int();
+        self.assign(int, Rvalue::Intrinsic(Intrinsic::RefRead, vec![cell]));
+        let value = self.assign(ty, Rvalue::Intrinsic(Intrinsic::RefValue, Vec::new()));
+        let unit = Ty::unit(self.db);
+        self.assign(unit, Rvalue::Intrinsic(Intrinsic::RefDone, Vec::new()));
+        value
+    }
+
+    /// `update`: the closure runs on the value read, and its result is
+    /// committed if the cell still holds that version, else it runs again.
+    /// An error result ends the update and is its value (§9.3).
+    fn ref_update(
+        &mut self,
+        expr: ExprId,
+        cell: Operand<'db>,
+        ty: Ty<'db>,
+        closure: ExprId,
+    ) -> Operand<'db> {
+        let (db, program) = (self.db, self.program);
+        if let Some((op, k)) = self.commutative(closure, ty) {
+            let Some((builtin, _)) = ty.as_builtin(db) else {
+                return self.trap(TrapKind::Error, Some(expr));
+            };
+            let k = self.expr(k);
+            let status = self.assign(
+                self.int(),
+                Rvalue::Intrinsic(Intrinsic::RefApply { op, ty: builtin }, vec![cell, k]),
+            );
+            let fits = self.assign(
+                self.bool_ty,
+                Rvalue::Compare {
+                    op: CmpOp::Eq,
+                    ty: Builtin::Int,
+                    a: status,
+                    b: Operand::Const(Constant::Int(0)),
+                },
+            );
+            let (done, overflow) = (self.new_block(), self.new_block());
+            self.terminate(Terminator::Branch {
+                cond: fits,
+                then: done,
+                otherwise: overflow,
+            });
+            self.switch_to(overflow);
+            self.trap(TrapKind::Overflow, Some(expr));
+            self.switch_to(done);
+            return self.unit();
+        }
+        let f = self.expr(closure);
+        let f_ty = self.ty(closure);
+        let f = Operand::Local(self.materialize(f, f_ty));
+        let TyKind::Fn { result, .. } = f_ty.kind(db) else {
+            return self.trap(TrapKind::Error, Some(expr));
+        };
+        let result_ty = *result;
+        let value = self.temp(self.ty(expr));
+        let (head, join) = (self.new_block(), self.new_block());
+        self.terminate(Terminator::Jump(head));
+        self.switch_to(head);
+        let int = self.int();
+        let version = self.assign(
+            int,
+            Rvalue::Intrinsic(Intrinsic::RefRead, vec![cell.clone()]),
+        );
+        let old = self.assign(ty, Rvalue::Intrinsic(Intrinsic::RefValue, Vec::new()));
+        let new = self.temp(result_ty);
+        let ran = self.new_block();
+        self.terminate(Terminator::CallValue {
+            callee: f,
+            args: vec![old],
+            dst: new,
+            target: ran,
+            site: expr,
+        });
+        self.switch_to(ran);
+        let errors = crag_types::error_members(db, program, result_ty);
+        if !errors.is_never(db) {
+            let (failed, fits) = (self.new_block(), self.new_block());
+            let cases = errors
+                .members(db)
+                .into_iter()
+                .map(|m| (m, failed))
+                .collect();
+            self.terminate(Terminator::Switch {
+                place: Place::local(new),
+                cases,
+                otherwise: fits,
+            });
+            self.switch_to(failed);
+            let unit = Ty::unit(db);
+            self.assign(unit, Rvalue::Intrinsic(Intrinsic::RefDone, Vec::new()));
+            self.assign_to(value, Operand::Local(new), result_ty);
+            self.terminate(Terminator::Jump(join));
+            self.switch_to(fits);
+        }
+        let new = self.coerce(Operand::Local(new), result_ty, ty);
+        let status = self.assign(
+            int,
+            Rvalue::Intrinsic(Intrinsic::RefCommit, vec![cell, version, new]),
+        );
+        let committed = self.assign(
+            self.bool_ty,
+            Rvalue::Compare {
+                op: CmpOp::Eq,
+                ty: Builtin::Int,
+                a: status,
+                b: Operand::Const(Constant::Int(0)),
+            },
+        );
+        let (done, again) = (self.new_block(), self.new_block());
+        self.terminate(Terminator::Branch {
+            cond: committed,
+            then: done,
+            otherwise: again,
+        });
+        self.switch_to(again);
+        self.push(Statement::Poll);
+        self.terminate(Terminator::Jump(head));
+        self.switch_to(done);
+        self.assign_to(value, self.unit(), Ty::unit(db));
+        self.terminate(Terminator::Jump(join));
+        self.switch_to(join);
+        Operand::Local(value)
+    }
+
+    /// The operation and the operand `k` of an update closure of the form
+    /// `v ⊕ k` on an integer, which the runtime applies under the cell's
+    /// lock so that the update never reruns (§9.4): `+`, `*` either way
+    /// round and `-` with `v` first, checked, and `k` a literal or another
+    /// binding, which the closure captures.
+    fn commutative(&self, closure: ExprId, ty: Ty<'db>) -> Option<(BinOp, ExprId)> {
+        let db = self.db;
+        ty.as_builtin(db).and_then(|(b, _)| b.int_range())?;
+        let body = self.body;
+        let Expr::Closure {
+            params,
+            body: inner,
+        } = body.expr(closure)
+        else {
+            return None;
+        };
+        let [param] = params.as_slice() else {
+            return None;
+        };
+        let Pat::Bind { binding, sub: None } = body.pat(param.pat) else {
+            return None;
+        };
+        let mut inner = *inner;
+        while let Expr::Block {
+            stmts,
+            tail: Some(tail),
+        } = body.expr(inner)
+            && stmts.is_empty()
+        {
+            inner = *tail;
+        }
+        let Expr::Call {
+            callee: _,
+            args,
+            fields: None,
+        } = body.expr(inner)
+        else {
+            return None;
+        };
+        let [a, b] = args.as_slice() else {
+            return None;
+        };
+        let instance = self.callee_instance(self.types.callee(inner)?)?;
+        let Some(Primitive::Arith {
+            op,
+            ty: builtin,
+            checked: true,
+        }) = self.primitive_of(&instance)
+        else {
+            return None;
+        };
+        if Some((builtin, &[][..])) != ty.as_builtin(db) {
+            return None;
+        }
+        let is_v =
+            |e: ExprId| matches!(body.expr(e), Expr::Name { local: Some(l), .. } if l == binding);
+        let is_k = |e: ExprId| match body.expr(e) {
+            Expr::Literal(_) => true,
+            Expr::Name { local: Some(l), .. } => l != binding,
+            _ => false,
+        };
+        match op {
+            BinOp::Add | BinOp::Mul if is_v(*a) && is_k(*b) => Some((op, *b)),
+            BinOp::Add | BinOp::Mul if is_k(*a) && is_v(*b) => Some((op, *a)),
+            BinOp::Sub if is_v(*a) && is_k(*b) => Some((op, *b)),
+            _ => None,
+        }
+    }
+
     /// The runtime operation a function of the standard library without a
     /// body stands for, if it is one.
     fn intrinsic(&self, instance: &Instance<'db>) -> Option<Intrinsic> {
@@ -763,9 +1061,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 // A closure reads a `var` as it is when it runs, which
                 // needs the variable on the side stack.
                 BindingKind::Var => return self.unsupported(frame, "closures capturing a `var`"),
-                BindingKind::Ref | BindingKind::Ext => {
-                    return self.unsupported(frame, "`ref` and `ext` bindings");
-                }
+                BindingKind::Ext => return self.unsupported(frame, "`ext` bindings"),
                 _ => {}
             }
             ops.push(Operand::Local(self.binding(binding)));
@@ -1751,6 +2047,11 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             return self.primitive_call(expr, primitive, positional);
         }
         if fields.is_none()
+            && let Some(access) = self.cell_access(instance)
+        {
+            return self.ref_access(expr, access, instance, positional);
+        }
+        if fields.is_none()
             && let Some(intrinsic) = self.intrinsic(instance)
         {
             let ops = positional.iter().map(|&arg| self.expr(arg)).collect();
@@ -2291,13 +2592,29 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 }
             }
             Stmt::Bind { binding, value, .. } => {
-                if body.binding(*binding).kind != BindingKind::Var {
-                    self.unsupported(*value, "`ref` and `ext` bindings");
-                    return;
-                }
                 let local = self.binding(*binding);
-                let op = self.expr(*value);
-                self.assign_to(local, op, self.ty(*value));
+                match body.binding(*binding).kind {
+                    BindingKind::Var => {
+                        let op = self.expr(*value);
+                        self.assign_to(local, op, self.ty(*value));
+                    }
+                    BindingKind::Ref => {
+                        let cell = self.locals[local.index()].ty;
+                        let Some((Builtin::Ref, &[ty])) = cell.as_builtin(self.db) else {
+                            self.trap(TrapKind::Error, Some(*value));
+                            return;
+                        };
+                        let op = self.expr(*value);
+                        let op = self.coerce(op, self.ty(*value), ty);
+                        self.push(Statement::Assign(
+                            local,
+                            Rvalue::Intrinsic(Intrinsic::RefNew, vec![op]),
+                        ));
+                    }
+                    _ => {
+                        self.unsupported(*value, "`ext` bindings");
+                    }
+                }
             }
             Stmt::Assign { binding, value } => {
                 let local = self.binding(*binding);

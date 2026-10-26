@@ -31,7 +31,8 @@
 use std::collections::BTreeSet;
 
 use crate::ir::{
-    BlockId, ClosurePlacement, Local, MirBody, Operand, Place, Rvalue, Statement, Terminator,
+    BlockId, ClosurePlacement, Intrinsic, Local, MirBody, Operand, Place, Rvalue, Statement,
+    Terminator,
 };
 
 pub type LocalSet = BTreeSet<Local>;
@@ -170,7 +171,12 @@ fn statement_uses(body: &MirBody<'_>, holds: &[LocalSet], statement: &Statement<
                         uses.operand(v, true);
                     }
                 }
-                Rvalue::Concat(parts) | Rvalue::Intrinsic(_, parts) => {
+                Rvalue::Intrinsic(intrinsic, args) => {
+                    for (k, o) in args.iter().enumerate() {
+                        uses.operand(o, intrinsic.consumes(k));
+                    }
+                }
+                Rvalue::Concat(parts) => {
                     for o in parts {
                         uses.operand(o, false);
                     }
@@ -221,7 +227,10 @@ fn terminator_uses(body: &MirBody<'_>, holds: &[LocalSet], terminator: &Terminat
 fn borrows(rvalue: &Rvalue<'_>) -> bool {
     matches!(
         rvalue,
-        Rvalue::Read(_) | Rvalue::Index { .. } | Rvalue::MapGet { boxed: false, .. }
+        Rvalue::Read(_)
+            | Rvalue::Index { .. }
+            | Rvalue::MapGet { boxed: false, .. }
+            | Rvalue::Intrinsic(Intrinsic::RefValue, _)
     )
 }
 

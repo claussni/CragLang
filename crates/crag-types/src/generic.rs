@@ -797,15 +797,42 @@ pub(crate) fn bind<'db>(
             let (open, closed): (Vec<Ty<'db>>, Vec<Ty<'db>>) = members
                 .iter()
                 .partition(|&&m| mentions(db, m, owner, &|_| true));
+            let mut rest: Vec<Ty<'db>> = found
+                .members(db)
+                .into_iter()
+                .filter(|&m| !closed.iter().any(|&c| is_subtype(db, program, m, c)))
+                .collect();
             if let [open] = open.as_slice() {
-                let rest: Vec<Ty<'db>> = found
-                    .members(db)
-                    .into_iter()
-                    .filter(|&m| !closed.iter().any(|&c| is_subtype(db, program, m, c)))
-                    .collect();
                 if !rest.is_empty() {
                     go(*open, normalize(db, program, rest).0, args);
                 }
+                return;
+            }
+            // `T | Empty[T]` against `Int | Empty[Int]`: a member with a
+            // head takes the members with the same head, and the one bare
+            // parameter what is left.
+            let mut bare = Vec::new();
+            for &o in &open {
+                let head = |t: Ty<'db>| match t.kind(db) {
+                    TyKind::Named(item, _) => Some(Ok(*item)),
+                    TyKind::Builtin(b, _) => Some(Err(*b)),
+                    _ => None,
+                };
+                match head(o) {
+                    Some(h) => rest.retain(|&m| {
+                        let same = head(m) == Some(h);
+                        if same {
+                            go(o, m, args);
+                        }
+                        !same
+                    }),
+                    None => bare.push(o),
+                }
+            }
+            if let [param] = bare.as_slice()
+                && !rest.is_empty()
+            {
+                go(*param, normalize(db, program, rest).0, args);
             }
         }
         _ => {}

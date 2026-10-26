@@ -224,18 +224,57 @@ pub enum Rvalue<'db> {
         code: InstanceKey<'db>,
         env: Operand<'db>,
     },
-    /// An operation of the runtime that a function of the standard library
-    /// without a body stands for, on borrowed operands (Plan §11.7.14).
+    /// An operation of the runtime, which a function of the standard
+    /// library without a body or a binding stands for (Plan §11.7.14). It
+    /// consumes the operands `Intrinsic::consumes` says, and borrows the
+    /// others.
     Intrinsic(Intrinsic, Vec<Operand<'db>>),
 }
 
-/// The runtime operations of the standard library's functions without a
-/// body.
+/// The operations of the runtime that MIR names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
 pub enum Intrinsic {
     /// Suspends the task for a number of nanoseconds, an `Int` above
     /// zero: `std.time.sleepNanos`.
     Sleep,
+    /// A new ref cell holding the value, a `Ref[T]` (Specification §9.1).
+    RefNew,
+    /// Begins a read of the ref cell: the version read, an `Int`. Nothing
+    /// that suspends may come before the read ends with `RefDone` or
+    /// `RefCommit`.
+    RefRead,
+    /// The value the last `RefRead` of the code read, borrowed from the
+    /// cell.
+    RefValue,
+    /// Ends a read that writes nothing.
+    RefDone,
+    /// Ends a read with the ref cell, the version read and the new value:
+    /// 0 when it was written, else the update must rerun. The value is
+    /// given up when it was not written.
+    RefCommit,
+    /// Places the value in the ref cell and gives the old one.
+    RefSwap,
+    /// Applies `v op k` to the integer of type `ty` in the ref cell, as an
+    /// update whose closure has that shape (§9.4), with the cell and `k`:
+    /// 0, or 2 when the result does not fit the type and the cell is
+    /// unchanged.
+    RefApply { op: BinOp, ty: Builtin },
+}
+
+impl Intrinsic {
+    /// Whether the operation consumes its operand at `index`.
+    pub fn consumes(self, index: usize) -> bool {
+        match self {
+            Intrinsic::RefNew => index == 0,
+            Intrinsic::RefCommit => index == 2,
+            Intrinsic::RefSwap => index == 1,
+            Intrinsic::Sleep
+            | Intrinsic::RefRead
+            | Intrinsic::RefValue
+            | Intrinsic::RefDone
+            | Intrinsic::RefApply { .. } => false,
+        }
+    }
 }
 
 /// Where a closure's environment lives, by its escape level (§11.5.8).

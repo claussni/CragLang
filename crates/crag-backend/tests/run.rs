@@ -63,6 +63,14 @@ pub type False
 pub type Bool = True | False
 pub type Empty[T]
 pub type Option[T] = T | Empty[T]
+pub type Oks[X]
+pub type Errs[X]
+pub type Ref[T]
+pub fn use[T](r: Ref[T]) -> T
+pub fn use[T, U](r: Ref[T], f: (T) -> U) -> U
+pub fn update[T, R](r: Ref[T], f: (T) -> R) -> () | Errs[R]
+pub fn swap[T](r: Ref[T], new: T) -> T
+pub fn empty[T](r: Ref[Option[T]]) -> Option[T]
 pub distinct type Error
 pub distinct type LifecycleHandler
 pub distinct type Dispose[T](..LifecycleHandler) where HandlerForm[(T) -> ()]
@@ -2455,4 +2463,42 @@ fn mapped(n: Int) -> Map[Int, Guard] { [1: Guard(n: n), 1: Guard(n: 1)] }
     assert_eq!(m.heap.live_blocks(), 0);
     let trap = m.run("mapped", &[0]).unwrap_err();
     assert_eq!(trap.kind, TrapKind::Hole);
+}
+
+const REFS: &str = r#"type Point(x: Int, y: Int)
+
+fn moved(n: Int) -> Int {
+  ref p = Point(x: 1, y: 2)
+  for k in 1..n {
+    p.update { q -> Point(x: q.x + k, y: q.y) }
+  }
+  p.update { q -> q }
+  let old = p.swap(Point(x: 0, y: 0))
+  let q = p.use()
+  old.x + q.y
+}
+
+fn kept(n: Int) -> Int {
+  ref p: Option[Point] = Point(x: n, y: 0)
+  case p.empty() {
+    q: Point -> q.x
+    _ -> 0
+  }
+}
+"#;
+
+#[test]
+fn refs_count_what_they_update() {
+    let mut m = Module::new(REFS);
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    // The runtime's ref functions need a fiber's task context.
+    assert_eq!(m.run("moved", &[10]).unwrap(), [1 + 55]);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+}
+
+#[test]
+fn refs_count_what_they_empty() {
+    let mut m = Module::new(REFS);
+    assert_eq!(m.run("kept", &[9]).unwrap(), [9]);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
 }

@@ -340,6 +340,26 @@ pub fn type_descriptor<'db>(
         }
         Some((Builtin::Map, [key, value])) => return map(*key, Some(*value)),
         Some((Builtin::Set, [key])) => return map(*key, None),
+        // A ref cell's box: the cell's version word, then the value laid
+        // out as in a collection (`crag_abi::REF_CELL_SIZE`).
+        Some((Builtin::Ref, [value])) => {
+            let base = HEADER_SIZE + 8;
+            let counted = element_layout(db, program, *value)?
+                .counted
+                .into_iter()
+                .map(|field| match field {
+                    CountedField::Box(offset) => CountedField::Box(base + offset),
+                    CountedField::Union { offset, boxed } => CountedField::Union {
+                        offset: base + offset,
+                        boxed,
+                    },
+                })
+                .collect();
+            return Some(TypeDescriptor::Record {
+                counted,
+                dispose: None,
+            });
+        }
         _ => {}
     }
     let (slots, _) = record_layout(db, program, ty)?;

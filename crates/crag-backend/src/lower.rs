@@ -42,8 +42,9 @@ use std::ops::Range;
 use crag_abi::{
     BUFFER_HEADER, CELL_FULL, CELL_STATE_OFFSET, CELL_VALUE_OFFSET, COUNT_OFFSET,
     FUNCTION_BOX_HEADER, HEADER_SIZE, HEAP_OFFSET, INLINE_TEXT_MAX, LEN_OFFSET, LIST_SIZE,
-    MAP_SIZE, MEMBER_BOX_SIZE, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, STATIC_COUNT, TEXT_BOX_HEADER,
-    TEXT_LEN_MAX, TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TypeDescriptor, inline_text, size_class,
+    MAP_SIZE, MEMBER_BOX_SIZE, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, REF_ADD, REF_CELL_SIZE, REF_MUL,
+    REF_SUB, REF_UNSIGNED, STATIC_COUNT, TEXT_BOX_HEADER, TEXT_LEN_MAX, TYPE_INDEX_OFFSET,
+    TrapKind as AbiTrap, TypeDescriptor, inline_text, size_class,
 };
 use crag_codegen::{
     BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, CallTarget, Cond, FuncId, Inst,
@@ -113,6 +114,7 @@ pub fn lower_to_lir<'db>(
         true_index: named("True").map_or(-1, type_index),
         false_index: named("False").map_or(-1, type_index),
         cell,
+        scratch: None,
     };
     for (i, decl) in mir.locals.iter().enumerate() {
         let layout = layout(db, program, decl.ty);
@@ -148,6 +150,18 @@ pub fn lower_to_lir<'db>(
         if let Err(what) = lowered {
             l.unsupported(what);
         }
+    }
+    // MIR's entry block is no branch target, so the scratch words are
+    // pushed once.
+    if let (Some(dst), Some(entry)) = (l.scratch, l.blocks[0].as_mut()) {
+        entry.insts.insert(
+            0,
+            Inst::SidePush {
+                dst,
+                size: 16,
+                align: 8,
+            },
+        );
     }
     if let Some(cell) = cell
         && !unknown_param
@@ -208,6 +222,9 @@ struct Lower<'a, 'db> {
     false_index: i64,
     /// The cell of the value the code computes, if it is a value's.
     cell: Option<SlotKey>,
+    /// Two words on the side stack that reads of ref cells put the value
+    /// in, pushed at the entry once the code reads one.
+    scratch: Option<VReg>,
 }
 
 impl<'a, 'db> Lower<'a, 'db> {
@@ -876,18 +893,151 @@ impl<'a, 'db> Lower<'a, 'db> {
                 };
                 Ok(vec![addr, word(&env)?])
             }
-            Rvalue::Intrinsic(intrinsic, args) => self.intrinsic(*intrinsic, args),
+            Rvalue::Intrinsic(intrinsic, args) => self.intrinsic(*intrinsic, args, ty),
         }
     }
 
-    /// The runtime call of an intrinsic, and its result's words.
+    /// The type of the value a ref cell of type `cell` holds.
+    fn cell_value_ty(&self, cell: Ty<'db>) -> Result<Ty<'db>, Unsupported> {
+        match cell.as_builtin(self.db) {
+            Some((Builtin::Ref, &[value])) => Ok(value),
+            _ => Err("cells of this type"),
+        }
+    }
+
+    /// The address of the cell in the box a local of a `Ref` holds.
+    fn cell_addr(&mut self, cell: &Operand<'db>) -> Result<VReg, Unsupported> {
+        let Operand::Local(local) = cell else {
+            return Err("cells of this type");
+        };
+        let ptr = word(&self.locals[local.index()].clone())?;
+        let header = self.constant(i64::from(HEADER_SIZE));
+        Ok(self.bin(LirBin::Add, ptr, header))
+    }
+
+    /// The type index of the list of `value`, whose elements the runtime
+    /// lays a cell's value out as.
+    fn cell_list(&mut self, value: Ty<'db>) -> Result<VReg, Unsupported> {
+        let list = Ty::new(self.db, TyKind::Builtin(Builtin::List, vec![value]));
+        self.describe(list)?;
+        Ok(self.constant(type_index(list)))
+    }
+
+    /// The scratch words for reads of ref cells.
+    fn scratch(&mut self) -> VReg {
+        match self.scratch {
+            Some(reg) => reg,
+            None => {
+                let reg = self.reg();
+                self.scratch = Some(reg);
+                reg
+            }
+        }
+    }
+
+    /// The runtime call of an intrinsic, and its result's words; `ty` is
+    /// the result's type.
     fn intrinsic(
         &mut self,
         intrinsic: Intrinsic,
         args: &[Operand<'db>],
+        ty: Ty<'db>,
     ) -> Result<Vec<VReg>, Unsupported> {
         let int = Ty::builtin(self.db, Builtin::Int);
         match (intrinsic, args) {
+            (Intrinsic::RefNew, [value]) => {
+                let value_ty = self.cell_value_ty(ty)?;
+                self.describe(ty)?;
+                let words = self.operand(value, value_ty)?;
+                let ptr = self.alloc(HEADER_SIZE + REF_CELL_SIZE as u32, type_index(ty));
+                let zero = self.constant(0);
+                let header = HEADER_SIZE as i32;
+                self.push(Inst::Store {
+                    src: zero,
+                    addr: ptr,
+                    offset: header,
+                });
+                for (k, src) in self.pad(words).into_iter().enumerate() {
+                    self.push(Inst::Store {
+                        src,
+                        addr: ptr,
+                        offset: header + 8 + 8 * k as i32,
+                    });
+                }
+                Ok(vec![ptr])
+            }
+            (Intrinsic::RefRead, [cell]) => {
+                let cell = self.cell_addr(cell)?;
+                let out = self.scratch();
+                Ok(vec![self.runtime(RuntimeFn::RefRead, vec![cell, out])])
+            }
+            (Intrinsic::RefValue, []) => {
+                let out = self.scratch();
+                let words = layout(self.db, self.program, ty)
+                    .ok_or("values of this type")?
+                    .words();
+                Ok((0..words).map(|k| self.load(out, 8 * k as i32)).collect())
+            }
+            (Intrinsic::RefDone, []) => {
+                self.push(Inst::CallRuntime {
+                    func: RuntimeFn::RefDone,
+                    args: Vec::new(),
+                    dsts: Vec::new(),
+                });
+                Ok(Vec::new())
+            }
+            (Intrinsic::RefCommit, [cell, version, value]) => {
+                let cell_ty = self.operand_ty(cell, ty);
+                let value_ty = self.cell_value_ty(cell_ty)?;
+                let list = self.cell_list(value_ty)?;
+                let cell = self.cell_addr(cell)?;
+                let version = word(&self.operand(version, int)?)?;
+                let words = self.operand(value, value_ty)?;
+                let [w0, w1] = self.pad(words);
+                Ok(vec![self.runtime(
+                    RuntimeFn::RefCommit,
+                    vec![cell, version, list, w0, w1],
+                )])
+            }
+            (Intrinsic::RefApply { op, ty: builtin }, [cell, k]) => {
+                let op = match op {
+                    BinOp::Add => REF_ADD,
+                    BinOp::Sub => REF_SUB,
+                    BinOp::Mul => REF_MUL,
+                    _ => return Err("this operation of the runtime"),
+                };
+                let (bits, unsigned) = match builtin {
+                    Builtin::Int => (64, false),
+                    Builtin::Int8 => (8, false),
+                    Builtin::Int16 => (16, false),
+                    Builtin::Int32 => (32, false),
+                    Builtin::UInt8 => (8, true),
+                    Builtin::UInt16 => (16, true),
+                    Builtin::UInt32 => (32, true),
+                    Builtin::UInt64 => (64, true),
+                    _ => return Err("this operation of the runtime"),
+                };
+                let width = if unsigned { bits | REF_UNSIGNED } else { bits };
+                let k_ty = Ty::builtin(self.db, builtin);
+                let k = word(&self.operand(k, k_ty)?)?;
+                let cell = self.cell_addr(cell)?;
+                let op = self.constant(op as i64);
+                let width = self.constant(width as i64);
+                Ok(vec![
+                    self.runtime(RuntimeFn::RefApply, vec![cell, op, width, k]),
+                ])
+            }
+            (Intrinsic::RefSwap, [cell, value]) => {
+                let list = self.cell_list(ty)?;
+                let cell = self.cell_addr(cell)?;
+                let words = self.operand(value, ty)?;
+                let [w0, w1] = self.pad(words);
+                let old = self.runtime2(RuntimeFn::RefSwap, vec![cell, list, w0, w1]);
+                let words = layout(self.db, self.program, ty)
+                    .ok_or("values of this type")?
+                    .words();
+                Ok(old[..words].to_vec())
+            }
             (Intrinsic::Sleep, [nanos]) => {
                 let nanos = word(&self.operand(nanos, int)?)?;
                 self.push(Inst::CallRuntime {

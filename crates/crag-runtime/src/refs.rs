@@ -288,6 +288,16 @@ unsafe extern "C" fn commit_entry(
     } else {
         loop {
             if !cell.lock(version) {
+                // The update reruns with a value of its own.
+                // SAFETY: as the caller promises.
+                unsafe {
+                    release_value(
+                        heap,
+                        types,
+                        words.as_mut_ptr().cast(),
+                        types.element_of(list),
+                    );
+                }
                 break crag_abi::REF_CONFLICT;
             }
             if let Some(old) = cell.replace(version, words) {

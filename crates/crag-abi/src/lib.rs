@@ -457,7 +457,8 @@ pub enum RuntimeFn {
     /// rerun. The value is laid out as the elements of the list type with
     /// index `list`. A committed value's references go to the cell; one
     /// identical to the value read is not written and its references are
-    /// given up (Specification §9.3). Unpins the task.
+    /// given up (Specification §9.3), and so are those of a value that
+    /// conflicted. Unpins the task.
     RefCommit = 42,
 
     /// `rt_ref_done(ctx)`.

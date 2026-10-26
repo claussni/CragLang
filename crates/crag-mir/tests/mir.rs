@@ -44,6 +44,10 @@ pub fn equals(a: Int, b: Int) -> Bool
 pub fn equals(a: Str, b: Str) -> Bool
 pub fn lessThan(a: Int, b: Int) -> Bool
 pub fn size(s: Str) -> Int
+pub type Oks[X]
+pub type Errs[X]
+pub type Ref[T]
+pub fn update[T, R](r: Ref[T], f: (T) -> R) -> () | Errs[R]
 "#;
 
 /// The type errors of the module, then the MIR of every function, test
@@ -1295,4 +1299,27 @@ fn instance_and_type_ids_are_never_reused() {
             "revision {i}"
         );
     }
+}
+
+#[test]
+fn commutative_updates_apply_in_the_cell() {
+    let out = mir_of(
+        r#"fn counts(k: Int) -> () {
+  ref n = 0
+  n.update { v -> v + k }
+  n.update { v -> 1 + v }
+  n.update { v -> v - 1 }
+}
+
+fn reruns(k: Int) -> () {
+  ref n = 0
+  n.update { v -> k - v }
+}
+"#,
+    );
+    let (counts, reruns) = out.split_once("reruns").unwrap();
+    assert_eq!(counts.matches("RefApply").count(), 3, "{out}");
+    assert!(!counts.contains("RefCommit"), "{out}");
+    assert!(!reruns.contains("RefApply"), "{out}");
+    assert!(reruns.contains("RefCommit"), "{out}");
 }
