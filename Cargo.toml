@@ -11,6 +11,8 @@ license = "GPL-3.0-or-later"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
+# Loom models build with `--cfg loom` (Implementation Plan §11.7.13).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
 # No `panic = "abort"` here: the host cancels queries by unwinding. Image
 # processes call `crag_runtime::abort_on_panic` at startup instead

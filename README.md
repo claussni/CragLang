@@ -41,6 +41,16 @@ so only Docker is needed on the host.
     ./cargo clippy --all-targets
     ./cargo fmt
 
+Three settings stress the runtime: `CRAG_TORTURE=1` moves a fiber's stack
+at every stack check, `CRAG_JITTER=<seed>` adds random delays at every
+suspension point and wake, and the loom models check the lock-free parts
+under every interleaving that matters:
+
+    CRAG_TORTURE=1 ./cargo test
+    CRAG_JITTER=7 ./cargo test
+    RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom \
+        ./cargo test -p crag-runtime --release --lib loom_model
+
 The `crag` command works on the project in the current directory, a
 directory with a `package.crag` naming the package and its `main` module:
 

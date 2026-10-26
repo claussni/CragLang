@@ -72,6 +72,7 @@ pub mod stack;
 mod stm;
 mod stream;
 pub mod stress;
+mod sync;
 pub mod teardown;
 #[cfg(test)]
 mod testing;

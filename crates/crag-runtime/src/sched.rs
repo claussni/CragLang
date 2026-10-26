@@ -613,19 +613,82 @@ pub(crate) unsafe fn settle(ctx: &TaskContext, fiber: *mut Fiber) -> FiberState 
     // SAFETY: as the caller promises, until the fiber is parked.
     unsafe {
         let waiting = FiberState::Waiting((*fiber).wait);
-        (*fiber).state = waiting;
-        match ctx.park.compare_exchange(
-            PARK_SUSPENDING,
-            PARK_PARKED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => waiting,
-            Err(_) => {
-                ctx.park.store(PARK_NONE, Ordering::Release);
-                (*fiber).state = FiberState::Runnable;
+        let parked = park(&ctx.park, |parked| {
+            (*fiber).state = if parked {
+                waiting
+            } else {
                 FiberState::Runnable
+            };
+        });
+        if parked {
+            waiting
+        } else {
+            FiberState::Runnable
+        }
+    }
+}
+
+/// The word a suspending fiber's worker and its waker agree through: the
+/// standard atomic, or loom's in a model.
+pub(crate) trait ParkWord {
+    fn load(&self, order: Ordering) -> usize;
+    fn store(&self, value: usize, order: Ordering);
+    fn compare_exchange(&self, current: usize, new: usize) -> Result<usize, usize>;
+}
+
+macro_rules! park_word {
+    ($t:ty) => {
+        impl ParkWord for $t {
+            fn load(&self, order: Ordering) -> usize {
+                <$t>::load(self, order)
             }
+            fn store(&self, value: usize, order: Ordering) {
+                <$t>::store(self, value, order)
+            }
+            fn compare_exchange(&self, current: usize, new: usize) -> Result<usize, usize> {
+                <$t>::compare_exchange(self, current, new, Ordering::AcqRel, Ordering::Acquire)
+            }
+        }
+    };
+}
+
+park_word!(std::sync::atomic::AtomicUsize);
+#[cfg(loom)]
+park_word!(loom::sync::atomic::AtomicUsize);
+
+/// The worker's half of the handshake, once a suspending fiber has left
+/// it: whether the fiber is parked, or runnable since a wake came first.
+/// `record` writes the fiber's state, which the waker writes once the
+/// fiber is parked, so it is written before the word says so.
+pub(crate) fn park(word: &impl ParkWord, mut record: impl FnMut(bool)) -> bool {
+    record(true);
+    match word.compare_exchange(PARK_SUSPENDING, PARK_PARKED) {
+        Ok(_) => true,
+        Err(_) => {
+            word.store(PARK_NONE, Ordering::Release);
+            record(false);
+            false
+        }
+    }
+}
+
+/// The waker's half: a fiber still suspending sees the wake when it
+/// settles; a parked one is made runnable by `runnable`, which owns it
+/// from then on.
+pub(crate) fn unpark(word: &impl ParkWord, runnable: impl FnOnce()) {
+    loop {
+        match word.load(Ordering::Acquire) {
+            PARK_SUSPENDING => {
+                if word.compare_exchange(PARK_SUSPENDING, PARK_WOKEN).is_ok() {
+                    return;
+                }
+            }
+            PARK_PARKED => {
+                word.store(PARK_NONE, Ordering::Release);
+                runnable();
+                return;
+            }
+            _ => return,
         }
     }
 }
@@ -720,33 +783,13 @@ pub fn wake(fiber: FiberRef, words: [u64; 2]) {
     let ctx = f.ctx.clone();
     ctx.wake_words[0].store(words[0], Ordering::Relaxed);
     ctx.wake_words[1].store(words[1], Ordering::Relaxed);
-    loop {
-        match ctx.park.load(Ordering::Acquire) {
-            PARK_SUSPENDING => {
-                if ctx
-                    .park
-                    .compare_exchange(
-                        PARK_SUSPENDING,
-                        PARK_WOKEN,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    return;
-                }
-            }
-            PARK_PARKED => {
-                ctx.park.store(PARK_NONE, Ordering::Release);
-                f.state = FiberState::Runnable;
-                if let Some(shared) = fiber.shared {
-                    shared.push_global(fiber.fiber as FiberPtr);
-                }
-                return;
-            }
-            _ => return,
+    crate::stress::jitter();
+    unpark(&ctx.park, || {
+        f.state = FiberState::Runnable;
+        if let Some(shared) = fiber.shared {
+            shared.push_global(fiber.fiber as FiberPtr);
         }
-    }
+    });
 }
 
 suspending_fn! {
@@ -857,5 +900,51 @@ mod tests {
             assert_eq!(f.ctx.park.load(Ordering::SeqCst), PARK_NONE);
             assert_eq!(f.state, FiberState::Runnable);
         }
+    }
+}
+
+/// Loom model (Plan §11.7.13): a worker settling a suspended fiber and a
+/// waker racing it agree on who queues the fiber, and the fiber's state is
+/// written by one at a time and ends runnable.
+#[cfg(all(test, loom))]
+mod loom_models {
+    use super::*;
+    use loom::cell::UnsafeCell;
+    use loom::sync::Arc;
+    use loom::sync::atomic::{AtomicBool, AtomicUsize};
+
+    /// The fiber's state: 1 waiting, 2 runnable.
+    struct State(UnsafeCell<u8>);
+
+    // SAFETY: the handshake orders the writes; loom checks that it does.
+    unsafe impl Sync for State {}
+
+    #[test]
+    fn loom_model_park() {
+        crate::sync::model(|| {
+            let word = Arc::new(AtomicUsize::new(PARK_SUSPENDING));
+            let state = Arc::new(State(UnsafeCell::new(0)));
+            let queued = Arc::new(AtomicBool::new(false));
+            let waker = {
+                let (word, state, queued) = (word.clone(), state.clone(), queued.clone());
+                loom::thread::spawn(move || {
+                    unpark(&*word, || {
+                        // SAFETY: loom checks the access.
+                        state.0.with_mut(|s| unsafe { *s = 2 });
+                        queued.store(true, Ordering::SeqCst);
+                    })
+                })
+            };
+            let parked = park(&*word, |parked| {
+                // SAFETY: loom checks the access.
+                state
+                    .0
+                    .with_mut(|s| unsafe { *s = if parked { 1 } else { 2 } });
+            });
+            waker.join().unwrap();
+            // SAFETY: both threads are done.
+            assert_eq!(state.0.with(|s| unsafe { *s }), 2);
+            assert_eq!(parked, queued.load(Ordering::SeqCst));
+        });
     }
 }

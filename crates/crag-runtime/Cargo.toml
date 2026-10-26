@@ -17,3 +17,6 @@ crag-abi = { path = "../crag-abi" }
 [dev-dependencies]
 crag-codegen = { path = "../crag-codegen" }
 crag-loader = { path = "../crag-loader" }
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"

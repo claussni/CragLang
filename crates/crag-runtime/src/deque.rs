@@ -24,8 +24,9 @@
 //! so old rings are kept until the deque is dropped: they total less than
 //! the current one.
 
-use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicUsize, Ordering, fence};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
+
+use crate::sync::{Arc, AtomicIsize, AtomicPtr, AtomicUsize, Mutex, fence};
 
 /// A ring of slots, its length a power of two.
 struct Ring {
@@ -78,7 +79,11 @@ pub enum Steal {
     Taken(usize),
 }
 
+#[cfg(not(loom))]
 const INITIAL: usize = 64;
+/// Small, so that a model grows the ring.
+#[cfg(loom)]
+const INITIAL: usize = 2;
 
 impl Deque {
     pub fn new() -> (Deque, Stealer) {
@@ -281,5 +286,38 @@ mod tests {
         }
         assert_eq!(total, WORDS);
         assert_eq!(seen.len(), WORDS);
+    }
+}
+
+/// Loom model (Plan §11.7.13): an owner pushes past the ring's size and
+/// takes while a thief steals; every word comes out exactly once.
+#[cfg(all(test, loom))]
+mod loom_models {
+    use super::*;
+
+    #[test]
+    fn loom_model_deque() {
+        crate::sync::model(|| {
+            let (deque, stealer) = Deque::new();
+            let thief = loom::thread::spawn(move || {
+                let mut got = Vec::new();
+                for _ in 0..2 {
+                    if let Steal::Taken(word) = stealer.steal() {
+                        got.push(word);
+                    }
+                }
+                got
+            });
+            for word in 1..=3 {
+                deque.push(word);
+            }
+            let mut got = Vec::new();
+            while let Some(word) = deque.take() {
+                got.push(word);
+            }
+            got.extend(thief.join().unwrap());
+            got.sort_unstable();
+            assert_eq!(got, [1, 2, 3]);
+        });
     }
 }

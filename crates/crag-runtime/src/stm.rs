@@ -251,31 +251,15 @@ system_stack_fn! {
 unsafe extern "C" fn read_entry(ctx: *const TaskContext, cell: *const Cell, out: *mut u64) -> u64 {
     // SAFETY: as the caller promises.
     let log = unsafe { log_of(&*ctx) };
-    let words = match log.written(cell) {
-        Some(w) => w.words,
-        None => {
-            // SAFETY: as the caller promises.
-            let c = unsafe { &*cell };
-            let mut spins = 0;
-            let (version, words) = loop {
-                match c.try_read() {
-                    Some(read) => break read,
-                    // Writes under way end soon; they make the others
-                    // conflict.
-                    None if log.alone => back_off(&mut spins),
-                    None => return TX_CONFLICT,
-                }
-            };
-            if version > log.read_version {
-                return TX_CONFLICT;
-            }
-            log.reads.push((cell, version));
-            words
-        }
-    };
     // SAFETY: as the caller promises.
-    unsafe { out.cast::<[u64; 2]>().write_unaligned(words) };
-    TX_OK
+    match unsafe { log.read(cell) } {
+        Some(words) => {
+            // SAFETY: as the caller promises.
+            unsafe { out.cast::<[u64; 2]>().write_unaligned(words) };
+            TX_OK
+        }
+        None => TX_CONFLICT,
+    }
 }
 
 system_stack_fn! {
@@ -300,16 +284,8 @@ unsafe extern "C" fn write_entry(
     // SAFETY: as the caller promises.
     let (log, (heap, types)) = unsafe { (log_of(&*ctx), parts(&*ctx)) };
     let mut words = [w0, w1];
-    // The value the attempt sees, given back unchanged, is not written.
-    let seen = match log.written(cell) {
-        Some(w) => Some(w.words),
-        // SAFETY: as the caller promises.
-        None => unsafe { &*cell }
-            .try_read()
-            .filter(|(v, _)| log.reads.iter().any(|&(c, r)| c == cell && r == *v))
-            .map(|(_, w)| w),
-    };
-    if seen == Some(words) {
+    // SAFETY: as the caller promises.
+    if !unsafe { log.write(cell, words, list) } {
         // SAFETY: the cell or the log holds a reference besides the
         // caller's, and the pin keeps the cell's.
         unsafe {
@@ -320,9 +296,7 @@ unsafe extern "C" fn write_entry(
                 types.element_of(list),
             )
         };
-        return;
     }
-    log.writes.push(Write { cell, words, list });
 }
 
 system_stack_fn! {
@@ -358,81 +332,153 @@ fn commit(ctx: &TaskContext, log: &mut TxLog, heap: &mut Heap, types: &Arc<Types
         log.finish(ctx, heap, types);
         return TX_OK;
     }
-    // The latest write of each cell, in address order.
-    let mut cells: Vec<usize> = (0..log.writes.len()).collect();
-    cells.sort_by_key(|&i| (log.writes[i].cell, std::cmp::Reverse(i)));
-    cells.dedup_by_key(|&mut i| log.writes[i].cell);
-    // The versions the locks were taken from.
-    let mut locked: Vec<u64> = Vec::with_capacity(cells.len());
-    let unlock = |locked: &[u64], log: &TxLog| {
-        for (&i, &version) in cells.iter().zip(locked) {
-            // SAFETY: the cell is live; the commit holds its lock.
-            unsafe { &*log.writes[i].cell }.unlock(version);
-        }
+    // SAFETY: as the caller promises, the cells are live.
+    let Some(old) = (unsafe { log.store() }) else {
+        return TX_CONFLICT;
     };
-    for &i in &cells {
-        // SAFETY: as the caller promises, the cells are live.
-        let cell = unsafe { &*log.writes[i].cell };
-        let mut spins = 0;
-        loop {
-            let version = cell.version();
-            if version & 1 == 0 {
-                if cell.lock(version) {
-                    locked.push(version);
-                    break;
-                }
-            } else if !log.alone {
-                unlock(&locked, log);
-                return TX_CONFLICT;
-            }
-            back_off(&mut spins);
-        }
+    for (words, list) in old {
+        retire(heap, types, words, list);
     }
-    let version = if log.alone {
-        tick_alone()
-    } else {
-        match tick() {
-            Some(version) => version,
-            None => {
-                unlock(&locked, log);
-                return TX_CONFLICT;
-            }
-        }
-    };
-    // No other write came in between when the clock moved by this one.
-    if version != log.read_version + 2 {
-        let valid = log.reads.iter().all(|&(cell, read)| {
-            match cells.iter().position(|&i| log.writes[i].cell == cell) {
-                Some(k) => locked[k] == read,
-                // SAFETY: the cell is live.
-                None => unsafe { &*cell }.version() == read,
-            }
-        });
-        if !valid {
-            unlock(&locked, log);
-            return TX_CONFLICT;
-        }
-    }
-    for &i in &cells {
-        let w = &log.writes[i];
-        // SAFETY: the cell is live and locked by this commit.
-        let cell = unsafe { &*w.cell };
-        let old = cell.store(w.words);
-        cell.unlock(version);
-        retire(heap, types, old, w.list);
-    }
-    // The cells took the values that won; the others are given up.
-    let mut won = vec![false; log.writes.len()];
-    for &i in &cells {
-        won[i] = true;
-    }
-    let mut k = 0;
-    log.writes.retain(|_| {
-        k += 1;
-        !won[k - 1]
-    });
     log.finish(ctx, heap, types);
     TX_OK
+}
+
+impl TxLog {
+    /// Reads `cell` in the attempt: what it wrote there, or the cell's
+    /// value, logged with its version; none on a conflict.
+    ///
+    /// # Safety
+    ///
+    /// The cell is live.
+    unsafe fn read(&mut self, cell: *const Cell) -> Option<[u64; 2]> {
+        if let Some(w) = self.written(cell) {
+            return Some(w.words);
+        }
+        // SAFETY: as the caller promises.
+        let c = unsafe { &*cell };
+        let mut spins = 0;
+        let (version, words) = loop {
+            match c.try_read() {
+                Some(read) => break read,
+                // Writes under way end soon; they make the others
+                // conflict.
+                None if self.alone => back_off(&mut spins),
+                None => return None,
+            }
+        };
+        if version > self.read_version {
+            return None;
+        }
+        self.reads.push((cell, version));
+        Some(words)
+    }
+
+    /// Logs a write of `words` to `cell`; not when the attempt sees that
+    /// value there already, and then the caller keeps its references.
+    ///
+    /// # Safety
+    ///
+    /// The cell is live.
+    unsafe fn write(&mut self, cell: *const Cell, words: [u64; 2], list: u64) -> bool {
+        let seen = match self.written(cell) {
+            Some(w) => Some(w.words),
+            // SAFETY: as the caller promises.
+            None => unsafe { &*cell }
+                .try_read()
+                .filter(|(v, _)| self.reads.iter().any(|&(c, r)| c == cell && r == *v))
+                .map(|(_, w)| w),
+        };
+        if seen == Some(words) {
+            return false;
+        }
+        self.writes.push(Write { cell, words, list });
+        true
+    }
+
+    /// Commits the outermost block's writes, TL2's commit: the values the
+    /// cells held, with their list types, to retire; none on a conflict.
+    /// The writes that lost to later ones of the same cell stay in the log.
+    ///
+    /// # Safety
+    ///
+    /// The cells are live.
+    unsafe fn store(&mut self) -> Option<Vec<([u64; 2], u64)>> {
+        let log = self;
+        // The latest write of each cell, in address order.
+        let mut cells: Vec<usize> = (0..log.writes.len()).collect();
+        cells.sort_by_key(|&i| (log.writes[i].cell, std::cmp::Reverse(i)));
+        cells.dedup_by_key(|&mut i| log.writes[i].cell);
+        // The versions the locks were taken from.
+        let mut locked: Vec<u64> = Vec::with_capacity(cells.len());
+        let unlock = |locked: &[u64], log: &TxLog| {
+            for (&i, &version) in cells.iter().zip(locked) {
+                // SAFETY: the cell is live; the commit holds its lock.
+                unsafe { &*log.writes[i].cell }.unlock(version);
+            }
+        };
+        for &i in &cells {
+            // SAFETY: as the caller promises, the cells are live.
+            let cell = unsafe { &*log.writes[i].cell };
+            let mut spins = 0;
+            loop {
+                let version = cell.version();
+                if version & 1 == 0 {
+                    if cell.lock(version) {
+                        locked.push(version);
+                        break;
+                    }
+                } else if !log.alone {
+                    unlock(&locked, log);
+                    return None;
+                }
+                back_off(&mut spins);
+            }
+        }
+        let version = if log.alone {
+            tick_alone()
+        } else {
+            match tick() {
+                Some(version) => version,
+                None => {
+                    unlock(&locked, log);
+                    return None;
+                }
+            }
+        };
+        // No other write came in between when the clock moved by this one.
+        if version != log.read_version + 2 {
+            let valid = log.reads.iter().all(|&(cell, read)| {
+                match cells.iter().position(|&i| log.writes[i].cell == cell) {
+                    Some(k) => locked[k] == read,
+                    // SAFETY: the cell is live.
+                    None => unsafe { &*cell }.version() == read,
+                }
+            });
+            if !valid {
+                unlock(&locked, log);
+                return None;
+            }
+        }
+        let mut old = Vec::with_capacity(cells.len());
+        for &i in &cells {
+            let w = &log.writes[i];
+            // SAFETY: the cell is live and locked by this commit.
+            let cell = unsafe { &*w.cell };
+            old.push((cell.store(w.words), w.list));
+            cell.unlock(version);
+        }
+        // The cells took the values that won; the others are given up.
+        let mut won = vec![false; log.writes.len()];
+        for &i in &cells {
+            won[i] = true;
+        }
+        let mut k = 0;
+        log.writes.retain(|_| {
+            k += 1;
+            !won[k - 1]
+        });
+        Some(old)
+    }
 }
 
 system_stack_fn! {
@@ -487,4 +533,65 @@ unsafe extern "C" fn retry_entry(ctx: *const TaskContext) {
         }
     }
     log.start(ctx);
+}
+
+/// Loom model (Plan §11.7.13): two transfers between two cells commit or
+/// conflict, and a third transaction that reads both sees their total.
+#[cfg(all(test, loom))]
+mod loom_models {
+    use super::*;
+    use crate::sync::Arc;
+
+    /// One attempt of a transfer of `amount` from `from` to `to`: whether
+    /// it committed.
+    fn transfer(from: &Cell, to: &Cell, amount: u64) -> bool {
+        let mut log = TxLog {
+            depth: 1,
+            read_version: clock(),
+            ..TxLog::default()
+        };
+        // SAFETY: the cells outlive the attempt.
+        unsafe {
+            let (Some(x), Some(y)) = (log.read(from), log.read(to)) else {
+                return false;
+            };
+            log.write(from, [x[0] - amount, 0], 0);
+            log.write(to, [y[0] + amount, 0], 0);
+            log.store().is_some()
+        }
+    }
+
+    #[test]
+    fn loom_model_tx_commit() {
+        crate::sync::model(|| {
+            let a = Arc::new(Cell::new([10, 0]));
+            let b = Arc::new(Cell::new([10, 0]));
+            let one = {
+                let (a, b) = (a.clone(), b.clone());
+                loom::thread::spawn(move || transfer(&a, &b, 1))
+            };
+            let two = {
+                let (a, b) = (a.clone(), b.clone());
+                loom::thread::spawn(move || transfer(&b, &a, 2))
+            };
+            let mut log = TxLog {
+                depth: 1,
+                read_version: clock(),
+                ..TxLog::default()
+            };
+            // The transfers may commit between the two reads.
+            // SAFETY: the cells outlive the attempt.
+            let x = unsafe { log.read(&*a) };
+            loom::thread::yield_now();
+            // SAFETY: as above.
+            let y = unsafe { log.read(&*b) };
+            if let (Some(x), Some(y)) = (x, y) {
+                assert_eq!(x[0] + y[0], 20, "an inconsistent read");
+            }
+            let (one, two) = (one.join().unwrap(), two.join().unwrap());
+            let (x, y) = (a.read().1[0], b.read().1[0]);
+            let moved = i64::from(one) - 2 * i64::from(two);
+            assert_eq!((x as i64, y as i64), (10 - moved, 10 + moved));
+        });
+    }
 }

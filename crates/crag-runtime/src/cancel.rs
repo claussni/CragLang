@@ -117,6 +117,7 @@ pub(crate) fn raise(ctx: &TaskContext, kind: TrapKind, position: Option<u32>) {
 /// Traps the calling runtime function with `Cancelled` if the task must
 /// stop now; whether it did.
 pub(crate) fn stop_if_due(ctx: &TaskContext) -> bool {
+    crate::stress::jitter();
     let due = due(ctx);
     if due {
         raise(ctx, TrapKind::Cancelled, None);

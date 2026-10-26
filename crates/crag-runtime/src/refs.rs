@@ -41,9 +41,9 @@
 //! instead of reading and committing, and it never reruns (§11.7.8).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering, fence};
+use std::sync::atomic::Ordering;
 
-use crag_abi::REF_CELL_SIZE;
+use crate::sync::{AtomicU64, fence};
 
 use crate::epoch::{pin, retire, unpin};
 use crate::fiber::{TaskContext, Worker};
@@ -59,11 +59,18 @@ pub(crate) struct Cell {
     value: [AtomicU64; 2],
 }
 
-const _: () = assert!(size_of::<Cell>() == REF_CELL_SIZE as usize);
+#[cfg(not(loom))]
+const _: () = assert!(size_of::<Cell>() == crag_abi::REF_CELL_SIZE as usize);
 
 /// The last version a write gave a cell, with [`ALONE`] while a task
 /// runs alone.
+#[cfg(not(loom))]
 static CLOCK: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(loom)]
+loom::lazy_static! {
+    static ref CLOCK: AtomicU64 = AtomicU64::new(0);
+}
 
 /// The bit of the clock that is set while a transaction runs alone
 /// (§11.7.7): every other write backs out until it is clear.
@@ -120,6 +127,15 @@ pub(crate) fn back_off(spins: &mut u32) {
 }
 
 impl Cell {
+    /// A cell holding `words`, at version 0, as generated code makes one.
+    #[cfg(all(test, loom))]
+    pub(crate) fn new(words: [u64; 2]) -> Cell {
+        Cell {
+            version: AtomicU64::new(0),
+            value: words.map(AtomicU64::new),
+        }
+    }
+
     /// The version and the value, once no write is under way.
     pub(crate) fn read(&self) -> (u64, [u64; 2]) {
         let mut spins = 0;
@@ -416,5 +432,44 @@ unsafe extern "C" fn apply_entry(
             return crag_abi::REF_COMMITTED;
         }
         wait_alone();
+    }
+}
+
+/// Loom model (Plan §11.7.13): a reader of a cell that a writer replaces
+/// twice never sees a torn value or a version going back.
+#[cfg(all(test, loom))]
+mod loom_models {
+    use super::*;
+    use crate::sync::Arc;
+
+    #[test]
+    fn loom_model_ref_cell() {
+        crate::sync::model(|| {
+            let cell = Arc::new(Cell::new([0, 0]));
+            let writer = {
+                let cell = cell.clone();
+                loom::thread::spawn(move || {
+                    for n in 1..=2 {
+                        let version = cell.lock_any();
+                        assert!(cell.replace(version, [n, n]).is_some());
+                    }
+                })
+            };
+            // The reader reads until it sees the last write, yielding so
+            // that loom runs the writer in between.
+            let mut last = 0;
+            while last < 4 {
+                if let Some((version, [a, b])) = cell.try_read() {
+                    assert_eq!(a, b, "a torn value");
+                    assert!(version >= last && version % 2 == 0);
+                    last = version;
+                }
+                loom::thread::yield_now();
+            }
+            writer.join().unwrap();
+            let (version, words) = cell.read();
+            assert_eq!(words, [2, 2]);
+            assert_eq!(version, 4);
+        });
     }
 }
