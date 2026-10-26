@@ -48,7 +48,8 @@ pub use case::{ListLen, Value};
 pub use decision::{Bindings, DecisionTree, Position, Step, decision_tree, decision_tree_with};
 pub use def::{
     FieldDef, HeaderKind, SigParam, Signature, TypeDef, TypeDefKind, TypeHeader, alias_target,
-    prelude_item, signature, success_type, type_def, type_header, type_parent, value_type,
+    place_positional, prelude_item, signature, success_type, type_def, type_header, type_parent,
+    value_type,
 };
 pub use effect::{EffectSet, Restriction};
 pub use escape::{BindingsOnly, EscapeLevel, Escapes};

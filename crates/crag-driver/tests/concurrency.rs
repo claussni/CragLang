@@ -262,3 +262,89 @@ fn main() -> ExitCode {
     );
     assert_eq!(code, 20, "{out}");
 }
+
+#[test]
+fn a_group_runs_its_tasks_before_it_returns() {
+    let (code, out) = run(
+        "group",
+        r#"import std.task
+
+fn main() -> ExitCode {
+  ref hits = 0
+  let n = all(limit: 3) { g ->
+    for i in 1..20 {
+      g.start { -> hits.update { h -> h + i } }
+    }
+    7
+  }
+  ExitCode(code: hits.use() - 200 + n)
+}
+"#,
+    );
+    // 1 + 2 + ... + 20 = 210.
+    assert_eq!(code, 17, "{out}");
+}
+
+#[test]
+fn first_result_takes_the_first_value_a_task_gives() {
+    let (code, out) = run(
+        "first-result",
+        r#"import std.task
+import std.time
+
+fn main() -> ExitCode {
+  let found: Option[Int] = firstResult { g ->
+    g.start { -> Empty }
+    g.start { -> sleep(millis(5))
+      42 }
+    g.start { -> sleep(seconds(30))
+      1 }
+  }
+  case found {
+    n: Int -> ExitCode(code: n)
+    _ -> ExitCode(code: 0)
+  }
+}
+"#,
+    );
+    assert_eq!(code, 42, "{out}");
+}
+
+#[test]
+fn transactions_keep_their_invariant_under_contention() {
+    for round in 0..3 {
+        let (code, out) = run(
+            &format!("contention-{round}"),
+            r#"import std.task
+
+fn transfer(from: Ref[Int], to: Ref[Int], amount: Int) -> () {
+  from.update { b -> b - amount }
+  to.update { b -> b + amount }
+}
+
+fn main() -> ExitCode {
+  ref a = 1000
+  ref b = 1000
+  ref bad = 0
+  ref bumps = 0
+  all(limit: 32) { g ->
+    for i in 1..200 {
+      g.start { -> atomic { transfer(a, b, 3) } }
+      g.start { -> atomic { transfer(b, a, 2) } }
+      g.start { -> atomic {
+        if a.use() + b.use() != 2000 { bad.update { n -> n + 1 } }
+      } }
+      g.start { -> bumps.update { n -> if n >= 0 { n + 1 } else { n } } }
+    }
+  }
+  if bad.use() == 0 and a.use() == 800 and b.use() == 1200 and bumps.use() == 200 {
+    ExitCode(code: 0)
+  } else {
+    ExitCode(code: 1)
+  }
+}
+"#,
+        );
+        assert_eq!(code, 0, "{out}");
+    }
+}

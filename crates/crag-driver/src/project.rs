@@ -39,6 +39,7 @@ use crag_hir::{ModuleId, PRELUDE, Program, Resource, SourceFile, embed_sources};
 const STD: &[(&str, &str)] = &[
     (PRELUDE, include_str!("../../../std/core.crag")),
     ("std.time", include_str!("../../../std/time.crag")),
+    ("std.task", include_str!("../../../std/task.crag")),
 ];
 
 /// A module's file, where diagnostics name it.

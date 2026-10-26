@@ -45,7 +45,8 @@ use crag_hir::{
 use crate::case::{Checker, PatternMatrix};
 use crate::def::SigParam;
 use crate::def::{
-    HeaderKind, TypeLowerer, alias_target, prelude_item, signature, type_header, value_type,
+    HeaderKind, TypeLowerer, alias_target, place_positional, prelude_item, signature, type_header,
+    value_type,
 };
 use crate::effect::{EffectSet, Walker};
 use crate::escape::{EscapeLevel, EscapeWalker, Escapes};
@@ -150,11 +151,11 @@ pub fn infer_in_group<'db>(
         }
         _ => {
             let summary_of = |f: ItemId<'db>| cx.escapes_of(f);
-            let names_of = |f: ItemId<'db>| -> Vec<Option<Name<'db>>> {
+            let names_of = |f: ItemId<'db>| -> Vec<(Option<Name<'db>>, bool)> {
                 signature(db, program, f)
                     .params
                     .iter()
-                    .map(|p| p.name)
+                    .map(|p| (p.name, p.default))
                     .collect()
             };
             let walker =
@@ -2569,15 +2570,24 @@ impl<'a, 'db> Infer<'a, 'db> {
             return None;
         }
         if !builds_record {
-            let mut given: Vec<Option<usize>> = (0..params.len())
-                .map(|i| (i < positional.len()).then_some(i))
-                .collect();
+            // The named arguments first, then the positional ones.
+            let mut given: Vec<Option<usize>> = vec![None; params.len()];
             let mut fits = true;
             for (j, (name, _)) in named.iter().enumerate() {
                 match params.iter().position(|p| p.name == Some(*name)) {
                     Some(i) if given[i].is_none() => given[i] = Some(positional.len() + j),
                     _ => fits = false,
                 }
+            }
+            let defaults: Vec<bool> = params.iter().map(|p| p.default).collect();
+            let taken: Vec<bool> = given.iter().map(Option::is_some).collect();
+            match place_positional(&defaults, &taken, positional.len()) {
+                Some(places) => {
+                    for (k, i) in places.into_iter().enumerate() {
+                        given[i] = Some(k);
+                    }
+                }
+                None => fits = false,
             }
             if fits
                 && given

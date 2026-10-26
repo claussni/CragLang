@@ -229,6 +229,37 @@ pub struct SigParam<'db> {
     pub default: bool,
 }
 
+/// The parameters the positional arguments of a call fill, in their order,
+/// once the named arguments took theirs (`taken`): the parameters left, in
+/// order, where one with a default takes an argument only when there are
+/// more arguments than parameters left without one (§5.6.2). So a trailing
+/// closure reaches the parameter after defaulted ones, as `body` of
+/// `all(limit: 8) { g -> … }` and of `all { g -> … }`. None when there are
+/// more arguments than parameters left.
+pub fn place_positional(
+    defaults: &[bool],
+    taken: &[bool],
+    positional: usize,
+) -> Option<Vec<usize>> {
+    let free: Vec<usize> = (0..defaults.len()).filter(|&i| !taken[i]).collect();
+    let required = free.iter().filter(|&&i| !defaults[i]).count();
+    let mut extra = positional.saturating_sub(required);
+    let mut out = Vec::with_capacity(positional);
+    for i in free {
+        if out.len() == positional {
+            break;
+        }
+        if defaults[i] {
+            if extra == 0 {
+                continue;
+            }
+            extra -= 1;
+        }
+        out.push(i);
+    }
+    (out.len() == positional).then_some(out)
+}
+
 /// A function's written signature. A form's function has the form's type
 /// parameters (§4.1).
 #[crag_db::tracked(returns(ref))]

@@ -38,7 +38,7 @@ use crag_hir::{
     Stmt, c_function, hir_body,
 };
 
-use crate::def::signature;
+use crate::def::{place_positional, signature};
 use crate::generic::mentions;
 use crate::result::{Callee, ErrorKind, Site, TypeError};
 use crate::ty::{Builtin, Ty, TyKind};
@@ -70,7 +70,9 @@ pub struct Escapes {
 /// The summary of a function without a body: a C function may keep what
 /// it is passed; a prelude operation calls the functions passed to it and
 /// gives back only what its result can hold, and an access function keeps
-/// only the value it places in its cell (§9.3).
+/// only the value it places in its cell (§9.3). The scopes of `std.task`
+/// run the functions passed to them as tasks that end before the scope
+/// does: Scoped (§10.2.1).
 pub fn intrinsic_escapes<'db>(
     db: &'db dyn Db,
     program: Program,
@@ -86,7 +88,9 @@ pub fn intrinsic_escapes<'db>(
     {
         return None;
     }
-    let prelude = function.module(db).path(db) == PRELUDE;
+    let path = function.module(db).path(db);
+    let prelude = path == PRELUDE;
+    let scope = path == "std.task";
     let result = sig.result;
     Some(
         sig.params
@@ -95,6 +99,7 @@ pub fn intrinsic_escapes<'db>(
                 TyKind::Builtin(Builtin::Ref | Builtin::Ext, _) | TyKind::Fn { .. } if prelude => {
                     EscapeLevel::Local
                 }
+                TyKind::Fn { .. } if scope => EscapeLevel::Scoped,
                 _ => {
                     // A value that the result's type parameters can hold
                     // may come back.
@@ -135,7 +140,7 @@ pub struct EscapeWalker<'a, 'db> {
     bindings: &'a [Option<Ty<'db>>],
     callees: HashMap<ExprId, &'a Callee<'db>>,
     summary_of: &'a dyn Fn(ItemId<'db>) -> Vec<EscapeLevel>,
-    signature_of: &'a dyn Fn(ItemId<'db>) -> Vec<Option<crag_hir::Name<'db>>>,
+    signature_of: &'a dyn Fn(ItemId<'db>) -> Vec<(Option<crag_hir::Name<'db>>, bool)>,
     levels: Vec<EscapeLevel>,
     /// Of closures and `lazy` expressions; a local function's is its
     /// binding's.
@@ -161,7 +166,7 @@ impl<'a, 'db> EscapeWalker<'a, 'db> {
         bindings: &'a [Option<Ty<'db>>],
         callees: &'a [(ExprId, Callee<'db>)],
         summary_of: &'a dyn Fn(ItemId<'db>) -> Vec<EscapeLevel>,
-        signature_of: &'a dyn Fn(ItemId<'db>) -> Vec<Option<crag_hir::Name<'db>>>,
+        signature_of: &'a dyn Fn(ItemId<'db>) -> Vec<(Option<crag_hir::Name<'db>>, bool)>,
     ) -> Self {
         let mut walker = EscapeWalker {
             db,
@@ -639,9 +644,21 @@ impl<'a, 'db> EscapeWalker<'a, 'db> {
             summaries
                 .iter()
                 .map(|&f| {
-                    let names = (this.signature_of)(f);
-                    let index = position
-                        .or_else(|| name.and_then(|n| names.iter().position(|p| *p == Some(n))));
+                    let params = (this.signature_of)(f);
+                    let index = match position {
+                        // The positional arguments fill what the named
+                        // ones leave, as inference places them.
+                        Some(k) => {
+                            let defaults: Vec<bool> = params.iter().map(|p| p.1).collect();
+                            let taken: Vec<bool> = params
+                                .iter()
+                                .map(|p| p.0.is_some() && named.iter().any(|(n, _)| *n == p.0))
+                                .collect();
+                            place_positional(&defaults, &taken, positional.len())
+                                .and_then(|places| places.get(k).copied())
+                        }
+                        None => name.and_then(|n| params.iter().position(|p| p.0 == Some(n))),
+                    };
                     // A named argument that names no parameter builds a
                     // record, which keeps it.
                     match index {
@@ -656,7 +673,7 @@ impl<'a, 'db> EscapeWalker<'a, 'db> {
             let level = level_of(self, Some(i), None);
             self.walk(arg, level);
         }
-        for (name, value) in named {
+        for &(name, value) in &named {
             let level = level_of(self, None, name);
             self.walk(value, level);
         }

@@ -127,6 +127,13 @@ pub fn compile<'a>(
             Entry::Default(_) => format!("a default in {}", owner_name(project, owner)),
             Entry::Dispose => format!("the dispose code of {}", owner_name(project, owner)),
         };
+        // `CRAG_MIR=1` shows the MIR of what is compiled, for debugging
+        // the compiler.
+        if std::env::var_os("CRAG_MIR").is_some()
+            && let Some(body) = mir(db, program, instance, Tier::Baseline)
+        {
+            eprintln!("{name}\n{}", body.pretty(db));
+        }
         let value = matches!(owner, Owner::Item(item) if item.kind(db).is_value());
         let code = match code(db, program, instance, Tier::Baseline) {
             Some(Ok(code)) => code,

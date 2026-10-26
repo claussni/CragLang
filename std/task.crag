@@ -1,0 +1,100 @@
+// This file is part of Crag.
+//
+// Copyright (C) 2026 Ralf Claussnitzer
+//
+// Crag is free software: you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the Free Software
+// Foundation, either version 3 of the License, or (at your option) any later
+// version.
+//
+// Crag is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+// A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// Crag. If not, see <https://www.gnu.org/licenses/>.
+
+// Task groups (Specification §10.2.1), as far as M4 reaches: `all` and
+// `firstResult` with a group, and `start`. The combinators of a fixed
+// record of branches wait for the type functions they need (§10.2).
+//
+// A group's body runs as the scope's first task, which the limit does not
+// count, while the caller waits for the tasks: a trap in any of them
+// cancels the others, and the caller traps once they are all done
+// (Implementation Plan §11.7.3).
+
+pub opaque type Group[T](scope: Int)
+
+// Starts a task of the group, waiting while the group's limit is reached.
+pub fn start[T](g: Group[T], task: () -> T) -> () {
+  scopeStart(g.scope, task, 0)
+}
+
+// Runs `body` with a group and waits for it and every task it started:
+// the body's value.
+pub fn all[V](limit: Option[Int] = Empty, body: (Group[()]) -> V) -> V {
+  let scope = scopeNew(limitOf(limit))
+  let g: Group[()] = Group(scope: scope)
+  scopeStart(scope, { -> body(g) }, 1)
+  drain(scope)
+  let value: V = scopeResult(scope, 0)
+  scopeEnd(scope)
+  value
+}
+
+// Runs `body` with a group until a task returns a value other than
+// `Empty`, which cancels the body and the other tasks: that value, or
+// `Empty` when no task gives one.
+pub fn firstResult[T](limit: Option[Int] = Empty, body: (Group[Option[T]]) -> ()) -> Option[T] {
+  let scope = scopeNew(limitOf(limit))
+  let g: Group[Option[T]] = Group(scope: scope)
+  scopeStart(scope, { -> body(g) }, 1)
+  let found: Option[T] = first(scope, Empty)
+  scopeEnd(scope)
+  found
+}
+
+fn limitOf(limit: Option[Int]) -> Int {
+  case limit {
+    n: Int -> n
+    _ -> 0
+  }
+}
+
+// Waits until every task of the scope is done.
+fn drain(scope: Int) -> () {
+  if scopeNext(scope) >= 0 {
+    drain(scope)
+  }
+}
+
+// Waits until every task of the scope is done, keeping the first value
+// other than `Empty` a task returned and cancelling the rest once there is
+// one.
+fn first[T](scope: Int, found: Option[T]) -> Option[T] {
+  let next = scopeNext(scope)
+  if next < 0 {
+    return found
+  }
+  // Index 0 is the body, which gives no value, and only a task that
+  // returned has one.
+  if next % 4 != 0 or next / 4 == 0 {
+    return first(scope, found)
+  }
+  let value: Option[T] = scopeResult(scope, next / 4)
+  if found is Empty and value is T {
+    scopeCancel(scope)
+    return first(scope, value)
+  }
+  first(scope, found)
+}
+
+// The runtime's scopes (Implementation Plan §11.7.3).
+fn scopeNew(limit: Int) -> Int
+fn scopeStart[T](scope: Int, task: () -> T, exempt: Int) -> ()
+// The index of the next task to finish times 4 plus how it finished, or
+// -1 once every task was given.
+fn scopeNext(scope: Int) -> Int
+fn scopeResult[T](scope: Int, index: Int) -> T
+fn scopeCancel(scope: Int) -> ()
+fn scopeEnd(scope: Int) -> ()

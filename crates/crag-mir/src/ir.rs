@@ -282,6 +282,19 @@ pub enum Intrinsic {
     SidePtr,
     SideEnd,
     SideReset,
+    /// A scope of tasks with a limit, an `Int`; zero for none
+    /// (`std.task.scopeNew`).
+    ScopeNew,
+    /// Starts a task of the scope that calls the function value, counted
+    /// towards the limit unless the third operand is nonzero.
+    ScopeStart,
+    /// The next task of the scope to finish: its index times 4 plus how it
+    /// finished, or -1 once every task was given.
+    ScopeNext,
+    /// The result of a task that returned, by its index.
+    ScopeResult,
+    ScopeCancel,
+    ScopeEnd,
 }
 
 impl Intrinsic {
@@ -290,7 +303,7 @@ impl Intrinsic {
         match self {
             Intrinsic::RefNew => index == 0,
             Intrinsic::RefCommit => index == 2,
-            Intrinsic::RefSwap => index == 1,
+            Intrinsic::RefSwap | Intrinsic::ScopeStart => index == 1,
             _ => false,
         }
     }

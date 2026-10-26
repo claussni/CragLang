@@ -43,9 +43,9 @@ use crag_abi::{
     BUFFER_HEADER, CELL_FULL, CELL_STATE_OFFSET, CELL_VALUE_OFFSET, COUNT_OFFSET,
     FUNCTION_BOX_HEADER, HEADER_SIZE, HEAP_OFFSET, INLINE_TEXT_MAX, LEN_OFFSET, LIST_SIZE,
     MAP_SIZE, MEMBER_BOX_SIZE, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, REF_ADD, REF_CELL_SIZE, REF_MUL,
-    REF_SUB, REF_UNSIGNED, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STATIC_COUNT, TEXT_BOX_HEADER,
-    TEXT_LEN_MAX, TX_CONFLICT_OFFSET, TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TypeDescriptor,
-    inline_text, size_class,
+    REF_SUB, REF_UNSIGNED, SCOPE_DONE, SIDE_END_OFFSET, SIDE_PTR_OFFSET, START_EXEMPT,
+    STATIC_COUNT, TEXT_BOX_HEADER, TEXT_LEN_MAX, TX_CONFLICT_OFFSET, TYPE_INDEX_OFFSET,
+    TrapKind as AbiTrap, TypeDescriptor, inline_text, size_class,
 };
 use crag_codegen::{
     BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, CallTarget, Cond, FuncId, Inst,
@@ -999,6 +999,71 @@ impl<'a, 'db> Lower<'a, 'db> {
                     RuntimeFn::RefCommit,
                     vec![cell, version, list, w0, w1],
                 )])
+            }
+            (Intrinsic::ScopeNew, [limit]) => {
+                let limit = word(&self.operand(limit, int)?)?;
+                Ok(vec![self.runtime(RuntimeFn::ScopeNew, vec![limit])])
+            }
+            (Intrinsic::ScopeStart, [scope, task, exempt]) => {
+                let task_ty = self.operand_ty(task, int);
+                let TyKind::Fn { result, .. } = task_ty.kind(self.db) else {
+                    return Err("this operation of the runtime");
+                };
+                let results = layout(self.db, self.program, *result)
+                    .ok_or("values of this type")?
+                    .words();
+                let scope = word(&self.operand(scope, int)?)?;
+                let [code, env] = self.operand(task, task_ty)?[..] else {
+                    return Err("this operation of the runtime");
+                };
+                let exempt = word(&self.operand(exempt, int)?)?;
+                let shift = self.constant(START_EXEMPT.trailing_zeros().into());
+                let exempt = self.bin(LirBin::Shl, exempt, shift);
+                let results = self.constant(results as i64);
+                let flags = self.bin(LirBin::Or, exempt, results);
+                self.runtime(RuntimeFn::ScopeStart, vec![scope, code, env, flags]);
+                Ok(Vec::new())
+            }
+            (Intrinsic::ScopeNext, [scope]) => {
+                let scope = word(&self.operand(scope, int)?)?;
+                let next = self.runtime2(RuntimeFn::ScopeNext, vec![scope]);
+                let (index, status) = (next[0], next[1]);
+                let done = self.constant(SCOPE_DONE as i64);
+                let is_done = self.cmp(Cond::Eq, index, done);
+                let two = self.constant(2);
+                let shifted = self.bin(LirBin::Shl, index, two);
+                let packed = self.bin(LirBin::Or, shifted, status);
+                let none = self.constant(-1);
+                let out = self.reg();
+                self.push(Inst::Select {
+                    dst: out,
+                    cond: is_done,
+                    a: none,
+                    b: packed,
+                });
+                Ok(vec![out])
+            }
+            (Intrinsic::ScopeResult, [scope, index]) => {
+                let scope = word(&self.operand(scope, int)?)?;
+                let index = word(&self.operand(index, int)?)?;
+                let words = layout(self.db, self.program, ty)
+                    .ok_or("values of this type")?
+                    .words();
+                let out = self.runtime2(RuntimeFn::ScopeResult, vec![scope, index]);
+                Ok(out[..words].to_vec())
+            }
+            (Intrinsic::ScopeCancel | Intrinsic::ScopeEnd, [scope]) => {
+                let scope = word(&self.operand(scope, int)?)?;
+                let func = match intrinsic {
+                    Intrinsic::ScopeCancel => RuntimeFn::ScopeCancel,
+                    _ => RuntimeFn::ScopeEnd,
+                };
+                self.push(Inst::CallRuntime {
+                    func,
+                    args: vec![scope],
+                    dsts: Vec::new(),
+                });
+                Ok(Vec::new())
             }
             (Intrinsic::TxBegin, []) => Ok(vec![self.runtime(RuntimeFn::TxBegin, Vec::new())]),
             (Intrinsic::TxCommit, []) => Ok(vec![self.runtime(RuntimeFn::TxCommit, Vec::new())]),

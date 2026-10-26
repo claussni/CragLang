@@ -104,13 +104,16 @@ pub fn build<'db>(
 type Start<'a, 'db> = Box<dyn FnOnce(&mut MirBuilder<'a, 'db>) + 'a>;
 
 /// Where a closure's environment goes: on the side stack when the closure
-/// does not outlive its frame (§11.5.8), unless it is made in a loop,
-/// which would push one per iteration; on the heap otherwise. Inlining a
-/// closure into a known callee, which needs no environment at all, comes
-/// with the optimizing tier.
+/// does not outlive its frame's use of it (§11.5.8), unless it is made in
+/// a loop, which would push one per iteration; on the heap otherwise. A
+/// closure a task runs goes on the heap too, whose environment holds its
+/// own references: the task runs on after the call that started it, while
+/// the frame's locals that a side-stack environment borrows may die.
+/// Inlining a closure into a known callee, which needs no environment at
+/// all, comes with the optimizing tier.
 pub fn place(level: EscapeLevel, in_loop: bool) -> ClosurePlacement {
     match level {
-        EscapeLevel::Local | EscapeLevel::Scoped if !in_loop => ClosurePlacement::SideStack,
+        EscapeLevel::Local if !in_loop => ClosurePlacement::SideStack,
         _ => ClosurePlacement::Heap,
     }
 }
@@ -1168,18 +1171,25 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     fn intrinsic(&self, instance: &Instance<'db>) -> Option<Intrinsic> {
         let db = self.db;
         let function = instance.function;
-        if !instance.args.is_empty()
-            || hir_body(db, self.program, Owner::Item(function))
-                .root
-                .is_some()
+        if hir_body(db, self.program, Owner::Item(function))
+            .root
+            .is_some()
         {
             return None;
         }
         let module = function.module(db).path(db);
-        match (module.as_str(), function.name(db).text(db).as_str()) {
-            ("std.time", "sleepNanos") => Some(Intrinsic::Sleep),
-            _ => None,
-        }
+        Some(
+            match (module.as_str(), function.name(db).text(db).as_str()) {
+                ("std.time", "sleepNanos") => Intrinsic::Sleep,
+                ("std.task", "scopeNew") => Intrinsic::ScopeNew,
+                ("std.task", "scopeStart") => Intrinsic::ScopeStart,
+                ("std.task", "scopeNext") => Intrinsic::ScopeNext,
+                ("std.task", "scopeResult") => Intrinsic::ScopeResult,
+                ("std.task", "scopeCancel") => Intrinsic::ScopeCancel,
+                ("std.task", "scopeEnd") => Intrinsic::ScopeEnd,
+                _ => return None,
+            },
+        )
     }
 
     /// The operation a concrete instance stands for, if it is one.
@@ -2293,12 +2303,11 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 _ => None,
             })
             .collect();
+        // As inference places them: the named arguments, then the
+        // positional ones.
         let mut slots: Vec<Option<ExprId>> = vec![None; params.len()];
         let mut fits = positional.len() <= params.len();
         if fits {
-            for (i, &arg) in positional.iter().enumerate() {
-                slots[i] = Some(arg);
-            }
             match &named {
                 Some(named) => {
                     for &(name, value) in named {
@@ -2306,6 +2315,16 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                             Some(i) if slots[i].is_none() => slots[i] = Some(value),
                             _ => fits = false,
                         }
+                    }
+                }
+                None => fits = false,
+            }
+            let defaults: Vec<bool> = params.iter().map(|p| p.default).collect();
+            let taken: Vec<bool> = slots.iter().map(Option::is_some).collect();
+            match crag_types::place_positional(&defaults, &taken, positional.len()) {
+                Some(places) => {
+                    for (&arg, i) in positional.iter().zip(places) {
+                        slots[i] = Some(arg);
                     }
                 }
                 None => fits = false,
