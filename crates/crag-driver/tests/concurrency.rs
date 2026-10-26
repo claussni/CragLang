@@ -600,3 +600,36 @@ fn a_server_echoes_for_many_connections_at_once() {
 fn a_server_echoes_for_hundreds_of_connections() {
     echo("echo-many", 200, 5);
 }
+
+#[test]
+fn large_lists_are_freed_between_fibers() {
+    let (code, out) = run(
+        "teardown",
+        r#"import std.task
+
+type Node(label: Str, children: List[Node])
+
+fn build(depth: Int) -> Node {
+  if depth == 0 {
+    return Node(label: "a leaf with a label too long to be inline", children: [])
+  }
+  let c = [build(depth - 1), build(depth - 1), build(depth - 1), build(depth - 1)]
+  Node(label: "a node at depth {depth} of the tree", children: c)
+}
+
+fn main() -> ExitCode {
+  ref built = 0
+  all(limit: 4) { g ->
+    for i in 1..8 {
+      g.start { ->
+        let forest = [build(7), build(7)]
+        built.update { n -> n + 1 }
+      }
+    }
+  }
+  ExitCode(code: built.use())
+}
+"#,
+    );
+    assert_eq!(code, 8, "{out}");
+}

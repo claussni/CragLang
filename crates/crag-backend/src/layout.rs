@@ -425,3 +425,40 @@ pub fn type_descriptor<'db>(
         dispose: dispose_word(db, program, ty),
     })
 }
+
+/// Whether a value of `ty` goes through deferred teardown when its last
+/// reference goes (Specification §13.3, §13.5): a collection, whose chain
+/// of boxes may be long, that holds nothing `Immediate`. The runtime's
+/// handles are: a socket closes, a stream end is abandoned and a lock is
+/// freed at the drop. So is what may hold anything, a function value or a
+/// type parameter.
+pub fn deferred<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
+    match ty.as_builtin(db) {
+        Some((Builtin::List | Builtin::Map | Builtin::Set | Builtin::Grid, args)) => args
+            .iter()
+            .all(|&a| !immediate(db, program, a, &mut Vec::new())),
+        _ => false,
+    }
+}
+
+/// Whether a value of `ty` may hold something `Immediate`.
+fn immediate<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>, seen: &mut Vec<Ty<'db>>) -> bool {
+    if seen.contains(&ty) {
+        return false;
+    }
+    seen.push(ty);
+    match ty.kind(db) {
+        TyKind::Builtin(b, args) => match b {
+            Builtin::Ext
+            | Builtin::Lazy
+            | Builtin::RuntimeStream
+            | Builtin::RuntimeHub
+            | Builtin::RuntimeSocket => true,
+            _ => args.iter().any(|&a| immediate(db, program, a, seen)),
+        },
+        TyKind::Named(..) | TyKind::Record { .. } => fields_of(db, program, ty)
+            .is_some_and(|fields| fields.iter().any(|&(_, f)| immediate(db, program, f, seen))),
+        TyKind::Union(members) => members.iter().any(|&m| immediate(db, program, m, seen)),
+        TyKind::Fn { .. } | TyKind::Param(..) | TyKind::Error => true,
+    }
+}

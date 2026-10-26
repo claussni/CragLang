@@ -61,7 +61,7 @@ use crag_mir::{
 use crag_types::{Builtin, Step, Ty, TyKind, prelude_item, signature};
 
 use crate::layout::{
-    Layout, boxed_indices, dispose_word, equal_by_words, layout, record_layout, subtypes,
+    Layout, boxed_indices, deferred, dispose_word, equal_by_words, layout, record_layout, subtypes,
     type_descriptor, type_index,
 };
 use crate::slot_key;
@@ -391,7 +391,14 @@ impl<'a, 'db> Lower<'a, 'db> {
                 self.assign(*local, values)
             }
             Statement::Retain(local) => self.count(*local, Self::retain),
-            Statement::Release(local) => self.count(*local, Self::release),
+            Statement::Release(local) => {
+                // A long chain of boxes is freed between fibers (§13.5).
+                let op = match deferred(self.db, self.program, self.local_ty(*local)) {
+                    true => Self::release_deferred,
+                    false => Self::release,
+                };
+                self.count(*local, op)
+            }
             Statement::Poll => {
                 self.push(Inst::Poll);
                 Ok(())
@@ -487,6 +494,17 @@ impl<'a, 'db> Lower<'a, 'db> {
     /// Gives up a reference to a box, unless it is static, and has the
     /// runtime free it with the last.
     fn release(&mut self, ptr: VReg) {
+        self.release_by(ptr, RuntimeFn::Release);
+    }
+
+    /// Gives up a reference as `release` does, but has the runtime free
+    /// the box with the last through deferred teardown, a bounded part at
+    /// once and the rest between fibers (Plan §11.7.12).
+    fn release_deferred(&mut self, ptr: VReg) {
+        self.release_by(ptr, RuntimeFn::ReleaseDeferred);
+    }
+
+    fn release_by(&mut self, ptr: VReg, func: RuntimeFn) {
         let (sub, free, done) = (self.new_block(), self.new_block(), self.new_block());
         let counted = self.counted(ptr);
         self.end(
@@ -510,7 +528,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             Some(free),
         );
         self.push(Inst::CallRuntime {
-            func: RuntimeFn::Release,
+            func,
             args: vec![ptr],
             dsts: Vec::new(),
         });

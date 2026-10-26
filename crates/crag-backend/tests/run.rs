@@ -338,7 +338,8 @@ impl Module {
         for func in RuntimeFn::ALL {
             let addr = match func {
                 RuntimeFn::Alloc => rt_alloc as *const () as usize,
-                RuntimeFn::Release => rt_release as *const () as usize,
+                // Without a scheduler a deferred release frees at once.
+                RuntimeFn::Release | RuntimeFn::ReleaseDeferred => rt_release as *const () as usize,
                 RuntimeFn::Trap => rt_trap as *const () as usize,
                 RuntimeFn::ListPush => rt_list_push as *const () as usize,
                 RuntimeFn::ListElem => rt_list_elem as *const () as usize,
