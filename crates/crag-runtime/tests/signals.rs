@@ -88,7 +88,7 @@ impl Builder {
 }
 
 /// `script(cell, scratch, out, lists) = status`: runs the steps, then takes
-/// up to [`MOST`] signals, their words to `out` and their list types to
+/// up to [`MOST`] signals, three words each to `out` and their list types to
 /// `lists`. The status is that of the last ref commit.
 fn script(steps: &[Step]) -> LirFunction {
     let (cell, scratch, out, lists) = (r(0), r(1), r(2), r(3));
@@ -114,8 +114,15 @@ fn script(steps: &[Step]) -> LirFunction {
             Step::Abort => b.call(RuntimeFn::TxAbort, vec![], vec![]),
             Step::Retry => b.call(RuntimeFn::TxRetry, vec![], vec![]),
             Step::Emit(qualifier, list, w0) => {
-                let args = vec![b.konst(qualifier), b.konst(list), b.konst(w0), b.konst(0)];
-                b.call(RuntimeFn::SignalEmit, args, vec![]);
+                let args = vec![
+                    b.konst(qualifier),
+                    b.konst(list),
+                    b.konst(w0),
+                    b.konst(0),
+                    b.konst(0),
+                ];
+                let held = b.reg();
+                b.call(RuntimeFn::SignalEmit, args, vec![held]);
             }
             Step::Read => {
                 let version = b.version;
@@ -144,7 +151,7 @@ fn script(steps: &[Step]) -> LirFunction {
     // A script that traps takes nothing.
     let takes = if term.is_some() { 0 } else { MOST };
     for i in 0..takes {
-        let (offset, at, list) = (b.konst(16 * i as u64), b.reg(), b.reg());
+        let (offset, at, list) = (b.konst(24 * i as u64), b.reg(), b.reg());
         b.insts.push(Inst::Bin {
             op: crag_codegen::BinOp::Add,
             dst: at,
@@ -197,7 +204,7 @@ fn run_script(steps: &[Step]) -> Run {
     worker.set_types(types());
     let cell = Box::new([AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
     let mut scratch = [0u64; 2];
-    let mut out = [0u64; 2 * MOST];
+    let mut out = [0u64; 3 * MOST];
     let mut lists = [SIGNAL_NONE; MOST];
     let args = [
         std::ptr::from_ref(&*cell) as u64,
@@ -212,7 +219,7 @@ fn run_script(steps: &[Step]) -> Run {
         .iter()
         .take_while(|&&list| list != SIGNAL_NONE)
         .enumerate()
-        .map(|(i, _)| out[2 * i])
+        .map(|(i, _)| out[3 * i])
         .collect();
     Run {
         state,
@@ -370,8 +377,9 @@ fn signals_not_delivered_are_given_up() {
     ];
     let got = run_script(&steps);
     assert_eq!(got.taken.len(), 1);
-    // The delivered one is the script's to release; the others were.
-    assert_eq!(x.count(), 1_001);
+    // The delivered one was lent until the next take; the others were
+    // given up.
+    assert_eq!(x.count(), 1_000);
 }
 
 #[test]

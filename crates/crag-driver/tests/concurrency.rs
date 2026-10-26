@@ -633,3 +633,94 @@ fn main() -> ExitCode {
     );
     assert_eq!(code, 8, "{out}");
 }
+
+#[test]
+fn signals_reach_the_most_specific_handler_of_the_innermost_block() {
+    let (code, out) = run(
+        "signals",
+        r#"import std.task
+
+pub distinct type ShopSignal(..Signal)
+type OrderPlaced(..ShopSignal, total: Int)
+type Note(..ShopSignal, n: Int)
+
+fn place(total: Int) -> () {
+  emit OrderPlaced(total: total)
+}
+
+fn main() -> ExitCode {
+  ref orders = 0
+  ref shop = 0
+  ref outer = 0
+  on ShopSignal { s -> outer.update { n -> n + 1 } }
+  {
+    on ShopSignal { s -> shop.update { n -> n + 1 } }
+    on OrderPlaced { o ->
+      orders.update { n -> n + o.total }
+      // Passes the signal on outward.
+      emit o
+    }
+    place(5)
+    emit Note(n: 1)
+    all { g ->
+      g.start { -> place(7) }
+    }
+  }
+  place(100)
+  ExitCode(code: orders.use() * 10 + shop.use() + outer.use())
+}
+"#,
+    );
+    // Orders 5 and 7 reach OrderPlaced; each also passes on to the outer
+    // ShopSignal handler, the note reaches the inner one, and 100 the
+    // outer one after the block: 12 * 10 + 1 + 3.
+    assert_eq!(code, 124, "{out}");
+}
+
+#[test]
+fn signals_of_a_transaction_wait_for_its_outcome() {
+    let (code, out) = run(
+        "signals-atomic",
+        r#"type Failed(..Error)
+type Done(..Signal, n: Int)
+
+fn main() -> ExitCode {
+  ref seen = 0
+  ref a = 0
+  on Done { d -> seen.update { s -> s * 10 + d.n } }
+  atomic {
+    a.update { v -> v + 1 }
+    emit ok Done(n: 1)
+    emit fail Done(n: 2)
+  }
+  let r = atomic {
+    emit ok Done(n: 3)
+    emit fail Done(n: 4)
+    Failed
+  }
+  a.update { v ->
+    emit Done(n: 5)
+    v + 1
+  }
+  ExitCode(code: seen.use() % 256)
+}
+"#,
+    );
+    // 1, then 4, then 5: 145.
+    assert_eq!(code, 145, "{out}");
+}
+
+#[test]
+fn a_signal_no_handler_takes_reaches_the_root() {
+    let (code, out) = run(
+        "signals-root",
+        r#"type Lost(..Signal, n: Int)
+
+fn main() -> ExitCode {
+  emit Lost(n: 1)
+  ExitCode(code: 3)
+}
+"#,
+    );
+    assert_eq!(code, 3, "{out}");
+}

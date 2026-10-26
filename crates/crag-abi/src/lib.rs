@@ -567,24 +567,28 @@ pub enum RuntimeFn {
     /// or waits for any more (§10.1).
     ExtFree = 55,
 
-    /// `rt_signal_emit(ctx, qualifier, list, w0, w1)`.
+    /// `rt_signal_emit(ctx, qualifier, list, w0, w1, info) -> status`.
     ///
-    /// Emits a signal in an `atomic` block or an update closure
-    /// (Specification §11.2), laid out as the elements of the list type
-    /// with index `list`, with its references. `qualifier` is one of
+    /// Emits a signal (Specification §11.2), laid out as the elements of
+    /// the list type with index `list`. `qualifier` is one of
     /// [`SIGNAL_PLAIN`], [`SIGNAL_OK`], [`SIGNAL_FAIL`] and
-    /// [`SIGNAL_RETRY`]. The signal is held until the block's outcome
-    /// decides whether it is delivered (Implementation Plan §11.7.10).
-    /// Outside a block, generated code delivers a signal itself.
+    /// [`SIGNAL_RETRY`]. In an `atomic` block or an update closure the
+    /// signal is held, with its references, until the block's outcome
+    /// decides whether it is delivered (Implementation Plan §11.7.10):
+    /// [`SIGNAL_HELD`]. Elsewhere generated code delivers it itself, and
+    /// keeps its references: [`SIGNAL_DELIVER`]. `info` points at what
+    /// generated code knows of the signal's type, in its static data:
+    /// the type index, 1 if the value is a box whose header has the
+    /// index, the length of the type's name and the name.
     SignalEmit = 56,
 
     /// `rt_signal_next(ctx, out) -> list`.
     ///
     /// Takes the next signal an outcome made deliverable: its list type,
-    /// with its two words at `out` and its references, or [`SIGNAL_NONE`].
+    /// with its two words and its `info` at `out`, or [`SIGNAL_NONE`].
+    /// The signal is borrowed until the next call, which gives it up.
     /// Generated code calls it after `TxCommit`, `TxAbort`, `TxRetry`,
-    /// `RefCommit` and `RefDone` until there is none, and runs the
-    /// handlers.
+    /// `RefCommit` and `RefDone` until there is none, and delivers each.
     SignalNext = 57,
 
     /// `rt_lazy_new(ctx, list) -> lazy`.
@@ -674,6 +678,48 @@ pub enum RuntimeFn {
     /// afterwards, or the error number. The caller holds the value until
     /// the call returns.
     IoWriteBytes = 70,
+
+    /// `rt_signal_mark(ctx) -> mark`.
+    ///
+    /// How many signal handlers the task has registered: the base of a
+    /// block's handlers, which `SignalReset` returns to when the block
+    /// ends (Implementation Plan §11.7.14).
+    SignalMark = 71,
+
+    /// `rt_signal_reset(ctx, mark)`.
+    ///
+    /// Forgets the handlers registered since the mark.
+    SignalReset = 72,
+
+    /// `rt_signal_on(ctx, code, env, types, packed, base)`.
+    ///
+    /// Registers a handler (Specification §11.3) of the block whose mark is
+    /// `base`: its function value, which the caller keeps until the block
+    /// ends, and a sorted array of the `u32` type indices of the signal
+    /// types it takes, in static data. `packed` holds the array's length
+    /// in its upper half, then how many parent types the handler's type
+    /// has, shifted by 8, then the words of its parameter, zero or one.
+    SignalOn = 73,
+
+    /// `rt_signal_find(ctx, index, out) -> found`.
+    ///
+    /// Finds the handler of a signal of type index `index`: the innermost
+    /// block's that takes it, and of those the most specific. Gives 1 with
+    /// its code, its environment and the words of its parameter at `out`,
+    /// and hides its block and those above while it runs, until
+    /// `SignalLeave`; else 0.
+    SignalFind = 74,
+
+    /// `rt_signal_leave(ctx)`.
+    ///
+    /// Shows what `SignalFind` hid, once the handler returned.
+    SignalLeave = 75,
+
+    /// `rt_signal_default(ctx, name, len)`.
+    ///
+    /// The root's handler of a signal no handler takes: writes the name of
+    /// its type to standard error.
+    SignalDefault = 76,
 }
 
 /// A status of the stream functions: sent, or a value taken.
@@ -739,6 +785,11 @@ pub const SIGNAL_RETRY: u64 = 3;
 /// What `rt_signal_next` gives when no signal is left to deliver.
 pub const SIGNAL_NONE: u64 = u64::MAX;
 
+/// What `rt_signal_emit` gives: the signal is held, or the caller delivers
+/// it.
+pub const SIGNAL_HELD: u64 = 0;
+pub const SIGNAL_DELIVER: u64 = 1;
+
 /// The statuses of `rt_lazy_get`: the value is there, the caller computes
 /// it, or its computation trapped.
 pub const LAZY_DONE: u64 = 0;
@@ -763,7 +814,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 71] = [
+    pub const ALL: [RuntimeFn; 77] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -835,6 +886,12 @@ impl RuntimeFn {
         RuntimeFn::IoBuffer,
         RuntimeFn::IoBytes,
         RuntimeFn::IoWriteBytes,
+        RuntimeFn::SignalMark,
+        RuntimeFn::SignalReset,
+        RuntimeFn::SignalOn,
+        RuntimeFn::SignalFind,
+        RuntimeFn::SignalLeave,
+        RuntimeFn::SignalDefault,
     ];
 
     /// The symbol the loader looks up.
@@ -911,6 +968,12 @@ impl RuntimeFn {
             RuntimeFn::IoBuffer => "rt_io_buffer",
             RuntimeFn::IoBytes => "rt_io_bytes",
             RuntimeFn::IoWriteBytes => "rt_io_write_bytes",
+            RuntimeFn::SignalMark => "rt_signal_mark",
+            RuntimeFn::SignalReset => "rt_signal_reset",
+            RuntimeFn::SignalOn => "rt_signal_on",
+            RuntimeFn::SignalFind => "rt_signal_find",
+            RuntimeFn::SignalLeave => "rt_signal_leave",
+            RuntimeFn::SignalDefault => "rt_signal_default",
         }
     }
 

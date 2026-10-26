@@ -246,6 +246,35 @@ pub fn record_subtypes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> V
     out
 }
 
+/// The type indices of the signal types a handler of `ty` takes (§11.3):
+/// `ty` and every named type without parameters that is a subtype of it,
+/// records and tags alike, sorted; and how many parent types `ty` has, which
+/// makes it more specific.
+pub fn signal_types<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> (Vec<u32>, u32) {
+    let mut out = vec![type_index(ty) as u32];
+    for &module in module_index(db, program).modules.values() {
+        for item in &item_tree(db, module).items {
+            let id = item.id;
+            if *id.kind(db) != ItemKind::Type || !type_header(db, program, id).params.is_empty() {
+                continue;
+            }
+            let candidate = Ty::new(db, TyKind::Named(id, Vec::new()));
+            if candidate != ty && is_subtype(db, program, candidate, ty) {
+                out.push(type_index(candidate) as u32);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    let mut parents = 0;
+    let mut at = ty;
+    while let Some(p) = parent(db, program, at) {
+        parents += 1;
+        at = p;
+    }
+    (out, parents)
+}
+
 /// The type indices a value of the union `ty` may carry with a box as its
 /// payload: those of its members that are boxes, and of their subtypes,
 /// and of its members of two words, in member boxes. None when a member

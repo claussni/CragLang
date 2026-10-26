@@ -169,6 +169,12 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::IoBuffer => net::rt_io_buffer as *const () as usize,
         RuntimeFn::IoBytes => net::rt_io_bytes as *const () as usize,
         RuntimeFn::IoWriteBytes => net::rt_io_write_bytes as *const () as usize,
+        RuntimeFn::SignalMark => signals::rt_signal_mark as *const () as usize,
+        RuntimeFn::SignalReset => signals::rt_signal_reset as *const () as usize,
+        RuntimeFn::SignalOn => signals::rt_signal_on as *const () as usize,
+        RuntimeFn::SignalFind => signals::rt_signal_find as *const () as usize,
+        RuntimeFn::SignalLeave => signals::rt_signal_leave as *const () as usize,
+        RuntimeFn::SignalDefault => signals::rt_signal_default as *const () as usize,
     }
 }
 

@@ -44,7 +44,7 @@ use crag_abi::{
     FUNCTION_BOX_HEADER, HEADER_SIZE, HEAP_OFFSET, INLINE_TEXT_MAX, LEN_OFFSET, LIST_SIZE,
     MAP_SIZE, MEMBER_BOX_SIZE, NO_POSITION, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, REF_ADD,
     REF_CELL_SIZE, REF_MUL, REF_SUB, REF_UNSIGNED, SCOPE_DONE, SIDE_END_OFFSET, SIDE_PTR_OFFSET,
-    START_EXEMPT, STATIC_COUNT, TEXT_BOX_HEADER, TEXT_LEN_MAX, TX_CONFLICT_OFFSET,
+    SIGNAL_NONE, START_EXEMPT, STATIC_COUNT, TEXT_BOX_HEADER, TEXT_LEN_MAX, TX_CONFLICT_OFFSET,
     TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TypeDescriptor, inline_text, size_class,
 };
 use crag_codegen::{
@@ -61,8 +61,8 @@ use crag_mir::{
 use crag_types::{Builtin, Step, Ty, TyKind, prelude_item, signature};
 
 use crate::layout::{
-    Layout, boxed_indices, deferred, dispose_word, equal_by_words, layout, record_layout, subtypes,
-    type_descriptor, type_index,
+    Layout, boxed_indices, deferred, dispose_word, equal_by_words, layout, record_layout,
+    signal_types, subtypes, type_descriptor, type_index,
 };
 use crate::slot_key;
 
@@ -159,7 +159,7 @@ pub fn lower_to_lir<'db>(
             0,
             Inst::SidePush {
                 dst,
-                size: 16,
+                size: 32,
                 align: 8,
             },
         );
@@ -223,8 +223,8 @@ struct Lower<'a, 'db> {
     false_index: i64,
     /// The cell of the value the code computes, if it is a value's.
     cell: Option<SlotKey>,
-    /// Two words on the side stack that reads of ref cells put the value
-    /// in, pushed at the entry once the code reads one.
+    /// Three words on the side stack that the runtime's reads put what they
+    /// read in, pushed at the entry once the code reads anything.
     scratch: Option<VReg>,
 }
 
@@ -924,6 +924,122 @@ impl<'a, 'db> Lower<'a, 'db> {
         }
     }
 
+    /// Static data with the bytes, and its address.
+    fn static_data(&mut self, bytes: Vec<u8>) -> VReg {
+        let data = match self.data.iter().position(|d| *d == bytes) {
+            Some(d) => d,
+            None => {
+                self.data.push(bytes);
+                self.data.len() - 1
+            }
+        };
+        let ptr = self.reg();
+        self.push(Inst::DataAddr {
+            dst: ptr,
+            data: data as u32,
+        });
+        ptr
+    }
+
+    /// What the delivery of a signal of type `ty` needs to know of it, in
+    /// static data (see `crag_abi::RuntimeFn::SignalEmit`): its type index,
+    /// whether its box's header has the index instead, and its name.
+    fn signal_info(&mut self, ty: Ty<'db>, boxed: bool) -> VReg {
+        let name = ty.display(self.db);
+        let mut bytes = Vec::new();
+        bytes.extend((type_index(ty) as u64).to_le_bytes());
+        bytes.extend(u64::from(boxed).to_le_bytes());
+        bytes.extend((name.len() as u64).to_le_bytes());
+        bytes.extend(name.as_bytes());
+        self.static_data(bytes)
+    }
+
+    /// Delivers a signal, whose first word is `w0`, to its handler, or to
+    /// the root's (§11.3). The handler gets a reference of its own; the
+    /// caller keeps the signal's.
+    fn deliver(&mut self, w0: VReg, info: VReg) {
+        let index = self.reg();
+        let (from_box, from_type, found_index) =
+            (self.new_block(), self.new_block(), self.new_block());
+        let boxed = self.load(info, 8);
+        self.end(
+            Term::Branch {
+                cond: boxed,
+                then: from_box,
+                otherwise: from_type,
+            },
+            Some(from_box),
+        );
+        // The box of a record has the type index of the record's type, a
+        // subtype's too, in the lower half of its header's second word.
+        let header = self.load(w0, TYPE_INDEX_OFFSET);
+        let lower = self.constant(0xffff_ffff);
+        let masked = self.bin(LirBin::And, header, lower);
+        self.push(Inst::Move {
+            dst: index,
+            src: masked,
+        });
+        self.end(Term::Jump(found_index), Some(from_type));
+        let static_index = self.load(info, 0);
+        self.push(Inst::Move {
+            dst: index,
+            src: static_index,
+        });
+        self.end(Term::Jump(found_index), Some(found_index));
+        let out = self.scratch();
+        let found = self.runtime(RuntimeFn::SignalFind, vec![index, out]);
+        let (call, root, done) = (self.new_block(), self.new_block(), self.new_block());
+        self.end(
+            Term::Branch {
+                cond: found,
+                then: call,
+                otherwise: root,
+            },
+            Some(call),
+        );
+        let code = self.load(out, 0);
+        let env = self.load(out, 8);
+        let words = self.load(out, 16);
+        let (with_value, without, left) = (self.new_block(), self.new_block(), self.new_block());
+        self.end(
+            Term::Branch {
+                cond: words,
+                then: with_value,
+                otherwise: without,
+            },
+            Some(with_value),
+        );
+        // A handler of one word takes a record: the signal's box.
+        self.retain(w0);
+        self.push(Inst::CallIndirect {
+            callee: code,
+            args: vec![env, w0],
+            dsts: Vec::new(),
+        });
+        self.end(Term::Jump(left), Some(without));
+        self.push(Inst::CallIndirect {
+            callee: code,
+            args: vec![env],
+            dsts: Vec::new(),
+        });
+        self.end(Term::Jump(left), Some(left));
+        self.push(Inst::CallRuntime {
+            func: RuntimeFn::SignalLeave,
+            args: Vec::new(),
+            dsts: Vec::new(),
+        });
+        self.end(Term::Jump(done), Some(root));
+        let header = self.constant(24);
+        let name = self.bin(LirBin::Add, info, header);
+        let len = self.load(info, 16);
+        self.push(Inst::CallRuntime {
+            func: RuntimeFn::SignalDefault,
+            args: vec![name, len],
+            dsts: Vec::new(),
+        });
+        self.end(Term::Jump(done), Some(done));
+    }
+
     /// A box of type `ty`, a `RuntimeStream` or `RuntimeHub`, holding a
     /// handle of the runtime.
     fn handle_box(&mut self, ty: Ty<'db>, handle: VReg) -> Result<Vec<VReg>, Unsupported> {
@@ -1377,6 +1493,95 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let left = word(&self.operand(left, int)?)?;
                 let out = self.runtime2(RuntimeFn::IoWriteBytes, vec![fd, w0, w1, left]);
                 Ok(vec![self.fd_or_error(out[0], out[1])])
+            }
+            (Intrinsic::SignalMark, []) => {
+                Ok(vec![self.runtime(RuntimeFn::SignalMark, Vec::new())])
+            }
+            (Intrinsic::SignalReset, [mark, ..]) => {
+                let mark = word(&self.operand(mark, int)?)?;
+                self.push(Inst::CallRuntime {
+                    func: RuntimeFn::SignalReset,
+                    args: vec![mark],
+                    dsts: Vec::new(),
+                });
+                Ok(Vec::new())
+            }
+            (Intrinsic::SignalOn, [handler, base]) => {
+                let handler_ty = self.operand_ty(handler, ty);
+                let TyKind::Fn { params, .. } = handler_ty.kind(self.db) else {
+                    return Err("signal handlers of this type");
+                };
+                let signal = params[0];
+                let words = layout(self.db, self.program, signal)
+                    .ok_or("signal handlers of this type")?
+                    .words();
+                if words > 1 {
+                    return Err("signal handlers of this type");
+                }
+                let (types, parents) = signal_types(self.db, self.program, signal);
+                let bytes: Vec<u8> = types.iter().flat_map(|t| t.to_le_bytes()).collect();
+                let table = self.static_data(bytes);
+                let [code, env] = self.operand(handler, handler_ty)?[..] else {
+                    return Err("signal handlers of this type");
+                };
+                let packed = (types.len() as i64) << 32 | i64::from(parents) << 8 | words as i64;
+                let packed = self.constant(packed);
+                let base = word(&self.operand(base, int)?)?;
+                self.push(Inst::CallRuntime {
+                    func: RuntimeFn::SignalOn,
+                    args: vec![code, env, table, packed, base],
+                    dsts: Vec::new(),
+                });
+                Ok(Vec::new())
+            }
+            (Intrinsic::SignalEmit { qualifier }, [signal]) => {
+                let signal_ty = self.operand_ty(signal, ty);
+                let signal_layout = layout(self.db, self.program, signal_ty);
+                let boxed = match signal_layout {
+                    Some(Layout::Box) => true,
+                    Some(Layout::Zero | Layout::Tag) => false,
+                    _ => return Err("signals of this type"),
+                };
+                let words = self.operand(signal, signal_ty)?;
+                let info = self.signal_info(signal_ty, boxed);
+                let list = self.cell_list(signal_ty)?;
+                let [w0, w1] = self.pad(words.clone());
+                let qualifier = self.constant(i64::from(qualifier));
+                let held = self.runtime(RuntimeFn::SignalEmit, vec![qualifier, list, w0, w1, info]);
+                let (deliver, done) = (self.new_block(), self.new_block());
+                self.end(
+                    Term::Branch {
+                        cond: held,
+                        then: deliver,
+                        otherwise: done,
+                    },
+                    Some(deliver),
+                );
+                self.deliver(w0, info);
+                self.count_words(signal_layout, signal_ty, &words, Self::release)?;
+                self.end(Term::Jump(done), Some(done));
+                Ok(Vec::new())
+            }
+            (Intrinsic::SignalDrain, []) => {
+                let (head, take, done) = (self.new_block(), self.new_block(), self.new_block());
+                self.end(Term::Jump(head), Some(head));
+                let out = self.scratch();
+                let list = self.runtime(RuntimeFn::SignalNext, vec![out]);
+                let none = self.constant(SIGNAL_NONE as i64);
+                let more = self.cmp(Cond::Ne, list, none);
+                self.end(
+                    Term::Branch {
+                        cond: more,
+                        then: take,
+                        otherwise: done,
+                    },
+                    Some(take),
+                );
+                let w0 = self.load(out, 0);
+                let info = self.load(out, 16);
+                self.deliver(w0, info);
+                self.end(Term::Jump(head), Some(done));
+                Ok(Vec::new())
             }
             (Intrinsic::ScopeNew, [limit]) => {
                 let limit = word(&self.operand(limit, int)?)?;

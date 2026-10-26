@@ -36,8 +36,9 @@ use std::collections::HashMap;
 
 use crag_db::Db;
 use crag_hir::{
-    Arm, BindingId, BindingKind, Body, Expr, ExprId, FieldArg, ItemId, ItemKind, Literal, LocalFn,
-    Name, Owner, PRELUDE, Pat, PatId, Program, Resolution, Stmt, StrPart, hir_body, lower_body,
+    Arm, BindingId, BindingKind, Body, EmitKind, Expr, ExprId, FieldArg, ItemId, ItemKind, Literal,
+    LocalFn, Name, Owner, PRELUDE, Pat, PatId, Program, Resolution, Stmt, StrPart, hir_body,
+    lower_body,
 };
 use crag_types::{
     Builtin, Callee, DecisionTree, Dispatch, EscapeLevel, Filling, Handler, HandlerCode,
@@ -201,6 +202,15 @@ enum Dest {
     Return,
 }
 
+/// The qualifiers of `crag_abi::RuntimeFn::SignalEmit`, which MIR names
+/// without depending on the ABI.
+mod qualifier {
+    pub const PLAIN: u8 = 0;
+    pub const OK: u8 = 1;
+    pub const FAIL: u8 = 2;
+    pub const RETRY: u8 = 3;
+}
+
 /// An `atomic` block being built (Plan §11.7.14).
 #[derive(Clone, Copy)]
 struct AtomicFrame {
@@ -210,6 +220,16 @@ struct AtomicFrame {
     outcome: BlockId,
     /// The block's value.
     value: Local,
+    /// How many blocks with signal handlers are around the block.
+    handlers: usize,
+}
+
+/// A block that registers signal handlers (§11.3): the mark they go back
+/// to when it ends, and their function values.
+#[derive(Clone)]
+struct HandlerBlock<'db> {
+    mark: Operand<'db>,
+    closures: Vec<Operand<'db>>,
 }
 
 /// An access function of a ref (Specification §9.3).
@@ -291,6 +311,9 @@ pub struct MirBuilder<'a, 'db> {
     loops: u32,
     /// The `atomic` blocks around what is being built, the innermost last.
     atomic: Vec<AtomicFrame>,
+    /// The blocks around what is being built that register signal handlers,
+    /// the innermost last.
+    handlers: Vec<HandlerBlock<'db>>,
     bool_ty: Ty<'db>,
     true_ty: Ty<'db>,
     false_ty: Ty<'db>,
@@ -349,6 +372,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             test: false,
             loops: 0,
             atomic: Vec::new(),
+            handlers: Vec::new(),
             bool_ty,
             true_ty,
             false_ty,
@@ -955,6 +979,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let outer = self.atomic.last().map(|f| f.handler);
         let side_ptr = self.assign(int, Rvalue::Intrinsic(Intrinsic::SidePtr, Vec::new()));
         let side_end = self.assign(int, Rvalue::Intrinsic(Intrinsic::SideEnd, Vec::new()));
+        let signal_mark = self.assign(int, Rvalue::Intrinsic(Intrinsic::SignalMark, Vec::new()));
         let depth = self.assign(int, Rvalue::Intrinsic(Intrinsic::TxBegin, Vec::new()));
         let (head, outcome, handler, join) = (
             self.new_block(),
@@ -969,6 +994,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             handler,
             outcome,
             value,
+            handlers: self.handlers.len(),
         });
         self.eval(inner, Dest::Value(value));
         self.terminate(Terminator::Jump(outcome));
@@ -986,21 +1012,31 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             });
             self.switch_to(abort);
             self.assign(unit, Rvalue::Intrinsic(Intrinsic::TxAbort, Vec::new()));
+            self.drain_signals();
             self.terminate(Terminator::Jump(join));
             self.switch_to(commit);
         }
         let status = self.assign(int, Rvalue::Intrinsic(Intrinsic::TxCommit, Vec::new()));
         let committed = self.is_zero(status);
+        let delivered = self.new_block();
         self.terminate(Terminator::Branch {
             cond: committed,
-            then: join,
+            then: delivered,
             otherwise: handler,
         });
+        self.switch_to(delivered);
+        self.drain_signals();
+        self.terminate(Terminator::Jump(join));
 
         self.switch_to(handler);
         self.assign(
             unit,
             Rvalue::Intrinsic(Intrinsic::SideReset, vec![side_ptr, side_end]),
+        );
+        // A throw may have left handlers of the frames it left.
+        self.assign(
+            unit,
+            Rvalue::Intrinsic(Intrinsic::SignalReset, vec![signal_mark]),
         );
         match outer {
             Some(outer) => self.terminate(Terminator::Jump(outer)),
@@ -1022,6 +1058,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 });
                 self.switch_to(retry);
                 self.assign(unit, Rvalue::Intrinsic(Intrinsic::TxRetry, Vec::new()));
+                self.drain_signals();
                 self.push(Statement::Poll);
                 self.terminate(Terminator::Jump(head));
                 self.switch_to(throw);
@@ -1030,6 +1067,26 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         }
         self.switch_to(join);
         Operand::Local(value)
+    }
+
+    /// Forgets the signal handlers of the blocks from the one at `depth`
+    /// on, as their code is left.
+    fn reset_handlers(&mut self, depth: usize) {
+        let Some(first) = self.handlers.get(depth) else {
+            return;
+        };
+        let mut ops = vec![first.mark.clone()];
+        for block in &self.handlers[depth..] {
+            ops.extend(block.closures.iter().cloned());
+        }
+        let unit = Ty::unit(self.db);
+        self.assign(unit, Rvalue::Intrinsic(Intrinsic::SignalReset, ops));
+    }
+
+    /// Delivers the signals an outcome made deliverable.
+    fn drain_signals(&mut self) {
+        let unit = Ty::unit(self.db);
+        self.assign(unit, Rvalue::Intrinsic(Intrinsic::SignalDrain, Vec::new()));
     }
 
     /// Leaves the attempt of the transaction for an `atomic` block of a
@@ -1297,6 +1354,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             self.switch_to(failed);
             let unit = Ty::unit(db);
             self.assign(unit, Rvalue::Intrinsic(Intrinsic::RefDone, Vec::new()));
+            self.drain_signals();
             self.assign_to(value, Operand::Local(new), result_ty);
             self.terminate(Terminator::Jump(join));
             self.switch_to(fits);
@@ -1306,6 +1364,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             int,
             Rvalue::Intrinsic(Intrinsic::RefCommit, vec![cell, version, new]),
         );
+        self.drain_signals();
         let committed = self.assign(
             self.bool_ty,
             Rvalue::Compare {
@@ -1752,6 +1811,17 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let body = self.body;
         match body.expr(expr) {
             Expr::Block { stmts, tail } => {
+                // A block with signal handlers forgets them when it ends.
+                let registers = stmts.iter().any(|s| matches!(s, Stmt::On { .. }));
+                if registers {
+                    let int = self.int();
+                    let mark =
+                        self.assign(int, Rvalue::Intrinsic(Intrinsic::SignalMark, Vec::new()));
+                    self.handlers.push(HandlerBlock {
+                        mark,
+                        closures: Vec::new(),
+                    });
+                }
                 for stmt in stmts {
                     self.stmt(stmt);
                 }
@@ -1761,6 +1831,13 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         let unit = Ty::unit(self.db);
                         self.finish_dest(self.unit(), unit, dest);
                     }
+                }
+                if registers {
+                    if !matches!(dest, Dest::Return) {
+                        let depth = self.handlers.len() - 1;
+                        self.reset_handlers(depth);
+                    }
+                    self.handlers.pop();
                 }
             }
             Expr::If {
@@ -1789,11 +1866,11 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Expr::Call { .. } | Expr::MethodCall { .. } | Expr::TypedCall { .. }
                 if matches!(dest, Dest::Return) =>
             {
-                let op = self.call(expr, self.atomic.is_empty());
+                let op = self.call(expr, self.atomic.is_empty() && self.handlers.is_empty());
                 self.finish_dest(op, self.ty(expr), dest);
             }
             Expr::Field { .. } if matches!(dest, Dest::Return) && self.is_call(expr) => {
-                let op = self.call(expr, self.atomic.is_empty());
+                let op = self.call(expr, self.atomic.is_empty() && self.handlers.is_empty());
                 self.finish_dest(op, self.ty(expr), dest);
             }
             _ => {
@@ -1812,7 +1889,14 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Dest::Return if !self.atomic.is_empty() => {
                 let frame = *self.atomic.last().expect("in a block");
                 self.assign_to(frame.value, op, ty);
+                self.reset_handlers(frame.handlers);
                 self.terminate(Terminator::Jump(frame.outcome));
+            }
+            Dest::Return if !self.handlers.is_empty() => {
+                self.reset_handlers(0);
+                let ty_op = self.coerce(op, ty, self.result);
+                let op = if self.test { self.unit() } else { ty_op };
+                self.terminate(Terminator::Return(op));
             }
             Dest::Return if self.test => {
                 self.terminate(Terminator::Return(self.unit()));
@@ -3120,11 +3204,33 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 let unit = Ty::unit(self.db);
                 self.finish_dest(self.unit(), unit, Dest::Return);
             }
-            Stmt::Emit { value, .. } => {
-                self.unsupported(*value, "`emit`");
+            Stmt::Emit { kind, value } => {
+                let qualifier = match kind {
+                    None => qualifier::PLAIN,
+                    Some(EmitKind::Ok) => qualifier::OK,
+                    Some(EmitKind::Fail) => qualifier::FAIL,
+                    Some(EmitKind::Retry) => qualifier::RETRY,
+                };
+                let op = self.expr(*value);
+                let op = self.typed(op, self.ty(*value));
+                let unit = Ty::unit(self.db);
+                self.assign(
+                    unit,
+                    Rvalue::Intrinsic(Intrinsic::SignalEmit { qualifier }, vec![op]),
+                );
             }
             Stmt::On { handler, .. } => {
-                self.unsupported(*handler, "`on` handlers");
+                let f = self.expr(*handler);
+                let f_ty = self.ty(*handler);
+                let f = Operand::Local(self.materialize(f, f_ty));
+                let Some(block) = self.handlers.last_mut() else {
+                    self.trap(TrapKind::Error, Some(*handler));
+                    return;
+                };
+                block.closures.push(f.clone());
+                let mark = block.mark.clone();
+                let unit = Ty::unit(self.db);
+                self.assign(unit, Rvalue::Intrinsic(Intrinsic::SignalOn, vec![f, mark]));
             }
             Stmt::Fn { binding, function } => {
                 let Some(root) = function.body else {

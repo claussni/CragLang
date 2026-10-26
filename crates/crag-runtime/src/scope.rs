@@ -336,6 +336,10 @@ unsafe extern "C" fn start_entry(
         let stub = scope.entries[(flags & 3) as usize];
         let mut fiber = Fiber::new(stub, code as usize, &[env], scope.config)
             .unwrap_or_else(|_| die("out of memory for a task's stack"));
+        // A task's signals go to the handlers its starter sees (§11.3).
+        fiber
+            .signals
+            .inherit(crate::signals::signals_of(ctx).inherited());
         // A cancelled starter that must stop still starts the task, which
         // owns the function value, but cancelled.
         let starter_stops = cancel::due(ctx);

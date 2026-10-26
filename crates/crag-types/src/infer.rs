@@ -3577,12 +3577,29 @@ impl<'a, 'db> Infer<'a, 'db> {
                 self.result_value(site, ty);
                 Ty::never(db)
             }
-            Stmt::On { handler, .. } => {
-                self.error(
-                    Site::Expr(*handler),
-                    ErrorKind::Unsupported("`on` handlers"),
+            // A signal handler: a function of the signal (§11.3). Trap
+            // handlers (§8.3.1) come later.
+            Stmt::On { ty, handler } => {
+                let signal = self.lower_type(*ty);
+                let is_signal = prelude_item(db, self.program, "Signal").is_some()
+                    && self.fits(signal, prelude_type(db, self.program, "Signal"));
+                if !is_signal {
+                    self.error(
+                        Site::Expr(*handler),
+                        ErrorKind::Unsupported("`on` handlers of what is not a signal"),
+                    );
+                    self.synth(*handler);
+                    return unit;
+                }
+                let expected = Ty::new(
+                    db,
+                    TyKind::Fn {
+                        params: vec![signal],
+                        result: unit,
+                        pure: false,
+                    },
                 );
-                self.synth(*handler);
+                self.check(*handler, expected);
                 unit
             }
             Stmt::Fn { binding, function } => {

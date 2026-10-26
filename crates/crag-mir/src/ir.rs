@@ -373,6 +373,22 @@ pub enum Intrinsic<'db> {
     /// Writes the last bytes the count says, all for -1: how many are left
     /// afterwards, or minus the error number.
     IoWrite,
+    /// Emits the signal (§11.2), with the qualifier of
+    /// `crag_abi::SIGNAL_PLAIN` to `SIGNAL_RETRY`: held in a block, else
+    /// delivered at once.
+    SignalEmit {
+        qualifier: u8,
+    },
+    /// Delivers the signals an outcome of a block made deliverable.
+    SignalDrain,
+    /// The mark of a block's handlers, an `Int`.
+    SignalMark,
+    /// Registers the function value as a handler of the block with the
+    /// mark (§11.3).
+    SignalOn,
+    /// Forgets the handlers since the mark; the function values after it,
+    /// those handlers, stay live until then.
+    SignalReset,
 }
 
 impl Intrinsic<'_> {
@@ -381,7 +397,10 @@ impl Intrinsic<'_> {
         match self {
             Intrinsic::RefCommit => index == 2,
             Intrinsic::RefSwap | Intrinsic::ScopeStart | Intrinsic::ExtStore => index == 1,
-            Intrinsic::RefNew | Intrinsic::ExtNew | Intrinsic::LazyNew => index == 0,
+            Intrinsic::RefNew
+            | Intrinsic::ExtNew
+            | Intrinsic::LazyNew
+            | Intrinsic::SignalEmit { .. } => index == 0,
             _ => false,
         }
     }
