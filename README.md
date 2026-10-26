@@ -14,7 +14,7 @@ The documents live as Claude Docs documents and are edited there.
 
 | Crate | Components |
 | --- | --- |
-| `crates/crag-runtime` | Fiber runtime, stack growth, side stack, sentinel, stress harness, allocator, reference counting and the queue of disposals, lists and maps, the scheduler, the I/O poller and timers, scopes and cancellation, streams and hubs, refs, transactions, ext locks, signals of blocks and lazy cells, strings and bytes, traps |
+| `crates/crag-runtime` | Fiber runtime, stack growth, side stack, sentinel, stress harness, allocator, reference counting and the queue of disposals, lists and maps, the scheduler, the I/O poller and timers, scopes and cancellation, streams and hubs, refs, transactions, ext locks, signals of blocks, lazy cells and deferred teardown, strings and bytes, traps |
 | `crates/crag-abi` | Constants shared by generated code and the runtime |
 | `crates/crag-codegen` | Cranelift facade |
 | `crates/crag-loader` | Code loader |

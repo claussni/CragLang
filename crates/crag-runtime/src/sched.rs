@@ -125,6 +125,11 @@ pub(crate) struct Shared {
     stats: Vec<Counters>,
     /// Where fibers wait for time and I/O.
     pub(crate) reactor: Reactor,
+    /// The rest of structures whose deferred teardown is under way, each a
+    /// list of dead boxes (Plan §11.7.12). Each counts as live.
+    teardown: Mutex<VecDeque<usize>>,
+    /// Deferred dispose handlers that trapped.
+    deferred_traps: AtomicU64,
 }
 
 // SAFETY: the fibers behind the words in the queues are owned by the
@@ -159,6 +164,8 @@ pub(crate) struct Local {
     shared: Arc<Shared>,
     index: usize,
     deque: Deque,
+    /// Counts the worker's turns, to interleave teardown.
+    turn: u32,
 }
 
 /// Worker threads running fibers until the scheduler is dropped.
@@ -184,6 +191,7 @@ impl Scheduler {
                     shared: shared.clone(),
                     index,
                     deque,
+                    turn: 0,
                 };
                 let (types, code) = (types.clone(), code.clone());
                 std::thread::Builder::new()
@@ -256,6 +264,11 @@ impl Scheduler {
             // no worker uses it any more.
             .map(|p| unsafe { Box::from_raw(p as *mut Fiber) })
             .collect()
+    }
+
+    /// How many deferred dispose handlers trapped so far.
+    pub fn deferred_traps(&self) -> u64 {
+        self.shared.deferred_traps.load(Ordering::Relaxed)
     }
 
     /// What each worker did so far.
@@ -336,10 +349,13 @@ impl Shared {
             shutdown: AtomicBool::new(false),
             stats: (0..n).map(|_| Counters::default()).collect(),
             reactor: Reactor::new().expect("the poller starts"),
+            teardown: Mutex::new(VecDeque::new()),
+            deferred_traps: AtomicU64::new(0),
         }
     }
 
-    /// Hands a new fiber, a task of a scope, to the workers: to the deque
+    /// Hands a new fiber, a task of a scope or a detached one, to the
+    /// workers: to the deque
     /// of `local`'s worker while it holds less than a batch, else to the
     /// global queue.
     pub(crate) fn launch(&self, fiber: Box<Fiber>, local: Option<&mut Local>) {
@@ -354,7 +370,20 @@ impl Shared {
         }
     }
 
-    /// Counts off a fiber that stopped and that its scope took.
+    /// Queues the rest of a structure to tear down: a list of dead boxes.
+    pub(crate) fn queue_teardown(&self, pending: *mut u8) {
+        *self.live.lock().unwrap() += 1;
+        self.requeue_teardown(pending);
+    }
+
+    /// Queues the rest of a structure a worker tore down a batch of.
+    pub(crate) fn requeue_teardown(&self, pending: *mut u8) {
+        self.teardown.lock().unwrap().push_back(pending as usize);
+        self.notify();
+    }
+
+    /// Counts off a fiber that stopped and that its scope took, a detached
+    /// fiber, or a structure torn down.
     pub(crate) fn retire(&self) {
         let mut live = self.live.lock().unwrap();
         *live -= 1;
@@ -385,7 +414,9 @@ impl Shared {
     }
 
     fn has_work(&self) -> bool {
-        !self.global.lock().unwrap().is_empty() || self.stealers.iter().any(|s| !s.is_empty())
+        !self.global.lock().unwrap().is_empty()
+            || self.stealers.iter().any(|s| !s.is_empty())
+            || !self.teardown.lock().unwrap().is_empty()
     }
 
     /// Records a fiber that finished, trapped or was paused.
@@ -399,16 +430,36 @@ impl Shared {
     }
 }
 
+/// What a worker does next.
+enum Work {
+    Fiber(FiberPtr),
+    /// A batch of a structure's teardown.
+    Teardown(usize),
+}
+
+/// A worker tears down a batch before looking for fibers once in this
+/// many turns, so that teardown goes on while fibers keep it busy.
+const TEARDOWN_TURNS: u32 = 8;
+
 impl Local {
-    /// The next fiber to run, parking until there is one; none once the
+    /// The next work to do, parking until there is some; none once the
     /// scheduler shuts down.
-    fn next(&mut self) -> Option<FiberPtr> {
+    fn next(&mut self) -> Option<Work> {
         loop {
             if self.shared.shutdown.load(Ordering::SeqCst) {
                 return None;
             }
+            self.turn = self.turn.wrapping_add(1);
+            if self.turn.is_multiple_of(TEARDOWN_TURNS)
+                && let Some(head) = self.take_teardown()
+            {
+                return Some(Work::Teardown(head));
+            }
             if let Some(fiber) = self.find() {
-                return Some(fiber);
+                return Some(Work::Fiber(fiber));
+            }
+            if let Some(head) = self.take_teardown() {
+                return Some(Work::Teardown(head));
             }
             let parker = &self.shared.parkers[self.index];
             parker.parked.store(true, Ordering::SeqCst);
@@ -428,6 +479,10 @@ impl Local {
                 std::thread::park();
             }
         }
+    }
+
+    fn take_teardown(&self) -> Option<usize> {
+        self.shared.teardown.lock().unwrap().pop_front()
     }
 
     /// A fiber from the own deque, the global queue or another worker's
@@ -498,7 +553,15 @@ fn worker_main(mut local: Local, types: Arc<Types>, code: Arc<CodeMap>) {
     worker.set_types(types);
     worker.set_code_map(code);
     let mut resumes = 0u64;
-    while let Some(ptr) = local.next() {
+    while let Some(work) = local.next() {
+        let ptr = match work {
+            Work::Fiber(ptr) => ptr,
+            Work::Teardown(head) => {
+                // SAFETY: the worker is between fibers.
+                unsafe { crate::teardown::batch(&shared, &raw mut worker, &mut local, head) };
+                continue;
+            }
+        };
         // SAFETY: a fiber in a queue is owned by the scheduler, and only
         // the worker that took it uses it until it is queued again.
         let fiber = unsafe { &mut *(ptr as *mut Fiber) };
@@ -514,6 +577,17 @@ fn worker_main(mut local: Local, types: Arc<Types>, code: Arc<CodeMap>) {
             FiberState::Runnable => shared.push_global(ptr),
             // Its wake queues it.
             FiberState::Waiting(_) => {}
+            // No one waits for a detached fiber.
+            FiberState::Finished | FiberState::Trapped if fiber.detached => {
+                // SAFETY: as below.
+                let fiber = unsafe { Box::from_raw(ptr as *mut Fiber) };
+                if fiber.state == FiberState::Trapped {
+                    shared.deferred_traps.fetch_add(1, Ordering::Relaxed);
+                    crate::teardown::trapped(&fiber);
+                }
+                drop(fiber);
+                shared.retire();
+            }
             // A task goes to its scope.
             FiberState::Finished | FiberState::Trapped if fiber.task.is_some() => {
                 // SAFETY: as above; no queue holds the fiber any more.

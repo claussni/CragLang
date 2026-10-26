@@ -242,15 +242,51 @@ pub(crate) unsafe fn release_value(
 /// refers to it. Every box it reaches was allocated with a type index that
 /// `types` describes, and its fields hold what the descriptor says.
 pub unsafe fn release_box(heap: &mut Heap, types: &Types, ptr: *mut u8) {
+    // SAFETY: as the caller promises.
+    unsafe {
+        let mut pending = start_chain(ptr);
+        free_chain(heap, types, &mut pending, usize::MAX, &mut |heap, ptr| {
+            heap.queue_disposal(ptr)
+        });
+    }
+}
+
+/// The list of boxes to free, holding the box at `ptr` alone.
+///
+/// # Safety
+///
+/// The count of the box at `ptr` has just reached zero.
+pub(crate) unsafe fn start_chain(ptr: *mut u8) -> *mut u8 {
+    // SAFETY: as the caller promises, the count word is free to hold the
+    // link to the next box.
+    unsafe { ptr.cast::<*mut u8>().write(null_mut()) };
+    ptr
+}
+
+/// Frees up to `budget` boxes from the list at `pending`, with what they
+/// release in turn, and leaves the rest there, null once all are freed. A
+/// box whose dispose handler has yet to run gets a count of one again and
+/// goes to `dispose`, which takes that reference.
+///
+/// # Safety
+///
+/// As for [`release_box`], for every box on the list.
+pub(crate) unsafe fn free_chain(
+    heap: &mut Heap,
+    types: &Types,
+    pending: &mut *mut u8,
+    budget: usize,
+    dispose: &mut dyn FnMut(&mut Heap, *mut u8),
+) {
     let link = |ptr: *mut u8| ptr.cast::<*mut u8>();
+    let mut freed = 0;
     // SAFETY: as the caller promises. A box on the list is dead, so its
     // count word is free to hold the link to the next.
     unsafe {
-        link(ptr).write(null_mut());
-        let mut pending = ptr;
-        while !pending.is_null() {
-            let ptr = pending;
-            pending = link(ptr).read();
+        while !pending.is_null() && freed < budget {
+            freed += 1;
+            let ptr = *pending;
+            *pending = link(ptr).read();
             if header(ptr) == BUFFER_HEADER {
                 // A buffer of a string or bytes holds no references.
                 heap.free(ptr);
@@ -259,8 +295,8 @@ pub unsafe fn release_box(heap: &mut Heap, types: &Types, ptr: *mut u8) {
             let kind = (header(ptr) >> 32) as u32;
             let mut dead = |child: *mut u8| {
                 if release(child) {
-                    link(child).write(pending);
-                    pending = child;
+                    link(child).write(*pending);
+                    *pending = child;
                 }
             };
             if let Some(at) = member_box_field(header(ptr)) {
@@ -275,7 +311,7 @@ pub unsafe fn release_box(heap: &mut Heap, types: &Types, ptr: *mut u8) {
                     dispose: Some(at), ..
                 } if ptr.add(*at as usize).cast::<u64>().read() != 0 => {
                     count(ptr).store(1, Ordering::Relaxed);
-                    heap.queue_disposal(ptr);
+                    dispose(heap, ptr);
                     continue;
                 }
                 TypeDescriptor::Record { counted, .. } => boxes_in(ptr, counted, &mut dead),
@@ -347,8 +383,20 @@ pub unsafe fn next_disposal(heap: &mut Heap, types: &Types) -> Disposal {
             code: 0,
         };
     };
-    // SAFETY: as the caller promises; only a type with a dispose word
-    // queues its boxes.
+    // SAFETY: as the caller promises.
+    let code = unsafe { take_dispose_code(types, ptr) };
+    Disposal { ptr, code }
+}
+
+/// The dispose code of a box whose handler is about to run, with the box's
+/// word of it cleared, so that the box is freed when its count next
+/// reaches zero.
+///
+/// # Safety
+///
+/// The box at `ptr` is live, of a type with a dispose word.
+pub(crate) unsafe fn take_dispose_code(types: &Types, ptr: *mut u8) -> u64 {
+    // SAFETY: as the caller promises.
     unsafe {
         let TypeDescriptor::Record {
             dispose: Some(at), ..
@@ -359,7 +407,7 @@ pub unsafe fn next_disposal(heap: &mut Heap, types: &Types) -> Disposal {
         let word = ptr.add(*at as usize).cast::<u64>();
         let code = word.read();
         word.write(0);
-        Disposal { ptr, code }
+        code
     }
 }
 

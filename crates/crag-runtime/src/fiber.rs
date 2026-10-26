@@ -204,6 +204,9 @@ pub struct Fiber {
     pub(crate) ext: Option<crate::ext::Held>,
     /// The signals of the blocks it runs in (Plan §11.7.10).
     pub(crate) signals: crate::signals::Signals,
+    /// Whether no one waits for it, as for a deferred dispose handler
+    /// (Plan §11.7.12): the scheduler drops it when it stops.
+    pub(crate) detached: bool,
 }
 
 impl Fiber {
@@ -296,6 +299,7 @@ impl Fiber {
             tx: None,
             ext: None,
             signals: Default::default(),
+            detached: false,
         }))
     }
 

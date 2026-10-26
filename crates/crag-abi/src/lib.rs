@@ -596,6 +596,16 @@ pub enum RuntimeFn {
     ///
     /// Frees the cell, which no task reads any more, with its value.
     LazyFree = 61,
+
+    /// `rt_release_deferred(ctx, ptr)`.
+    ///
+    /// As `Release`, for a box of a type that is not `Immediate`
+    /// (Specification §13.3): frees a bounded part of the structure and
+    /// leaves the rest to the scheduler, which frees it between fibers and
+    /// runs the `Deferred` dispose handlers in it as tasks of their own
+    /// (Implementation Plan §11.7.12). The handlers of the part freed at
+    /// once are queued for `Disposal`, as `Release` queues them.
+    ReleaseDeferred = 62,
 }
 
 /// A status of the stream functions: sent, or a value taken.
@@ -685,7 +695,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 62] = [
+    pub const ALL: [RuntimeFn; 63] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -748,6 +758,7 @@ impl RuntimeFn {
         RuntimeFn::LazyGet,
         RuntimeFn::LazySet,
         RuntimeFn::LazyFree,
+        RuntimeFn::ReleaseDeferred,
     ];
 
     /// The symbol the loader looks up.
@@ -815,6 +826,7 @@ impl RuntimeFn {
             RuntimeFn::LazyGet => "rt_lazy_get",
             RuntimeFn::LazySet => "rt_lazy_set",
             RuntimeFn::LazyFree => "rt_lazy_free",
+            RuntimeFn::ReleaseDeferred => "rt_release_deferred",
         }
     }
 
