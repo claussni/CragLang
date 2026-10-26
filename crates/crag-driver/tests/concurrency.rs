@@ -513,3 +513,90 @@ fn main() -> ExitCode {
     );
     assert_eq!(code, 55, "{out}");
 }
+
+/// The M4 exit example (Plan §6): a server that serves its connections
+/// from a task group, each in a task of its own, echoing what it reads.
+const ECHO_SERVER: &str = r#"import std.io
+import std.task
+
+fn serve(c: Connection) -> () {
+  case c.read() {
+    bytes: Bytes -> {
+      let written = c.write(bytes)
+      serve(c)
+    }
+    _ -> ()
+  }
+}
+
+fn main() -> ExitCode {
+  case listen(PORT) {
+    l: Listener -> {
+      all(limit: 64) { g ->
+        for i in 1..CONNECTIONS {
+          case l.accept() {
+            c: Connection -> g.start { -> serve(c) }
+            _ -> ()
+          }
+        }
+      }
+      ExitCode(code: 0)
+    }
+    _ -> ExitCode(code: 1)
+  }
+}
+"#;
+
+/// Runs the echo server for `connections` clients, each sending
+/// `messages` messages of growing length, and checks every echo.
+fn echo(name: &str, connections: usize, messages: usize) {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let app = ECHO_SERVER
+        .replace("PORT", &port.to_string())
+        .replace("CONNECTIONS", &connections.to_string());
+    let server = std::thread::spawn({
+        let name = name.to_string();
+        move || run(&name, &app)
+    });
+    let clients: Vec<_> = (0..connections)
+        .map(|k| {
+            std::thread::spawn(move || {
+                let mut stream = loop {
+                    match TcpStream::connect(("127.0.0.1", port)) {
+                        Ok(stream) => break stream,
+                        Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                    }
+                };
+                for m in 0..messages {
+                    let message = format!("client {k} message {m} {}", "x".repeat(m * 37));
+                    stream.write_all(message.as_bytes()).unwrap();
+                    let mut echoed = vec![0; message.len()];
+                    stream.read_exact(&mut echoed).unwrap();
+                    assert_eq!(echoed, message.as_bytes());
+                }
+            })
+        })
+        .collect();
+    for client in clients {
+        client.join().unwrap();
+    }
+    let (code, out) = server.join().unwrap();
+    assert_eq!(code, 0, "{out}");
+}
+
+#[test]
+fn a_server_echoes_for_many_connections_at_once() {
+    echo("echo", 50, 20);
+}
+
+#[test]
+fn a_server_echoes_for_hundreds_of_connections() {
+    echo("echo-many", 200, 5);
+}

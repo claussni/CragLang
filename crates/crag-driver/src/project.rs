@@ -41,6 +41,7 @@ const STD: &[(&str, &str)] = &[
     ("std.time", include_str!("../../../std/time.crag")),
     ("std.task", include_str!("../../../std/task.crag")),
     ("std.stream", include_str!("../../../std/stream.crag")),
+    ("std.io", include_str!("../../../std/io.crag")),
 ];
 
 /// A module's file, where diagnostics name it.

@@ -58,6 +58,7 @@ mod lazy;
 pub mod list;
 pub mod map;
 pub mod meter;
+mod net;
 pub mod poll;
 pub mod print;
 pub mod rc;
@@ -161,6 +162,13 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::LazyFree => lazy::rt_lazy_free as *const () as usize,
         RuntimeFn::ReleaseDeferred => teardown::rt_release_deferred as *const () as usize,
         RuntimeFn::TxThrow => unwind::rt_tx_throw as *const () as usize,
+        RuntimeFn::IoListen => net::rt_io_listen as *const () as usize,
+        RuntimeFn::IoPort => net::rt_io_port as *const () as usize,
+        RuntimeFn::IoSocket => net::rt_io_socket as *const () as usize,
+        RuntimeFn::IoConnectLocal => net::rt_io_connect_local as *const () as usize,
+        RuntimeFn::IoBuffer => net::rt_io_buffer as *const () as usize,
+        RuntimeFn::IoBytes => net::rt_io_bytes as *const () as usize,
+        RuntimeFn::IoWriteBytes => net::rt_io_write_bytes as *const () as usize,
     }
 }
 

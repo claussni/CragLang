@@ -82,7 +82,7 @@ unsafe extern "C" fn sleep_entry(ctx: *const TaskContext, nanos: u64) {
 /// Called by the Rust half of a function `suspending_fn!` defined, for
 /// the fiber it was called on, with an operation whose buffer lives until
 /// the fiber continues.
-unsafe fn perform(ctx: *const TaskContext, op: IoOp) -> Words {
+pub(crate) unsafe fn perform(ctx: *const TaskContext, op: IoOp) -> Words {
     let words = |[a, b]: IoResult| Words(a, b);
     // SAFETY: as the caller promises.
     let ctx = unsafe { &*ctx };

@@ -631,6 +631,49 @@ pub enum RuntimeFn {
     /// first frame whose call has a handler, and continues at the handler
     /// (Implementation Plan §11.7.14).
     TxThrow = 63,
+
+    /// `rt_io_listen(ctx, port) -> (fd, errno)`.
+    ///
+    /// A non-blocking TCP socket listening on the loopback interface at
+    /// `port`, any free one for zero (Implementation Plan §11.7.14).
+    IoListen = 64,
+
+    /// `rt_io_port(ctx, fd) -> port`.
+    ///
+    /// The port a socket is bound to.
+    IoPort = 65,
+
+    /// `rt_io_socket(ctx) -> (fd, errno)`.
+    ///
+    /// A new non-blocking TCP socket, for `IoConnectLocal`.
+    IoSocket = 66,
+
+    /// `rt_io_connect_local(ctx, fd, port) -> (0, errno)`.
+    ///
+    /// Connects a socket to `port` on the loopback interface, suspending
+    /// until the connection is made, as `IoConnect` does.
+    IoConnectLocal = 67,
+
+    /// `rt_io_buffer(ctx, len) -> buffer`.
+    ///
+    /// A buffer of a string or bytes with room for `len` bytes, for a read
+    /// into it after its header.
+    IoBuffer = 68,
+
+    /// `rt_io_bytes(ctx, buffer, n) -> (w0, w1)`.
+    ///
+    /// The bytes value of the first `n` bytes of a buffer from `IoBuffer`,
+    /// whose reference it takes: inline when they fit, and the buffer is
+    /// freed.
+    IoBytes = 69,
+
+    /// `rt_io_write_bytes(ctx, fd, w0, w1, left) -> (left, errno)`.
+    ///
+    /// Writes the last `left` bytes of a bytes value, all of them for
+    /// `u64::MAX`, suspending until some can go: how many are left
+    /// afterwards, or the error number. The caller holds the value until
+    /// the call returns.
+    IoWriteBytes = 70,
 }
 
 /// A status of the stream functions: sent, or a value taken.
@@ -720,7 +763,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 64] = [
+    pub const ALL: [RuntimeFn; 71] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -785,6 +828,13 @@ impl RuntimeFn {
         RuntimeFn::LazyFree,
         RuntimeFn::ReleaseDeferred,
         RuntimeFn::TxThrow,
+        RuntimeFn::IoListen,
+        RuntimeFn::IoPort,
+        RuntimeFn::IoSocket,
+        RuntimeFn::IoConnectLocal,
+        RuntimeFn::IoBuffer,
+        RuntimeFn::IoBytes,
+        RuntimeFn::IoWriteBytes,
     ];
 
     /// The symbol the loader looks up.
@@ -854,6 +904,13 @@ impl RuntimeFn {
             RuntimeFn::LazyFree => "rt_lazy_free",
             RuntimeFn::ReleaseDeferred => "rt_release_deferred",
             RuntimeFn::TxThrow => "rt_tx_throw",
+            RuntimeFn::IoListen => "rt_io_listen",
+            RuntimeFn::IoPort => "rt_io_port",
+            RuntimeFn::IoSocket => "rt_io_socket",
+            RuntimeFn::IoConnectLocal => "rt_io_connect_local",
+            RuntimeFn::IoBuffer => "rt_io_buffer",
+            RuntimeFn::IoBytes => "rt_io_bytes",
+            RuntimeFn::IoWriteBytes => "rt_io_write_bytes",
         }
     }
 
@@ -990,6 +1047,9 @@ pub enum CountedField {
     /// A hub at this offset, whose handle the runtime gives up with the
     /// box.
     Hub(u32),
+    /// A socket's file descriptor at this offset, which the runtime closes
+    /// with the box.
+    Socket(u32),
 }
 
 /// The words of a value inside a collection: at most two, with the fields

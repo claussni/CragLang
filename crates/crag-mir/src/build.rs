@@ -170,6 +170,7 @@ pub(crate) fn counted<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bo
                 | Builtin::Lazy
                 | Builtin::RuntimeStream
                 | Builtin::RuntimeHub
+                | Builtin::RuntimeSocket
                 | Builtin::Oks
                 | Builtin::Errs
         ),
@@ -1436,6 +1437,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 ("std.stream", "hubSource") => Intrinsic::HubSource,
                 ("std.stream", "hubSeal") => Intrinsic::HubSeal,
                 ("std.stream", "hubRelease") => Intrinsic::HubRelease,
+                ("std.io", "ioListen") => Intrinsic::IoListen,
+                ("std.io", "ioOwn") => Intrinsic::IoOwn,
+                ("std.io", "ioPort") => Intrinsic::IoPort,
+                ("std.io", "ioAccept") => Intrinsic::IoAccept,
+                ("std.io", "ioSocket") => Intrinsic::IoSocket,
+                ("std.io", "ioConnect") => Intrinsic::IoConnect,
+                ("std.io", "ioRead") => Intrinsic::IoRead,
+                ("std.io", "ioReadBytes") => Intrinsic::IoReadBytes,
+                ("std.io", "ioWrite") => Intrinsic::IoWrite,
                 _ => return None,
             },
         )

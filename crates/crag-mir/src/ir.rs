@@ -356,6 +356,23 @@ pub enum Intrinsic<'db> {
     HubSeal,
     /// Makes that many consumers of a fan-out read `Closed`.
     HubRelease,
+    /// `std.io`'s sockets: a descriptor, or minus the error number, for
+    /// `IoListen`, `IoAccept` and `IoSocket`.
+    IoListen,
+    IoAccept,
+    IoSocket,
+    /// The box of a `RuntimeSocket` for a descriptor.
+    IoOwn,
+    IoPort,
+    /// Connects the socket to a port: 0, or the error number.
+    IoConnect,
+    /// Reads at most the count: how many were read, with their bytes for
+    /// `IoReadBytes`, 0 at the end, or minus the error number.
+    IoRead,
+    IoReadBytes,
+    /// Writes the last bytes the count says, all for -1: how many are left
+    /// afterwards, or minus the error number.
+    IoWrite,
 }
 
 impl Intrinsic<'_> {

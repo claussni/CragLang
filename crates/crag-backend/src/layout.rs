@@ -80,7 +80,8 @@ pub fn layout<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Lay
             | Builtin::Ext
             | Builtin::Lazy
             | Builtin::RuntimeStream
-            | Builtin::RuntimeHub => Layout::Box,
+            | Builtin::RuntimeHub
+            | Builtin::RuntimeSocket => Layout::Box,
             b => Layout::Imm(*b),
         },
         TyKind::Named(item, _) => match type_def(db, program, *item).kind {
@@ -352,6 +353,12 @@ pub fn type_descriptor<'db>(
         Some((Builtin::RuntimeHub, [])) => {
             return Some(TypeDescriptor::Record {
                 counted: vec![CountedField::Hub(HEADER_SIZE)],
+                dispose: None,
+            });
+        }
+        Some((Builtin::RuntimeSocket, [])) => {
+            return Some(TypeDescriptor::Record {
+                counted: vec![CountedField::Socket(HEADER_SIZE)],
                 dispose: None,
             });
         }

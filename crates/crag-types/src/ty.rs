@@ -91,6 +91,8 @@ pub enum Builtin {
     /// `std.stream` declares and uses (§19.2).
     RuntimeStream,
     RuntimeHub,
+    /// The runtime's socket, which only `std.io` declares and uses.
+    RuntimeSocket,
     /// The type functions `Oks[X]` and `Errs[X]`, the members of `X` that
     /// are not errors and those that are (§8.1). They stay applied only to
     /// what names type parameters.
@@ -125,6 +127,7 @@ impl Builtin {
             "Lazy" => (Builtin::Lazy, 1),
             "RuntimeStream" => (Builtin::RuntimeStream, 0),
             "RuntimeHub" => (Builtin::RuntimeHub, 0),
+            "RuntimeSocket" => (Builtin::RuntimeSocket, 0),
             "Oks" => (Builtin::Oks, 1),
             "Errs" => (Builtin::Errs, 1),
             _ => return None,
@@ -155,6 +158,7 @@ impl Builtin {
             Builtin::Lazy => "Lazy",
             Builtin::RuntimeStream => "RuntimeStream",
             Builtin::RuntimeHub => "RuntimeHub",
+            Builtin::RuntimeSocket => "RuntimeSocket",
             Builtin::Oks => "Oks",
             Builtin::Errs => "Errs",
         }

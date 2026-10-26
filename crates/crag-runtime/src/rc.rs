@@ -200,7 +200,8 @@ pub(crate) unsafe fn boxes_in(base: *mut u8, fields: &[CountedField], mut f: imp
                 CountedField::Ext(_)
                 | CountedField::Lazy(_)
                 | CountedField::Stream(_)
-                | CountedField::Hub(_) => {}
+                | CountedField::Hub(_)
+                | CountedField::Socket(_) => {}
             }
         }
     }
@@ -335,6 +336,9 @@ pub(crate) unsafe fn free_chain(
                                 heap,
                                 types,
                             ),
+                            CountedField::Socket(at) => {
+                                crate::net::close(ptr.add(*at as usize).cast::<u64>().read())
+                            }
                             CountedField::Hub(at) => crate::stream::drop_hub(
                                 ptr.add(*at as usize).cast::<u64>().read(),
                                 heap,

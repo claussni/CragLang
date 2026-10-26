@@ -1,0 +1,111 @@
+// This file is part of Crag.
+//
+// Copyright (C) 2026 Ralf Claussnitzer
+//
+// Crag is free software: you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the Free Software
+// Foundation, either version 3 of the License, or (at your option) any later
+// version.
+//
+// Crag is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+// A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// Crag. If not, see <https://www.gnu.org/licenses/>.
+
+// Connections (Specification §15.1, §15.2), as far as M4 reaches: TCP on
+// the loopback interface. A socket is a box of the runtime's handle,
+// closed with the box (Implementation Plan §11.7.14).
+
+import std.stream
+
+type RuntimeSocket
+
+pub opaque type Listener(socket: RuntimeSocket)
+pub opaque type Connection(socket: RuntimeSocket)
+
+// An error of the operating system, by its error number.
+pub type IoError(..Error, code: Int)
+
+// Listens on the loopback interface at `port`, any free one for zero.
+pub fn listen(port: Int) -> Listener | IoError {
+  let fd = ioListen(port)
+  if fd < 0 {
+    return IoError(code: 0 - fd)
+  }
+  Listener(socket: ioOwn(fd))
+}
+
+// The port a listener listens at.
+pub fn port(l: Listener) -> Int {
+  ioPort(l.socket)
+}
+
+// The next incoming connection, waiting until there is one.
+pub fn accept(l: Listener) -> Connection | IoError {
+  let fd = ioAccept(l.socket)
+  if fd < 0 {
+    return IoError(code: 0 - fd)
+  }
+  Connection(socket: ioOwn(fd))
+}
+
+// Connects to `port` on the loopback interface.
+pub fn connect(port: Int) -> Connection | IoError {
+  let fd = ioSocket()
+  if fd < 0 {
+    return IoError(code: 0 - fd)
+  }
+  let socket = ioOwn(fd)
+  let failed = ioConnect(socket, port)
+  if failed != 0 {
+    return IoError(code: failed)
+  }
+  Connection(socket: socket)
+}
+
+// The next bytes the peer sent, waiting until there are some, or
+// `Closed` once the peer closed the connection (§15.2).
+pub fn read(c: Connection) -> Bytes | Closed | IoError {
+  let n = ioRead(c.socket, 4096)
+  if n > 0 {
+    let bytes: Bytes = ioReadBytes()
+    return bytes
+  }
+  if n == 0 {
+    return Closed
+  }
+  IoError(code: 0 - n)
+}
+
+// Writes all the bytes.
+pub fn write(c: Connection, bytes: Bytes) -> () | IoError {
+  writeRest(c.socket, bytes, -1)
+}
+
+fn writeRest(socket: RuntimeSocket, bytes: Bytes, left: Int) -> () | IoError {
+  let rest = ioWrite(socket, bytes, left)
+  if rest < 0 {
+    return IoError(code: 0 - rest)
+  }
+  if rest > 0 {
+    return writeRest(socket, bytes, rest)
+  }
+}
+
+// The runtime's sockets: a descriptor, or minus the error number.
+fn ioListen(port: Int) -> Int
+fn ioOwn(fd: Int) -> RuntimeSocket
+fn ioPort(socket: RuntimeSocket) -> Int
+fn ioAccept(socket: RuntimeSocket) -> Int
+fn ioSocket() -> Int
+// 0, or the error number.
+fn ioConnect(socket: RuntimeSocket, port: Int) -> Int
+// The count read, with the bytes for `ioReadBytes`, 0 at the end, or minus
+// the error number.
+fn ioRead(socket: RuntimeSocket, max: Int) -> Int
+fn ioReadBytes() -> Bytes
+// The bytes left to write, all for -1: those left after, or minus the
+// error number.
+fn ioWrite(socket: RuntimeSocket, bytes: Bytes, left: Int) -> Int

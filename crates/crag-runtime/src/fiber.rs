@@ -104,6 +104,9 @@ pub struct TaskContext {
     pub(crate) pinned: AtomicU64,
     /// The lazy values the task computes, innermost last (Plan §11.7.11).
     pub(crate) lazy: Mutex<Vec<Arc<crate::lazy::LazyCell>>>,
+    /// The bytes of an inline value a write waits to write (Plan
+    /// §11.7.14).
+    pub(crate) io_hold: Mutex<Vec<u8>>,
 }
 
 const _: () = assert!(offset_of!(TaskContext, stack_limit) == STACK_LIMIT_OFFSET as usize);
@@ -257,6 +260,7 @@ impl Fiber {
             waiting: Mutex::new(None),
             pinned: AtomicU64::new(0),
             lazy: Mutex::new(Vec::new()),
+            io_hold: Mutex::new(Vec::new()),
         });
 
         // The first switch into the fiber pops six registers and returns, so

@@ -919,6 +919,22 @@ impl<'a, 'db> Lower<'a, 'db> {
         Ok(vec![ptr])
     }
 
+    /// A result of the runtime's sockets as `std.io` takes it: `value`, or
+    /// minus the error number when there is one.
+    fn fd_or_error(&mut self, value: VReg, errno: VReg) -> VReg {
+        let zero = self.constant(0);
+        let failed = self.cmp(Cond::Ne, errno, zero);
+        let negated = self.bin(LirBin::Sub, zero, errno);
+        let out = self.reg();
+        self.push(Inst::Select {
+            dst: out,
+            cond: failed,
+            a: negated,
+            b: value,
+        });
+        out
+    }
+
     /// The runtime handle in the box of a `RuntimeStream` or `RuntimeHub`.
     fn handle_of(&mut self, handle: &Operand<'db>) -> Result<VReg, Unsupported> {
         let ptr = self.box_of(handle)?;
@@ -1272,6 +1288,77 @@ impl<'a, 'db> Lower<'a, 'db> {
                     dsts: Vec::new(),
                 });
                 Ok(Vec::new())
+            }
+            (Intrinsic::IoListen | Intrinsic::IoAccept | Intrinsic::IoSocket, args) => {
+                let (func, args) = match (intrinsic, args) {
+                    (Intrinsic::IoListen, [port]) => {
+                        (RuntimeFn::IoListen, vec![word(&self.operand(port, int)?)?])
+                    }
+                    (Intrinsic::IoAccept, [socket]) => {
+                        (RuntimeFn::IoAccept, vec![self.handle_of(socket)?])
+                    }
+                    (Intrinsic::IoSocket, []) => (RuntimeFn::IoSocket, Vec::new()),
+                    _ => return Err("this operation of the runtime"),
+                };
+                let out = self.runtime2(func, args);
+                Ok(vec![self.fd_or_error(out[0], out[1])])
+            }
+            (Intrinsic::IoOwn, [fd]) => {
+                let fd = word(&self.operand(fd, int)?)?;
+                self.handle_box(ty, fd)
+            }
+            (Intrinsic::IoPort, [socket]) => {
+                let fd = self.handle_of(socket)?;
+                Ok(vec![self.runtime(RuntimeFn::IoPort, vec![fd])])
+            }
+            (Intrinsic::IoConnect, [socket, port]) => {
+                let fd = self.handle_of(socket)?;
+                let port = word(&self.operand(port, int)?)?;
+                let out = self.runtime2(RuntimeFn::IoConnectLocal, vec![fd, port]);
+                Ok(vec![out[1]])
+            }
+            (Intrinsic::IoRead, [socket, max]) => {
+                let fd = self.handle_of(socket)?;
+                let max = word(&self.operand(max, int)?)?;
+                let buffer = self.runtime(RuntimeFn::IoBuffer, vec![max]);
+                let header = self.constant(i64::from(HEADER_SIZE));
+                let data = self.bin(LirBin::Add, buffer, header);
+                let out = self.runtime2(RuntimeFn::IoRead, vec![fd, data, max]);
+                let (n, errno) = (out[0], out[1]);
+                // An end or an error keeps no bytes.
+                let zero = self.constant(0);
+                let failed = self.cmp(Cond::Ne, errno, zero);
+                let count = self.reg();
+                self.push(Inst::Select {
+                    dst: count,
+                    cond: failed,
+                    a: zero,
+                    b: n,
+                });
+                let bytes = self.runtime2(RuntimeFn::IoBytes, vec![buffer, count]);
+                let scratch = self.scratch();
+                for (k, &src) in bytes.iter().enumerate() {
+                    self.push(Inst::Store {
+                        src,
+                        addr: scratch,
+                        offset: 8 * k as i32,
+                    });
+                }
+                Ok(vec![self.fd_or_error(n, errno)])
+            }
+            (Intrinsic::IoReadBytes, []) => {
+                let scratch = self.scratch();
+                Ok(vec![self.load(scratch, 0), self.load(scratch, 8)])
+            }
+            (Intrinsic::IoWrite, [socket, bytes, left]) => {
+                let fd = self.handle_of(socket)?;
+                let bytes_ty = self.operand_ty(bytes, ty);
+                let [w0, w1] = self.operand(bytes, bytes_ty)?[..] else {
+                    return Err("this operation of the runtime");
+                };
+                let left = word(&self.operand(left, int)?)?;
+                let out = self.runtime2(RuntimeFn::IoWriteBytes, vec![fd, w0, w1, left]);
+                Ok(vec![self.fd_or_error(out[0], out[1])])
             }
             (Intrinsic::ScopeNew, [limit]) => {
                 let limit = word(&self.operand(limit, int)?)?;
