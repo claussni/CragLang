@@ -264,15 +264,20 @@ fn reader() -> LirFunction {
 /// update does.
 fn adder() -> LirFunction {
     let cell = r(0);
-    let (op, ty, one, status) = (r(5), r(6), r(7), r(8));
+    let (op, ty, one, status, list) = (r(5), r(6), r(7), r(8), r(9));
     repeat(
         2,
-        9,
+        10,
         vec![
             konst(op, REF_ADD as i64),
             konst(ty, 64),
             konst(one, 1),
-            runtime(RuntimeFn::RefApply, vec![cell, op, ty, one], vec![status]),
+            konst(list, INTS as i64),
+            runtime(
+                RuntimeFn::RefApply,
+                vec![cell, op, ty, one, list],
+                vec![status],
+            ),
         ],
         r(1),
     )
@@ -316,7 +321,7 @@ impl Setup {
                 calling(RuntimeFn::RefSwap, 4, 2),
                 swapper(),
                 reader(),
-                calling(RuntimeFn::RefApply, 4, 1),
+                calling(RuntimeFn::RefApply, 5, 1),
                 adder(),
             ]),
             types,
@@ -578,7 +583,7 @@ fn a_commutative_update_applies_its_operation() {
     ];
     for (op, ty, value, k, result) in cases {
         let cell = cell(value);
-        let [status, _] = setup.call(APPLY, &[addr(&*cell), op, ty, k], 1);
+        let [status, _] = setup.call(APPLY, &[addr(&*cell), op, ty, k, INTS], 1);
         assert_eq!(status, REF_COMMITTED, "{op} {ty:#x} {value} {k}");
         assert_eq!(
             cell[1].load(Ordering::SeqCst),
@@ -611,7 +616,7 @@ fn a_commutative_update_that_overflows_changes_nothing() {
     ];
     for (op, ty, value, k) in cases {
         let cell = cell(value);
-        let [status, _] = setup.call(APPLY, &[addr(&*cell), op, ty, k], 1);
+        let [status, _] = setup.call(APPLY, &[addr(&*cell), op, ty, k, INTS], 1);
         assert_eq!(status, REF_OVERFLOW, "{op} {ty:#x} {value} {k}");
         assert_eq!(cell[1].load(Ordering::SeqCst), value);
         assert_eq!(cell[0].load(Ordering::SeqCst), 0);
@@ -625,7 +630,7 @@ fn a_commit_after_a_commutative_update_conflicts() {
     let cell = cell(5);
     let mut out = [0u64; 2];
     let [version, _] = setup.call(READ, &[addr(&*cell), out.as_mut_ptr() as u64], 1);
-    let [status, _] = setup.call(APPLY, &[addr(&*cell), REF_ADD, 64, 1], 1);
+    let [status, _] = setup.call(APPLY, &[addr(&*cell), REF_ADD, 64, 1, INTS], 1);
     assert_eq!(status, REF_COMMITTED);
     let [status, _] = setup.call(COMMIT, &[addr(&*cell), version, INTS, 10, 0], 1);
     assert_eq!(status, REF_CONFLICT);

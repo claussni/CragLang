@@ -290,10 +290,14 @@ pub fn insert_rc_ops(body: &mut MirBody<'_>, live: &Liveness) {
         // A terminator consumes or borrows; those it borrows last die on
         // its edges, which `insert_drops` handles.
         let uses = terminator_uses(body, &live.holds, &block.terminator);
+        // What a successor needs after a call, the handler's path too.
         let kept = match &block.terminator {
-            Terminator::Call { target, .. } | Terminator::CallValue { target, .. } => {
-                needed(&live.live_in, &block.terminator, *target)
-            }
+            Terminator::Call { .. } | Terminator::CallValue { .. } => block
+                .terminator
+                .successors()
+                .into_iter()
+                .flat_map(|s| needed(&live.live_in, &block.terminator, s))
+                .collect(),
             _ => set.clone(),
         };
         for x in distinct(&uses.consumed) {
@@ -386,11 +390,12 @@ pub fn insert_drops(body: &mut MirBody<'_>, live: &Liveness) {
             let dying: Vec<Local> = match &terminator {
                 // What a call borrows dies after it returns, with a result
                 // no one reads.
+                // The handler's path, after the first, gets no result.
                 Terminator::Call { dst, .. } | Terminator::CallValue { dst, .. } => {
                     let mut dying: Vec<Local> =
                         held.difference(&live.live_in[s.index()]).copied().collect();
                     let counted = body.locals[dst.index()].counted;
-                    if counted && !live.live_in[s.index()].contains(dst) {
+                    if counted && !live.live_in[s.index()].contains(dst) && k == 0 {
                         dying.push(*dst);
                     }
                     dying

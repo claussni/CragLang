@@ -166,6 +166,22 @@ pub enum Inst {
         args: Vec<VReg>,
         dsts: Vec<VReg>,
     },
+    /// A call, as `Call`, that continues at `handler` instead when the code
+    /// it called leaves a transaction's attempt with `rt_tx_throw`. The
+    /// handler sees the registers as they were before the call.
+    TryCall {
+        func: CallTarget,
+        args: Vec<VReg>,
+        dsts: Vec<VReg>,
+        handler: BlockId,
+    },
+    /// A call, as `CallIndirect`, with a handler, as `TryCall` has.
+    TryCallIndirect {
+        callee: VReg,
+        args: Vec<VReg>,
+        dsts: Vec<VReg>,
+        handler: BlockId,
+    },
     /// A call of a runtime function with the C calling convention. The task
     /// context goes first, before `args`; `dsts` receive the results, at
     /// most two.
@@ -361,6 +377,31 @@ impl LirFunction {
                         }
                         reg(callee)?;
                         args.iter().chain(dsts).try_for_each(reg)?;
+                    }
+                    Inst::TryCall {
+                        args,
+                        dsts,
+                        handler,
+                        ..
+                    } => {
+                        if dsts.len() > 2 {
+                            return Err("a call with more than 2 results".into());
+                        }
+                        args.iter().chain(dsts).try_for_each(reg)?;
+                        block(handler)?;
+                    }
+                    Inst::TryCallIndirect {
+                        callee,
+                        args,
+                        dsts,
+                        handler,
+                    } => {
+                        if dsts.len() > 2 {
+                            return Err("a call with more than 2 results".into());
+                        }
+                        reg(callee)?;
+                        args.iter().chain(dsts).try_for_each(reg)?;
+                        block(handler)?;
                     }
                     Inst::Load { dst, addr, .. } => {
                         reg(dst)?;

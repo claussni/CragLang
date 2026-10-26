@@ -184,3 +184,81 @@ fn a_commutative_update_traps_on_overflow() {
     assert_eq!(code, 70, "{out}");
     assert!(out.starts_with("trap: arithmetic overflow"), "{out}");
 }
+
+#[test]
+fn an_atomic_block_commits_its_updates_together() {
+    let (code, out) = run(
+        "atomic",
+        r#"fn move(from: Ref[Int], to: Ref[Int], amount: Int) -> () {
+  from.update { b -> b - amount }
+  to.update { b -> b + amount }
+}
+
+fn main() -> ExitCode {
+  ref a = 100
+  ref b = 0
+  atomic {
+    a.update { x -> x - 25 }
+    b.update { x -> x + 25 }
+  }
+  atomic { move(a, b, 5) }
+  let both = atomic { a.use() * 1000 + b.use() }
+  ExitCode(code: both % 256)
+}
+"#,
+    );
+    // 70 * 1000 + 30 = 70030, and 70030 % 256 = 142.
+    assert_eq!(code, 142, "{out}");
+}
+
+#[test]
+fn an_atomic_block_with_an_error_value_writes_nothing() {
+    let (code, out) = run(
+        "atomic-abort",
+        r#"type InsufficientFunds(..Error)
+
+fn transfer(from: Ref[Int], to: Ref[Int], amount: Int) -> () | InsufficientFunds {
+  atomic {
+    to.update { b -> b + amount }
+    if from.use() < amount { return InsufficientFunds }
+    from.update { b -> b - amount }
+  }
+}
+
+fn main() -> ExitCode {
+  ref a = 10
+  ref b = 0
+  let first = transfer(a, b, 4)
+  let second = transfer(a, b, 7)
+  case second {
+    InsufficientFunds -> ExitCode(code: a.use() * 10 + b.use())
+    _ -> ExitCode(code: 0)
+  }
+}
+"#,
+    );
+    assert_eq!(code, 64, "{out}");
+}
+
+#[test]
+fn nested_atomic_blocks_keep_the_inner_writes() {
+    let (code, out) = run(
+        "atomic-nested",
+        r#"type Nope(..Error)
+
+fn main() -> ExitCode {
+  ref n = 1
+  atomic {
+    n.update { v -> v + 1 }
+    let inner = atomic {
+      n.update { v -> v * 100 }
+      Nope
+    }
+    atomic { n.update { v -> v * 10 } }
+  }
+  ExitCode(code: n.use())
+}
+"#,
+    );
+    assert_eq!(code, 20, "{out}");
+}

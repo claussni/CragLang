@@ -27,8 +27,9 @@
 use std::io::{self, Read, Write};
 
 use crag_abi::{
-    CodeObject, CountedField, ElementLayout, FuncId, Number, Reloc, RelocKind, RelocTarget,
-    RuntimeFn, Shape, ShapeField, Shapes, SlotKey, StackCheck, StackMap, TrapKind, TypeDescriptor,
+    CallHandler, CodeObject, CountedField, ElementLayout, FuncId, Number, Reloc, RelocKind,
+    RelocTarget, RuntimeFn, Shape, ShapeField, Shapes, SlotKey, StackCheck, StackMap, TrapKind,
+    TypeDescriptor,
 };
 
 /// The version of the protocol, raised whenever a message changes, or
@@ -422,6 +423,11 @@ impl Writer {
             w.u32(m.return_offset);
             w.seq(&m.slots, |w, s| w.u32(*s));
         });
+        self.seq(&o.handlers, |w, h| {
+            w.u32(h.return_offset);
+            w.u32(h.handler_offset);
+            w.u32(h.frame_offset);
+        });
     }
 
     fn text(&mut self, text: &str) {
@@ -652,6 +658,13 @@ impl Reader<'_> {
                 Ok(StackMap {
                     return_offset: r.u32()?,
                     slots: r.seq(Reader::u32)?,
+                })
+            })?,
+            handlers: self.seq(|r| {
+                Ok(CallHandler {
+                    return_offset: r.u32()?,
+                    handler_offset: r.u32()?,
+                    frame_offset: r.u32()?,
                 })
             })?,
         })
@@ -987,6 +1000,11 @@ mod tests {
             ],
             footprint: 48,
             stack_check,
+            handlers: vec![CallHandler {
+                return_offset: 3,
+                handler_offset: 9,
+                frame_offset: 16,
+            }],
             stack_maps: vec![StackMap {
                 return_offset: 1,
                 slots: vec![0, 8],

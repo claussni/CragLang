@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use crag_abi::{
     FUEL_OFFSET, HEAP_OFFSET, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET, STACK_MARGIN,
+    TX_CONFLICT_OFFSET,
 };
 
 use crate::cancel::Waiting;
@@ -64,6 +65,9 @@ pub struct TaskContext {
     pub(crate) heap: AtomicPtr<Heap>,
     /// The steps metered code may take before it calls `rt_refuel`.
     pub(crate) fuel: AtomicI64,
+    /// Nonzero once a ref function found that the transaction's attempt
+    /// must rerun (`crag_abi::TX_CONFLICT_OFFSET`).
+    pub(crate) tx_conflict: AtomicU64,
     /// The worker running the fiber. The assembly routines find the system
     /// stack through it.
     pub(crate) worker: AtomicPtr<Worker>,
@@ -107,6 +111,7 @@ const _: () = assert!(offset_of!(TaskContext, side_ptr) == SIDE_PTR_OFFSET as us
 const _: () = assert!(offset_of!(TaskContext, side_end) == SIDE_END_OFFSET as usize);
 const _: () = assert!(offset_of!(TaskContext, heap) == HEAP_OFFSET as usize);
 const _: () = assert!(offset_of!(TaskContext, fuel) == FUEL_OFFSET as usize);
+const _: () = assert!(offset_of!(TaskContext, tx_conflict) == TX_CONFLICT_OFFSET as usize);
 
 pub(crate) const STATUS_FINISHED: usize = 1;
 pub(crate) const STATUS_TRAPPED: usize = 2;
@@ -237,6 +242,7 @@ impl Fiber {
             heap: AtomicPtr::new(std::ptr::null_mut()),
             // Unmetered: metered code it calls never runs out.
             fuel: AtomicI64::new(i64::MAX),
+            tx_conflict: AtomicU64::new(0),
             worker: AtomicPtr::new(std::ptr::null_mut()),
             saved_sp: AtomicUsize::new(0),
             status: AtomicUsize::new(0),

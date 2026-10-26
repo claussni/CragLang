@@ -43,8 +43,9 @@ use crag_abi::{
     BUFFER_HEADER, CELL_FULL, CELL_STATE_OFFSET, CELL_VALUE_OFFSET, COUNT_OFFSET,
     FUNCTION_BOX_HEADER, HEADER_SIZE, HEAP_OFFSET, INLINE_TEXT_MAX, LEN_OFFSET, LIST_SIZE,
     MAP_SIZE, MEMBER_BOX_SIZE, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, REF_ADD, REF_CELL_SIZE, REF_MUL,
-    REF_SUB, REF_UNSIGNED, STATIC_COUNT, TEXT_BOX_HEADER, TEXT_LEN_MAX, TYPE_INDEX_OFFSET,
-    TrapKind as AbiTrap, TypeDescriptor, inline_text, size_class,
+    REF_SUB, REF_UNSIGNED, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STATIC_COUNT, TEXT_BOX_HEADER,
+    TEXT_LEN_MAX, TX_CONFLICT_OFFSET, TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TypeDescriptor,
+    inline_text, size_class,
 };
 use crag_codegen::{
     BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, CallTarget, Cond, FuncId, Inst,
@@ -999,6 +1000,45 @@ impl<'a, 'db> Lower<'a, 'db> {
                     vec![cell, version, list, w0, w1],
                 )])
             }
+            (Intrinsic::TxBegin, []) => Ok(vec![self.runtime(RuntimeFn::TxBegin, Vec::new())]),
+            (Intrinsic::TxCommit, []) => Ok(vec![self.runtime(RuntimeFn::TxCommit, Vec::new())]),
+            (Intrinsic::TxAbort | Intrinsic::TxRetry | Intrinsic::TxThrow, []) => {
+                let func = match intrinsic {
+                    Intrinsic::TxAbort => RuntimeFn::TxAbort,
+                    Intrinsic::TxRetry => RuntimeFn::TxRetry,
+                    _ => RuntimeFn::TxThrow,
+                };
+                self.push(Inst::CallRuntime {
+                    func,
+                    args: Vec::new(),
+                    dsts: Vec::new(),
+                });
+                Ok(Vec::new())
+            }
+            (Intrinsic::TxConflicted | Intrinsic::SidePtr | Intrinsic::SideEnd, []) => {
+                let offset = match intrinsic {
+                    Intrinsic::TxConflicted => TX_CONFLICT_OFFSET,
+                    Intrinsic::SidePtr => SIDE_PTR_OFFSET,
+                    _ => SIDE_END_OFFSET,
+                };
+                let ctx = self.reg();
+                self.push(Inst::Context { dst: ctx });
+                Ok(vec![self.load(ctx, offset)])
+            }
+            (Intrinsic::SideReset, [ptr, end]) => {
+                let ptr = word(&self.operand(ptr, int)?)?;
+                let end = word(&self.operand(end, int)?)?;
+                let ctx = self.reg();
+                self.push(Inst::Context { dst: ctx });
+                for (src, offset) in [(ptr, SIDE_PTR_OFFSET), (end, SIDE_END_OFFSET)] {
+                    self.push(Inst::Store {
+                        src,
+                        addr: ctx,
+                        offset,
+                    });
+                }
+                Ok(Vec::new())
+            }
             (Intrinsic::RefApply { op, ty: builtin }, [cell, k]) => {
                 let op = match op {
                     BinOp::Add => REF_ADD,
@@ -1020,12 +1060,14 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let width = if unsigned { bits | REF_UNSIGNED } else { bits };
                 let k_ty = Ty::builtin(self.db, builtin);
                 let k = word(&self.operand(k, k_ty)?)?;
+                let list = self.cell_list(k_ty)?;
                 let cell = self.cell_addr(cell)?;
                 let op = self.constant(op as i64);
                 let width = self.constant(width as i64);
-                Ok(vec![
-                    self.runtime(RuntimeFn::RefApply, vec![cell, op, width, k]),
-                ])
+                Ok(vec![self.runtime(
+                    RuntimeFn::RefApply,
+                    vec![cell, op, width, k, list],
+                )])
             }
             (Intrinsic::RefSwap, [cell, value]) => {
                 let list = self.cell_list(ty)?;
@@ -1670,15 +1712,21 @@ impl<'a, 'db> Lower<'a, 'db> {
                 args,
                 dst,
                 target,
+                unwind,
                 ..
             } => {
                 let args = self.arguments(*func, args)?;
                 let dsts = self.locals[dst.index()].clone();
                 self.layouts[dst.index()].ok_or("values of this type")?;
-                self.push(Inst::Call {
-                    func: self.slot(*func),
-                    args,
-                    dsts,
+                let func = self.slot(*func);
+                self.push(match unwind {
+                    None => Inst::Call { func, args, dsts },
+                    Some(handler) => Inst::TryCall {
+                        func,
+                        args,
+                        dsts,
+                        handler: block(*handler),
+                    },
                 });
                 self.end(Term::Jump(block(*target)), None);
             }
@@ -1695,15 +1743,24 @@ impl<'a, 'db> Lower<'a, 'db> {
                 args,
                 dst,
                 target,
+                unwind,
                 ..
             } => {
                 let (code, args) = self.value_arguments(callee, args)?;
                 let dsts = self.locals[dst.index()].clone();
                 self.layouts[dst.index()].ok_or("values of this type")?;
-                self.push(Inst::CallIndirect {
-                    callee: code,
-                    args,
-                    dsts,
+                self.push(match unwind {
+                    None => Inst::CallIndirect {
+                        callee: code,
+                        args,
+                        dsts,
+                    },
+                    Some(handler) => Inst::TryCallIndirect {
+                        callee: code,
+                        args,
+                        dsts,
+                        handler: block(*handler),
+                    },
                 });
                 self.end(Term::Jump(block(*target)), None);
             }

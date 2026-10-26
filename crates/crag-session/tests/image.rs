@@ -36,6 +36,7 @@ fn function(id: u32, params: u32, relocs: Vec<Reloc>) -> ShippedFunction {
             footprint: 16,
             stack_check: StackCheck::Margin,
             stack_maps: Vec::new(),
+            handlers: Vec::new(),
         },
     }
 }

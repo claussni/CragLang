@@ -195,6 +195,17 @@ enum Dest {
     Return,
 }
 
+/// An `atomic` block being built (Plan §11.7.14).
+#[derive(Clone, Copy)]
+struct AtomicFrame {
+    /// Where conflicts go: the block's handler.
+    handler: BlockId,
+    /// Where the block's value decides between commit and abort.
+    outcome: BlockId,
+    /// The block's value.
+    value: Local,
+}
+
 /// An access function of a ref (Specification §9.3).
 #[derive(Clone, Copy)]
 enum Access {
@@ -272,6 +283,8 @@ pub struct MirBuilder<'a, 'db> {
     test: bool,
     /// The `for` loops around what is being built.
     loops: u32,
+    /// The `atomic` blocks around what is being built, the innermost last.
+    atomic: Vec<AtomicFrame>,
     bool_ty: Ty<'db>,
     true_ty: Ty<'db>,
     false_ty: Ty<'db>,
@@ -329,6 +342,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             result: Ty::unit(db),
             test: false,
             loops: 0,
+            atomic: Vec::new(),
             bool_ty,
             true_ty,
             false_ty,
@@ -594,6 +608,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             dst,
             target,
             site: expr,
+            unwind: None,
         });
         self.switch_to(target);
         self.finish_dest(Operand::Local(dst), ty, Dest::Return);
@@ -781,6 +796,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     dst,
                     target,
                     site: expr,
+                    unwind: None,
                 });
                 self.switch_to(target);
                 Operand::Local(dst)
@@ -788,7 +804,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Access::Swap => {
                 let new = self.expr(positional[1]);
                 let new = self.coerce(new, self.ty(positional[1]), ty);
-                self.assign(ty, Rvalue::Intrinsic(Intrinsic::RefSwap, vec![cell, new]))
+                let old = self.assign(ty, Rvalue::Intrinsic(Intrinsic::RefSwap, vec![cell, new]));
+                self.leave_on_conflict();
+                old
             }
             Access::Empty => {
                 let empty_item = prelude_item(db, self.program, "Empty");
@@ -798,16 +816,158 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     return self.trap(TrapKind::Error, Some(expr));
                 };
                 let new = self.coerce(Operand::Const(Constant::Tag(empty)), empty, ty);
-                self.assign(ty, Rvalue::Intrinsic(Intrinsic::RefSwap, vec![cell, new]))
+                let old = self.assign(ty, Rvalue::Intrinsic(Intrinsic::RefSwap, vec![cell, new]));
+                self.leave_on_conflict();
+                old
             }
             Access::Update => self.ref_update(expr, cell, ty, positional[1]),
         }
+    }
+
+    /// An `atomic` block (§9.5): its body runs between `TxBegin` and the
+    /// commit, or the abort when its value is an error. A conflict, found
+    /// by a ref operation in the body, by code the body calls or by the
+    /// commit, goes to the handler: it frees what the attempt pushed on the
+    /// side stack, then passes the conflict to the block around this one,
+    /// or reruns the body if this is the outermost of the transaction, or
+    /// else leaves this function's frame for the block of a caller.
+    fn atomic_block(&mut self, expr: ExprId, inner: ExprId) -> Operand<'db> {
+        let (db, program) = (self.db, self.program);
+        let ty = self.ty(expr);
+        let (int, unit) = (self.int(), Ty::unit(db));
+        let outer = self.atomic.last().map(|f| f.handler);
+        let side_ptr = self.assign(int, Rvalue::Intrinsic(Intrinsic::SidePtr, Vec::new()));
+        let side_end = self.assign(int, Rvalue::Intrinsic(Intrinsic::SideEnd, Vec::new()));
+        let depth = self.assign(int, Rvalue::Intrinsic(Intrinsic::TxBegin, Vec::new()));
+        let (head, outcome, handler, join) = (
+            self.new_block(),
+            self.new_block(),
+            self.new_block(),
+            self.new_block(),
+        );
+        let value = self.temp(ty);
+        self.terminate(Terminator::Jump(head));
+        self.switch_to(head);
+        self.atomic.push(AtomicFrame {
+            handler,
+            outcome,
+            value,
+        });
+        self.eval(inner, Dest::Value(value));
+        self.terminate(Terminator::Jump(outcome));
+        self.atomic.pop();
+
+        self.switch_to(outcome);
+        let errors = crag_types::error_members(db, program, ty);
+        if !errors.is_never(db) {
+            let (abort, commit) = (self.new_block(), self.new_block());
+            let cases = errors.members(db).into_iter().map(|m| (m, abort)).collect();
+            self.terminate(Terminator::Switch {
+                place: Place::local(value),
+                cases,
+                otherwise: commit,
+            });
+            self.switch_to(abort);
+            self.assign(unit, Rvalue::Intrinsic(Intrinsic::TxAbort, Vec::new()));
+            self.terminate(Terminator::Jump(join));
+            self.switch_to(commit);
+        }
+        let status = self.assign(int, Rvalue::Intrinsic(Intrinsic::TxCommit, Vec::new()));
+        let committed = self.is_zero(status);
+        self.terminate(Terminator::Branch {
+            cond: committed,
+            then: join,
+            otherwise: handler,
+        });
+
+        self.switch_to(handler);
+        self.assign(
+            unit,
+            Rvalue::Intrinsic(Intrinsic::SideReset, vec![side_ptr, side_end]),
+        );
+        match outer {
+            Some(outer) => self.terminate(Terminator::Jump(outer)),
+            None => {
+                let outermost = self.assign(
+                    self.bool_ty,
+                    Rvalue::Compare {
+                        op: CmpOp::Eq,
+                        ty: Builtin::Int,
+                        a: depth,
+                        b: Operand::Const(Constant::Int(1)),
+                    },
+                );
+                let (retry, throw) = (self.new_block(), self.new_block());
+                self.terminate(Terminator::Branch {
+                    cond: outermost,
+                    then: retry,
+                    otherwise: throw,
+                });
+                self.switch_to(retry);
+                self.assign(unit, Rvalue::Intrinsic(Intrinsic::TxRetry, Vec::new()));
+                self.push(Statement::Poll);
+                self.terminate(Terminator::Jump(head));
+                self.switch_to(throw);
+                self.throw();
+            }
+        }
+        self.switch_to(join);
+        Operand::Local(value)
+    }
+
+    /// Leaves the attempt of the transaction for an `atomic` block of a
+    /// caller.
+    fn throw(&mut self) {
+        let unit = Ty::unit(self.db);
+        self.assign(unit, Rvalue::Intrinsic(Intrinsic::TxThrow, Vec::new()));
+        self.terminate(Terminator::Trap {
+            kind: TrapKind::Error,
+            site: None,
+        });
+    }
+
+    /// After a ref operation that reads a cell: when the attempt of the
+    /// transaction the task runs must rerun, goes to the handler of the
+    /// `atomic` block around, or leaves the frame for a caller's.
+    fn leave_on_conflict(&mut self) {
+        let int = self.int();
+        let flag = self.assign(int, Rvalue::Intrinsic(Intrinsic::TxConflicted, Vec::new()));
+        let clear = self.is_zero(flag);
+        let (go_on, conflict) = (self.new_block(), self.new_block());
+        self.terminate(Terminator::Branch {
+            cond: clear,
+            then: go_on,
+            otherwise: conflict,
+        });
+        self.switch_to(conflict);
+        match self.atomic.last() {
+            Some(frame) => {
+                let handler = frame.handler;
+                self.terminate(Terminator::Jump(handler));
+            }
+            None => self.throw(),
+        }
+        self.switch_to(go_on);
+    }
+
+    /// Whether an `Int` is zero, a `Bool`.
+    fn is_zero(&mut self, value: Operand<'db>) -> Operand<'db> {
+        self.assign(
+            self.bool_ty,
+            Rvalue::Compare {
+                op: CmpOp::Eq,
+                ty: Builtin::Int,
+                a: value,
+                b: Operand::Const(Constant::Int(0)),
+            },
+        )
     }
 
     /// The current value of a ref cell, with a reference of its own.
     fn ref_get(&mut self, cell: Operand<'db>, ty: Ty<'db>) -> Operand<'db> {
         let int = self.int();
         self.assign(int, Rvalue::Intrinsic(Intrinsic::RefRead, vec![cell]));
+        self.leave_on_conflict();
         let value = self.assign(ty, Rvalue::Intrinsic(Intrinsic::RefValue, Vec::new()));
         let unit = Ty::unit(self.db);
         self.assign(unit, Rvalue::Intrinsic(Intrinsic::RefDone, Vec::new()));
@@ -834,6 +994,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 self.int(),
                 Rvalue::Intrinsic(Intrinsic::RefApply { op, ty: builtin }, vec![cell, k]),
             );
+            self.leave_on_conflict();
             let fits = self.assign(
                 self.bool_ty,
                 Rvalue::Compare {
@@ -870,6 +1031,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             int,
             Rvalue::Intrinsic(Intrinsic::RefRead, vec![cell.clone()]),
         );
+        self.leave_on_conflict();
         let old = self.assign(ty, Rvalue::Intrinsic(Intrinsic::RefValue, Vec::new()));
         let new = self.temp(result_ty);
         let ran = self.new_block();
@@ -879,6 +1041,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             dst: new,
             target: ran,
             site: expr,
+            unwind: None,
         });
         self.switch_to(ran);
         let errors = crag_types::error_members(db, program, result_ty);
@@ -1191,7 +1354,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
 
     /// Ends the current block. What follows goes to a block no path
     /// reaches until the caller switches to another.
-    fn terminate(&mut self, terminator: Terminator<'db>) {
+    fn terminate(&mut self, mut terminator: Terminator<'db>) {
+        // A call in an `atomic` block goes to its handler when the code it
+        // called leaves the attempt.
+        if let Some(frame) = self.atomic.last()
+            && let Terminator::Call { unwind, .. } | Terminator::CallValue { unwind, .. } =
+                &mut terminator
+        {
+            *unwind = Some(frame.handler);
+        }
         let slot = &mut self.blocks[self.current.index()].1;
         assert!(slot.is_none(), "a block ends once");
         *slot = Some(terminator);
@@ -1347,14 +1518,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 self.switch_to(join);
             }
             Expr::Case { subject, arms } => self.case(expr, *subject, arms, dest),
+            // A tail call would leave an `atomic` block's frame.
             Expr::Call { .. } | Expr::MethodCall { .. } | Expr::TypedCall { .. }
                 if matches!(dest, Dest::Return) =>
             {
-                let op = self.call(expr, true);
+                let op = self.call(expr, self.atomic.is_empty());
                 self.finish_dest(op, self.ty(expr), dest);
             }
             Expr::Field { .. } if matches!(dest, Dest::Return) && self.is_call(expr) => {
-                let op = self.call(expr, true);
+                let op = self.call(expr, self.atomic.is_empty());
                 self.finish_dest(op, self.ty(expr), dest);
             }
             _ => {
@@ -1369,6 +1541,12 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Dest::Value(local) => self.assign_to(local, op, ty),
             Dest::Discard => {}
             // A test gives no value.
+            // `return` in an `atomic` block gives the block's value.
+            Dest::Return if !self.atomic.is_empty() => {
+                let frame = *self.atomic.last().expect("in a block");
+                self.assign_to(frame.value, op, ty);
+                self.terminate(Terminator::Jump(frame.outcome));
+            }
             Dest::Return if self.test => {
                 self.terminate(Terminator::Return(self.unit()));
             }
@@ -1509,7 +1687,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Expr::TypeArgs { .. } => self.unsupported(expr, "type arguments"),
             Expr::Closure { .. } => self.closure_value(expr, ty, None),
             Expr::Pass => self.unsupported(expr, "`pass`"),
-            Expr::Atomic(_) => self.unsupported(expr, "`atomic` blocks"),
+            Expr::Atomic(inner) => self.atomic_block(expr, *inner),
             Expr::Lazy(_) => self.unsupported(expr, "`lazy`"),
         }
     }
@@ -1592,6 +1770,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     dst,
                     target,
                     site,
+                    unwind: None,
                 });
                 self.switch_to(target);
                 Some(dst)
@@ -1624,6 +1803,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             dst,
             target,
             site: expr,
+            unwind: None,
         });
         self.switch_to(target);
         self.coerce(Operand::Local(dst), ty, self.ty(expr))
@@ -1888,6 +2068,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             dst,
             target,
             site: expr,
+            unwind: None,
         });
         self.switch_to(target);
         Operand::Local(dst)
@@ -2022,6 +2203,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     dst: out,
                     target,
                     site: expr,
+                    unwind: None,
                 });
                 self.switch_to(target);
                 Operand::Local(out)
@@ -2081,6 +2263,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             dst,
             target,
             site: expr,
+            unwind: None,
         });
         self.switch_to(target);
         Operand::Local(dst)
@@ -2346,6 +2529,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             dst,
             target,
             site,
+            unwind: None,
         });
         self.switch_to(target);
         dst

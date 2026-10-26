@@ -45,6 +45,7 @@ fn object(code: Vec<u8>, relocs: Vec<Reloc>) -> CodeObject {
         footprint: 0,
         stack_check: StackCheck::None,
         stack_maps: vec![],
+        handlers: vec![],
     }
 }
 

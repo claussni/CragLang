@@ -26,6 +26,12 @@
 //! Crag has no trap handlers yet (Specification §8.3), so a trap always ends
 //! its task. Cancellation ends a task the same way, with a `Cancelled` trap
 //! (§11.7.4).
+//!
+//! `rt_tx_throw` walks the chain the same way, but stops at the first frame
+//! whose call has a handler: the call of an `atomic` block's code, whose
+//! attempt the frames above it left (§11.7.14). That frame continues at the
+//! handler with its frame pointer and the stack pointer it had at the call,
+//! as Cranelift's `try_call` expects, and keeps what it holds.
 
 use std::sync::atomic::Ordering;
 
@@ -44,6 +50,9 @@ pub struct CodeMap {
     safepoints: Vec<(usize, Box<[u32]>)>,
     /// The start and end of each function's code, sorted.
     functions: Vec<(usize, usize, FuncId)>,
+    /// Return addresses of calls with a handler, sorted, with the
+    /// handler's address and the frame offset of the call.
+    handlers: Vec<(usize, usize, u32)>,
     /// The entry stubs a task of a scope starts in, which call a function
     /// value's code with its environment: by the code's number of results.
     task_entries: Option<[usize; 3]>,
@@ -64,6 +73,20 @@ impl CodeMap {
             self.safepoints.push((ret, map.slots.clone().into()));
         }
         self.safepoints.sort_unstable_by_key(|s| s.0);
+        for h in &object.handlers {
+            let ret = base + h.return_offset as usize;
+            self.handlers
+                .push((ret, base + h.handler_offset as usize, h.frame_offset));
+        }
+        self.handlers.sort_unstable_by_key(|h| h.0);
+    }
+
+    /// The handler of the call returning to `ret` and the call's frame
+    /// offset, if it has one.
+    fn handler(&self, ret: usize) -> Option<(usize, u32)> {
+        let i = self.handlers.binary_search_by_key(&ret, |h| h.0).ok()?;
+        let (_, handler, offset) = self.handlers[i];
+        Some((handler, offset))
     }
 
     /// Gives the entry stubs of tasks: from `compile_entry_stub` with one
@@ -199,6 +222,80 @@ unsafe fn unwind(worker: *mut Worker, mut ret: *const usize, mut fp: usize) -> V
             fp = (fp as *const usize).read();
         }
     }
+}
+
+/// `rt_tx_throw(ctx)`: see `crag_abi::RuntimeFn::TxThrow`.
+///
+/// Passes where the throwing frame's return address lies and its frame
+/// pointer to `throw_entry`, on the system stack, as `rt_trap` does.
+///
+/// # Safety
+///
+/// Only generated code may call this, on a fiber stack, with the fiber's
+/// task context, from code a call with a handler is below.
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn rt_tx_throw(ctx: *const TaskContext) -> ! {
+    std::arch::naked_asm!(
+        "mov rsi, rsp",
+        "mov rdx, rbp",
+        "mov rax, [rdi + {worker}]",
+        "mov rsp, [rax]",
+        "and rsp, -16",
+        "call {entry}",
+        "ud2",
+        worker = const std::mem::offset_of!(TaskContext, worker),
+        entry = sym throw_entry,
+    )
+}
+
+/// The Rust half of `rt_tx_throw`: releases what the frames hold up to the
+/// first whose call has a handler, and continues that frame there.
+///
+/// # Safety
+///
+/// Called only by `rt_tx_throw`. `ret` is where the return address into the
+/// throwing frame lies, and `fp` is that frame's frame pointer.
+unsafe extern "C" fn throw_entry(
+    ctx: *const TaskContext,
+    mut ret: *const usize,
+    mut fp: usize,
+) -> ! {
+    // SAFETY: as for `trap_entry`; a runtime call never has a handler, so
+    // the throwing frame is released like the others.
+    unsafe {
+        let worker: *mut Worker = (*ctx).worker.load(Ordering::Relaxed);
+        let code = Worker::code(worker);
+        let (heap, types) = Worker::heap_and_types(worker);
+        loop {
+            let at = ret.read();
+            if let Some((handler, offset)) = code.handler(at) {
+                land(fp - offset as usize, fp, handler);
+            }
+            let sp = ret as usize + 8;
+            for &offset in code.slots(at) {
+                let ptr = ((sp + offset as usize) as *const *mut u8).read();
+                if holds_box(ptr) {
+                    drop_box(heap, types, ptr);
+                }
+            }
+            if fp == 0 {
+                die("a transaction's conflict reached no atomic block");
+            }
+            ret = (fp + 8) as *const usize;
+            fp = (fp as *const usize).read();
+        }
+    }
+}
+
+/// Continues a frame at a handler: its stack and frame pointers, and where.
+///
+/// # Safety
+///
+/// `pc` is the handler of a call of the frame whose pointers these are,
+/// which a throw left.
+#[unsafe(naked)]
+unsafe extern "C" fn land(sp: usize, fp: usize, pc: usize) -> ! {
+    std::arch::naked_asm!("mov rsp, rdi", "mov rbp, rsi", "jmp rdx")
 }
 
 /// Continues the worker at the switch frame its `resume` left on the

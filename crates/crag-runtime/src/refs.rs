@@ -51,6 +51,7 @@ use crate::heap::Heap;
 use crate::io::Words;
 use crate::rc::{Types, release_value, retain_value};
 use crate::signals::signals_of;
+use crate::stm::{conflicted, running};
 
 /// A ref cell, as generated code lays it out.
 #[repr(C)]
@@ -239,6 +240,17 @@ system_stack_fn! {
 /// at `out`.
 unsafe extern "C" fn read_entry(ctx: *const TaskContext, cell: *const Cell, out: *mut u64) -> u64 {
     // SAFETY: as the caller promises.
+    if let Some(log) = unsafe { running(&*ctx) } {
+        // SAFETY: as the caller promises.
+        let words = unsafe { log.read(cell) }.unwrap_or_else(|| {
+            conflicted(unsafe { &*ctx });
+            [0, 0]
+        });
+        // SAFETY: as the caller promises.
+        unsafe { out.cast::<[u64; 2]>().write_unaligned(words) };
+        return 0;
+    }
+    // SAFETY: as the caller promises.
     unsafe {
         pin(&*ctx);
         signals_of(&*ctx).open();
@@ -272,6 +284,23 @@ unsafe extern "C" fn commit_entry(
     // SAFETY: as the caller promises.
     let (ctx, cell, (heap, types)) = unsafe { (&*ctx, &*cell, parts(&*ctx)) };
     let mut words = [w0, w1];
+    // SAFETY: as the caller promises.
+    if let Some(log) = unsafe { running(ctx) } {
+        // SAFETY: as the caller promises.
+        if !unsafe { log.write(cell, words, list) } {
+            // SAFETY: the cell or the log holds a reference besides the
+            // caller's.
+            unsafe {
+                release_value(
+                    heap,
+                    types,
+                    words.as_mut_ptr().cast(),
+                    types.element_of(list),
+                )
+            };
+        }
+        return crag_abi::REF_COMMITTED;
+    }
     let status = if cell.read() == (version, words) {
         // The value read, unchanged: nothing is written, and the cell
         // still holds a reference besides the caller's.
@@ -329,6 +358,11 @@ system_stack_fn! {
 ///
 /// Called only by `rt_ref_done`.
 unsafe extern "C" fn done_entry(ctx: *const TaskContext) {
+    // A transaction's reads end with it.
+    // SAFETY: as the caller promises.
+    if unsafe { running(&*ctx) }.is_some() {
+        return;
+    }
     // SAFETY: as the caller promises.
     unsafe {
         let (heap, types) = parts(&*ctx);
@@ -358,6 +392,26 @@ unsafe extern "C" fn swap_entry(
 ) -> Words {
     // SAFETY: as the caller promises.
     let (cell, (heap, types)) = unsafe { (&*cell, parts(&*ctx)) };
+    // SAFETY: as the caller promises.
+    if let Some(log) = unsafe { running(&*ctx) } {
+        let mut new = [w0, w1];
+        // SAFETY: as the caller promises.
+        let Some(mut old) = (unsafe { log.read(cell) }) else {
+            conflicted(unsafe { &*ctx });
+            // SAFETY: the caller's references to the new value.
+            unsafe { release_value(heap, types, new.as_mut_ptr().cast(), types.element_of(list)) };
+            return Words(0, 0);
+        };
+        // SAFETY: the cell or the log holds the old value until the
+        // attempt ends, and the caller gets references of its own.
+        unsafe {
+            retain_value(old.as_mut_ptr().cast(), types.element_of(list));
+            if !log.write(cell, new, list) {
+                release_value(heap, types, new.as_mut_ptr().cast(), types.element_of(list));
+            }
+        }
+        return Words(old[0], old[1]);
+    }
     let mut old = loop {
         let version = cell.lock_any();
         if let Some(old) = cell.replace(version, [w0, w1]) {
@@ -409,9 +463,9 @@ fn apply(op: u64, ty: u64, v: u64, k: u64) -> Option<u64> {
 }
 
 system_stack_fn! {
-    /// `rt_ref_apply(ctx, cell, op, ty, k) -> status`: see
+    /// `rt_ref_apply(ctx, cell, op, ty, k, list) -> status`: see
     /// `crag_abi::RuntimeFn::RefApply`.
-    fn rt_ref_apply(ctx: *const TaskContext, cell: *const Cell, op: u64, ty: u64, k: u64) -> u64 => apply_entry
+    fn rt_ref_apply(ctx: *const TaskContext, cell: *const Cell, op: u64, ty: u64, k: u64, list: u64) -> u64 => apply_entry
 }
 
 /// The Rust half of `rt_ref_apply`.
@@ -421,12 +475,29 @@ system_stack_fn! {
 /// Called only by `rt_ref_apply`, with a live cell holding an integer of
 /// type `ty`.
 unsafe extern "C" fn apply_entry(
-    _ctx: *const TaskContext,
+    ctx: *const TaskContext,
     cell: *const Cell,
     op: u64,
     ty: u64,
     k: u64,
+    list: u64,
 ) -> u64 {
+    // In a transaction the update is a read and a write of the log, which
+    // the commit checks with the others.
+    // SAFETY: as the caller promises.
+    if let Some(log) = unsafe { running(&*ctx) } {
+        // SAFETY: as the caller promises.
+        let Some(words) = (unsafe { log.read(cell) }) else {
+            conflicted(unsafe { &*ctx });
+            return crag_abi::REF_COMMITTED;
+        };
+        let Some(result) = apply(op, ty, words[0], k) else {
+            return crag_abi::REF_OVERFLOW;
+        };
+        // SAFETY: an integer holds no references.
+        unsafe { log.write(cell, [result, words[1]], list) };
+        return crag_abi::REF_COMMITTED;
+    }
     // SAFETY: as the caller promises.
     let cell = unsafe { &*cell };
     loop {

@@ -160,6 +160,7 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::LazySet => lazy::rt_lazy_set as *const () as usize,
         RuntimeFn::LazyFree => lazy::rt_lazy_free as *const () as usize,
         RuntimeFn::ReleaseDeferred => teardown::rt_release_deferred as *const () as usize,
+        RuntimeFn::TxThrow => unwind::rt_tx_throw as *const () as usize,
     }
 }
 

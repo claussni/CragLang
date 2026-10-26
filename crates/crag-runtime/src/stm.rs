@@ -121,6 +121,7 @@ impl TxLog {
         pin(ctx);
         self.depth = 1;
         self.read_version = clock();
+        ctx.tx_conflict.store(0, Ordering::Relaxed);
     }
 
     /// Forgets the attempt: its writes are given up and the task is
@@ -212,11 +213,31 @@ pub(crate) fn stopped(fiber: &mut Fiber, ctx: &TaskContext, heap: &mut Heap, typ
     {
         log.finish(ctx, heap, types);
     }
+    ctx.tx_conflict.store(0, Ordering::Relaxed);
+}
+
+/// The log of the transaction the fiber of `ctx` runs, if it runs one:
+/// the ref functions then read and write through it, as the block's own
+/// accesses do (Plan §11.7.14).
+///
+/// # Safety
+///
+/// A worker runs the fiber.
+pub(crate) unsafe fn running<'a>(ctx: &TaskContext) -> Option<&'a mut TxLog> {
+    // SAFETY: as the caller promises.
+    let fiber = unsafe { &mut *ctx.fiber.load(Ordering::Relaxed) };
+    fiber.tx.as_deref_mut().filter(|log| log.depth > 0)
+}
+
+/// Records that the running attempt must rerun, for generated code to
+/// leave it (`crag_abi::TX_CONFLICT_OFFSET`).
+pub(crate) fn conflicted(ctx: &TaskContext) {
+    ctx.tx_conflict.store(1, Ordering::Relaxed);
 }
 
 system_stack_fn! {
-    /// `rt_tx_begin(ctx)`: see `crag_abi::RuntimeFn::TxBegin`.
-    fn rt_tx_begin(ctx: *const TaskContext) => begin_entry
+    /// `rt_tx_begin(ctx) -> depth`: see `crag_abi::RuntimeFn::TxBegin`.
+    fn rt_tx_begin(ctx: *const TaskContext) -> u64 => begin_entry
 }
 
 /// The Rust half of `rt_tx_begin`.
@@ -224,7 +245,7 @@ system_stack_fn! {
 /// # Safety
 ///
 /// Called only by `rt_tx_begin`.
-unsafe extern "C" fn begin_entry(ctx: *const TaskContext) {
+unsafe extern "C" fn begin_entry(ctx: *const TaskContext) -> u64 {
     // SAFETY: as the caller promises.
     let (ctx, log, signals) = unsafe { (&*ctx, log_of(&*ctx), signals_of(&*ctx)) };
     signals.open();
@@ -234,6 +255,7 @@ unsafe extern "C" fn begin_entry(ctx: *const TaskContext) {
         log.savepoints.push(log.writes.len());
         log.depth += 1;
     }
+    u64::from(log.depth)
 }
 
 system_stack_fn! {
@@ -350,7 +372,7 @@ impl TxLog {
     /// # Safety
     ///
     /// The cell is live.
-    unsafe fn read(&mut self, cell: *const Cell) -> Option<[u64; 2]> {
+    pub(crate) unsafe fn read(&mut self, cell: *const Cell) -> Option<[u64; 2]> {
         if let Some(w) = self.written(cell) {
             return Some(w.words);
         }
@@ -379,7 +401,7 @@ impl TxLog {
     /// # Safety
     ///
     /// The cell is live.
-    unsafe fn write(&mut self, cell: *const Cell, words: [u64; 2], list: u64) -> bool {
+    pub(crate) unsafe fn write(&mut self, cell: *const Cell, words: [u64; 2], list: u64) -> bool {
         let seen = match self.written(cell) {
             Some(w) => Some(w.words),
             // SAFETY: as the caller promises.

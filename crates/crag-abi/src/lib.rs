@@ -110,6 +110,13 @@ pub const HEAP_OFFSET: i32 = 24;
 /// the fuel.
 pub const FUEL_OFFSET: i32 = 32;
 
+/// Offset of the conflict word in the task context, nonzero once a ref
+/// function found that the running transaction's attempt must rerun
+/// (Implementation Plan §11.7.14). Generated code reads it after each ref
+/// function that reads a cell and leaves the attempt: to its block's handler
+/// inside an `atomic` block, else by `TxThrow`. `TxRetry` clears it.
+pub const TX_CONFLICT_OFFSET: i32 = 40;
+
 /// The value the runtime stores in `stack_limit` to force the next check into
 /// the runtime (Plan §11.3.4). The check compares unsigned, so no stack
 /// pointer passes it.
@@ -443,6 +450,12 @@ pub enum RuntimeFn {
 
     /// `rt_ref_read(ctx, cell, out) -> version`.
     ///
+    /// While the task runs a transaction, this and the other ref functions
+    /// act on its log as `TxRead` and `TxWrite` do: an update writes to the
+    /// log and commits, and a read that conflicts sets the conflict word
+    /// ([`TX_CONFLICT_OFFSET`]) and gives zero words (Implementation Plan
+    /// §11.7.14).
+    ///
     /// Reads the ref cell at `cell` (see [`REF_CELL_SIZE`]): its value's
     /// two words to `out`, borrowed, and the version they belong to. The
     /// task stays pinned until `RefCommit` or `RefDone`, so a value a
@@ -473,12 +486,13 @@ pub enum RuntimeFn {
     /// and gives the old one with references of its own.
     RefSwap = 44,
 
-    /// `rt_tx_begin(ctx)`.
+    /// `rt_tx_begin(ctx) -> depth`.
     ///
     /// Opens an `atomic` block (Specification §9.5): the outermost starts
     /// an attempt of a transaction, an inner one takes a savepoint
-    /// (Implementation Plan §11.7.7). The block is a region where
-    /// cancellation waits, and nothing in it may suspend.
+    /// (Implementation Plan §11.7.7). Gives the number of blocks open, 1
+    /// for the outermost. The block is a region where cancellation waits,
+    /// and nothing in it may suspend.
     TxBegin = 45,
 
     /// `rt_tx_read(ctx, cell, out) -> status`.
@@ -515,7 +529,7 @@ pub enum RuntimeFn {
     /// block's code runs again from its start.
     TxRetry = 50,
 
-    /// `rt_ref_apply(ctx, cell, op, ty, k) -> status`.
+    /// `rt_ref_apply(ctx, cell, op, ty, k, list) -> status`.
     ///
     /// Applies `v ⊕ k` to the integer in a ref cell under the cell's lock,
     /// as the compiler lowers an update whose closure has that shape, so
@@ -524,6 +538,8 @@ pub enum RuntimeFn {
     /// 16, 32 or 64, with [`REF_UNSIGNED`] for an unsigned one. Gives
     /// [`REF_COMMITTED`], or [`REF_OVERFLOW`] when the result is outside
     /// the type, and then the cell is unchanged and the caller traps.
+    /// `list` is the type index of a list of the integers, which a
+    /// transaction's log keeps the write with.
     RefApply = 51,
 
     /// `rt_ext_new(ctx) -> ext`.
@@ -607,6 +623,14 @@ pub enum RuntimeFn {
     /// (Implementation Plan §11.7.12). The handlers of the part freed at
     /// once are queued for `Disposal`, as `Release` queues them.
     ReleaseDeferred = 62,
+
+    /// `rt_tx_throw(ctx) -> !`.
+    ///
+    /// Leaves the attempt of a transaction from code an `atomic` block
+    /// called: releases what the frames hold, as a trap does, up to the
+    /// first frame whose call has a handler, and continues at the handler
+    /// (Implementation Plan §11.7.14).
+    TxThrow = 63,
 }
 
 /// A status of the stream functions: sent, or a value taken.
@@ -696,7 +720,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 63] = [
+    pub const ALL: [RuntimeFn; 64] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -760,6 +784,7 @@ impl RuntimeFn {
         RuntimeFn::LazySet,
         RuntimeFn::LazyFree,
         RuntimeFn::ReleaseDeferred,
+        RuntimeFn::TxThrow,
     ];
 
     /// The symbol the loader looks up.
@@ -828,6 +853,7 @@ impl RuntimeFn {
             RuntimeFn::LazySet => "rt_lazy_set",
             RuntimeFn::LazyFree => "rt_lazy_free",
             RuntimeFn::ReleaseDeferred => "rt_release_deferred",
+            RuntimeFn::TxThrow => "rt_tx_throw",
         }
     }
 
@@ -1152,6 +1178,23 @@ pub struct CodeObject {
     pub stack_check: StackCheck,
     /// Where the tracked values are at each call, ordered by offset.
     pub stack_maps: Vec<StackMap>,
+    /// The calls with a handler, which `TxThrow` continues at, ordered by
+    /// offset.
+    pub handlers: Vec<CallHandler>,
+}
+
+/// A call whose frame takes over when the code it called leaves a
+/// transaction's attempt (Implementation Plan §11.7.14). The handler
+/// expects the frame pointer the frame had and the stack pointer
+/// `frame_offset` below it, and nothing else in registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CallHandler {
+    /// Offset in `CodeObject::code` of the return address of the call.
+    pub return_offset: u32,
+    /// Offset in `CodeObject::code` of the handler.
+    pub handler_offset: u32,
+    /// From the frame pointer down to the stack pointer at the call.
+    pub frame_offset: u32,
 }
 
 /// The tracked values of one frame while it is suspended at a call.

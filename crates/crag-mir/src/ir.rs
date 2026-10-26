@@ -258,7 +258,30 @@ pub enum Intrinsic {
     /// update whose closure has that shape (§9.4), with the cell and `k`:
     /// 0, or 2 when the result does not fit the type and the cell is
     /// unchanged.
-    RefApply { op: BinOp, ty: Builtin },
+    RefApply {
+        op: BinOp,
+        ty: Builtin,
+    },
+    /// Opens an `atomic` block: the number of blocks open, an `Int`.
+    TxBegin,
+    /// Closes a block whose value is a success: 0, or else the attempt
+    /// must rerun.
+    TxCommit,
+    /// Closes a block whose value is an error.
+    TxAbort,
+    /// Starts the next attempt of the outermost block.
+    TxRetry,
+    /// Leaves the attempt from code an `atomic` block of another function
+    /// runs; it does not return.
+    TxThrow,
+    /// Whether a ref operation found that the attempt must rerun: an `Int`,
+    /// nonzero if so.
+    TxConflicted,
+    /// The side stack's pointer and end, `Int`s, which `SideReset` gives
+    /// back, freeing what was pushed since.
+    SidePtr,
+    SideEnd,
+    SideReset,
 }
 
 impl Intrinsic {
@@ -268,11 +291,7 @@ impl Intrinsic {
             Intrinsic::RefNew => index == 0,
             Intrinsic::RefCommit => index == 2,
             Intrinsic::RefSwap => index == 1,
-            Intrinsic::Sleep
-            | Intrinsic::RefRead
-            | Intrinsic::RefValue
-            | Intrinsic::RefDone
-            | Intrinsic::RefApply { .. } => false,
+            _ => false,
         }
     }
 }
@@ -331,13 +350,16 @@ pub enum Terminator<'db> {
         otherwise: BlockId,
     },
     /// Calls a function and continues at `target` with its result in
-    /// `dst`.
+    /// `dst`, or at `unwind`, without one, when the code it called left
+    /// the attempt of the transaction of an `atomic` block around the call
+    /// (Plan §11.7.14).
     Call {
         func: InstanceKey<'db>,
         args: Vec<Operand<'db>>,
         dst: Local,
         target: BlockId,
         site: ExprId,
+        unwind: Option<BlockId>,
     },
     /// A call that replaces this function's frame (§5.6.3).
     TailCall {
@@ -353,6 +375,7 @@ pub enum Terminator<'db> {
         dst: Local,
         target: BlockId,
         site: ExprId,
+        unwind: Option<BlockId>,
     },
     TailCallValue {
         callee: Operand<'db>,
@@ -376,7 +399,10 @@ impl<'db> Terminator<'db> {
             Terminator::Switch {
                 cases, otherwise, ..
             } => cases.iter().map(|(_, b)| *b).chain([*otherwise]).collect(),
-            Terminator::Call { target, .. } | Terminator::CallValue { target, .. } => vec![*target],
+            Terminator::Call { target, unwind, .. }
+            | Terminator::CallValue { target, unwind, .. } => {
+                [*target].into_iter().chain(*unwind).collect()
+            }
             Terminator::TailCall { .. }
             | Terminator::TailCallValue { .. }
             | Terminator::Return(_)
@@ -397,7 +423,10 @@ impl<'db> Terminator<'db> {
                 .map(|(_, b)| b)
                 .chain([otherwise])
                 .collect(),
-            Terminator::Call { target, .. } | Terminator::CallValue { target, .. } => vec![target],
+            Terminator::Call { target, unwind, .. }
+            | Terminator::CallValue { target, unwind, .. } => {
+                [target].into_iter().chain(unwind.as_mut()).collect()
+            }
             Terminator::TailCall { .. }
             | Terminator::TailCallValue { .. }
             | Terminator::Return(_)
@@ -714,13 +743,15 @@ fn terminator_text<'db>(db: &'db dyn Db, terminator: &Terminator<'db>) -> String
             args,
             dst,
             target,
+            unwind,
             ..
         } => format!(
-            "_{} = call {}({}) -> bb{}",
+            "_{} = call {}({}) -> bb{}{}",
             dst.0,
             func_name(db, *func),
             ops(args),
-            target.0
+            target.0,
+            unwind.map_or(String::new(), |u| format!(", unwind bb{}", u.0))
         ),
         Terminator::TailCall { func, args, .. } => {
             format!("tail call {}({})", func_name(db, *func), ops(args))
@@ -730,13 +761,15 @@ fn terminator_text<'db>(db: &'db dyn Db, terminator: &Terminator<'db>) -> String
             args,
             dst,
             target,
+            unwind,
             ..
         } => format!(
-            "_{} = call value {}({}) -> bb{}",
+            "_{} = call value {}({}) -> bb{}{}",
             dst.0,
             op(callee),
             ops(args),
-            target.0
+            target.0,
+            unwind.map_or(String::new(), |u| format!(", unwind bb{}", u.0))
         ),
         Terminator::TailCallValue { callee, args, .. } => {
             format!("tail call value {}({})", op(callee), ops(args))
