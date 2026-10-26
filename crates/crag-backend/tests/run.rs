@@ -72,6 +72,8 @@ pub fn update[T, R](r: Ref[T], f: (T) -> R) -> () | Errs[R]
 pub fn swap[T](r: Ref[T], new: T) -> T
 pub fn empty[T](r: Ref[Option[T]]) -> Option[T]
 pub type Ext[T]
+pub fn value[T](l: Lazy[T]) -> T
+pub type Lazy[T]
 pub fn use[T](r: Ext[T]) -> T
 pub fn update[T, R](r: Ext[T], f: (T) -> R) -> () | Errs[R]
 pub fn swap[T](r: Ext[T], new: T) -> T
@@ -2525,5 +2527,23 @@ fn held(n: Int) -> Int {
     assert_eq!(m.unsupported, Vec::<String>::new());
     // The ext's lock needs a fiber's task context.
     assert_eq!(m.run("held", &[10]).unwrap(), [1 + 55]);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+}
+
+#[test]
+fn lazy_values_count_what_they_hold() {
+    let mut m = Module::new(
+        r#"fn twice(n: Int) -> Int {
+  let s = "a string too long to be inline"
+  let l = lazy "{s} {s}"
+  let a = l.value
+  let b = l.value
+  if a == b { n } else { 0 }
+}
+"#,
+    );
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    // Lazy cells need a fiber's task context.
+    assert_eq!(m.run("twice", &[5]).unwrap(), [5]);
     assert_eq!(m.worker.heap().live_blocks(), 0);
 }

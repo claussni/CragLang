@@ -981,6 +981,9 @@ pub enum CountedField {
     /// the runtime frees with the box (Implementation Plan §11.7.14). No
     /// reference: it is never counted.
     Ext(u32),
+    /// The cell of a lazy value at this offset, from `LazyNew`, which the
+    /// runtime frees with the box, giving up the value it holds.
+    Lazy(u32),
 }
 
 /// The words of a value inside a collection: at most two, with the fields

@@ -340,6 +340,17 @@ pub fn type_descriptor<'db>(
         }
         Some((Builtin::Map, [key, value])) => return map(*key, Some(*value)),
         Some((Builtin::Set, [key])) => return map(*key, None),
+        // A lazy value's box: the runtime's cell, which holds the value,
+        // then the function value that computes it.
+        Some((Builtin::Lazy, [_])) => {
+            return Some(TypeDescriptor::Record {
+                counted: vec![
+                    CountedField::Lazy(HEADER_SIZE),
+                    CountedField::Box(HEADER_SIZE + 16),
+                ],
+                dispose: None,
+            });
+        }
         // A ref cell's box: the cell's version word, then the value laid
         // out as in a collection (`crag_abi::REF_CELL_SIZE`); an `ext`'s:
         // the lock, then the value.
@@ -355,6 +366,7 @@ pub fn type_descriptor<'db>(
                         boxed,
                     },
                     CountedField::Ext(offset) => CountedField::Ext(base + offset),
+                    CountedField::Lazy(offset) => CountedField::Lazy(base + offset),
                 })
                 .collect();
             if b == Builtin::Ext {

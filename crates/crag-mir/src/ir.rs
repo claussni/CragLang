@@ -307,6 +307,23 @@ pub enum Intrinsic {
     ExtValue,
     /// Places the value in the `ext`, giving up the one it held.
     ExtStore,
+    /// A lazy value computed by the function value, a `Lazy[T]` (§6.10).
+    LazyNew,
+    /// Reads the lazy value: 0 when it is there for `LazyValue`, 1 when
+    /// the reader must compute it with `LazyCode` and store it with
+    /// `LazySet`, or 2 when its computation trapped, for `LazyTrap`.
+    LazyGet,
+    /// The value the last `LazyGet` of the code read, with references of
+    /// its own.
+    LazyValue,
+    /// The function value that computes the lazy value, borrowed from it.
+    LazyCode,
+    /// Stores the computed value in the lazy value, which takes references
+    /// of its own.
+    LazySet,
+    /// Traps as the computation that the last `LazyGet` found did; it does
+    /// not return.
+    LazyTrap,
 }
 
 impl Intrinsic {
@@ -315,7 +332,7 @@ impl Intrinsic {
         match self {
             Intrinsic::RefCommit => index == 2,
             Intrinsic::RefSwap | Intrinsic::ScopeStart | Intrinsic::ExtStore => index == 1,
-            Intrinsic::RefNew | Intrinsic::ExtNew => index == 0,
+            Intrinsic::RefNew | Intrinsic::ExtNew | Intrinsic::LazyNew => index == 0,
             _ => false,
         }
     }

@@ -96,7 +96,12 @@ pub fn intrinsic_escapes<'db>(
         sig.params
             .iter()
             .map(|p| match p.ty.kind(db) {
-                TyKind::Builtin(Builtin::Ref | Builtin::Ext, _) | TyKind::Fn { .. } if prelude => {
+                // Reading a lazy value keeps it no more than an access
+                // keeps a cell.
+                TyKind::Builtin(Builtin::Ref | Builtin::Ext | Builtin::Lazy, _)
+                | TyKind::Fn { .. }
+                    if prelude =>
+                {
                     EscapeLevel::Local
                 }
                 TyKind::Fn { .. } if scope => EscapeLevel::Scoped,

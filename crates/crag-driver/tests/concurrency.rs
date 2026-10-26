@@ -376,3 +376,49 @@ fn main() -> ExitCode {
     );
     assert_eq!(code, 50, "{out}");
 }
+
+#[test]
+fn a_lazy_value_is_computed_once() {
+    let (code, out) = run(
+        "lazy",
+        r#"import std.task
+import std.time
+
+fn main() -> ExitCode {
+  ref runs = 0
+  let text = lazy {
+    runs.update { n -> n + 1 }
+    sleep(millis(10))
+    "computed once by its first reader"
+  }
+  ref same = 0
+  all { g ->
+    for i in 1..20 {
+      g.start { ->
+        if text.value == "computed once by its first reader" {
+          same.update { n -> n + 1 }
+        }
+      }
+    }
+  }
+  ExitCode(code: runs.use() * 100 + same.use())
+}
+"#,
+    );
+    assert_eq!(code, 120, "{out}");
+}
+
+#[test]
+fn a_lazy_value_that_traps_traps_its_readers() {
+    let (code, out) = run(
+        "lazy-trap",
+        r#"fn main() -> ExitCode {
+  let n = 0
+  let bad = lazy 10 / n
+  ExitCode(code: bad.value)
+}
+"#,
+    );
+    assert_eq!(code, 70, "{out}");
+    assert!(out.starts_with("trap: division by zero"), "{out}");
+}

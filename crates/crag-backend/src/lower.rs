@@ -42,10 +42,10 @@ use std::ops::Range;
 use crag_abi::{
     BUFFER_HEADER, CELL_FULL, CELL_STATE_OFFSET, CELL_VALUE_OFFSET, COUNT_OFFSET,
     FUNCTION_BOX_HEADER, HEADER_SIZE, HEAP_OFFSET, INLINE_TEXT_MAX, LEN_OFFSET, LIST_SIZE,
-    MAP_SIZE, MEMBER_BOX_SIZE, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, REF_ADD, REF_CELL_SIZE, REF_MUL,
-    REF_SUB, REF_UNSIGNED, SCOPE_DONE, SIDE_END_OFFSET, SIDE_PTR_OFFSET, START_EXEMPT,
-    STATIC_COUNT, TEXT_BOX_HEADER, TEXT_LEN_MAX, TX_CONFLICT_OFFSET, TYPE_INDEX_OFFSET,
-    TrapKind as AbiTrap, TypeDescriptor, inline_text, size_class,
+    MAP_SIZE, MEMBER_BOX_SIZE, NO_POSITION, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, REF_ADD,
+    REF_CELL_SIZE, REF_MUL, REF_SUB, REF_UNSIGNED, SCOPE_DONE, SIDE_END_OFFSET, SIDE_PTR_OFFSET,
+    START_EXEMPT, STATIC_COUNT, TEXT_BOX_HEADER, TEXT_LEN_MAX, TX_CONFLICT_OFFSET,
+    TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TypeDescriptor, inline_text, size_class,
 };
 use crag_codegen::{
     BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, CallTarget, Cond, FuncId, Inst,
@@ -1081,6 +1081,77 @@ impl<'a, 'db> Lower<'a, 'db> {
                     });
                 }
                 self.count_words(value_layout, value_ty, &old, Self::release)?;
+                Ok(Vec::new())
+            }
+            (Intrinsic::LazyNew, [code]) => {
+                let Some((Builtin::Lazy, &[value_ty])) = ty.as_builtin(self.db) else {
+                    return Err("lazy values of this type");
+                };
+                self.describe(ty)?;
+                let code_ty = self.operand_ty(code, ty);
+                let [code, env] = self.operand(code, code_ty)?[..] else {
+                    return Err("lazy values of this type");
+                };
+                let list = self.cell_list(value_ty)?;
+                let cell = self.runtime(RuntimeFn::LazyNew, vec![list]);
+                let ptr = self.alloc(HEADER_SIZE + 24, type_index(ty));
+                let header = HEADER_SIZE as i32;
+                for (k, src) in [cell, code, env].into_iter().enumerate() {
+                    self.push(Inst::Store {
+                        src,
+                        addr: ptr,
+                        offset: header + 8 * k as i32,
+                    });
+                }
+                Ok(vec![ptr])
+            }
+            (Intrinsic::LazyGet, [lazy]) => {
+                let ptr = self.box_of(lazy)?;
+                let cell = self.load(ptr, HEADER_SIZE as i32);
+                let out = self.scratch();
+                Ok(vec![self.runtime(RuntimeFn::LazyGet, vec![cell, out])])
+            }
+            (Intrinsic::LazyValue, []) => {
+                let out = self.scratch();
+                let words = layout(self.db, self.program, ty)
+                    .ok_or("values of this type")?
+                    .words();
+                Ok((0..words).map(|k| self.load(out, 8 * k as i32)).collect())
+            }
+            (Intrinsic::LazyCode, [lazy]) => {
+                let ptr = self.box_of(lazy)?;
+                let header = HEADER_SIZE as i32;
+                Ok(vec![
+                    self.load(ptr, header + 8),
+                    self.load(ptr, header + 16),
+                ])
+            }
+            (Intrinsic::LazySet, [lazy, value]) => {
+                let value_ty = self.operand_ty(value, ty);
+                let value_layout = layout(self.db, self.program, value_ty);
+                let ptr = self.box_of(lazy)?;
+                let cell = self.load(ptr, HEADER_SIZE as i32);
+                let words = self.operand(value, value_ty)?;
+                // The cell takes references of its own; the reader keeps
+                // the value.
+                self.count_words(value_layout, value_ty, &words, Self::retain)?;
+                let [w0, w1] = self.pad(words);
+                self.push(Inst::CallRuntime {
+                    func: RuntimeFn::LazySet,
+                    args: vec![cell, w0, w1],
+                    dsts: Vec::new(),
+                });
+                Ok(Vec::new())
+            }
+            (Intrinsic::LazyTrap, []) => {
+                let out = self.scratch();
+                let kind = self.load(out, 0);
+                let position = self.constant(NO_POSITION as i64);
+                self.push(Inst::CallRuntime {
+                    func: RuntimeFn::Trap,
+                    args: vec![kind, position],
+                    dsts: Vec::new(),
+                });
                 Ok(Vec::new())
             }
             (Intrinsic::ScopeNew, [limit]) => {

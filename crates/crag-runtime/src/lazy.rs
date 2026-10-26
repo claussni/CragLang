@@ -294,6 +294,21 @@ system_stack_fn! {
 ///
 /// Called only by `rt_lazy_free`, once, with a cell no task reads or
 /// computes any more.
+/// Frees the cell of a lazy value's box being freed, with its value.
+///
+/// # Safety
+///
+/// `lazy` came from `rt_lazy_new`, no task reads or computes it any more,
+/// and it is freed once.
+pub(crate) unsafe fn free(lazy: u64, heap: &mut Heap, types: &Types) {
+    // SAFETY: as the caller promises.
+    let cell = unsafe { Arc::from_raw(lazy as *const LazyCell) };
+    let phase = std::mem::replace(&mut cell.state.lock().unwrap().phase, Phase::Unstarted);
+    if let Phase::Done(words) = phase {
+        release(heap, types, cell.list, words);
+    }
+}
+
 unsafe extern "C" fn free_entry(ctx: *const TaskContext, lazy: *const LazyCell) {
     // SAFETY: as the caller promises.
     let (cell, (heap, types)) = unsafe { (Arc::from_raw(lazy), worker_of(&*ctx)) };

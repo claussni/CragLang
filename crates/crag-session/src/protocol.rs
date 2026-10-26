@@ -558,6 +558,10 @@ impl Writer {
                 w.u8(2);
                 w.u32(*offset);
             }
+            CountedField::Lazy(offset) => {
+                w.u8(3);
+                w.u32(*offset);
+            }
         });
     }
 }
@@ -786,6 +790,7 @@ impl Reader<'_> {
                     boxed: r.seq(Reader::u32)?,
                 },
                 2 => CountedField::Ext(r.u32()?),
+                3 => CountedField::Lazy(r.u32()?),
                 tag => return Err(invalid(format!("a counted field with the tag {tag}"))),
             })
         })

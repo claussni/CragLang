@@ -393,15 +393,18 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Some((binding, _)) => self.binding_ty(binding)?,
             None => self.expr_ty(frame)?,
         };
-        let TyKind::Fn {
-            params: param_tys,
-            result,
-            ..
-        } = ty.kind(db)
-        else {
-            return None;
+        // A `lazy` expression is the code of a function without
+        // parameters.
+        let (param_tys, result) = match (ty.kind(db), body.expr(frame)) {
+            (_, Expr::Lazy(_)) => match ty.as_builtin(db) {
+                Some((Builtin::Lazy, &[value])) => (Vec::new(), value),
+                _ => return None,
+            },
+            (TyKind::Fn { params, result, .. }, _) => (params.clone(), *result),
+            _ => return None,
         };
-        self.result = *result;
+        let param_tys = &param_tys;
+        self.result = result;
         let (captures, env_ty) = self.environment(frame, own);
         let env = self.temp(env_ty);
         self.env = true;
@@ -431,6 +434,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 }
                 *inner
             }
+            (None, Expr::Lazy(inner)) => *inner,
             _ => return None,
         };
         self.params = self.locals.len();
@@ -730,6 +734,110 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 .or_else(|| result_type(db, program, instance.function))
                 .map(ty),
         }
+    }
+
+    /// The value type of a read of a lazy value, if the call is the
+    /// prelude's `value` (§6.10).
+    fn lazy_read(&self, instance: &Instance<'db>) -> Option<Ty<'db>> {
+        let db = self.db;
+        let function = instance.function;
+        if function.module(db).path(db) != PRELUDE
+            || function.name(db).text(db) != "value"
+            || hir_body(db, self.program, Owner::Item(function))
+                .root
+                .is_some()
+        {
+            return None;
+        }
+        let sig = self.instance_signature(instance);
+        match sig.params.first()?.ty.as_builtin(db) {
+            Some((Builtin::Lazy, &[value])) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// `.value` of a lazy value: the value there, or the one the reader
+    /// computes and stores when it is the first, or a trap like the
+    /// computation's.
+    fn lazy_value(&mut self, expr: ExprId, lazy: Operand<'db>, ty: Ty<'db>) -> Operand<'db> {
+        let db = self.db;
+        let int = self.int();
+        let status = self.assign(
+            int,
+            Rvalue::Intrinsic(Intrinsic::LazyGet, vec![lazy.clone()]),
+        );
+        let value = self.temp(ty);
+        let (done, other, run, trapped, join) = (
+            self.new_block(),
+            self.new_block(),
+            self.new_block(),
+            self.new_block(),
+            self.new_block(),
+        );
+        let there = self.is_zero(status.clone());
+        self.terminate(Terminator::Branch {
+            cond: there,
+            then: done,
+            otherwise: other,
+        });
+        self.switch_to(done);
+        let read = self.assign(ty, Rvalue::Intrinsic(Intrinsic::LazyValue, Vec::new()));
+        self.assign_to(value, read, ty);
+        self.terminate(Terminator::Jump(join));
+        self.switch_to(other);
+        let compute = self.assign(
+            self.bool_ty,
+            Rvalue::Compare {
+                op: CmpOp::Eq,
+                ty: Builtin::Int,
+                a: status,
+                b: Operand::Const(Constant::Int(1)),
+            },
+        );
+        self.terminate(Terminator::Branch {
+            cond: compute,
+            then: run,
+            otherwise: trapped,
+        });
+        self.switch_to(run);
+        let code_ty = Ty::new(
+            db,
+            TyKind::Fn {
+                params: Vec::new(),
+                result: ty,
+                pure: false,
+            },
+        );
+        let code = self.assign(
+            code_ty,
+            Rvalue::Intrinsic(Intrinsic::LazyCode, vec![lazy.clone()]),
+        );
+        let computed = self.temp(ty);
+        let after = self.new_block();
+        self.terminate(Terminator::CallValue {
+            callee: code,
+            args: Vec::new(),
+            dst: computed,
+            target: after,
+            site: expr,
+            unwind: None,
+        });
+        self.switch_to(after);
+        let unit = Ty::unit(db);
+        self.assign(
+            unit,
+            Rvalue::Intrinsic(Intrinsic::LazySet, vec![lazy, Operand::Local(computed)]),
+        );
+        self.assign_to(value, Operand::Local(computed), ty);
+        self.terminate(Terminator::Jump(join));
+        self.switch_to(trapped);
+        self.assign(unit, Rvalue::Intrinsic(Intrinsic::LazyTrap, Vec::new()));
+        self.terminate(Terminator::Trap {
+            kind: TrapKind::Error,
+            site: Some(expr),
+        });
+        self.switch_to(join);
+        Operand::Local(value)
     }
 
     /// The access function of a ref that a call of the prelude names, if
@@ -1819,7 +1927,21 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Expr::Closure { .. } => self.closure_value(expr, ty, None),
             Expr::Pass => self.unsupported(expr, "`pass`"),
             Expr::Atomic(inner) => self.atomic_block(expr, *inner),
-            Expr::Lazy(_) => self.unsupported(expr, "`lazy`"),
+            Expr::Lazy(_) => {
+                let Some((Builtin::Lazy, &[value])) = ty.as_builtin(db) else {
+                    return self.trap(TrapKind::Error, Some(expr));
+                };
+                let code = Ty::new(
+                    db,
+                    TyKind::Fn {
+                        params: Vec::new(),
+                        result: value,
+                        pure: false,
+                    },
+                );
+                let f = self.closure_value(expr, code, None);
+                self.assign(ty, Rvalue::Intrinsic(Intrinsic::LazyNew, vec![f]))
+            }
         }
     }
 
@@ -2358,6 +2480,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             && let Some(primitive) = self.primitive_of(instance)
         {
             return self.primitive_call(expr, primitive, positional);
+        }
+        if fields.is_none()
+            && let Some(value) = self.lazy_read(instance)
+            && let [lazy] = positional
+        {
+            let op = self.expr(*lazy);
+            let ty = self.ty(*lazy);
+            let lazy = Operand::Local(self.materialize(op, ty));
+            return self.lazy_value(expr, lazy, value);
         }
         if fields.is_none()
             && let Some(access) = self.cell_access(instance)

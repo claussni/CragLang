@@ -197,7 +197,7 @@ pub(crate) unsafe fn boxes_in(base: *mut u8, fields: &[CountedField], mut f: imp
                         f(at.add(1).cast::<*mut u8>().read());
                     }
                 }
-                CountedField::Ext(_) => {}
+                CountedField::Ext(_) | CountedField::Lazy(_) => {}
             }
         }
     }
@@ -318,8 +318,16 @@ pub(crate) unsafe fn free_chain(
                 TypeDescriptor::Record { counted, .. } => {
                     boxes_in(ptr, counted, &mut dead);
                     for field in counted {
-                        if let CountedField::Ext(at) = field {
-                            crate::ext::free(ptr.add(*at as usize).cast::<u64>().read());
+                        match field {
+                            CountedField::Ext(at) => {
+                                crate::ext::free(ptr.add(*at as usize).cast::<u64>().read())
+                            }
+                            CountedField::Lazy(at) => crate::lazy::free(
+                                ptr.add(*at as usize).cast::<u64>().read(),
+                                heap,
+                                types,
+                            ),
+                            _ => {}
                         }
                     }
                 }

@@ -230,7 +230,10 @@ fn borrows(rvalue: &Rvalue<'_>) -> bool {
         Rvalue::Read(_)
             | Rvalue::Index { .. }
             | Rvalue::MapGet { boxed: false, .. }
-            | Rvalue::Intrinsic(Intrinsic::RefValue | Intrinsic::ExtValue, _)
+            | Rvalue::Intrinsic(
+                Intrinsic::RefValue | Intrinsic::ExtValue | Intrinsic::LazyCode,
+                _
+            )
     )
 }
 

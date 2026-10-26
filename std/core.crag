@@ -37,6 +37,8 @@ pub type Map[K, V]
 pub type Set[T]
 pub type Grid[T]
 pub type Lazy[T]
+// The value of a lazy expression, computed by the first read (§6.10).
+pub fn value[T](l: Lazy[T]) -> T
 
 pub type True
 pub type False
