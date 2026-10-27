@@ -20,6 +20,7 @@
 //! runs them on fibers. `Scratch` runs code in the scratch image instead
 //! (§11.6.3).
 
+pub mod app;
 pub mod diagnostics;
 pub mod exec;
 pub mod fmt;
@@ -93,23 +94,7 @@ fn run(root: &Path, out: &mut dyn Write) -> Result<u8, String> {
         return Ok(1);
     };
     let (db, program) = (&project.db, project.program);
-    let path = project
-        .main
-        .as_deref()
-        .ok_or("package.crag names no `main` module")?;
-    let module = project
-        .module(path)
-        .ok_or_else(|| format!("the `main` module `{path}` does not exist"))?;
-    let item = item_tree(db, module)
-        .items
-        .iter()
-        .map(|i| i.id)
-        .find(|id| *id.kind(db) == ItemKind::Function && id.name(db).text(db) == "main")
-        .ok_or_else(|| format!("module `{path}` declares no `fn main()`"))?;
-    if !signature(db, program, item).params.is_empty() {
-        return Err("`main` takes no parameters; arguments come from `args()`".into());
-    }
-    let key = InstanceKey::body(db, Owner::Item(item));
+    let key = main_instance(&project)?;
     let result = mir(db, program, key, Tier::Baseline)
         .as_ref()
         .ok_or("`main` has no body")?
@@ -145,6 +130,28 @@ fn run(root: &Path, out: &mut dyn Write) -> Result<u8, String> {
             Ok(EXIT_TRAP)
         }
     }
+}
+
+/// The project's `fn main()`, which the manifest's `main` module declares.
+pub fn main_instance(project: &Project) -> Result<InstanceKey<'_>, String> {
+    let (db, program) = (&project.db, project.program);
+    let path = project
+        .main
+        .as_deref()
+        .ok_or("package.crag names no `main` module")?;
+    let module = project
+        .module(path)
+        .ok_or_else(|| format!("the `main` module `{path}` does not exist"))?;
+    let item = item_tree(db, module)
+        .items
+        .iter()
+        .map(|i| i.id)
+        .find(|id| *id.kind(db) == ItemKind::Function && id.name(db).text(db) == "main")
+        .ok_or_else(|| format!("module `{path}` declares no `fn main()`"))?;
+    if !signature(db, program, item).params.is_empty() {
+        return Err("`main` takes no parameters; arguments come from `args()`".into());
+    }
+    Ok(InstanceKey::body(db, Owner::Item(item)))
 }
 
 /// `crag` without arguments: the REPL, in the project at `root` if there is

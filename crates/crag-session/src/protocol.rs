@@ -34,7 +34,7 @@ use crag_abi::{
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -90,6 +90,22 @@ pub enum Message {
     },
     /// From the image: the result of a `Show`, as text.
     Shown(String),
+    /// From the host, to the app image: starts a loaded function without
+    /// parameters as the app's root task and answers at once, while the
+    /// app runs on (§11.8.4).
+    Start(FuncId),
+    /// From the image: the app runs.
+    Started,
+    /// From the host: how the app is doing. The image answers `Running`,
+    /// or how the app ended: `Finished`, `Trapped` or `Stopped`.
+    Status,
+    /// From the image: the app runs on.
+    Running,
+    /// From the host: cancels the app's root task and waits for its tasks
+    /// to stop.
+    Stop,
+    /// From the image: the app was stopped, or had already ended.
+    Stopped,
 }
 
 /// A function's code, shipped to an image.
@@ -137,6 +153,12 @@ const FAILED: u8 = 9;
 const INTERRUPTED: u8 = 10;
 const SHOW: u8 = 11;
 const SHOWN: u8 = 12;
+const START: u8 = 13;
+const STARTED: u8 = 14;
+const STATUS: u8 = 15;
+const RUNNING: u8 = 16;
+const STOP: u8 = 17;
+const STOPPED: u8 = 18;
 
 impl Message {
     /// The body of the message's frame.
@@ -223,6 +245,15 @@ impl Message {
                 w.u8(SHOWN);
                 w.text(text);
             }
+            Message::Start(func) => {
+                w.u8(START);
+                w.u32(func.0);
+            }
+            Message::Started => w.u8(STARTED),
+            Message::Status => w.u8(STATUS),
+            Message::Running => w.u8(RUNNING),
+            Message::Stop => w.u8(STOP),
+            Message::Stopped => w.u8(STOPPED),
         }
         w.0
     }
@@ -290,6 +321,12 @@ impl Message {
                 Message::Show { func, shapes, root }
             }
             SHOWN => Message::Shown(r.text()?),
+            START => Message::Start(FuncId(r.u32()?)),
+            STARTED => Message::Started,
+            STATUS => Message::Status,
+            RUNNING => Message::Running,
+            STOP => Message::Stop,
+            STOPPED => Message::Stopped,
             tag => return Err(invalid(format!("a message with the unknown tag {tag}"))),
         };
         match r.0.len() {
@@ -913,6 +950,12 @@ mod tests {
             },
             Message::Loaded,
             Message::Run(FuncId(9)),
+            Message::Start(FuncId(9)),
+            Message::Started,
+            Message::Status,
+            Message::Running,
+            Message::Stop,
+            Message::Stopped,
             Message::Finished(vec![0, u64::MAX]),
             Message::Trapped {
                 kind: TrapKind::Overflow,

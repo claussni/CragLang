@@ -487,7 +487,48 @@ pub fn replace_group(
     symbols: &mut SymbolTable,
     group: &[(SlotKey, &CodeObject)],
 ) -> Result<Vec<CodeAddr>, LoadError> {
-    enter(arena, symbols, group, true)
+    let staged = stage_group(arena, symbols, group)?;
+    let entries = staged.entries();
+    publish(symbols, staged);
+    Ok(entries)
+}
+
+/// Code that is loaded and entered in the symbol table, but not yet in
+/// its slots, so no call reaches it: a reload makes everything ready for
+/// the new code first, such as the code map of running workers, and then
+/// publishes it.
+#[must_use = "staged code is reached only once published"]
+pub struct Staged {
+    slots: Vec<(SlotIndex, CodeAddr)>,
+}
+
+impl Staged {
+    /// The entry points, in the order of the group.
+    pub fn entries(&self) -> Vec<CodeAddr> {
+        self.slots.iter().map(|&(_, entry)| entry).collect()
+    }
+}
+
+/// Loads functions as `replace_group` does, without filling their slots.
+pub fn stage_group(
+    arena: &mut CodeArena,
+    symbols: &mut SymbolTable,
+    group: &[(SlotKey, &CodeObject)],
+) -> Result<Staged, LoadError> {
+    let entries = enter(arena, symbols, group, true)?;
+    let slots = group
+        .iter()
+        .zip(entries)
+        .map(|(&(key, _), entry)| (symbols.slots.index(key).expect("assigned"), entry))
+        .collect();
+    Ok(Staged { slots })
+}
+
+/// Fills the slots of staged code, so later calls reach it.
+pub fn publish(symbols: &SymbolTable, staged: Staged) {
+    for (slot, entry) in staged.slots {
+        slot_set(&symbols.slots, slot, entry);
+    }
 }
 
 fn enter(
@@ -518,10 +559,13 @@ fn enter(
     }
     let items: Vec<_> = group.iter().map(|&(key, code)| (Some(key), code)).collect();
     let entries = place(arena, symbols, &items)?;
-    // The code is executable now, so it may be published.
+    // The code is executable now, so it may be published; a replacement
+    // is published by its caller.
     for ((&(key, _), &entry), &slot) in group.iter().zip(&entries).zip(&slots) {
         symbols.functions.insert(key.func, entry);
-        slot_set(&symbols.slots, slot, entry);
+        if !replace {
+            slot_set(&symbols.slots, slot, entry);
+        }
     }
     Ok(entries)
 }

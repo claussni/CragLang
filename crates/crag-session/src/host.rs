@@ -64,18 +64,21 @@ pub const IMAGE_ARG: &str = "__image";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageKind {
     Scratch,
+    App,
 }
 
 impl ImageKind {
     pub fn name(self) -> &'static str {
         match self {
             ImageKind::Scratch => "scratch",
+            ImageKind::App => "app",
         }
     }
 
     pub fn from_name(name: &str) -> Option<ImageKind> {
         match name {
             "scratch" => Some(ImageKind::Scratch),
+            "app" => Some(ImageKind::App),
             _ => None,
         }
     }
@@ -113,10 +116,10 @@ pub struct ImageHandle {
     stream: UnixStream,
     state: ImageState,
     /// What the image has loaded: functions with the hash of their code,
-    /// stubs by their words, and type indices.
+    /// stubs by their words, and type descriptors by index.
     functions: HashMap<FuncId, blake3::Hash>,
     stubs: HashSet<(u32, u32)>,
-    types: HashSet<u32>,
+    descriptors: HashMap<u32, blake3::Hash>,
 }
 
 impl ImageHandle {
@@ -213,7 +216,7 @@ pub fn spawn_image(command: &ImageCommand, kind: ImageKind) -> io::Result<ImageH
             state: ImageState::Running,
             functions: HashMap::new(),
             stubs: HashSet::new(),
-            types: HashSet::new(),
+            descriptors: HashMap::new(),
         }),
         Err(e) => {
             let _ = child.kill();
@@ -341,6 +344,10 @@ impl fmt::Display for ImageExit {
 pub enum SessionError {
     /// The image died; a fresh one runs in its place.
     Exited(ImageExit),
+    /// The app image died, and with it the app; it is not restarted.
+    AppExited(ImageExit),
+    /// There is no app image to ask.
+    NoApp,
     /// The image died or misbehaved, and no fresh one could be started.
     Io(io::Error),
     /// The image could not do what it was asked, and why; it runs on.
@@ -351,6 +358,8 @@ impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SessionError::Exited(exit) => write!(f, "{exit}; a fresh one has started"),
+            SessionError::AppExited(exit) => write!(f, "{exit}"),
+            SessionError::NoApp => write!(f, "no app runs"),
             SessionError::Io(e) => write!(f, "the image cannot be started: {e}"),
             SessionError::Refused(why) => write!(f, "the image refused: {why}"),
         }
@@ -365,32 +374,67 @@ impl From<io::Error> for SessionError {
     }
 }
 
-/// The images of a session and how to start them. M3 has the scratch
-/// image, which evaluates REPL input.
+/// The images of a session and how to start them: the scratch image,
+/// which evaluates REPL input and is restarted when it dies, and the app
+/// image while the app runs (Specification §20.1).
 pub struct Session {
     command: ImageCommand,
     scratch: ImageHandle,
+    app: Option<ImageHandle>,
 }
+
+/// How long the app image may take to shut down before it is killed.
+const APP_EXIT_GRACE: Duration = Duration::from_secs(2);
 
 impl Session {
     pub fn start(command: ImageCommand) -> io::Result<Session> {
         let scratch = spawn_image(&command, ImageKind::Scratch)?;
-        Ok(Session { command, scratch })
+        Ok(Session {
+            command,
+            scratch,
+            app: None,
+        })
     }
 
     pub fn scratch(&self) -> &ImageHandle {
         &self.scratch
     }
 
+    /// The app image, while there is one.
+    pub fn app(&self) -> Option<&ImageHandle> {
+        self.app.as_ref()
+    }
+
+    /// Starts an app image, which code is then shipped to and started in;
+    /// one that runs already is shut down first.
+    pub fn start_app_image(&mut self) -> io::Result<()> {
+        self.app = None;
+        self.app = Some(spawn_image(&self.command, ImageKind::App)?);
+        Ok(())
+    }
+
     /// Sends a message to the scratch image and returns its reply. If the
     /// image dies on the way, or breaks the protocol, it is reaped and
     /// replaced, and the error tells how it ended.
     pub fn request(&mut self, message: &Message) -> Result<Message, SessionError> {
-        if self.scratch.state != ImageState::Running {
+        self.request_to(ImageKind::Scratch, message)
+    }
+
+    /// Sends a message to an image and returns its reply. A scratch image
+    /// that dies is replaced; an app image that dies is gone, with the app.
+    pub fn request_to(
+        &mut self,
+        kind: ImageKind,
+        message: &Message,
+    ) -> Result<Message, SessionError> {
+        if kind == ImageKind::Scratch && self.scratch.state != ImageState::Running {
             // A restart failed before; try again.
             self.scratch = spawn_image(&self.command, ImageKind::Scratch)?;
         }
-        let image = &mut self.scratch;
+        let image = match kind {
+            ImageKind::Scratch => &mut self.scratch,
+            ImageKind::App => self.app.as_mut().ok_or(SessionError::NoApp)?,
+        };
         let error = match send(image, message).and_then(|()| receive(image)) {
             Ok(reply) => return Ok(reply),
             Err(e) => e,
@@ -403,8 +447,18 @@ impl Session {
             | io::ErrorKind::ConnectionReset => EXIT_GRACE,
             _ => Duration::ZERO,
         };
-        let status = self.scratch.reap(grace)?;
-        Err(SessionError::Exited(self.on_image_exit(status)?))
+        let status = image.reap(grace)?;
+        match kind {
+            ImageKind::Scratch => Err(SessionError::Exited(self.on_image_exit(status)?)),
+            ImageKind::App => {
+                let app = self.app.take().expect("an app image");
+                Err(SessionError::AppExited(ImageExit {
+                    kind,
+                    pid: app.pid,
+                    status,
+                }))
+            }
+        }
     }
 
     /// Ships code to the scratch image: the functions, stubs and type
@@ -421,7 +475,45 @@ impl Session {
         reset: &[SlotKey],
         fills: &[Fill],
     ) -> Result<usize, SessionError> {
-        let image = &self.scratch;
+        self.ship_to(ImageKind::Scratch, types, stubs, functions, reset, fills)
+    }
+
+    /// The functions among `functions` that an image lacks, or has with
+    /// other code: what `ship_to` would send.
+    pub fn changed(&self, kind: ImageKind, functions: &[ShippedFunction]) -> Vec<FuncId> {
+        let Some(image) = self.image(kind) else {
+            return functions.iter().map(|f| f.id).collect();
+        };
+        functions
+            .iter()
+            .filter(|f| image.functions.get(&f.id) != Some(&blake3::hash(&f.encode())))
+            .map(|f| f.id)
+            .collect()
+    }
+
+    /// The type descriptors an image holds, by index.
+    pub fn descriptors(&self, kind: ImageKind) -> Option<&HashMap<u32, blake3::Hash>> {
+        self.image(kind).map(|i| &i.descriptors)
+    }
+
+    fn image(&self, kind: ImageKind) -> Option<&ImageHandle> {
+        match kind {
+            ImageKind::Scratch => Some(&self.scratch),
+            ImageKind::App => self.app.as_ref(),
+        }
+    }
+
+    /// Ships code to an image, as `ship` does to the scratch image.
+    pub fn ship_to(
+        &mut self,
+        kind: ImageKind,
+        types: &[(u32, TypeDescriptor)],
+        stubs: &[Stub],
+        functions: &[ShippedFunction],
+        reset: &[SlotKey],
+        fills: &[Fill],
+    ) -> Result<usize, SessionError> {
+        let image = self.image(kind).ok_or(SessionError::NoApp)?;
         let mut hashes = HashMap::new();
         let mut new_functions = Vec::new();
         for f in functions {
@@ -445,10 +537,13 @@ impl Session {
             })
             .cloned()
             .collect();
-        let mut indices = HashSet::new();
+        let mut indices = HashMap::new();
         let new_types: Vec<(u32, TypeDescriptor)> = types
             .iter()
-            .filter(|(index, _)| !image.types.contains(index) && indices.insert(*index))
+            .filter(|(index, d)| {
+                !image.descriptors.contains_key(index)
+                    && indices.insert(*index, descriptor_hash(d)).is_none()
+            })
             .cloned()
             .collect();
         let sent = new_functions.len();
@@ -467,12 +562,15 @@ impl Session {
             reset: reset.to_vec(),
             fills: fills.to_vec(),
         };
-        match self.request(&load)? {
+        match self.request_to(kind, &load)? {
             Message::Loaded => {
-                let image = &mut self.scratch;
+                let image = match kind {
+                    ImageKind::Scratch => &mut self.scratch,
+                    ImageKind::App => self.app.as_mut().expect("answered"),
+                };
                 image.functions.extend(hashes);
                 image.stubs.extend(shapes);
-                image.types.extend(indices);
+                image.descriptors.extend(indices);
                 Ok(sent)
             }
             Message::Failed(why) => Err(SessionError::Refused(why)),
@@ -501,6 +599,62 @@ impl Session {
                 "the image answered {other:?} to Run"
             ))),
         }
+    }
+
+    /// Starts a loaded function as the app in the app image.
+    pub fn start_app(&mut self, func: FuncId) -> Result<(), SessionError> {
+        match self.request_to(ImageKind::App, &Message::Start(func))? {
+            Message::Started => Ok(()),
+            Message::Failed(why) => Err(SessionError::Refused(why)),
+            other => Err(SessionError::Refused(format!(
+                "the image answered {other:?} to Start"
+            ))),
+        }
+    }
+
+    /// How the app is doing: running, or how it ended.
+    pub fn app_status(&mut self) -> Result<AppStatus, SessionError> {
+        Ok(match self.request_to(ImageKind::App, &Message::Status)? {
+            Message::Running => AppStatus::Running,
+            Message::Stopped => AppStatus::Stopped,
+            Message::Finished(words) => AppStatus::Ended(RunResult::Finished(words)),
+            Message::Trapped {
+                kind,
+                position,
+                stack,
+            } => AppStatus::Ended(RunResult::Trapped(Trap {
+                kind,
+                position,
+                stack,
+            })),
+            Message::Failed(why) => return Err(SessionError::Refused(why)),
+            other => {
+                return Err(SessionError::Refused(format!(
+                    "the image answered {other:?} to Status"
+                )));
+            }
+        })
+    }
+
+    /// Stops the app and ends its image, killing it if the app does not
+    /// stop in time.
+    pub fn stop_app(&mut self) -> Result<(), SessionError> {
+        if self.app.is_none() {
+            return Ok(());
+        }
+        let stopped = matches!(
+            self.request_to(ImageKind::App, &Message::Stop),
+            Ok(Message::Stopped)
+        );
+        if let Some(mut app) = self.app.take() {
+            if stopped {
+                let _ = send(&mut app, &Message::Shutdown);
+                let _ = app.reap(APP_EXIT_GRACE);
+            } else {
+                let _ = app.reap(Duration::ZERO);
+            }
+        }
+        Ok(())
     }
 
     /// Runs a loaded function as `run` does, and has the image show its
@@ -552,6 +706,21 @@ impl Session {
         self.scratch = spawn_image(&self.command, exit.kind)?;
         Ok(exit)
     }
+}
+
+/// A hash of a type descriptor, to tell whether an image holds the same.
+pub fn descriptor_hash(descriptor: &TypeDescriptor) -> blake3::Hash {
+    blake3::hash(format!("{descriptor:?}").as_bytes())
+}
+
+/// How the app is doing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AppStatus {
+    Running,
+    /// It ended, as the result tells; this is said once.
+    Ended(RunResult),
+    /// It was stopped, or its end was told already.
+    Stopped,
 }
 
 /// How a run in an image ended.

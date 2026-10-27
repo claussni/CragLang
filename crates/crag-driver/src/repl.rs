@@ -50,6 +50,10 @@ const SESSION: &str = "repl";
 const HELP: &str = "\
 Enter a definition to add it to the session, or an expression to run it.
   :rebind <definition>  replace a definition of the session
+  :start                start the project's app in the app image
+  :reload               read changed files and swap their code into the app
+  :status               how the app runs, and the files that differ from it
+  :stop                 stop the app
   :help                 show this
   :quit                 leave; so does Ctrl-D
 An input continues on the next line until it is complete; an empty line
@@ -66,6 +70,8 @@ pub struct Repl {
     input: Option<String>,
     /// The definition being added, whose errors are shown as the input's.
     fresh: Option<usize>,
+    /// The text of each file as the app runs it, while it runs.
+    app: Option<Vec<(String, String)>>,
 }
 
 /// The session's definitions, as the text of one module.
@@ -246,6 +252,7 @@ impl Repl {
             scratch,
             input: None,
             fresh: None,
+            app: None,
         }
     }
 
@@ -283,10 +290,73 @@ impl Repl {
             "quit" | "q" => Ok(EvalOutput::Quit),
             "help" => Ok(EvalOutput::Text(HELP.into())),
             "rebind" => self.rebind(rest.trim()),
+            "start" => self.start_app(),
+            "reload" => self.reload(),
+            "status" => self.status(),
+            "stop" => {
+                self.scratch
+                    .stop_app()
+                    .map_err(|e| format!("error: {e}\n"))?;
+                self.app = None;
+                Ok(EvalOutput::Text("the app stopped\n".into()))
+            }
             _ => Err(format!(
                 "error: there is no command :{name}; :help lists them\n"
             )),
         }
+    }
+
+    fn start_app(&mut self) -> Result<EvalOutput, String> {
+        if self.project.root.is_none() {
+            return Err("error: the REPL runs outside a project, which has no app\n".into());
+        }
+        self.project.refresh();
+        let shipment = self
+            .scratch
+            .start_app(&self.project)
+            .map_err(|e| format!("error: {e}\n"))?;
+        self.app = Some(self.project.texts());
+        Ok(EvalOutput::Text(format!(
+            "the app runs, with {} functions\n",
+            shipment.functions
+        )))
+    }
+
+    fn reload(&mut self) -> Result<EvalOutput, String> {
+        let files = self.project.refresh();
+        let shipment = self
+            .scratch
+            .reload(&self.project)
+            .map_err(|e| format!("error: {e}\n"))?;
+        self.app = Some(self.project.texts());
+        let files = match files.as_slice() {
+            [] => String::new(),
+            files => format!(" from {}", files.join(", ")),
+        };
+        Ok(EvalOutput::Text(format!(
+            "reloaded{files}: {} functions, {} values to compute again\n",
+            shipment.functions, shipment.values
+        )))
+    }
+
+    fn status(&mut self) -> Result<EvalOutput, String> {
+        let mut out = match self.scratch.app_status(&self.project) {
+            Ok(None) => "the app runs\n".to_string(),
+            Ok(Some(ended)) => {
+                self.app = None;
+                format!("{}\n", ended.trim_end())
+            }
+            Err(e) => return Err(format!("error: {e}\n")),
+        };
+        if let (Some(app), Some(root)) = (&self.app, &self.project.root) {
+            for (shown, text) in app {
+                let disk = std::fs::read_to_string(root.join(shown)).unwrap_or_default();
+                if disk != *text {
+                    out += &format!("  {shown} changed since the app got its code\n");
+                }
+            }
+        }
+        Ok(EvalOutput::Text(out))
     }
 
     /// Replaces the definitions of the names a definition declares. Each

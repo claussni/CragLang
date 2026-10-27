@@ -27,8 +27,12 @@
 //! Baseline code calls other Crag functions through their slots
 //! (Implementation Plan §11.6.4), so that an image can replace a function
 //! without reloading its callers. A slot is the function's id and its
-//! signature: the index of the function type its MIR has, parameters and
-//! result, which stays the same while the signature does.
+//! signature: a hash of the function type its MIR has, parameters and
+//! result, with every declared type spelled out to its fields. It stays
+//! the same while the signature and the layouts of what passes through it
+//! do. So a reload never lets running code call new code that lays out
+//! its arguments or result otherwise: a function whose types changed gets
+//! another slot, which only new code calls (§11.8.5).
 //!
 //! A read of a module-level value calls the code that computes it. That
 //! code keeps the value in a cell the loader makes, and gives what the cell
@@ -40,13 +44,13 @@ mod layout;
 mod lower;
 mod shape;
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crag_abi::{SlotKey, TypeDescriptor};
 
 use crag_codegen::{CodeObject, CodegenSettings, OptLevel, Target, compile, target_for};
 use crag_db::Db;
-use crag_db::plumbing::AsId;
 use crag_hir::{Owner, Program};
 use crag_mir::{Entry, InstanceKey, Tier, mir};
 use crag_types::{Ty, TyKind};
@@ -91,9 +95,10 @@ pub fn slot_key<'db>(db: &'db dyn Db, program: Program, instance: InstanceKey<'d
     }
 }
 
-/// The signature part of an instance's slot: the index of the function
-/// type of its MIR, or zero for what has none. A query of its own, so that
-/// callers depend on the signature and not on the body.
+/// The signature part of an instance's slot: a hash of the function type
+/// of its MIR with the fields of its types, or zero for what has none. A
+/// query of its own, so that callers depend on the signature and not on
+/// the body.
 #[crag_db::tracked]
 fn slot_signature<'db>(db: &'db dyn Db, program: Program, instance: InstanceKey<'db>) -> u32 {
     let Some(body) = mir(db, program, instance, Tier::Baseline) else {
@@ -107,7 +112,101 @@ fn slot_signature<'db>(db: &'db dyn Db, program: Program, instance: InstanceKey<
             pure: false,
         },
     );
-    ty.as_id().index()
+    let hash = structure(db, program, ty, &mut Vec::new(), &mut HashMap::new());
+    // Zero is for what has no signature.
+    ((hash >> 32) as u32 ^ hash as u32).max(1)
+}
+
+/// A hash of a type as it is laid out: a declared type by its name and its
+/// fields, in order, with theirs. A type met again within itself is hashed
+/// by its name alone. `memo` holds the hashes made so far, so a type the
+/// others share is spelled out once.
+fn structure<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    ty: Ty<'db>,
+    open: &mut Vec<Ty<'db>>,
+    memo: &mut HashMap<Ty<'db>, u64>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    if let Some(&hash) = memo.get(&ty) {
+        return hash;
+    }
+    let mut hasher = std::hash::DefaultHasher::new();
+    let mut list =
+        |types: &[Ty<'db>], open: &mut Vec<Ty<'db>>, hasher: &mut std::hash::DefaultHasher| {
+            types.len().hash(hasher);
+            for &t in types {
+                structure(db, program, t, open, memo).hash(hasher);
+            }
+        };
+    let mut cut = false;
+    match ty.kind(db) {
+        TyKind::Error => 0u8.hash(&mut hasher),
+        TyKind::Builtin(builtin, args) => {
+            1u8.hash(&mut hasher);
+            format!("{builtin:?}").hash(&mut hasher);
+            list(args, open, &mut hasher);
+        }
+        TyKind::Named(item, args) => {
+            2u8.hash(&mut hasher);
+            item.module(db).path(db).hash(&mut hasher);
+            item.name(db).text(db).hash(&mut hasher);
+            item.ordinal(db).hash(&mut hasher);
+            list(args, open, &mut hasher);
+            if open.contains(&ty) {
+                cut = true;
+            } else {
+                open.push(ty);
+                match record_layout(db, program, ty) {
+                    Some((slots, size)) => {
+                        size.hash(&mut hasher);
+                        for slot in slots {
+                            slot.name.text(db).hash(&mut hasher);
+                            slot.offset.hash(&mut hasher);
+                            structure(db, program, slot.ty, open, memo).hash(&mut hasher);
+                        }
+                    }
+                    None => 0u32.hash(&mut hasher),
+                }
+                open.pop();
+            }
+        }
+        TyKind::Record { fields, open: rest } => {
+            3u8.hash(&mut hasher);
+            rest.hash(&mut hasher);
+            fields.len().hash(&mut hasher);
+            for (name, t) in fields {
+                name.text(db).hash(&mut hasher);
+                structure(db, program, *t, open, memo).hash(&mut hasher);
+            }
+        }
+        TyKind::Fn {
+            params,
+            result,
+            pure,
+        } => {
+            4u8.hash(&mut hasher);
+            pure.hash(&mut hasher);
+            list(params, open, &mut hasher);
+            structure(db, program, *result, open, memo).hash(&mut hasher);
+        }
+        TyKind::Union(members) => {
+            5u8.hash(&mut hasher);
+            list(members, open, &mut hasher);
+        }
+        TyKind::Param(_, index, name) => {
+            6u8.hash(&mut hasher);
+            index.hash(&mut hasher);
+            name.text(db).hash(&mut hasher);
+        }
+    }
+    let hash = hasher.finish();
+    // A type cut short within itself is not the whole type.
+    if !cut {
+        memo.insert(ty, hash);
+    }
+    hash
 }
 
 /// The code object of an instance; none for what has no MIR, and an error

@@ -146,12 +146,12 @@ fn an_image_needs_a_socket() {
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.starts_with("crag image: "), "{err}");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_crag"))
-        .args(["__image", "app", "/nonexistent/image.sock"])
+        .args(["__image", "editor", "/nonexistent/image.sock"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(out.stderr).unwrap(),
-        "crag image: no image is called `app`\n"
+        "crag image: no image is called `editor`\n"
     );
 }

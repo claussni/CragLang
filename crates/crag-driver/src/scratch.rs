@@ -27,21 +27,37 @@ use crag_backend::{func_id, shapes};
 use crag_codegen::{CodeObject, CodegenSettings, compile_entry_stub};
 use crag_mir::InstanceKey;
 use crag_runtime::Trap;
-use crag_session::{ImageCommand, RunResult, Session, ShippedFunction, Stub};
+use crag_session::{ImageCommand, ImageKind, RunResult, Session, ShippedFunction, Stub};
 use crag_types::Ty;
 
-use crate::exec::{Function, Sources, compile, constants, report, stub_settings};
+use crate::exec::{Compiled, Function, Sources, compile, constants, report, stub_settings};
 use crate::project::Project;
 
-/// A session with its scratch image, and what the host knows of the code
-/// it shipped there.
-pub struct Scratch {
-    session: Session,
-    settings: CodegenSettings,
-    functions: HashMap<FuncId, Function>,
+/// What the host knows of the code it shipped to an image.
+#[derive(Default)]
+pub(crate) struct Shipped {
+    pub functions: HashMap<FuncId, Function>,
     /// For each module-level value, a hash of the code its value was
     /// computed with: its own and what that calls.
-    values: HashMap<SlotKey, u64>,
+    pub values: HashMap<SlotKey, u64>,
+}
+
+/// What a shipment did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Shipment {
+    /// Functions sent, new or with new code.
+    pub functions: usize,
+    /// Module-level values to be computed again.
+    pub values: usize,
+}
+
+/// A session with its scratch image and, while the app runs, its app
+/// image, and what the host knows of the code it shipped to each.
+pub struct Scratch {
+    pub(crate) session: Session,
+    settings: CodegenSettings,
+    pub(crate) scratch: Shipped,
+    pub(crate) app: Shipped,
     /// How many values the compiler computed were sent to their cells.
     constants: usize,
 }
@@ -51,8 +67,8 @@ impl Scratch {
         Ok(Scratch {
             session: Session::start(command)?,
             settings: stub_settings().map_err(io::Error::other)?,
-            functions: HashMap::new(),
-            values: HashMap::new(),
+            scratch: Shipped::default(),
+            app: Shipped::default(),
             constants: 0,
         })
     }
@@ -71,6 +87,22 @@ impl Scratch {
     /// an entry stub for each root: how many functions were sent.
     pub fn ship(&mut self, project: &Project, roots: &[InstanceKey]) -> Result<usize, String> {
         let compiled = compile(project, roots)?;
+        Ok(self
+            .ship_to(ImageKind::Scratch, project, &compiled, roots, true)?
+            .functions)
+    }
+
+    /// Ships compiled code to an image. Values whose code changed are
+    /// computed again; with `fill`, those the compiler computed are filled
+    /// in, which only an image that runs nothing yet may take.
+    pub(crate) fn ship_to(
+        &mut self,
+        kind: ImageKind,
+        project: &Project,
+        compiled: &Compiled,
+        roots: &[InstanceKey],
+        fill: bool,
+    ) -> Result<Shipment, String> {
         let functions: Vec<ShippedFunction> = compiled
             .objects
             .iter()
@@ -122,11 +154,15 @@ impl Scratch {
             .iter()
             .map(|&(slot, o)| (slot.func, o))
             .collect();
+        let shipped = match kind {
+            ImageKind::Scratch => &mut self.scratch,
+            ImageKind::App => &mut self.app,
+        };
         let mut values = Vec::new();
         for (&id, f) in &compiled.functions {
             if let Some(cell) = f.cell {
                 let hash = code_hash(id, &compiled.functions, &codes);
-                if self.values.get(&cell) != Some(&hash) {
+                if shipped.values.get(&cell) != Some(&hash) {
                     values.push((cell, hash));
                 }
             }
@@ -140,15 +176,26 @@ impl Scratch {
             .filter(|(cell, _)| reset.contains(cell))
             .copied()
             .collect();
-        let fills = constants(project, &changed);
+        let fills = if fill {
+            constants(project, &changed)
+        } else {
+            Vec::new()
+        };
         let sent = self
             .session
-            .ship(&compiled.types, &stubs, &functions, &reset, &fills)
+            .ship_to(kind, &compiled.types, &stubs, &functions, &reset, &fills)
             .map_err(|e| e.to_string())?;
-        self.functions.extend(compiled.functions);
-        self.values.extend(values);
+        let shipped = match kind {
+            ImageKind::Scratch => &mut self.scratch,
+            ImageKind::App => &mut self.app,
+        };
+        shipped.functions.extend(compiled.functions.clone());
+        shipped.values.extend(values);
         self.constants += fills.len();
-        Ok(sent)
+        Ok(Shipment {
+            functions: sent,
+            values: reset.len(),
+        })
     }
 
     /// Ships a root without parameters and runs it in the image: how the
@@ -190,7 +237,7 @@ impl Scratch {
 
     /// A trap in shipped code as the user sees it.
     pub fn report(&self, sources: &dyn Sources, trap: &Trap) -> String {
-        report(sources, &self.functions, trap)
+        report(sources, &self.scratch.functions, trap)
     }
 }
 

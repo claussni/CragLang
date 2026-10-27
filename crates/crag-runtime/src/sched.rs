@@ -130,6 +130,12 @@ pub(crate) struct Shared {
     teardown: Mutex<VecDeque<usize>>,
     /// Deferred dispose handlers that trapped.
     deferred_traps: AtomicU64,
+    /// The descriptors and the code map workers are to use, once a reload
+    /// gave new ones, and how many times it did.
+    tables: Mutex<Option<(Arc<Types>, Arc<CodeMap>)>>,
+    epoch: AtomicU64,
+    /// For each worker, the epoch of the tables it uses.
+    adopted: Vec<AtomicU64>,
 }
 
 // SAFETY: the fibers behind the words in the queues are owned by the
@@ -288,6 +294,36 @@ impl Scheduler {
             .collect()
     }
 
+    /// Gives the workers new descriptors and a new code map, which must
+    /// hold everything the old ones do, as a reload's new code needs them
+    /// (Implementation Plan §11.8.5). Each worker takes them before the
+    /// next fiber it runs; the epoch returned is for `wait_tables`.
+    pub fn update_tables(&self, types: Arc<Types>, code: Arc<CodeMap>) -> u64 {
+        let mut tables = self.shared.tables.lock().unwrap();
+        *tables = Some((types, code));
+        self.shared.epoch.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Waits until no worker runs a fiber with tables older than `epoch`,
+    /// at most `timeout`: whether that came. Then new code may be reached,
+    /// since whatever runs it unwinds and frees by the new tables.
+    pub fn wait_tables(&self, epoch: u64, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let current = (0..self.shared.adopted.len()).all(|i| {
+                self.shared.adopted[i].load(Ordering::SeqCst) >= epoch
+                    || self.shared.running[i].lock().unwrap().is_none()
+            });
+            if current {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// How many deferred dispose handlers trapped so far.
     pub fn deferred_traps(&self) -> u64 {
         self.shared.deferred_traps.load(Ordering::Relaxed)
@@ -373,7 +409,25 @@ impl Shared {
             reactor: Reactor::new().expect("the poller starts"),
             teardown: Mutex::new(VecDeque::new()),
             deferred_traps: AtomicU64::new(0),
+            tables: Mutex::new(None),
+            epoch: AtomicU64::new(0),
+            adopted: (0..n).map(|_| AtomicU64::new(0)).collect(),
         }
+    }
+
+    /// Gives a worker the latest tables, if a reload changed them since it
+    /// last looked. Called between fibers.
+    fn adopt(&self, index: usize, worker: &mut Worker) {
+        let epoch = self.epoch.load(Ordering::SeqCst);
+        if self.adopted[index].load(Ordering::Relaxed) == epoch {
+            return;
+        }
+        let tables = self.tables.lock().unwrap().clone();
+        if let Some((types, code)) = tables {
+            worker.set_types(types);
+            worker.set_code_map(code);
+        }
+        self.adopted[index].store(epoch, Ordering::SeqCst);
     }
 
     /// Hands a new fiber, a task of a scope or a detached one, to the
@@ -579,6 +633,7 @@ fn worker_main(mut local: Local, types: Arc<Types>, code: Arc<CodeMap>) {
         let ptr = match work {
             Work::Fiber(ptr) => ptr,
             Work::Teardown(head) => {
+                shared.adopt(index, &mut worker);
                 // SAFETY: the worker is between fibers.
                 unsafe { crate::teardown::batch(&shared, &raw mut worker, &mut local, head) };
                 continue;
@@ -589,6 +644,9 @@ fn worker_main(mut local: Local, types: Arc<Types>, code: Arc<CodeMap>) {
         let fiber = unsafe { &mut *(ptr as *mut Fiber) };
         resumes += 1;
         *shared.running[index].lock().unwrap() = Some((resumes, fiber.stop_handle()));
+        // After `running` is set, so that `wait_tables` sees either this
+        // fiber running or the tables taken.
+        shared.adopt(index, &mut worker);
         worker.sched = Some(local);
         let state = worker.resume(fiber);
         local = worker.sched.take().expect("put back");

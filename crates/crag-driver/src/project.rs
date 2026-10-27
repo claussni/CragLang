@@ -161,6 +161,40 @@ impl Project {
         module
     }
 
+    /// Reads the project's files again, as a reload does, and gives the
+    /// database those that changed on disk: the files that did.
+    pub fn refresh(&mut self) -> Vec<String> {
+        let Some(root) = self.root.clone() else {
+            return Vec::new();
+        };
+        let mut changed = Vec::new();
+        for i in STD.len()..self.files.len() {
+            let file = &self.files[i];
+            let Ok(text) = fs::read_to_string(root.join(&file.shown)) else {
+                continue;
+            };
+            if text != *self.source(file.module) {
+                let (module, shown) = (file.module, file.shown.clone());
+                self.set_source(module, text);
+                changed.push(shown);
+            }
+        }
+        changed
+    }
+
+    /// The text of each of the project's files as the database holds it;
+    /// modules no file holds, such as the REPL's, are left out.
+    pub fn texts(&self) -> Vec<(String, String)> {
+        let Some(root) = &self.root else {
+            return Vec::new();
+        };
+        self.own()
+            .iter()
+            .filter(|f| root.join(&f.shown).is_file())
+            .map(|f| (f.shown.clone(), self.source(f.module).to_string()))
+            .collect()
+    }
+
     /// The modules of the project itself, without `std`.
     pub fn own(&self) -> &[ModuleFile] {
         &self.files[STD.len()..]

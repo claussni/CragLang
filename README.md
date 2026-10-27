@@ -74,7 +74,10 @@ With `CRAG_MIR=1`, `crag` also writes the MIR of what it compiles to
 standard error, with what code generation does not support yet.
 
 Without arguments, `crag` opens the REPL, in the project of the current
-directory if there is one. `:help` lists its commands.
+directory if there is one. `:help` lists its commands. In a project,
+`:start` runs the app in an image of its own; after editing its files,
+`:reload` swaps the changed code into the running app, which keeps its
+state and connections, and `:stop` ends it.
 
     /path/to/target/debug/crag
 

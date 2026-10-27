@@ -29,6 +29,12 @@
 //! still running the old code finish there. The old code stays loaded and
 //! in the code map.
 //!
+//! The app image runs the app as `Start` asks and keeps answering while it
+//! runs (§11.8.4). A `Load` then replaces code under the running app: the
+//! new code is loaded, the app's workers take the code map and
+//! descriptors that include it, and only then do its slots point to it,
+//! so whatever runs new code can unwind it and free its boxes (§11.8.5).
+//!
 //! SIGINT interrupts a run (§11.6.2): the image cancels the root task,
 //! which stops at its next safepoint, a function entry, a loop's back-edge
 //! or a wait, and passes the cancellation to the tasks it started (Plan
@@ -45,7 +51,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crag_abi::{CodeObject, FuncId, RuntimeFn, Shapes, SlotKey, TypeDescriptor};
-use crag_loader::{CodeArena, SymbolTable, load, replace_group};
+use crag_loader::{CodeArena, SymbolTable, load, publish, stage_group};
 use crag_runtime::{
     CodeMap, Fiber, FiberConfig, FiberState, PrintLimits, Scheduler, SchedulerConfig, Types,
     Worker, decode_value, print_value, release_value,
@@ -65,6 +71,13 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 /// How often the waiting thread looks for an interrupt.
 const INTERRUPT_POLL: Duration = Duration::from_millis(20);
+
+/// How long a `Stop` waits for the app's tasks to stop.
+const STOP_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a reload waits for the app's workers to take the new tables
+/// before new code may be reached.
+const TABLES_WAIT: Duration = Duration::from_secs(2);
 
 extern "C" fn on_interrupt(_signal: libc::c_int) {
     INTERRUPTED.store(true, Ordering::SeqCst);
@@ -104,6 +117,16 @@ pub struct Image {
     /// The worker whose heap holds the values the compiler computed and
     /// the results the image shows.
     worker: Worker,
+    /// The app that runs, in the app image.
+    app: Option<App>,
+}
+
+/// The app's run: its scheduler, which keeps running while the image
+/// answers the host, and how to cancel its root task.
+struct App {
+    scheduler: Scheduler,
+    cancel: crag_runtime::CancelHandle,
+    returns: u32,
 }
 
 impl Image {
@@ -121,6 +144,7 @@ impl Image {
             code: Vec::new(),
             code_map: Arc::new(CodeMap::new()),
             worker: Worker::new(),
+            app: None,
         })
     }
 
@@ -152,6 +176,9 @@ impl Image {
                 Err(reply) => reply,
             },
             Message::Show { func, shapes, root } => self.show(func, &shapes, root),
+            Message::Start(func) => self.start(func),
+            Message::Status => self.status(),
+            Message::Stop => self.stop(),
             other => Message::Failed(format!("an image does not take {other:?}")),
         })
     }
@@ -208,12 +235,13 @@ impl Image {
                 (slot, &f.object)
             })
             .collect();
-        let entries = replace_group(&mut self.arena, &mut self.symbols, &group)
+        // Loaded, but not reached through the slots until the tables that
+        // describe it are everywhere.
+        let staged = stage_group(&mut self.arena, &mut self.symbols, &group)
             .map_err(|e| format!("cannot load the code: {e}"))?;
-        for (f, entry) in functions.into_iter().zip(entries) {
-            self.functions
-                .insert(f.id, (entry.addr(), f.params, f.returns));
-            self.code.push((f.id, entry.addr(), f.object));
+        let entries = staged.entries();
+        for (f, entry) in functions.iter().zip(&entries) {
+            self.code.push((f.id, entry.addr(), f.object.clone()));
         }
         for t in types {
             if !self.types.contains(&t) {
@@ -233,7 +261,104 @@ impl Image {
         }
         self.code_map = Arc::new(map);
         self.worker.set_code_map(self.code_map.clone());
+        // A running app's workers take the new tables before any of them
+        // can reach the new code (Implementation Plan §11.8.5).
+        if let Some(app) = &self.app {
+            let epoch = app
+                .scheduler
+                .update_tables(self.worker.types(), self.code_map.clone());
+            if !app.scheduler.wait_tables(epoch, TABLES_WAIT) {
+                return Err(format!(
+                    "the app's workers did not take the new code within {} s",
+                    TABLES_WAIT.as_secs()
+                ));
+            }
+        }
+        publish(&self.symbols, staged);
+        for (f, entry) in functions.into_iter().zip(entries) {
+            self.functions
+                .insert(f.id, (entry.addr(), f.params, f.returns));
+        }
         Ok(())
+    }
+
+    /// Starts the app: a loaded function without parameters as the root
+    /// task of a scheduler that runs on while the image answers.
+    fn start(&mut self, func: FuncId) -> Message {
+        if self.app.is_some() {
+            return Message::Failed("the app runs already".into());
+        }
+        let (fiber, returns) = match self.root_fiber(func) {
+            Ok(root) => root,
+            Err(reply) => return reply,
+        };
+        let cancel = fiber.cancel_handle();
+        let scheduler = Scheduler::new(
+            SchedulerConfig::default(),
+            self.worker.types(),
+            self.code_map.clone(),
+        );
+        scheduler.spawn(fiber);
+        self.app = Some(App {
+            scheduler,
+            cancel,
+            returns,
+        });
+        Message::Started
+    }
+
+    /// How the app is doing: `Running`, or how it ended, once.
+    fn status(&mut self) -> Message {
+        let Some(app) = &self.app else {
+            return Message::Stopped;
+        };
+        match app.scheduler.wait_timeout(Duration::ZERO) {
+            None => Message::Running,
+            Some(mut stopped) => {
+                let app = self.app.take().expect("an app");
+                Self::ended(stopped.pop(), app.returns, false)
+            }
+        }
+    }
+
+    /// Cancels the app and waits, within a bound, for its tasks to stop.
+    fn stop(&mut self) -> Message {
+        let Some(app) = &self.app else {
+            return Message::Stopped;
+        };
+        app.cancel.cancel();
+        match app.scheduler.wait_timeout(STOP_WAIT) {
+            Some(_) => {
+                self.app = None;
+                Message::Stopped
+            }
+            None => Message::Failed(format!(
+                "the app did not stop within {} s",
+                STOP_WAIT.as_secs()
+            )),
+        }
+    }
+
+    /// The answer for a root task that stopped.
+    fn ended(root: Option<Box<Fiber>>, returns: u32, interrupted: bool) -> Message {
+        let Some(fiber) = root else {
+            return Message::Failed("the root task is gone".into());
+        };
+        match fiber.state() {
+            FiberState::Trapped if interrupted => Message::Interrupted,
+            FiberState::Finished => {
+                Message::Finished(fiber.results().expect("finished")[..returns as usize].to_vec())
+            }
+            FiberState::Trapped => {
+                let trap = fiber.trap().expect("trapped");
+                Message::Trapped {
+                    kind: trap.kind,
+                    position: trap.position,
+                    stack: trap.stack.clone(),
+                }
+            }
+            state => Message::Failed(format!("the fiber stopped as {state:?}")),
+        }
     }
 
     /// Runs a function as `run` does and shows its result, which it then
@@ -262,10 +387,9 @@ impl Image {
         Message::Shown(text)
     }
 
-    /// Runs a loaded function without parameters as the root task of a
-    /// scheduler: its result words, or the answer that tells how it ended
-    /// otherwise.
-    fn run(&mut self, func: FuncId) -> Result<Vec<u64>, Message> {
+    /// A fiber for a loaded function without parameters, with the words of
+    /// its result.
+    fn root_fiber(&self, func: FuncId) -> Result<(Box<Fiber>, u32), Message> {
         let Some(&(entry, params, returns)) = self.functions.get(&func) else {
             return Err(Message::Failed(format!(
                 "function {} is not loaded",
@@ -286,10 +410,17 @@ impl Image {
         // SAFETY: the host compiled the stub for the function's words, and
         // both stay loaded while the image exists, which outlives the fiber.
         let fiber = unsafe { Fiber::new(stub, entry, &[], FiberConfig::default()) };
-        let fiber = match fiber {
-            Ok(fiber) => fiber,
-            Err(e) => return Err(Message::Failed(format!("cannot map a fiber's stack: {e}"))),
-        };
+        match fiber {
+            Ok(fiber) => Ok((fiber, returns)),
+            Err(e) => Err(Message::Failed(format!("cannot map a fiber's stack: {e}"))),
+        }
+    }
+
+    /// Runs a loaded function without parameters as the root task of a
+    /// scheduler: its result words, or the answer that tells how it ended
+    /// otherwise.
+    fn run(&mut self, func: FuncId) -> Result<Vec<u64>, Message> {
+        let (fiber, returns) = self.root_fiber(func)?;
         let cancel = fiber.cancel_handle();
         let scheduler = Scheduler::new(
             SchedulerConfig::default(),
@@ -309,30 +440,20 @@ impl Image {
             }
         };
         drop(scheduler);
-        let fiber = stopped.pop().expect("the root task stops");
-        Err(match fiber.state() {
-            FiberState::Trapped if interrupted => Message::Interrupted,
-            FiberState::Finished => {
-                return Ok(fiber.results().expect("finished")[..returns as usize].to_vec());
-            }
-            FiberState::Trapped => {
-                let trap = fiber.trap().expect("trapped");
-                Message::Trapped {
-                    kind: trap.kind,
-                    position: trap.position,
-                    stack: trap.stack.clone(),
-                }
-            }
-            state => Message::Failed(format!("the fiber stopped as {state:?}")),
-        })
+        match Self::ended(stopped.pop(), returns, interrupted) {
+            Message::Finished(words) => Ok(words),
+            other => Err(other),
+        }
     }
 }
 
 /// Connects to the host at `socket`, says `Hello` and answers messages
 /// until the host says `Shutdown` or goes away.
 pub fn serve(kind: ImageKind, socket: &Path) -> io::Result<()> {
-    let ImageKind::Scratch = kind;
-    handle_interrupts()?;
+    // Ctrl-C interrupts REPL input; the app is stopped by the host.
+    if kind == ImageKind::Scratch {
+        handle_interrupts()?;
+    }
     let mut image = Image::new()?;
     let mut stream = UnixStream::connect(socket)?;
     write_message(
@@ -346,12 +467,21 @@ pub fn serve(kind: ImageKind, socket: &Path) -> io::Result<()> {
         let message = match read_message(&mut stream) {
             Ok(message) => message,
             // The host is gone, so nothing is left to answer.
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return end(image),
             Err(e) => return Err(e),
         };
         match image.answer(message) {
             Some(reply) => write_message(&mut stream, &reply)?,
-            None => return Ok(()),
+            None => return end(image),
         }
     }
+}
+
+/// Ends the image. A running app is not waited for: its tasks may be in
+/// the middle of anything, and the process ending stops them all.
+fn end(image: Image) -> io::Result<()> {
+    if image.app.is_some() {
+        std::process::exit(0);
+    }
+    Ok(())
 }
