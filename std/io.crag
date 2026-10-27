@@ -14,9 +14,11 @@
 // You should have received a copy of the GNU General Public License along with
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
-// Connections (Specification §15.1, §15.2), as far as M4 reaches: TCP on
-// the loopback interface. A socket is a box of the runtime's handle,
-// closed with the box (Implementation Plan §11.7.14).
+// Standard output (Specification §15.6), files and connections (§15.1,
+// §15.2), as far as they reach yet: printing, reading a whole file, and
+// TCP to a host by name or on the loopback interface. A socket is a box of
+// the runtime's handle, closed with the box (Implementation Plan
+// §11.7.14).
 
 import std.stream
 
@@ -27,6 +29,45 @@ pub opaque type Connection(socket: RuntimeSocket)
 
 // An error of the operating system, by its error number.
 pub type IoError(..Error, code: Int)
+
+// A host name that has no address.
+pub type UnknownHost(..Error, name: Str)
+
+// Bytes that are not UTF-8, where a string was wanted.
+pub type NotUtf8(..Error)
+
+// Writes the text to standard output. Failing to write is a `Fault` trap.
+pub fn print(text: Str) -> () {
+  if ioPrint(text, 0) != 0 { ioFault() }
+}
+
+// Writes the text and a newline to standard output, as one write.
+pub fn printLine(text: Str) -> () {
+  if ioPrint(text, 1) != 0 { ioFault() }
+}
+
+// The bytes as a string, if they are UTF-8.
+pub fn text(bytes: Bytes) -> Str | NotUtf8 {
+  if ioUtf8(bytes) == 0 { return NotUtf8() }
+  ioText(bytes)
+}
+
+// The bytes of the file at `path`, a path of the system, relative to the
+// working directory unless it starts with `/`.
+pub fn readFile(path: Str) -> Bytes | IoError {
+  let failed = ioReadFile(path)
+  if failed != 0 { return IoError(code: failed) }
+  let bytes: Bytes = ioReadBytes()
+  bytes
+}
+
+// The text of the file at `path`.
+pub fn readText(path: Str) -> Str | IoError | NotUtf8 {
+  case readFile(path) {
+    bytes: Bytes -> text(bytes)
+    e: IoError -> e
+  }
+}
 
 // Listens on the loopback interface at `port`, any free one for zero.
 pub fn listen(port: Int) -> Listener | IoError {
@@ -43,6 +84,17 @@ pub fn accept(l: Listener) -> Connection | IoError {
   let fd = ioAccept(l.socket)
   if fd < 0 { return IoError(code: 0 - fd) }
   Connection(socket: ioOwn(fd))
+}
+
+// Connects to `port` at `host`, a name or an address.
+pub fn connect(host: Str, port: Int) -> Connection | UnknownHost | IoError {
+  let fd = ioSocketAny()
+  if fd < 0 { return IoError(code: 0 - fd) }
+  let socket = ioOwn(fd)
+  let failed = ioConnectHost(socket, host, port)
+  if failed == 65536 { return UnknownHost(name: host) }
+  if failed != 0 { return IoError(code: failed) }
+  Connection(socket: socket)
 }
 
 // Connects to `port` on the loopback interface.
@@ -76,14 +128,24 @@ fn writeRest(socket: RuntimeSocket, bytes: Bytes, left: Int) -> () | IoError {
   if rest > 0 { return writeRest(socket, bytes, rest) }
 }
 
+// The runtime's output and files: 0, or the error number; the bytes of a
+// file read follow from `ioReadBytes`.
+fn ioPrint(text: Str, newline: Int) -> Int
+fn ioFault() -> ()
+fn ioReadFile(path: Str) -> Int
+fn ioUtf8(bytes: Bytes) -> Int
+fn ioText(bytes: Bytes) -> Str
 // The runtime's sockets: a descriptor, or minus the error number.
 fn ioListen(port: Int) -> Int
 fn ioOwn(fd: Int) -> RuntimeSocket
 fn ioPort(socket: RuntimeSocket) -> Int
 fn ioAccept(socket: RuntimeSocket) -> Int
 fn ioSocket() -> Int
+fn ioSocketAny() -> Int
 // 0, or the error number.
 fn ioConnect(socket: RuntimeSocket, port: Int) -> Int
+// 0, the error number, or 65536 for a name without an address.
+fn ioConnectHost(socket: RuntimeSocket, host: Str, port: Int) -> Int
 // The count read, with the bytes for `ioReadBytes`, 0 at the end, or minus
 // the error number.
 fn ioRead(socket: RuntimeSocket, max: Int) -> Int

@@ -235,8 +235,16 @@ pub fn crag_repl(root: &Path) -> u8 {
     };
     let mut repl = Repl::new(project, scratch);
     let mut editor = line::LineEditor::new();
-    while let Some(input) = line::read_input(&mut editor, &|prefix| repl.completions(prefix)) {
-        match repl.eval_input(&input) {
+    loop {
+        // What the app printed while the prompt waited.
+        print!("{}", repl.take_printed());
+        let _ = std::io::stdout().flush();
+        let Some(input) = line::read_input(&mut editor, &|prefix| repl.completions(prefix)) else {
+            break;
+        };
+        let result = repl.eval_input(&input);
+        print!("{}", repl.take_printed());
+        match result {
             Ok(EvalOutput::Quit) => break,
             Ok(output) => print!("{}", output.render()),
             Err(errors) => print!("{errors}"),

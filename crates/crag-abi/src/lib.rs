@@ -731,7 +731,43 @@ pub enum RuntimeFn {
     /// the calling frame. The debugger may stop the task here; it returns
     /// once the task is resumed.
     Step = 77,
+
+    /// `rt_io_print(ctx, w0, w1, newline) -> errno`.
+    ///
+    /// Writes a string to standard output, with a newline when `newline`
+    /// is 1, as one write that other prints do not interleave with: 0, or
+    /// the error number (Specification §15.6).
+    IoPrint = 78,
+
+    /// `rt_io_read_file(ctx, w0, w1, out) -> errno`.
+    ///
+    /// Reads the whole file the string names into a bytes value, whose
+    /// two words it writes at `out`: 0, or the error number.
+    IoReadFile = 79,
+
+    /// `rt_io_socket_any(ctx) -> (fd, errno)`.
+    ///
+    /// A new non-blocking TCP socket for `IoConnectHost`, which reaches
+    /// IPv6 and IPv4 addresses alike where the system has IPv6.
+    IoSocketAny = 80,
+
+    /// `rt_io_connect_host(ctx, fd, w0, w1, port) -> (0, errno)`.
+    ///
+    /// Looks up the host the string names and connects a socket from
+    /// `IoSocketAny` to `port` there, suspending until the connection is
+    /// made: 0, the error number, or [`UNKNOWN_HOST`] when the name has no
+    /// address.
+    IoConnectHost = 81,
+
+    /// `rt_text_utf8(ctx, w0, w1) -> 1 | 0`.
+    ///
+    /// Whether the bytes of a value are valid UTF-8.
+    TextUtf8 = 82,
 }
+
+/// The error of `IoConnectHost` for a host name without an address, above
+/// every error number.
+pub const UNKNOWN_HOST: u64 = 1 << 16;
 
 /// A status of the stream functions: sent, or a value taken.
 pub const STREAM_OK: u64 = 0;
@@ -825,7 +861,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 78] = [
+    pub const ALL: [RuntimeFn; 83] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -904,6 +940,11 @@ impl RuntimeFn {
         RuntimeFn::SignalLeave,
         RuntimeFn::SignalDefault,
         RuntimeFn::Step,
+        RuntimeFn::IoPrint,
+        RuntimeFn::IoReadFile,
+        RuntimeFn::IoSocketAny,
+        RuntimeFn::IoConnectHost,
+        RuntimeFn::TextUtf8,
     ];
 
     /// The symbol the loader looks up.
@@ -987,6 +1028,11 @@ impl RuntimeFn {
             RuntimeFn::SignalLeave => "rt_signal_leave",
             RuntimeFn::SignalDefault => "rt_signal_default",
             RuntimeFn::Step => "rt_step",
+            RuntimeFn::IoPrint => "rt_io_print",
+            RuntimeFn::IoReadFile => "rt_io_read_file",
+            RuntimeFn::IoSocketAny => "rt_io_socket_any",
+            RuntimeFn::IoConnectHost => "rt_io_connect_host",
+            RuntimeFn::TextUtf8 => "rt_text_utf8",
         }
     }
 
@@ -1022,10 +1068,13 @@ pub enum TrapKind {
     Cancelled = 9,
     /// A lazy value's computation read the value itself.
     Cycle = 10,
+    /// The environment failed an operation that has no error value, such
+    /// as writing to a closed standard output (Specification §8.3, §15.6).
+    Fault = 11,
 }
 
 impl TrapKind {
-    pub const ALL: [TrapKind; 11] = [
+    pub const ALL: [TrapKind; 12] = [
         TrapKind::Overflow,
         TrapKind::DivideByZero,
         TrapKind::Index,
@@ -1037,6 +1086,7 @@ impl TrapKind {
         TrapKind::OutOfMemory,
         TrapKind::Cancelled,
         TrapKind::Cycle,
+        TrapKind::Fault,
     ];
 
     /// The kind with this discriminant, if any.

@@ -1,0 +1,5 @@
+import hello.main
+
+test "greets by name" {
+  if greeting("Ada") != "Hello, Ada!" { ??? }
+}

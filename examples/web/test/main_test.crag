@@ -1,0 +1,38 @@
+import std.io
+import std.task
+
+import web.main
+
+// Answers one request with a small page.
+fn answer(l: Listener) -> () {
+  case l.accept() {
+    c: Connection -> {
+      let request = c.read()
+      let sent = c.write(b"HTTP/1.0 200 OK\r\n\r\nhello")
+    }
+    _ -> ()
+  }
+}
+
+test "fetches a page from a local server" {
+  case listen(0) {
+    l: Listener -> {
+      let response = all { g ->
+        g.start { -> answer(l) }
+        fetch("localhost", l.port(), "/")
+      }
+      case response {
+        page: Str -> if page != "HTTP/1.0 200 OK\r\n\r\nhello" { ??? }
+        _ -> ???
+      }
+    }
+    _ -> ???
+  }
+}
+
+test "a host without an address is an error" {
+  case fetch("no-such-host.invalid", 80, "/") {
+    e: UnknownHost -> if e.name != "no-such-host.invalid" { ??? }
+    _ -> ???
+  }
+}

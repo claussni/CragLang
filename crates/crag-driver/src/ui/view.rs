@@ -408,7 +408,7 @@ fn draw_repl(frame: &mut Frame, ui: &Ui, theme: &Theme, area: Rect) {
     for out in &ui.output {
         let style = match out.kind {
             OutKind::Input => Style::default().add_modifier(Modifier::BOLD),
-            OutKind::Value => Style::default(),
+            OutKind::Value | OutKind::Printed => Style::default(),
             OutKind::Type | OutKind::Info => theme.dim(),
             OutKind::Error => theme.error(),
         };

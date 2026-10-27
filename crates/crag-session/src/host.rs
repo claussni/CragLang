@@ -37,7 +37,7 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -115,6 +115,10 @@ pub struct ImageHandle {
     child: Child,
     stream: UnixStream,
     state: ImageState,
+    /// The image's standard output, while it is open, and what it printed
+    /// that was not taken yet.
+    stdout: Option<ChildStdout>,
+    printed: Vec<u8>,
     /// What the image has loaded: functions with the hash of their code,
     /// stubs by their words, and type descriptors by index.
     functions: HashMap<FuncId, blake3::Hash>,
@@ -133,6 +137,71 @@ impl ImageHandle {
 
     pub fn state(&self) -> ImageState {
         self.state
+    }
+
+    /// What the image printed since the last call.
+    pub fn take_output(&mut self) -> Vec<u8> {
+        self.drain();
+        std::mem::take(&mut self.printed)
+    }
+
+    /// Keeps what the image printed and the pipe holds, without waiting.
+    fn drain(&mut self) {
+        use std::io::Read;
+        let Some(stdout) = &mut self.stdout else {
+            return;
+        };
+        let mut buf = [0; 8192];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => {
+                    self.stdout = None;
+                    return;
+                }
+                Ok(n) => self.printed.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(_) => {
+                    self.stdout = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Waits until the stream has something to read, keeping what the
+    /// image prints meanwhile, so an image that prints much never waits on
+    /// a full pipe while the host waits on it.
+    fn wait_for_message(&mut self) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        loop {
+            self.drain();
+            let mut fds = [
+                libc::pollfd {
+                    fd: self.stream.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.stdout.as_ref().map_or(-1, |s| s.as_raw_fd()),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: the array outlives the call, and a negative
+            // descriptor is skipped.
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            if ready < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            if fds[0].revents != 0 {
+                return Ok(());
+            }
+        }
     }
 
     /// Whether the image has loaded the function.
@@ -205,8 +274,19 @@ pub fn spawn_image(command: &ImageCommand, kind: ImageKind) -> io::Result<ImageH
         .arg(kind.name())
         .arg(&path)
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .spawn()?;
     let pid = child.id();
+    let stdout = child.stdout.take();
+    if let Some(stdout) = &stdout {
+        use std::os::fd::AsRawFd;
+        // SAFETY: plain system calls on the pipe's descriptor.
+        unsafe {
+            let fd = stdout.as_raw_fd();
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
     match connect(&listener, &mut child) {
         Ok(stream) => Ok(ImageHandle {
             kind,
@@ -214,6 +294,8 @@ pub fn spawn_image(command: &ImageCommand, kind: ImageKind) -> io::Result<ImageH
             child,
             stream,
             state: ImageState::Running,
+            stdout,
+            printed: Vec::new(),
             functions: HashMap::new(),
             stubs: HashSet::new(),
             descriptors: HashMap::new(),
@@ -283,9 +365,13 @@ pub fn send(image: &mut ImageHandle, message: &Message) -> io::Result<()> {
     write_message(&mut image.stream, message)
 }
 
-/// Receives the image's next message.
+/// Receives the image's next message. What the image printed before it
+/// sent the message is kept by then, for `take_output`.
 pub fn receive(image: &mut ImageHandle) -> io::Result<Message> {
-    read_message(&mut image.stream)
+    image.wait_for_message()?;
+    let message = read_message(&mut image.stream);
+    image.drain();
+    message
 }
 
 /// How a process ended, as a phrase: "exited with status 3", "was killed
@@ -381,6 +467,8 @@ pub struct Session {
     command: ImageCommand,
     scratch: ImageHandle,
     app: Option<ImageHandle>,
+    /// What images that are gone printed and was not taken yet.
+    printed: Vec<u8>,
 }
 
 /// How long the app image may take to shut down before it is killed.
@@ -393,6 +481,7 @@ impl Session {
             command,
             scratch,
             app: None,
+            printed: Vec::new(),
         })
     }
 
@@ -405,9 +494,34 @@ impl Session {
         self.app.as_ref()
     }
 
+    /// What the images printed since the last call: the scratch image's,
+    /// then the app's.
+    pub fn take_output(&mut self) -> Vec<u8> {
+        let mut out = std::mem::take(&mut self.printed);
+        out.extend(self.scratch.take_output());
+        if let Some(app) = &mut self.app {
+            out.extend(app.take_output());
+        }
+        out
+    }
+
+    /// Keeps what an image that is going away printed.
+    fn keep_output(&mut self, kind: ImageKind) {
+        let out = match kind {
+            ImageKind::Scratch => self.scratch.take_output(),
+            ImageKind::App => self
+                .app
+                .as_mut()
+                .map(ImageHandle::take_output)
+                .unwrap_or_default(),
+        };
+        self.printed.extend(out);
+    }
+
     /// Starts an app image, which code is then shipped to and started in;
     /// one that runs already is shut down first.
     pub fn start_app_image(&mut self) -> io::Result<()> {
+        self.keep_output(ImageKind::App);
         self.app = None;
         self.app = Some(spawn_image(&self.command, ImageKind::App)?);
         Ok(())
@@ -429,6 +543,7 @@ impl Session {
     ) -> Result<Message, SessionError> {
         if kind == ImageKind::Scratch && self.scratch.state != ImageState::Running {
             // A restart failed before; try again.
+            self.keep_output(ImageKind::Scratch);
             self.scratch = spawn_image(&self.command, ImageKind::Scratch)?;
         }
         let image = match kind {
@@ -451,6 +566,7 @@ impl Session {
         match kind {
             ImageKind::Scratch => Err(SessionError::Exited(self.on_image_exit(status)?)),
             ImageKind::App => {
+                self.keep_output(ImageKind::App);
                 let app = self.app.take().expect("an app image");
                 Err(SessionError::AppExited(ImageExit {
                     kind,
@@ -684,6 +800,7 @@ impl Session {
             self.request_to(ImageKind::App, &Message::Stop),
             Ok(Message::Stopped)
         );
+        self.keep_output(ImageKind::App);
         if let Some(mut app) = self.app.take() {
             if stopped {
                 let _ = send(&mut app, &Message::Shutdown);
@@ -741,6 +858,7 @@ impl Session {
             pid: self.scratch.pid,
             status,
         };
+        self.keep_output(ImageKind::Scratch);
         self.scratch = spawn_image(&self.command, exit.kind)?;
         Ok(exit)
     }

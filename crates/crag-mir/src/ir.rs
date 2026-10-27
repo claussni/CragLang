@@ -373,6 +373,23 @@ pub enum Intrinsic<'db> {
     /// Writes the last bytes the count says, all for -1: how many are left
     /// afterwards, or minus the error number.
     IoWrite,
+    /// Prints a string, with a newline for 1: 0, or the error number.
+    IoPrint,
+    /// Traps with `Fault`: the environment failed (§15.6).
+    IoFault,
+    /// Reads the file a string names: 0, with its bytes for
+    /// `IoReadBytes`, or the error number.
+    IoReadFile,
+    /// A socket for `IoConnectHost`: a descriptor, or minus the error
+    /// number.
+    IoSocketAny,
+    /// Connects the socket to a host by name and a port: 0, the error
+    /// number, or `crag_abi::UNKNOWN_HOST`.
+    IoConnectHost,
+    /// Whether bytes are UTF-8: 1 or 0.
+    TextUtf8,
+    /// The same text as another type: bytes as a string.
+    TextCast,
     /// Emits the signal (§11.2), with the qualifier of
     /// `crag_abi::SIGNAL_PLAIN` to `SIGNAL_RETRY`: held in a block, else
     /// delivered at once.

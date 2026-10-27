@@ -244,8 +244,8 @@ enum Access {
     Empty,
 }
 
-/// An operator of the prelude that is an operation on numbers.
-#[derive(Clone, Copy)]
+/// An operator of the prelude that is an operation on numbers or text.
+#[derive(Clone, Copy, PartialEq)]
 enum Primitive {
     Arith {
         op: BinOp,
@@ -254,6 +254,8 @@ enum Primitive {
     },
     Negate(Builtin),
     Compare(CmpOp, Builtin),
+    /// Strings or bytes joined, or a string's bytes: a `Concat`.
+    Concat,
 }
 
 /// A field of a record being built: the expression written for it, or
@@ -1505,6 +1507,13 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 ("std.io", "ioRead") => Intrinsic::IoRead,
                 ("std.io", "ioReadBytes") => Intrinsic::IoReadBytes,
                 ("std.io", "ioWrite") => Intrinsic::IoWrite,
+                ("std.io", "ioPrint") => Intrinsic::IoPrint,
+                ("std.io", "ioFault") => Intrinsic::IoFault,
+                ("std.io", "ioReadFile") => Intrinsic::IoReadFile,
+                ("std.io", "ioSocketAny") => Intrinsic::IoSocketAny,
+                ("std.io", "ioConnectHost") => Intrinsic::IoConnectHost,
+                ("std.io", "ioUtf8") => Intrinsic::TextUtf8,
+                ("std.io", "ioText") => Intrinsic::TextCast,
                 _ => return None,
             },
         )
@@ -2808,7 +2817,12 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             let ordered = number(*a) || *a == Builtin::CodePoint;
             (a == b && (ordered || text)).then_some(Primitive::Compare(op, *a))
         };
+        let text = |b: Builtin| matches!(b, Builtin::Str | Builtin::Bytes);
         match name {
+            "add" if matches!(params.as_slice(), [a, b] if text(*a) && a == b) => {
+                Some(Primitive::Concat)
+            }
+            "bytes" if params == [Builtin::Str] => Some(Primitive::Concat),
             "add" => arith(BinOp::Add, true),
             "subtract" => arith(BinOp::Sub, true),
             "multiply" => arith(BinOp::Mul, true),
@@ -2855,6 +2869,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         ty: Ty<'db>,
         ops: Vec<Operand<'db>>,
     ) -> Operand<'db> {
+        if primitive == Primitive::Concat {
+            return self.assign(ty, Rvalue::Concat(ops));
+        }
         let mut ops = ops.into_iter();
         match (primitive, ops.next(), ops.next()) {
             (Primitive::Arith { op, ty: b, checked }, Some(a), Some(c)) => {

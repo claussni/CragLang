@@ -1,0 +1,4 @@
+package files 0.1
+runtime 0.0
+
+main files.main

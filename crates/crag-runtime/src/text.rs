@@ -120,6 +120,11 @@ system_stack_fn! {
         => show_entry
 }
 
+system_stack_fn! {
+    /// `rt_text_utf8(ctx, w0, w1)`: see `crag_abi::RuntimeFn::TextUtf8`.
+    fn rt_text_utf8(ctx: *const TaskContext, w0: u64, w1: u64) -> u64 => utf8_entry
+}
+
 /// The Rust halves of the functions above, on the system stack.
 ///
 /// # Safety
@@ -151,6 +156,13 @@ unsafe extern "C" fn equals_entry(
 ) -> u64 {
     // SAFETY: as the caller promises.
     unsafe { u64::from(bytes_of(&[a0, a1]) == bytes_of(&[b0, b1])) }
+}
+
+/// See `concat_entry`.
+unsafe extern "C" fn utf8_entry(_ctx: *const TaskContext, w0: u64, w1: u64) -> u64 {
+    let words = [w0, w1];
+    // SAFETY: as the caller promises.
+    u64::from(std::str::from_utf8(unsafe { bytes_of(&words) }).is_ok())
 }
 
 /// See `concat_entry`.

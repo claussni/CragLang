@@ -1538,6 +1538,60 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let out = self.runtime2(RuntimeFn::IoWriteBytes, vec![fd, w0, w1, left]);
                 Ok(vec![self.fd_or_error(out[0], out[1])])
             }
+            (Intrinsic::IoPrint, [text, newline]) => {
+                let text_ty = self.operand_ty(text, ty);
+                let [w0, w1] = self.operand(text, text_ty)?[..] else {
+                    return Err("this operation of the runtime");
+                };
+                let newline = word(&self.operand(newline, int)?)?;
+                Ok(vec![
+                    self.runtime(RuntimeFn::IoPrint, vec![w0, w1, newline]),
+                ])
+            }
+            (Intrinsic::IoFault, []) => {
+                let kind = self.constant(AbiTrap::Fault as i64);
+                let position = self.constant(crag_abi::NO_POSITION as i64);
+                // `rt_trap` does not return.
+                self.push(Inst::CallRuntime {
+                    func: RuntimeFn::Trap,
+                    args: vec![kind, position],
+                    dsts: Vec::new(),
+                });
+                Ok(Vec::new())
+            }
+            (Intrinsic::IoReadFile, [path]) => {
+                let path_ty = self.operand_ty(path, ty);
+                let [w0, w1] = self.operand(path, path_ty)?[..] else {
+                    return Err("this operation of the runtime");
+                };
+                // The bytes wait in the scratch words for `IoReadBytes`.
+                let scratch = self.scratch();
+                Ok(vec![
+                    self.runtime(RuntimeFn::IoReadFile, vec![w0, w1, scratch]),
+                ])
+            }
+            (Intrinsic::IoSocketAny, []) => {
+                let out = self.runtime2(RuntimeFn::IoSocketAny, Vec::new());
+                Ok(vec![self.fd_or_error(out[0], out[1])])
+            }
+            (Intrinsic::IoConnectHost, [socket, host, port]) => {
+                let fd = self.handle_of(socket)?;
+                let host_ty = self.operand_ty(host, ty);
+                let [w0, w1] = self.operand(host, host_ty)?[..] else {
+                    return Err("this operation of the runtime");
+                };
+                let port = word(&self.operand(port, int)?)?;
+                let out = self.runtime2(RuntimeFn::IoConnectHost, vec![fd, w0, w1, port]);
+                Ok(vec![out[1]])
+            }
+            (Intrinsic::TextUtf8, [bytes]) => {
+                let bytes_ty = self.operand_ty(bytes, ty);
+                let [w0, w1] = self.operand(bytes, bytes_ty)?[..] else {
+                    return Err("this operation of the runtime");
+                };
+                Ok(vec![self.runtime(RuntimeFn::TextUtf8, vec![w0, w1])])
+            }
+            (Intrinsic::TextCast, [text]) => self.concat(std::slice::from_ref(text)),
             (Intrinsic::SignalMark, []) => {
                 Ok(vec![self.runtime(RuntimeFn::SignalMark, Vec::new())])
             }
@@ -1841,7 +1895,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             let ty = self.operand_ty(part, str_ty);
             let words = self.operand(part, ty)?;
             let (words, owned) = match ty.as_builtin(db) {
-                Some((Builtin::Str, _)) => (words, false),
+                Some((Builtin::Str | Builtin::Bytes, _)) => (words, false),
                 Some((b, _)) => {
                     let number = crate::shape::number(b).ok_or("interpolations of this type")?;
                     let code = self.constant(number.code() as i64);

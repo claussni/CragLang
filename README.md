@@ -31,6 +31,7 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-fmt` | The formatter: the canonical layout of source files (M5) |
 | `crates/crag-package` | Packages: manifests, versions, folder registries, resolution and the SBOM (M6) |
 | `std` | The standard library: the prelude `std.core` (M1), `std.time`, `std.task`, `std.stream` and `std.io` (M4) |
+| `examples` | Small programs to run and explore: hello world, reading a file, loading a web page |
 
 ## Build
 
@@ -65,6 +66,10 @@ directory with a `package.crag` naming the package and its `main` module:
 `crag fmt` formats every module of the project in place, or the files
 named; `-` formats standard input to standard output, and `--check` only
 lists the files that are not formatted.
+
+`examples/` holds small projects to start from: `hello`, `files`, which
+prints a text file, and `web`, which loads a web page. Its README tells
+how to run them and explore them in the editor and the REPL.
 
 Packages come from folder registries, which `registries.crag` in the
 settings directory (`$CRAG_HOME`, else `~/.crag`) lists:

@@ -71,6 +71,7 @@ pub mod sentinel;
 pub mod side_stack;
 mod signals;
 pub mod stack;
+mod stdio;
 mod stm;
 mod stream;
 pub mod stress;
@@ -177,6 +178,11 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::SignalLeave => signals::rt_signal_leave as *const () as usize,
         RuntimeFn::SignalDefault => signals::rt_signal_default as *const () as usize,
         RuntimeFn::Step => debug::rt_step as *const () as usize,
+        RuntimeFn::IoPrint => stdio::rt_io_print as *const () as usize,
+        RuntimeFn::IoReadFile => stdio::rt_io_read_file as *const () as usize,
+        RuntimeFn::IoSocketAny => net::rt_io_socket_any as *const () as usize,
+        RuntimeFn::IoConnectHost => net::rt_io_connect_host as *const () as usize,
+        RuntimeFn::TextUtf8 => text::rt_text_utf8 as *const () as usize,
     }
 }
 

@@ -1,0 +1,4 @@
+package web 0.1
+runtime 0.0
+
+main web.main

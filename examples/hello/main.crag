@@ -1,0 +1,8 @@
+// Hello, world: the smallest program that does something you can see.
+
+import std.io
+
+// The greeting for someone.
+pub fn greeting(name: Str) -> Str { "Hello, {name}!" }
+
+fn main() { printLine(greeting("world")) }

@@ -275,6 +275,12 @@ impl Repl {
         &mut self.project
     }
 
+    /// What the scratch image and the app printed since the last call
+    /// (Specification §15.6).
+    pub fn take_printed(&mut self) -> String {
+        String::from_utf8_lossy(&self.scratch.session.take_output()).into_owned()
+    }
+
     /// The type of the value the last input showed.
     pub fn shown_type(&self) -> Option<&str> {
         self.shown_type.as_deref()

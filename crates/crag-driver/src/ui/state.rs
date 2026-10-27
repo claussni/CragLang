@@ -112,6 +112,8 @@ pub enum OutKind {
     Type,
     Error,
     Info,
+    /// What a program printed.
+    Printed,
 }
 
 /// Where a pick leads.
@@ -369,6 +371,8 @@ pub struct Ui {
     pub right_selected: usize,
     pub input: Buffer,
     pub output: Vec<OutLine>,
+    /// The end of what programs printed after its last newline.
+    printed: String,
     pub history: Vec<String>,
     history_at: Option<usize>,
     pub overlay: Option<Overlay>,
@@ -428,6 +432,7 @@ impl Ui {
             right_selected: 0,
             input: Buffer::new("input", "", None),
             output: Vec::new(),
+            printed: String::new(),
             history: Vec::new(),
             history_at: None,
             overlay: None,
@@ -695,6 +700,7 @@ impl Ui {
         if self.push_at.is_some_and(|at| now >= at) {
             self.push();
         }
+        self.show_printed(false);
         if self.repl.app_runs() {
             let pauses = self.repl.pauses().unwrap_or_default();
             let new = pauses
@@ -1686,9 +1692,27 @@ impl Ui {
         self.run_repl_quietly(text);
     }
 
+    /// Shows what programs printed as lines of the REPL's output; a line
+    /// not ended yet waits for its end, unless `all`.
+    fn show_printed(&mut self, all: bool) {
+        self.printed += &self.repl.take_printed();
+        let end = match all {
+            true => self.printed.len(),
+            false => self.printed.rfind('\n').map_or(0, |i| i + 1),
+        };
+        let done: String = self.printed.drain(..end).collect();
+        for line in done.lines() {
+            self.output.push(OutLine {
+                text: line.to_string(),
+                kind: OutKind::Printed,
+            });
+        }
+    }
+
     fn run_repl_quietly(&mut self, text: &str) {
         self.push();
         let result = self.repl.eval_input(text);
+        self.show_printed(true);
         let (shown, kind) = match result {
             Ok(EvalOutput::Quit) => {
                 self.quit = true;

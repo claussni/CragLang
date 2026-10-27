@@ -1,0 +1,15 @@
+import std.io
+
+test "the poem is there" {
+  case readText("poem.txt") {
+    text: Str -> if text == "" { ??? }
+    _ -> ???
+  }
+}
+
+test "a missing file is an error" {
+  case readText("missing.txt") {
+    e: IoError -> if e.code != 2 { ??? }
+    _ -> ???
+  }
+}

@@ -1,0 +1,24 @@
+// Reads a text file and prints it, telling what went wrong when it
+// cannot.
+
+import std.io
+
+// The file to print, relative to the directory the program runs in.
+let path = "poem.txt"
+
+fn main() -> ExitCode {
+  case readText(path) {
+    text: Str -> {
+      print(text)
+      ExitCode(code: 0)
+    }
+    e: IoError -> {
+      printLine("cannot read {path}: error {e.code}")
+      ExitCode(code: 1)
+    }
+    e: NotUtf8 -> {
+      printLine("{path} is not UTF-8 text")
+      ExitCode(code: 1)
+    }
+  }
+}

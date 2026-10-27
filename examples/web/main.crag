@@ -1,0 +1,53 @@
+// Loads a web page over plain HTTP and prints the server's response: the
+// status line, the headers and the page.
+
+import std.io
+import std.stream
+
+// The response to a GET of `path` at `host`.
+pub fn fetch(host: Str, port: Int, path: Str) -> Str | UnknownHost | IoError | NotUtf8 {
+  case connect(host, port) {
+    c: Connection -> {
+      let request = "GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+      case c.write(bytes(request)) {
+        e: IoError -> e
+        _ -> case readAll(c, b"") {
+          response: Bytes -> text(response)
+          e: IoError -> e
+        }
+      }
+    }
+    e: UnknownHost -> e
+    e: IoError -> e
+  }
+}
+
+// Everything the server sends until it closes the connection.
+fn readAll(c: Connection, sofar: Bytes) -> Bytes | IoError {
+  case c.read() {
+    more: Bytes -> readAll(c, sofar + more)
+    Closed -> sofar
+    e: IoError -> e
+  }
+}
+
+fn main() -> ExitCode {
+  case fetch("example.com", 80, "/") {
+    page: Str -> {
+      print(page)
+      ExitCode(code: 0)
+    }
+    e: UnknownHost -> {
+      printLine("no address for {e.name}")
+      ExitCode(code: 1)
+    }
+    e: IoError -> {
+      printLine("the connection failed: error {e.code}")
+      ExitCode(code: 1)
+    }
+    e: NotUtf8 -> {
+      printLine("the page is not UTF-8 text")
+      ExitCode(code: 1)
+    }
+  }
+}

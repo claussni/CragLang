@@ -1,0 +1,4 @@
+package hello 0.1
+runtime 0.0
+
+main hello.main

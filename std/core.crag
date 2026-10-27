@@ -257,7 +257,12 @@ pub fn greaterOrEqual(a: CodePoint, b: CodePoint) -> Bool
 // Str
 
 pub fn equals(a: Str, b: Str) -> Bool
+// The two strings joined: `a + b`.
+pub fn add(a: Str, b: Str) -> Str
+// The string's UTF-8 bytes.
+pub fn bytes(s: Str) -> Bytes
 
 // Bytes
 
 pub fn equals(a: Bytes, b: Bytes) -> Bool
+pub fn add(a: Bytes, b: Bytes) -> Bytes
