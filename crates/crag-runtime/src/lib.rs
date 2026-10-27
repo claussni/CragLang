@@ -48,6 +48,7 @@ mod system;
 
 mod cancel;
 pub mod codec;
+mod collections;
 pub mod debug;
 mod deque;
 mod epoch;
@@ -195,6 +196,10 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::ValueShapes => values::rt_value_shapes as *const () as usize,
         RuntimeFn::ValueOp => values::rt_value_op as *const () as usize,
         RuntimeFn::ValueShow => values::rt_value_show as *const () as usize,
+        RuntimeFn::ListSet => collections::rt_list_set as *const () as usize,
+        RuntimeFn::ListConcat => collections::rt_list_concat as *const () as usize,
+        RuntimeFn::MapRemove => collections::rt_map_remove as *const () as usize,
+        RuntimeFn::MapList => collections::rt_map_list as *const () as usize,
     }
 }
 

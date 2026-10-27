@@ -297,7 +297,7 @@ fn commands_and_completion() {
     );
     assert_eq!(eval(&mut r, "fn total(n: Int) -> Int { n }"), "");
     assert_eq!(eval(&mut r, "let tally = 3"), "");
-    assert_eq!(r.completions("ta"), ["tally"]);
+    assert_eq!(r.completions("tal"), ["tally"]);
     assert_eq!(r.completions("tot"), ["total"]);
     // Keywords, and the prelude's names.
     assert_eq!(r.completions("retu"), ["return"]);

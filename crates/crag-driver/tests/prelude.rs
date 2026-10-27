@@ -247,3 +247,147 @@ fn maps_have_no_order() {
         "{out}"
     );
 }
+
+#[test]
+fn lists() {
+    check(&[
+        ("let xs = [3, 1, 2]", ""),
+        ("xs.count()", "3"),
+        ("let none: List[Int] = []", ""),
+        ("none.isEmpty()", "True"),
+        ("xs.get(5)", "Empty"),
+        ("xs.get(-1)", "Empty"),
+        ("xs.first()", "3"),
+        ("xs.last()", "2"),
+        ("xs.append(4)", "[3, 1, 2, 4]"),
+        ("xs.prepend(0)", "[0, 3, 1, 2]"),
+        ("xs + [9]", "[3, 1, 2, 9]"),
+        ("xs.insert(1, 7)", "[3, 7, 1, 2]"),
+        ("xs.insert(3, 7)", "[3, 1, 2, 7]"),
+        ("xs.set(0, 8)", "[8, 1, 2]"),
+        ("xs.remove(1)", "[3, 2]"),
+        ("xs.slice(1..2)", "[1, 2]"),
+        ("xs.take(2)", "[3, 1]"),
+        ("xs.take(9)", "[3, 1, 2]"),
+        ("xs.drop(1)", "[1, 2]"),
+        ("xs.drop(9)", "[]"),
+        ("xs.reverse()", "[2, 1, 3]"),
+        ("xs", "[3, 1, 2]"),
+        ("xs.sort()", "[1, 2, 3]"),
+        (
+            r#"["bb", "a", "ccc", "d"].sortBy { s -> s.byteCount() }"#,
+            r#"["a", "d", "bb", "ccc"]"#,
+        ),
+        ("xs.sortWith { a, b -> compare(b, a) }", "[3, 2, 1]"),
+        ("xs.indexOf(2)", "2"),
+        ("xs.indexOf(5)", "Empty"),
+        ("xs.contains(1)", "True"),
+        ("[1, 2, 1, 3].unique()", "[1, 2, 3]"),
+        (
+            r#"xs.zip(["a", "b"])"#,
+            r#"[(first: 3, second: "a"), (first: 1, second: "b")]"#,
+        ),
+        (
+            "xs.indexed()",
+            "[(index: 0, value: 3), (index: 1, value: 1), (index: 2, value: 2)]",
+        ),
+        ("[1, 2, 3, 4, 5].chunks(2)", "[[1, 2], [3, 4], [5]]"),
+    ]);
+}
+
+#[test]
+fn collectors() {
+    check(&[
+        ("let xs = [3, 1, 2]", ""),
+        ("xs.map { x -> x * 2 }", "[6, 2, 4]"),
+        ("xs.filter { x -> x > 1 }", "[3, 2]"),
+        ("let ys: List[Int] = xs.flatMap { x -> [x, x] }", ""),
+        ("ys", "[3, 3, 1, 1, 2, 2]"),
+        ("xs.fold(0) { acc, x -> acc + x }", "6"),
+        ("xs.find { x -> x < 3 }", "1"),
+        ("xs.find { x -> x > 5 }", "Empty"),
+        ("xs.any { x -> x > 2 }", "True"),
+        ("xs.all { x -> x > 2 }", "False"),
+        ("xs.count { x -> x > 1 }", "2"),
+        ("xs.min()", "1"),
+        ("xs.max()", "3"),
+        ("let none: List[Int] = []", ""),
+        ("none.max()", "Empty"),
+        (r#"["bb", "a"].minBy { s -> s.byteCount() }"#, r#""a""#),
+        (r#"["bb", "a"].maxBy { s -> s.byteCount() }"#, r#""bb""#),
+        ("xs.sum()", "6"),
+        ("[1.5, 2.5].sum()", "4.0"),
+        (
+            "[1, 2, 3, 4].groupBy { x -> x % 2 }",
+            "[0: [2, 4], 1: [1, 3]]",
+        ),
+        ("(1..5).map { n -> n * n }", "[1, 4, 9, 16, 25]"),
+        ("(1..10).filter { n -> n % 3 == 0 }", "[3, 6, 9]"),
+        ("(1..4).fold(0) { a, n -> a + n }", "10"),
+        ("(1..4).contains(3)", "True"),
+        ("(1..3).toList()", "[1, 2, 3]"),
+    ]);
+}
+
+#[test]
+fn maps_and_sets() {
+    check(&[
+        (r#"let m = ["a": 1, "b": 2]"#, ""),
+        ("m.count()", "2"),
+        (r#"m.get("a")"#, "1"),
+        (r#"m.has("c")"#, "False"),
+        (r#"m.set("c", 3)"#, r#"["a": 1, "b": 2, "c": 3]"#),
+        (r#"m.remove("a")"#, r#"["b": 2]"#),
+        (
+            r#"m.change("a") { v -> v.then { n -> n + 10 } }"#,
+            r#"["a": 11, "b": 2]"#,
+        ),
+        (r#"m.change("a") { v -> Empty }"#, r#"["b": 2]"#),
+        ("m.keys()", r#"["a", "b"]"#),
+        ("m.values().sort()", "[1, 2]"),
+        (
+            "m.entries().sortBy { e -> e.key }",
+            r#"[(key: "a", value: 1), (key: "b", value: 2)]"#,
+        ),
+        (
+            r#"m.merge(["b": 20, "z": 26])"#,
+            r#"["a": 1, "b": 20, "z": 26]"#,
+        ),
+        (
+            r#"m.merge(["b": 20]) { k, a, b -> a + b }"#,
+            r#"["a": 1, "b": 22]"#,
+        ),
+        ("m.mapValues { v -> v * 100 }", r#"["a": 100, "b": 200]"#),
+        ("m.filter { k, v -> v > 1 }", r#"["b": 2]"#),
+        (
+            r#"[(key: "x", value: 1), (key: "x", value: 2)].toMap()"#,
+            r#"["x": 2]"#,
+        ),
+        ("let s: Set[Int] = [1, 2, 3]", ""),
+        ("s.count()", "3"),
+        ("s.contains(2)", "True"),
+        ("s.insert(4)", "[1, 2, 3, 4]"),
+        ("s.remove(1)", "[2, 3]"),
+        ("s.union([9])", "[1, 2, 3, 9]"),
+        ("s.intersection([2, 3, 4])", "[2, 3]"),
+        ("s.difference([2])", "[1, 3]"),
+        ("s.isSubset([1, 2, 3, 4])", "True"),
+        ("s.filter { x -> x > 1 }", "[2, 3]"),
+        ("s.map { x -> x * 10 }.sort()", "[10, 20, 30]"),
+        ("[1, 1, 2].toSet()", "[1, 2]"),
+    ]);
+}
+
+#[test]
+fn positions_outside_a_list_trap() {
+    let mut r = repl();
+    for input in [
+        "[1].set(1, 0)",
+        "[1].remove(-1)",
+        "[1].insert(2, 0)",
+        "[1, 2].slice(1..2)",
+    ] {
+        let out = r.eval_input(input).unwrap().render();
+        assert!(out.contains("trap: index out of range"), "{input}: {out}");
+    }
+}

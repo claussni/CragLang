@@ -829,6 +829,32 @@ pub enum RuntimeFn {
     ///
     /// A value written as source, as the REPL shows it.
     ValueShow = 92,
+
+    /// `rt_list_set(ctx, list, at, w0, w1) -> list`.
+    ///
+    /// The list with element `at` replaced. It takes the list's reference
+    /// and the value's; `at` is inside the list.
+    ListSet = 93,
+
+    /// `rt_list_concat(ctx, a, b) -> list`.
+    ///
+    /// A new list of the elements of `a`, then those of `b`. It borrows
+    /// both.
+    ListConcat = 94,
+
+    /// `rt_map_remove(ctx, map, k0, k1) -> map`.
+    ///
+    /// The map or set without the key. It takes the map's reference and
+    /// borrows the key.
+    MapRemove = 95,
+
+    /// `rt_map_list(ctx, map, list, values) -> list`.
+    ///
+    /// The list with the keys of the map or set after its elements, or
+    /// with the values for `values` 1, in the map's order, each with a
+    /// reference of its own. It borrows the map and takes the list's
+    /// reference.
+    MapList = 96,
 }
 
 /// The operations of `RuntimeFn::ValueOp`.
@@ -976,7 +1002,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 93] = [
+    pub const ALL: [RuntimeFn; 97] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -1070,6 +1096,10 @@ impl RuntimeFn {
         RuntimeFn::ValueShapes,
         RuntimeFn::ValueOp,
         RuntimeFn::ValueShow,
+        RuntimeFn::ListSet,
+        RuntimeFn::ListConcat,
+        RuntimeFn::MapRemove,
+        RuntimeFn::MapList,
     ];
 
     /// The symbol the loader looks up.
@@ -1168,6 +1198,10 @@ impl RuntimeFn {
             RuntimeFn::ValueShapes => "rt_value_shapes",
             RuntimeFn::ValueOp => "rt_value_op",
             RuntimeFn::ValueShow => "rt_value_show",
+            RuntimeFn::ListSet => "rt_list_set",
+            RuntimeFn::ListConcat => "rt_list_concat",
+            RuntimeFn::MapRemove => "rt_map_remove",
+            RuntimeFn::MapList => "rt_map_list",
         }
     }
 

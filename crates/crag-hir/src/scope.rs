@@ -607,9 +607,14 @@ fn meet<'a, 'db>(
             collisions.push(same);
         }
     }
-    // Overloads with one signature clash (§14.3).
+    // Overloads with one signature clash (§14.3), but the prelude's give
+    // way to the module's own and to those it imports (§19.3).
     let mut shapes: Vec<(FnShape, Vec<&Entry>)> = Vec::new();
+    let shadowing = functions.iter().any(|f| f.origin != Origin::Prelude);
     for function in functions {
+        if shadowing && function.origin == Origin::Prelude {
+            continue;
+        }
         let shape = fn_shape(&function.item.signature);
         match shapes.iter_mut().find(|(s, _)| *s == shape) {
             Some((_, same)) => same.push(function),

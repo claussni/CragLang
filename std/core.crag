@@ -568,10 +568,400 @@ fn trapIndex() -> ()
 
 // Lists (Specification §19.11)
 
-fn listAppend[T](xs: List[T], x: T) -> List[T]
+pub fn count[T](xs: List[T]) -> Int { collCount(xs) }
+pub fn isEmpty[T](xs: List[T]) -> Bool { collCount(xs) == 0 }
+
+pub fn get[T](xs: List[T], at: Int) -> Option[T] {
+  if at < 0 or at >= collCount(xs) { return Empty }
+  xs[at]
+}
+
+pub fn first[T](xs: List[T]) -> Option[T] { xs.get(0) }
+pub fn last[T](xs: List[T]) -> Option[T] { xs.get(collCount(xs) - 1) }
+pub fn append[T](xs: List[T], x: T) -> List[T] { listAppend(xs, x) }
+pub fn prepend[T](xs: List[T], x: T) -> List[T] { listConcat([x], xs) }
+pub fn add[T](a: List[T], b: List[T]) -> List[T] { listConcat(a, b) }
+
+pub fn insert[T](xs: List[T], at: Int, x: T) -> List[T] {
+  let n = collCount(xs)
+  if at < 0 or at > n { trapIndex() }
+  listConcat(listAppend(listSlice(xs, 0, n - at), x), listSlice(xs, at, 0))
+}
+
+pub fn set[T](xs: List[T], at: Int, x: T) -> List[T] {
+  if at < 0 or at >= collCount(xs) { trapIndex() }
+  listSet(xs, at, x)
+}
+
+pub fn remove[T](xs: List[T], at: Int) -> List[T] {
+  let n = collCount(xs)
+  if at < 0 or at >= n { trapIndex() }
+  listConcat(listSlice(xs, 0, n - at), listSlice(xs, at + 1, 0))
+}
+
+// The elements in the range, sharing storage (§12.4).
+pub fn slice[T](xs: List[T], range: Range[Int]) -> List[T] {
+  let n = collCount(xs)
+  if range.first < 0 or range.last >= n or range.first > range.last + 1 { trapIndex() }
+  listSlice(xs, range.first, n - 1 - range.last)
+}
+
+// At most `n` elements from the front.
+pub fn take[T](xs: List[T], n: Int) -> List[T] {
+  let len = collCount(xs)
+  if n >= len { return xs }
+  if n <= 0 { return [] }
+  listSlice(xs, 0, len - n)
+}
+
+// The elements after the first `n`.
+pub fn drop[T](xs: List[T], n: Int) -> List[T] {
+  let len = collCount(xs)
+  if n <= 0 { return xs }
+  if n >= len { return [] }
+  listSlice(xs, n, 0)
+}
+
+pub fn reverse[T](xs: List[T]) -> List[T] {
+  var out: List[T] = []
+  let n = collCount(xs)
+  for i in 1..n { out = listAppend(out, xs[n - i]) }
+  out
+}
+
+// Sorted by `order`, keeping the order of equal elements.
+pub fn sortWith[T](xs: List[T], order: (T, T) -> Ordering) -> List[T] {
+  let n = collCount(xs)
+  if n <= 1 { return xs }
+  let half = n / 2
+  merge(sortWith(take(xs, half), order), sortWith(drop(xs, half), order), order)
+}
+
+fn merge[T](a: List[T], b: List[T], order: (T, T) -> Ordering) -> List[T] {
+  var out: List[T] = []
+  var i = 0
+  var j = 0
+  let na = collCount(a)
+  let nb = collCount(b)
+  for k in 1..(na + nb) {
+    if j >= nb or (i < na and not (order(b[j], a[i]) is Less)) {
+      out = listAppend(out, a[i])
+      i = i + 1
+    } else {
+      out = listAppend(out, b[j])
+      j = j + 1
+    }
+  }
+  out
+}
+
+pub fn sort[T: Ordered](xs: List[T]) -> List[T] { sortWith(xs) { a, b -> compare(a, b) } }
+
+pub fn sortBy[T, K: Ordered](xs: List[T], key: (T) -> K) -> List[T] {
+  sortWith(xs) { a, b -> compare(key(a), key(b)) }
+}
+
+pub fn indexOf[T](xs: List[T], x: T) -> Option[Int] {
+  var i = 0
+  for y in xs {
+    if y == x { return i }
+    i = i + 1
+  }
+  Empty
+}
+
+pub fn contains[T](xs: List[T], x: T) -> Bool { not (indexOf(xs, x) is Empty[Int]) }
+
+// The first of each element, in order.
+pub fn unique[T](xs: List[T]) -> List[T] {
+  var seen: Set[T] = []
+  var out: List[T] = []
+  for x in xs {
+    if setContains(seen, x) == 0 {
+      seen = setInsert(seen, x)
+      out = listAppend(out, x)
+    }
+  }
+  out
+}
+
+// The pairs of elements at the same positions, as long as the shorter.
+pub fn zip[T, U](xs: List[T], ys: List[U]) -> List[(first: T, second: U)] {
+  var out: List[(first: T, second: U)] = []
+  let n = if collCount(xs) < collCount(ys) { collCount(xs) } else { collCount(ys) }
+  for i in 1..n { out = listAppend(out, (first: xs[i - 1], second: ys[i - 1])) }
+  out
+}
+
+pub fn indexed[T](xs: List[T]) -> List[(index: Int, value: T)] {
+  var out: List[(index: Int, value: T)] = []
+  var i = 0
+  for x in xs {
+    out = listAppend(out, (index: i, value: x))
+    i = i + 1
+  }
+  out
+}
+
+// The elements in lists of `size`, the last one shorter if they run out.
+pub fn chunks[T](xs: List[T], size: Int) -> List[List[T]] {
+  if size <= 0 { trapIndex() }
+  var out: List[List[T]] = []
+  var rest = xs
+  for i in 1..((collCount(xs) + size - 1) / size) {
+    out = listAppend(out, take(rest, size))
+    rest = drop(rest, size)
+  }
+  out
+}
+
+// The collectors (Specification §19.11), on lists.
 
 pub fn map[T, U](xs: List[T], f: (T) -> U) -> List[U] {
   var out: List[U] = []
   for x in xs { out = listAppend(out, f(x)) }
   out
 }
+
+pub fn filter[T](xs: List[T], keep: (T) -> Bool) -> List[T] {
+  var out: List[T] = []
+  for x in xs {
+    if keep(x) { out = listAppend(out, x) }
+  }
+  out
+}
+
+pub fn flatMap[T, U](xs: List[T], f: (T) -> List[U]) -> List[U] {
+  var out: List[U] = []
+  for x in xs { out = listConcat(out, f(x)) }
+  out
+}
+
+pub fn fold[T, A](xs: List[T], initial: A, f: (A, T) -> A) -> A {
+  var acc = initial
+  for x in xs { acc = f(acc, x) }
+  acc
+}
+
+pub fn find[T](xs: List[T], holds: (T) -> Bool) -> Option[T] {
+  for x in xs {
+    if holds(x) { return x }
+  }
+  Empty
+}
+
+pub fn any[T](xs: List[T], holds: (T) -> Bool) -> Bool {
+  for x in xs {
+    if holds(x) { return True }
+  }
+  False
+}
+
+pub fn all[T](xs: List[T], holds: (T) -> Bool) -> Bool {
+  for x in xs {
+    if not holds(x) { return False }
+  }
+  True
+}
+
+pub fn count[T](xs: List[T], holds: (T) -> Bool) -> Int {
+  var n = 0
+  for x in xs {
+    if holds(x) { n = n + 1 }
+  }
+  n
+}
+
+pub fn toList[T](xs: List[T]) -> List[T] { xs }
+
+pub fn min[T: Ordered](xs: List[T]) -> Option[T] { minBy(xs) { x -> x } }
+pub fn max[T: Ordered](xs: List[T]) -> Option[T] { maxBy(xs) { x -> x } }
+
+pub fn minBy[T, K: Ordered](xs: List[T], key: (T) -> K) -> Option[T] {
+  if collCount(xs) == 0 { return Empty }
+  var best = xs[0]
+  for x in xs {
+    if compare(key(x), key(best)) is Less { best = x }
+  }
+  best
+}
+
+pub fn maxBy[T, K: Ordered](xs: List[T], key: (T) -> K) -> Option[T] {
+  if collCount(xs) == 0 { return Empty }
+  var best = xs[0]
+  for x in xs {
+    if compare(key(x), key(best)) is Greater { best = x }
+  }
+  best
+}
+
+pub fn sum(xs: List[Int]) -> Int {
+  var total = 0
+  for x in xs { total = total + x }
+  total
+}
+
+pub fn sum(xs: List[Float]) -> Float {
+  var total = 0.0
+  for x in xs { total = total + x }
+  total
+}
+
+pub fn groupBy[T, K](xs: List[T], key: (T) -> K) -> Map[K, List[T]] {
+  var out: Map[K, List[T]] = [:]
+  for x in xs {
+    let k = key(x)
+    let group: List[T] = out[k].orElse([])
+    out = mapInsert(out, k, listAppend(group, x))
+  }
+  out
+}
+
+// Maps
+
+pub fn count[K, V](m: Map[K, V]) -> Int { collCount(m) }
+pub fn isEmpty[K, V](m: Map[K, V]) -> Bool { collCount(m) == 0 }
+pub fn get[K, V](m: Map[K, V], key: K) -> Option[V] { m[key] }
+pub fn has[K, V](m: Map[K, V], key: K) -> Bool { not (m[key] is Empty[V]) }
+pub fn set[K, V](m: Map[K, V], key: K, value: V) -> Map[K, V] { mapInsert(m, key, value) }
+pub fn remove[K, V](m: Map[K, V], key: K) -> Map[K, V] { mapRemove(m, key) }
+
+// The map with the key's value changed; `Empty` removes the key.
+pub fn change[K, V](m: Map[K, V], key: K, f: (Option[V]) -> Option[V]) -> Map[K, V] {
+  case f(m[key]) {
+    e: Empty[V] -> mapRemove(m, key)
+    v: V -> mapInsert(m, key, v)
+  }
+}
+
+pub fn keys[K, V](m: Map[K, V]) -> Set[K] {
+  var out: Set[K] = []
+  for k in mapKeys(m) { out = setInsert(out, k) }
+  out
+}
+
+pub fn values[K, V](m: Map[K, V]) -> List[V] { mapValues(m) }
+
+pub fn entries[K, V](m: Map[K, V]) -> List[(key: K, value: V)] {
+  var out: List[(key: K, value: V)] = []
+  let ks: List[K] = mapKeys(m)
+  let vs: List[V] = mapValues(m)
+  var i = 0
+  for k in ks {
+    out = listAppend(out, (key: k, value: vs[i]))
+    i = i + 1
+  }
+  out
+}
+
+// The entries of both; `other`'s value wins for a key both have.
+pub fn merge[K, V](m: Map[K, V], other: Map[K, V]) -> Map[K, V] {
+  var out = m
+  for e in entries(other) { out = mapInsert(out, e.key, e.value) }
+  out
+}
+
+pub fn merge[K, V](m: Map[K, V], other: Map[K, V], f: (K, V, V) -> V) -> Map[K, V] {
+  var out = m
+  for e in entries(other) {
+    let v = case out[e.key] {
+      mine: V -> f(e.key, mine, e.value)
+      _ -> e.value
+    }
+    out = mapInsert(out, e.key, v)
+  }
+  out
+}
+
+pub fn mapValues[K, V, W](m: Map[K, V], f: (V) -> W) -> Map[K, W] {
+  var out: Map[K, W] = [:]
+  for e in entries(m) { out = mapInsert(out, e.key, f(e.value)) }
+  out
+}
+
+pub fn filter[K, V](m: Map[K, V], keep: (K, V) -> Bool) -> Map[K, V] {
+  var out: Map[K, V] = [:]
+  for e in entries(m) {
+    if keep(e.key, e.value) { out = mapInsert(out, e.key, e.value) }
+  }
+  out
+}
+
+// A later entry wins.
+pub fn toMap[K, V](entries: List[(key: K, value: V)]) -> Map[K, V] {
+  var out: Map[K, V] = [:]
+  for e in entries { out = mapInsert(out, e.key, e.value) }
+  out
+}
+
+// Sets
+
+pub fn count[T](s: Set[T]) -> Int { collCount(s) }
+pub fn isEmpty[T](s: Set[T]) -> Bool { collCount(s) == 0 }
+pub fn contains[T](s: Set[T], x: T) -> Bool { setContains(s, x) == 1 }
+pub fn insert[T](s: Set[T], x: T) -> Set[T] { setInsert(s, x) }
+pub fn remove[T](s: Set[T], x: T) -> Set[T] { mapRemove(s, x) }
+pub fn toList[T](s: Set[T]) -> List[T] { mapKeys(s) }
+
+pub fn union[T](a: Set[T], b: Set[T]) -> Set[T] {
+  var out = a
+  for x in mapKeys(b) { out = setInsert(out, x) }
+  out
+}
+
+pub fn intersection[T](a: Set[T], b: Set[T]) -> Set[T] { filter(a) { x -> setContains(b, x) == 1 } }
+pub fn difference[T](a: Set[T], b: Set[T]) -> Set[T] { filter(a) { x -> setContains(b, x) == 0 } }
+
+pub fn isSubset[T](a: Set[T], of: Set[T]) -> Bool {
+  all(mapKeys(a)) { x -> setContains(of, x) == 1 }
+}
+
+pub fn filter[T](s: Set[T], keep: (T) -> Bool) -> Set[T] {
+  var out: Set[T] = []
+  for x in mapKeys(s) {
+    if keep(x) { out = setInsert(out, x) }
+  }
+  out
+}
+
+pub fn map[T, U](s: Set[T], f: (T) -> U) -> List[U] { map(mapKeys(s), f) }
+
+pub fn toSet[T](xs: List[T]) -> Set[T] {
+  var out: Set[T] = []
+  for x in xs { out = setInsert(out, x) }
+  out
+}
+
+// Ranges
+
+pub fn toList[T](r: Range[T]) -> List[T] {
+  var out: List[T] = []
+  for x in r { out = listAppend(out, x) }
+  out
+}
+
+pub fn map[T, U](r: Range[T], f: (T) -> U) -> List[U] {
+  var out: List[U] = []
+  for x in r { out = listAppend(out, f(x)) }
+  out
+}
+
+pub fn filter[T](r: Range[T], keep: (T) -> Bool) -> List[T] { filter(toList(r), keep) }
+pub fn fold[T, A](r: Range[T], initial: A, f: (A, T) -> A) -> A { fold(toList(r), initial, f) }
+pub fn contains[T: Ordered](r: Range[T], x: T) -> Bool { r.first <= x and x <= r.last }
+
+fn listAppend[T](xs: List[T], x: T) -> List[T]
+fn listSet[T](xs: List[T], at: Int, x: T) -> List[T]
+fn listConcat[T](a: List[T], b: List[T]) -> List[T]
+fn listSlice[T](xs: List[T], front: Int, back: Int) -> List[T]
+fn collCount[T](xs: List[T]) -> Int
+fn collCount[K, V](m: Map[K, V]) -> Int
+fn collCount[T](s: Set[T]) -> Int
+fn mapInsert[K, V](m: Map[K, V], key: K, value: V) -> Map[K, V]
+fn mapRemove[K, V](m: Map[K, V], key: K) -> Map[K, V]
+fn mapRemove[T](s: Set[T], key: T) -> Set[T]
+fn mapKeys[K, V](m: Map[K, V]) -> List[K]
+fn mapKeys[T](s: Set[T]) -> List[T]
+fn mapValues[K, V](m: Map[K, V]) -> List[V]
+fn setInsert[T](s: Set[T], x: T) -> Set[T]
+fn setContains[T](s: Set[T], x: T) -> Int

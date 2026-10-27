@@ -1463,6 +1463,16 @@ impl<'a, 'db> Infer<'a, 'db> {
             Expr::Call { callee, args, .. } if args.len() == 1 && self.is_negation(*callee) => {
                 self.could_fit(args[0], param)
             }
+            // A construction of a declared type cannot give a builtin one.
+            Expr::Call { callee, .. }
+                if matches!(
+                    self.body.expr(*callee),
+                    Expr::Name { item: Some(Resolution::Type(item)), .. }
+                        if *item.module(db).path(db) != crag_hir::PRELUDE
+                ) =>
+            {
+                any(&|k| !matches!(k, TyKind::Builtin(..)))
+            }
             Expr::Hole => true,
             Expr::Closure { params, .. } => {
                 any(&|k| matches!(k, TyKind::Fn { params: p, .. } if p.len() == params.len()))
@@ -1518,7 +1528,17 @@ impl<'a, 'db> Infer<'a, 'db> {
             Expr::Literal(Literal::Float(_)) => {
                 param.members(db).contains(&self.builtin(Builtin::Float))
             }
-            Expr::Call { args, .. } => self.default_fits(args[0], param),
+            Expr::Call { args, .. } => args.first().is_none_or(|&a| self.default_fits(a, param)),
+            // A list literal fits a list whose element its items fit.
+            Expr::List(items) => param
+                .members(db)
+                .into_iter()
+                .any(|m| match m.as_builtin(db) {
+                    Some((Builtin::List | Builtin::Set, [element])) => {
+                        items.iter().all(|&item| self.default_fits(item, *element))
+                    }
+                    _ => false,
+                }),
             Expr::Range { start, .. } => param
                 .members(db)
                 .into_iter()
@@ -2111,7 +2131,20 @@ impl<'a, 'db> Infer<'a, 'db> {
                 .collect();
             match most_specific(db, self.program, &ranked) {
                 Ok(best) => viable = best.into_iter().map(|k| viable[k]).collect(),
-                Err(several) => modules = several,
+                Err(several) => {
+                    // The literals' default types may leave one module.
+                    let defaults: Vec<usize> = (0..viable.len())
+                        .filter(|&k| self.defaults_fit(&provisional[viable[k]], positional))
+                        .collect();
+                    let ranked: Vec<Ranked<'db>> =
+                        defaults.iter().map(|&k| ranked[k].clone()).collect();
+                    match most_specific(db, self.program, &ranked) {
+                        Ok(best) if defaults.len() < viable.len() && !best.is_empty() => {
+                            viable = best.into_iter().map(|k| viable[defaults[k]]).collect()
+                        }
+                        _ => modules = several,
+                    }
+                }
             }
         }
         if viable.len() > 1 && modules.is_empty() {

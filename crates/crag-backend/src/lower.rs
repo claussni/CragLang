@@ -1717,6 +1717,89 @@ impl<'a, 'db> Lower<'a, 'db> {
                     .runtime2(RuntimeFn::ValueShow, vec![handle, w0, w1])
                     .to_vec())
             }
+            (Intrinsic::CollCount, [c]) => {
+                let c_ty = self.operand_ty(c, ty);
+                let ptr = word(&self.operand(c, c_ty)?)?;
+                Ok(vec![self.load(ptr, LEN_OFFSET)])
+            }
+            (Intrinsic::ListSet, [list, at, value]) => {
+                let list_ty = self.operand_ty(list, ty);
+                let element = element_of(self.db, list_ty)?;
+                self.describe(list_ty)?;
+                let list = word(&self.operand(list, list_ty)?)?;
+                let at = word(&self.operand(at, int)?)?;
+                let words = self.operand(value, element)?;
+                let [w0, w1] = self.pad(words);
+                Ok(vec![
+                    self.runtime(RuntimeFn::ListSet, vec![list, at, w0, w1]),
+                ])
+            }
+            (Intrinsic::ListConcat, [a, b]) => {
+                let list_ty = self.operand_ty(a, ty);
+                self.describe(list_ty)?;
+                let a = word(&self.operand(a, list_ty)?)?;
+                let b = word(&self.operand(b, list_ty)?)?;
+                Ok(vec![self.runtime(RuntimeFn::ListConcat, vec![a, b])])
+            }
+            (Intrinsic::ListSlice, [list, front, back]) => {
+                let list_ty = self.operand_ty(list, ty);
+                self.describe(list_ty)?;
+                let list = word(&self.operand(list, list_ty)?)?;
+                let front = word(&self.operand(front, int)?)?;
+                let back = word(&self.operand(back, int)?)?;
+                Ok(vec![
+                    self.runtime(RuntimeFn::ListSlice, vec![list, front, back]),
+                ])
+            }
+            (Intrinsic::MapInsert | Intrinsic::SetInsert, [map, key, value @ ..]) => {
+                let map_ty = self.operand_ty(map, ty);
+                let (k, v) = match map_ty.as_builtin(self.db) {
+                    Some((Builtin::Map, &[k, v])) => (k, Some(v)),
+                    Some((Builtin::Set, &[k])) => (k, None),
+                    _ => return Err("collections of this type"),
+                };
+                self.describe(map_ty)?;
+                let map = word(&self.operand(map, map_ty)?)?;
+                let key = self.operand(key, k)?;
+                let [k0, k1] = self.pad(key);
+                let [v0, v1] = match (value, v) {
+                    ([value], Some(v)) => {
+                        let value = self.operand(value, v)?;
+                        self.pad(value)
+                    }
+                    _ => self.pad(Vec::new()),
+                };
+                Ok(vec![
+                    self.runtime(RuntimeFn::MapInsert, vec![map, k0, k1, v0, v1]),
+                ])
+            }
+            (Intrinsic::MapRemove | Intrinsic::SetContains, [map, key]) => {
+                let map_ty = self.operand_ty(map, ty);
+                let k = match map_ty.as_builtin(self.db) {
+                    Some((Builtin::Map | Builtin::Set, args)) => args[0],
+                    _ => return Err("collections of this type"),
+                };
+                self.describe(map_ty)?;
+                let map = word(&self.operand(map, map_ty)?)?;
+                let key = self.operand(key, k)?;
+                let [k0, k1] = self.pad(key);
+                if intrinsic == Intrinsic::MapRemove {
+                    return Ok(vec![self.runtime(RuntimeFn::MapRemove, vec![map, k0, k1])]);
+                }
+                let at = self.runtime(RuntimeFn::MapGet, vec![map, k0, k1]);
+                let zero = self.constant(0);
+                Ok(vec![self.cmp(Cond::Ne, at, zero)])
+            }
+            (Intrinsic::MapKeys | Intrinsic::MapValues, [map]) => {
+                let map_ty = self.operand_ty(map, ty);
+                self.describe(map_ty)?;
+                let map = word(&self.operand(map, map_ty)?)?;
+                let list = self.empty(ty, LIST_SIZE)?;
+                let values = self.constant(i64::from(intrinsic == Intrinsic::MapValues));
+                Ok(vec![
+                    self.runtime(RuntimeFn::MapList, vec![map, list, values]),
+                ])
+            }
             (Intrinsic::ListAppend, [list, value]) => {
                 let list_ty = self.operand_ty(list, ty);
                 let element = element_of(self.db, list_ty)?;

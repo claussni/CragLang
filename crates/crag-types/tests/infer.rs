@@ -1312,13 +1312,11 @@ fn lookup[K](k: K) -> Int where Show[K], Hash[K] { 3 }";
 
 #[test]
 fn candidates_of_several_modules_are_not_ranked() {
-    // The prelude's `size(s: Str)` and this module's both fit.
-    let text = "type Text(s: Str)
-fn size(s: Str) -> Int { 1 }
-fn size(t: Text) -> Int { 2 }
-fn f(t: Text) {
+    // The prelude's `size(s: Str)` fits better than this module's generic
+    // one, so neither gives way.
+    let text = "fn size[T](x: T) -> Int { 1 }
+fn f() {
   let a = size(\"a\")
-  let b = size(t)
 }";
     assert_eq!(
         errors(text),
@@ -1327,6 +1325,20 @@ fn f(t: Text) {
           import one of them selectively"
         ]
     );
+}
+
+#[test]
+fn a_modules_own_candidate_shadows_the_preludes() {
+    // The prelude's `size(s: Str)` gives way to this module's of the same
+    // signature (§19.3).
+    let text = "type Text(s: Str)
+fn size(s: Str) -> Int { 1 }
+fn size(t: Text) -> Int { 2 }
+fn f(t: Text) {
+  let a = size(\"a\")
+  let b = size(t)
+}";
+    assert_eq!(errors(text), Vec::<String>::new());
 }
 
 #[test]

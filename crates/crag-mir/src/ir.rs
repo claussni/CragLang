@@ -408,6 +408,25 @@ pub enum Intrinsic<'db> {
     ListAppend,
     /// Traps with the kind, a `crag_abi::TrapKind` by its number.
     TrapWith(u8),
+    /// The number of elements of a list, map or set.
+    CollCount,
+    /// The list with an element replaced, which consumes the list and the
+    /// value; two lists joined; the elements but the first and last
+    /// counts given.
+    ListSet,
+    ListConcat,
+    ListSlice,
+    /// The map with a key bound, which consumes the map, the key and the
+    /// value; the set with a key, which consumes both; either without a
+    /// key, which consumes the collection.
+    MapInsert,
+    SetInsert,
+    MapRemove,
+    /// Whether a set has the key: 1 or 0.
+    SetContains,
+    /// The keys of a map or set, or the values of a map, as a list.
+    MapKeys,
+    MapValues,
     /// Equality, order or hash of values of the type by its shape
     /// (`crag_abi::value_op`), and a value written as source.
     ValueOp {
@@ -442,6 +461,10 @@ impl Intrinsic<'_> {
             Intrinsic::RefCommit => index == 2,
             Intrinsic::RefSwap | Intrinsic::ScopeStart | Intrinsic::ExtStore => index == 1,
             Intrinsic::ListAppend => index <= 1,
+            Intrinsic::ListSet => index == 0 || index == 2,
+            Intrinsic::MapInsert => index <= 2,
+            Intrinsic::SetInsert => index <= 1,
+            Intrinsic::MapRemove => index == 0,
             Intrinsic::RefNew
             | Intrinsic::ExtNew
             | Intrinsic::LazyNew
