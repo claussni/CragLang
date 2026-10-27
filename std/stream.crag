@@ -49,16 +49,12 @@ pub fn infiniteStream[T](capacity: Int) -> (sink: Sink[T], source: Infinite[T]) 
 }
 
 // Puts a value, waiting while the buffer is full.
-pub fn put[T](s: Sink[T], v: T) -> Sent | Closed {
-  sent(streamPut(s.end, v))
-}
+pub fn put[T](s: Sink[T], v: T) -> Sent | Closed { sent(streamPut(s.end, v)) }
 
 // Puts a value if there is room.
 pub fn tryPut[T](s: Sink[T], v: T) -> Sent | Full | Closed {
   let code = streamTryPut(s.end, v)
-  if code == 1 {
-    return Full
-  }
+  if code == 1 { return Full }
   sent(code)
 }
 
@@ -71,9 +67,7 @@ pub fn putAll[T](s: FiniteSink[T], items: List[T]) -> () {
 
 fn putEach[T](s: Sink[T], items: List[T]) -> () {
   for item in items {
-    if put(s, item) is Closed {
-      return
-    }
+    if put(s, item) is Closed { return }
   }
 }
 
@@ -84,30 +78,20 @@ pub fn next[T](s: Source[T]) -> T | Closed {
     let v: T = streamValue()
     return v
   }
-  if code == 3 {
-    return Abandoned
-  }
+  if code == 3 { return Abandoned }
   Closed
 }
 
 // Ends the stream from either side: the other reads `Closed`.
-pub fn close[T](s: FiniteSink[T]) -> () {
-  streamClose(s.end)
-}
+pub fn close[T](s: FiniteSink[T]) -> () { streamClose(s.end) }
 
-pub fn close[T](s: Source[T]) -> () {
-  streamClose(s.end)
-}
+pub fn close[T](s: Source[T]) -> () { streamClose(s.end) }
 
 // A union keeps which member a value is, so `Abandoned` stays itself in
 // the result.
 fn sent(code: Int) -> Sent | Closed {
-  if code == 0 {
-    return Sent
-  }
-  if code == 3 {
-    return Abandoned
-  }
+  if code == 0 { return Sent }
+  if code == 3 { return Abandoned }
   Closed
 }
 
@@ -117,45 +101,27 @@ fn sent(code: Int) -> Sent | Closed {
 pub opaque type FanOut[T](hub: RuntimeHub)
 pub opaque type Broadcast[T](hub: RuntimeHub)
 
-pub fn fanOut[T](capacity: Int) -> FanOut[T] {
-  FanOut(hub: hubNew[T](capacity, 0))
-}
+pub fn fanOut[T](capacity: Int) -> FanOut[T] { FanOut(hub: hubNew[T](capacity, 0)) }
 
-pub fn broadcast[T](capacity: Int) -> Broadcast[T] {
-  Broadcast(hub: hubNew[T](capacity, 1))
-}
+pub fn broadcast[T](capacity: Int) -> Broadcast[T] { Broadcast(hub: hubNew[T](capacity, 1)) }
 
 // Joins as a producer, until the hub is sealed.
-pub fn sink[T](h: FanOut[T]) -> FiniteSink[T] {
-  FiniteSink(end: hubSink(h.hub))
-}
+pub fn sink[T](h: FanOut[T]) -> FiniteSink[T] { FiniteSink(end: hubSink(h.hub)) }
 
-pub fn sink[T](h: Broadcast[T]) -> FiniteSink[T] {
-  FiniteSink(end: hubSink(h.hub))
-}
+pub fn sink[T](h: Broadcast[T]) -> FiniteSink[T] { FiniteSink(end: hubSink(h.hub)) }
 
 // Joins as a consumer.
-pub fn source[T](h: FanOut[T]) -> Finite[T] {
-  Finite(end: hubSource(h.hub))
-}
+pub fn source[T](h: FanOut[T]) -> Finite[T] { Finite(end: hubSource(h.hub)) }
 
-pub fn source[T](h: Broadcast[T]) -> Finite[T] {
-  Finite(end: hubSource(h.hub))
-}
+pub fn source[T](h: Broadcast[T]) -> Finite[T] { Finite(end: hubSource(h.hub)) }
 
 // Admits no further producers.
-pub fn seal[T](h: FanOut[T]) -> () {
-  hubSeal(h.hub)
-}
+pub fn seal[T](h: FanOut[T]) -> () { hubSeal(h.hub) }
 
-pub fn seal[T](h: Broadcast[T]) -> () {
-  hubSeal(h.hub)
-}
+pub fn seal[T](h: Broadcast[T]) -> () { hubSeal(h.hub) }
 
 // Makes `n` consumers of the fan-out read `Closed`.
-pub fn release[T](h: FanOut[T], n: Int) -> () {
-  hubRelease(h.hub, n)
-}
+pub fn release[T](h: FanOut[T], n: Int) -> () { hubRelease(h.hub, n) }
 
 // The runtime's streams and hubs (Implementation Plan §11.7.5).
 fn streamNew[T](capacity: Int) -> RuntimeStream

@@ -26,9 +26,7 @@
 pub opaque type Group[T](scope: Int)
 
 // Starts a task of the group, waiting while the group's limit is reached.
-pub fn start[T](g: Group[T], task: () -> T) -> () {
-  scopeStart(g.scope, task, 0)
-}
+pub fn start[T](g: Group[T], task: () -> T) -> () { scopeStart(g.scope, task, 0) }
 
 // Runs `body` with a group and waits for it and every task it started:
 // the body's value.
@@ -63,9 +61,7 @@ fn limitOf(limit: Option[Int]) -> Int {
 
 // Waits until every task of the scope is done.
 fn drain(scope: Int) -> () {
-  if scopeNext(scope) >= 0 {
-    drain(scope)
-  }
+  if scopeNext(scope) >= 0 { drain(scope) }
 }
 
 // Waits until every task of the scope is done, keeping the first value
@@ -73,14 +69,10 @@ fn drain(scope: Int) -> () {
 // one.
 fn first[T](scope: Int, found: Option[T]) -> Option[T] {
   let next = scopeNext(scope)
-  if next < 0 {
-    return found
-  }
+  if next < 0 { return found }
   // Index 0 is the body, which gives no value, and only a task that
   // returned has one.
-  if next % 4 != 0 or next / 4 == 0 {
-    return first(scope, found)
-  }
+  if next % 4 != 0 or next / 4 == 0 { return first(scope, found) }
   let value: Option[T] = scopeResult(scope, next / 4)
   if found is Empty and value is T {
     scopeCancel(scope)

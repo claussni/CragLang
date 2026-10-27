@@ -28,9 +28,7 @@ pub fn hours(n: Int) -> Duration { minutes(n * 60) }
 // Suspends the current task for `d`, at once for a span of zero or less.
 // A cancelled task stops here (§10.4).
 pub fn sleep(d: Duration) -> () {
-  if d.ns > 0 {
-    sleepNanos(d.ns)
-  }
+  if d.ns > 0 { sleepNanos(d.ns) }
 }
 
 // The runtime's sleep (Implementation Plan §11.7.2).

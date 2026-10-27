@@ -139,6 +139,7 @@ dependencies = [
  "crag-codegen",
  "crag-db",
  "crag-eval",
+ "crag-fmt",
  "crag-hir",
  "crag-loader",
  "crag-mir",
@@ -163,6 +164,13 @@ dependencies = [
  "crag-mir",
  "crag-runtime",
  "crag-types",
+]
+
+[[package]]
+name = "crag-fmt"
+version = "0.0.0"
+dependencies = [
+ "crag-syntax",
 ]
 
 [[package]]

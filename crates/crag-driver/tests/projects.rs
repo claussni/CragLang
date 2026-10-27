@@ -14,13 +14,14 @@
 // You should have received a copy of the GNU General Public License along with
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
-//! `crag run` and `crag test` on small multi-module projects on disk.
+//! `crag run`, `crag test` and `crag fmt` on small multi-module projects on
+//! disk.
 
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use crag_driver::{EXIT_TRAP, crag_run, crag_test};
+use crag_driver::{EXIT_TRAP, crag_fmt, crag_run, crag_test};
 
 /// A fresh project directory holding the files.
 fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
@@ -503,4 +504,53 @@ fn main() {}
         ],
         "{out}"
     );
+}
+
+#[test]
+fn fmt_formats_every_module_in_place_and_check_lists_the_rest() {
+    let root = project(
+        "fmt",
+        &[
+            ("package.crag", MANIFEST),
+            (
+                "app.crag",
+                "import demo.geo.shape\nimport std.time\nfn main( ) -> Int {\n  area(Point(x:1,y:2))\n}\n",
+            ),
+            ("geo/shape.crag", SHAPE),
+        ],
+    );
+    let mut out = Vec::new();
+    assert_eq!(crag_fmt(&root, &["--check"], &mut out), 1);
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "app.crag: not formatted\ngeo/shape.crag: not formatted\n"
+    );
+    let mut out = Vec::new();
+    assert_eq!(
+        crag_fmt(&root, &[], &mut out),
+        0,
+        "{}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("app.crag")).unwrap(),
+        "import std.time\n\nimport demo.geo.shape\n\nfn main() -> Int { area(Point(x: 1, y: 2)) }\n"
+    );
+    let mut out = Vec::new();
+    assert_eq!(crag_fmt(&root, &["--check", "all"], &mut out), 0);
+    // A file that does not parse is reported and left alone.
+    fs::write(root.join("broken.crag"), "fn f( {\n").unwrap();
+    let mut out = Vec::new();
+    let broken = root.join("broken.crag");
+    assert_eq!(crag_fmt(&root, &[broken.to_str().unwrap()], &mut out), 1);
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .contains("broken.crag: not formatted, since it does not parse")
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("broken.crag")).unwrap(),
+        "fn f( {\n"
+    );
+    let _ = fs::remove_dir_all(&root);
 }

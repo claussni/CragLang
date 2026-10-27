@@ -25,9 +25,10 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-types` | Types and core inference (M1) |
 | `crates/crag-mir` | MIR builder (M1) |
 | `crates/crag-backend` | Code generation from MIR (M1) |
-| `crates/crag-driver` | The `crag` command: `run` and `test`, diagnostics (M1) |
+| `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1) |
 | `crates/crag-session` | Session manager: image processes, their protocol and supervision (M3) |
 | `crates/crag-eval` | Compile-time evaluation of constants, `embed`s among them, in the metered tier (M3) |
+| `crates/crag-fmt` | The formatter: the canonical layout of source files (M5) |
 | `std` | The standard library: the prelude `std.core` (M1), `std.time`, `std.task`, `std.stream` and `std.io` (M4) |
 
 ## Build
@@ -58,6 +59,11 @@ directory with a `package.crag` naming the package and its `main` module:
     cd my-project
     /path/to/target/debug/crag run
     /path/to/target/debug/crag test [filter]
+    /path/to/target/debug/crag fmt [--check] [all | - | file...]
+
+`crag fmt` formats every module of the project in place, or the files
+named; `-` formats standard input to standard output, and `--check` only
+lists the files that are not formatted.
 
 With `CRAG_MIR=1`, `crag` also writes the MIR of what it compiles to
 standard error, with what code generation does not support yet.

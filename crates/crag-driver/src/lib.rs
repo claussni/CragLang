@@ -22,6 +22,7 @@
 
 pub mod diagnostics;
 pub mod exec;
+pub mod fmt;
 pub mod line;
 pub mod project;
 pub mod repl;
@@ -37,6 +38,7 @@ use crag_types::{Ty, TyKind, prelude_item, signature};
 
 pub use diagnostics::{Diagnostic, check, render_diagnostic};
 pub use exec::Image;
+pub use fmt::crag_fmt;
 pub use project::Project;
 pub use repl::{EvalOutput, Repl};
 pub use scratch::Scratch;

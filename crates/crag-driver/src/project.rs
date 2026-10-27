@@ -269,7 +269,7 @@ fn read_resource(root: &Path, dir: &Path, source: &str) -> Result<Arc<[u8]>, Str
 
 /// The `.crag` files below `dir`, leaving out hidden directories and the
 /// build output.
-fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+pub(crate) fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
