@@ -24,7 +24,7 @@ use std::process::ExitCode;
 
 use crag_driver::{crag_fmt, crag_repl, crag_run, crag_test};
 
-const USAGE: &str = "usage: crag\n       crag run\n       crag test [filter]\n       crag fmt [--check] [all | - | file...]\n";
+const USAGE: &str = "usage: crag\n       crag run\n       crag test [filter]\n       crag fmt [--check] [all | - | file...]\n       crag lsp\n";
 
 fn main() -> ExitCode {
     crag_runtime::abort_on_panic();
@@ -36,6 +36,7 @@ fn main() -> ExitCode {
         ["test"] => test(root, None),
         ["test", filter] => test(root, Some(filter)),
         ["fmt", ref rest @ ..] => ExitCode::from(crag_fmt(root, rest, &mut std::io::stderr())),
+        ["lsp"] => ExitCode::from(crag_driver::lsp::serve(std::io::stdin(), std::io::stdout())),
         [crag_session::host::IMAGE_ARG, kind, socket] => image(kind, socket),
         _ => {
             eprint!("{USAGE}");

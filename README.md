@@ -25,7 +25,7 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-types` | Types and core inference (M1) |
 | `crates/crag-mir` | MIR builder (M1) |
 | `crates/crag-backend` | Code generation from MIR (M1) |
-| `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1) |
+| `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1); the language server `crag lsp` (M5) |
 | `crates/crag-session` | Session manager: image processes, their protocol and supervision (M3) |
 | `crates/crag-eval` | Compile-time evaluation of constants, `embed`s among them, in the metered tier (M3) |
 | `crates/crag-fmt` | The formatter: the canonical layout of source files (M5) |
@@ -64,6 +64,11 @@ directory with a `package.crag` naming the package and its `main` module:
 `crag fmt` formats every module of the project in place, or the files
 named; `-` formats standard input to standard output, and `--check` only
 lists the files that are not formatted.
+
+`crag lsp` is the language server, for editors that speak the Language
+Server Protocol: diagnostics as you type, hover, go to definition,
+references, rename, completion, formatting and the outline. An editor
+starts it in the project's directory, or names the project as its root.
 
 With `CRAG_MIR=1`, `crag` also writes the MIR of what it compiles to
 standard error, with what code generation does not support yet.

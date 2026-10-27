@@ -24,6 +24,7 @@ pub mod diagnostics;
 pub mod exec;
 pub mod fmt;
 pub mod line;
+pub mod lsp;
 pub mod project;
 pub mod repl;
 pub mod scratch;

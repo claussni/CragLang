@@ -22,8 +22,8 @@ use std::ops::Range;
 use crag_db::Db;
 use crag_eval::EvalError;
 use crag_hir::{
-    ImportCycle, LowerError, ModuleId, NameError, Origin, PathError, Previous, Redeclaration,
-    check_shadowing, import_graph, lower_body, module_scope, owners, parse,
+    ImportCycle, LowerError, ModuleId, NameError, Origin, PathError, Previous, Program,
+    Redeclaration, check_shadowing, import_graph, lower_body, module_scope, owners, parse,
 };
 use crag_syntax::SyntaxNode;
 
@@ -43,78 +43,9 @@ pub fn check(project: &Project) -> Vec<Diagnostic> {
     let (db, program) = (&project.db as &dyn Db, project.program);
     let mut out = Vec::new();
     for file in &project.files {
-        let module = file.module;
-        let at = |range: Range<u32>, message: String| Diagnostic {
-            module,
-            range,
-            message,
-        };
-        for error in &parse(db, *module.file(db)).errors {
-            out.push(at(error.range.clone(), error.message.clone()));
-        }
-        for error in &module_scope(db, program, module).errors {
-            out.push(at(
-                name_error_range(db, module, error),
-                name_error(db, error),
-            ));
-        }
-        for redeclaration in check_shadowing(db, program, module) {
-            out.push(at(
-                redeclaration.range.clone(),
-                redeclared(db, redeclaration),
-            ));
-        }
-        for owner in owners(db, module) {
-            let lowered = lower_body(db, program, owner);
-            for error in &lowered.errors {
-                let (range, message) = lower_error(db, error);
-                out.push(at(range, message));
-            }
-        }
-        for (owner, error) in crag_types::module_type_errors(db, program, module) {
-            let map = &lower_body(db, program, owner).source_map;
-            let range = error.site.range(map).unwrap_or(0..0);
-            out.push(at(range, error.kind.message(db)));
-        }
-        // Constants are evaluated at compile time (Specification §18.4),
-        // and an evaluation that fails is an error at the value.
-        for (item, error) in crag_eval::eval_errors(db, program, module) {
-            let name = item.name(db).text(db);
-            let range = decl_range(db, module, item_decl(db, item));
-            let (kind, stack) = match error {
-                EvalError::Trap { kind, stack, .. } => (kind, stack),
-                // An `embed` handler's error, at the line and column of
-                // the resource it names (§18.4.1).
-                EvalError::Embed {
-                    message,
-                    line,
-                    column,
-                } => {
-                    let source = crag_hir::embed_source(db, item).unwrap_or_default();
-                    let place = match (line, column) {
-                        (0, _) => String::new(),
-                        (line, 0) => format!(", at {source}:{line}"),
-                        (line, column) => format!(", at {source}:{line}:{column}"),
-                    };
-                    let message = format!("`{name}` cannot be embedded: {message}{place}");
-                    out.push(at(range, message));
-                    continue;
-                }
-                EvalError::NotConstant(_) => continue,
-            };
-            let mut message = format!(
-                "`{name}` cannot be computed at compile time: it {}",
-                trap_verb(kind)
-            );
-            if let Some(inner) = stack.first().filter(|f| *f != name) {
-                message += &format!(" in {inner}");
-            }
-            out.push(at(range, message));
-        }
+        out.extend(module_diagnostics(db, program, file.module));
     }
-    for cycle in &import_graph(db, program).cycles {
-        out.push(import_cycle(db, cycle));
-    }
+    out.extend(import_cycles(db, program));
     let mut seen = Vec::new();
     out.retain(|d| {
         let new = !seen.contains(d);
@@ -125,6 +56,88 @@ pub fn check(project: &Project) -> Vec<Diagnostic> {
     });
     let order = |m: ModuleId| project.files.iter().position(|f| f.module == m);
     out.sort_by_key(|d| (order(d.module), d.range.start));
+    out
+}
+
+/// The errors of the program's import graph: its cycles.
+pub fn import_cycles(db: &dyn Db, program: Program) -> Vec<Diagnostic> {
+    import_graph(db, program)
+        .cycles
+        .iter()
+        .map(|cycle| import_cycle(db, cycle))
+        .collect()
+}
+
+/// The errors in one module, in the order they are found.
+pub fn module_diagnostics(db: &dyn Db, program: Program, module: ModuleId) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    let at = |range: Range<u32>, message: String| Diagnostic {
+        module,
+        range,
+        message,
+    };
+    for error in &parse(db, *module.file(db)).errors {
+        out.push(at(error.range.clone(), error.message.clone()));
+    }
+    for error in &module_scope(db, program, module).errors {
+        out.push(at(
+            name_error_range(db, module, error),
+            name_error(db, error),
+        ));
+    }
+    for redeclaration in check_shadowing(db, program, module) {
+        out.push(at(
+            redeclaration.range.clone(),
+            redeclared(db, redeclaration),
+        ));
+    }
+    for owner in owners(db, module) {
+        let lowered = lower_body(db, program, owner);
+        for error in &lowered.errors {
+            let (range, message) = lower_error(db, error);
+            out.push(at(range, message));
+        }
+    }
+    for (owner, error) in crag_types::module_type_errors(db, program, module) {
+        let map = &lower_body(db, program, owner).source_map;
+        let range = error.site.range(map).unwrap_or(0..0);
+        out.push(at(range, error.kind.message(db)));
+    }
+    // Constants are evaluated at compile time (Specification §18.4),
+    // and an evaluation that fails is an error at the value.
+    for (item, error) in crag_eval::eval_errors(db, program, module) {
+        let name = item.name(db).text(db);
+        let range = decl_range(db, module, item_decl(db, item));
+        let (kind, stack) = match error {
+            EvalError::Trap { kind, stack, .. } => (kind, stack),
+            // An `embed` handler's error, at the line and column of
+            // the resource it names (§18.4.1).
+            EvalError::Embed {
+                message,
+                line,
+                column,
+            } => {
+                let source = crag_hir::embed_source(db, item).unwrap_or_default();
+                let place = match (line, column) {
+                    (0, _) => String::new(),
+                    (line, 0) => format!(", at {source}:{line}"),
+                    (line, column) => format!(", at {source}:{line}:{column}"),
+                };
+                let message = format!("`{name}` cannot be embedded: {message}{place}");
+                out.push(at(range, message));
+                continue;
+            }
+            EvalError::NotConstant(_) => continue,
+        };
+        let mut message = format!(
+            "`{name}` cannot be computed at compile time: it {}",
+            trap_verb(kind)
+        );
+        if let Some(inner) = stack.first().filter(|f| *f != name) {
+            message += &format!(" in {inner}");
+        }
+        out.push(at(range, message));
+    }
     out
 }
 
