@@ -887,7 +887,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                     self.runtime(RuntimeFn::ListSlice, vec![ptr, front, back]),
                 ])
             }
-            Rvalue::Concat(parts) => self.concat(parts),
+            Rvalue::Concat(parts) => self.concat(parts, ty),
             Rvalue::Closure {
                 code,
                 env,
@@ -1111,6 +1111,16 @@ impl<'a, 'db> Lower<'a, 'db> {
             b: value,
         });
         out
+    }
+
+    /// The runtime's handle of a type's shapes, which the code keeps as
+    /// bytes (`RuntimeFn::ValueShapes`).
+    fn value_shapes(&mut self, ty: Ty<'db>) -> Result<VReg, Unsupported> {
+        let (shapes, root) = crate::shape::shapes(self.db, self.program, ty);
+        let mut bytes = root.to_le_bytes().to_vec();
+        bytes.extend(shapes.encode());
+        let words = self.text_literal(&bytes)?;
+        Ok(self.runtime(RuntimeFn::ValueShapes, words))
     }
 
     /// The two words of a string or bytes operand.
@@ -1603,7 +1613,10 @@ impl<'a, 'db> Lower<'a, 'db> {
                 };
                 Ok(vec![self.runtime(RuntimeFn::TextUtf8, vec![w0, w1])])
             }
-            (Intrinsic::TextCast, [text]) => self.concat(std::slice::from_ref(text)),
+            (Intrinsic::TextCast, [text]) => {
+                let bytes = Ty::builtin(self.db, Builtin::Bytes);
+                self.concat(std::slice::from_ref(text), bytes)
+            }
             (Intrinsic::TextMeasure(op), [text]) => {
                 let [w0, w1] = self.text_words(text, ty)?;
                 let op = self.constant(i64::from(op));
@@ -1628,7 +1641,10 @@ impl<'a, 'db> Lower<'a, 'db> {
                     }
                     _ => op,
                 };
-                Ok(vec![self.runtime(RuntimeFn::TextFind, vec![a0, a1, b0, b1, packed])])
+                Ok(vec![self.runtime(
+                    RuntimeFn::TextFind,
+                    vec![a0, a1, b0, b1, packed],
+                )])
             }
             (Intrinsic::TextMap(op), [text]) => {
                 let [w0, w1] = self.text_words(text, ty)?;
@@ -1639,7 +1655,9 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let [w0, w1] = self.text_words(text, ty)?;
                 let from = word(&self.operand(from, int)?)?;
                 let to = word(&self.operand(to, int)?)?;
-                Ok(self.runtime2(RuntimeFn::TextSlice, vec![w0, w1, from, to]).to_vec())
+                Ok(self
+                    .runtime2(RuntimeFn::TextSlice, vec![w0, w1, from, to])
+                    .to_vec())
             }
             (Intrinsic::CodePointOp(op), [c]) => {
                 let c_ty = self.operand_ty(c, ty);
@@ -1671,6 +1689,33 @@ impl<'a, 'db> Lower<'a, 'db> {
             (Intrinsic::Word, [x]) => {
                 let x_ty = self.operand_ty(x, ty);
                 Ok(vec![word(&self.operand(x, x_ty)?)?])
+            }
+            (Intrinsic::ValueOp { op, ty: value_ty }, [a, rest @ ..]) => {
+                let handle = self.value_shapes(value_ty)?;
+                let a = self.operand(a, value_ty)?;
+                let [a0, a1] = self.pad(a);
+                let [b0, b1] = match rest {
+                    [b] => {
+                        let b = self.operand(b, value_ty)?;
+                        self.pad(b)
+                    }
+                    _ => [a0, a1],
+                };
+                let eight = self.constant(8);
+                let shifted = self.bin(LirBin::Shl, handle, eight);
+                let op = self.constant(i64::from(op));
+                let packed = self.bin(LirBin::Or, shifted, op);
+                Ok(vec![
+                    self.runtime(RuntimeFn::ValueOp, vec![packed, a0, a1, b0, b1]),
+                ])
+            }
+            (Intrinsic::ValueShow { ty: value_ty }, [x]) => {
+                let handle = self.value_shapes(value_ty)?;
+                let x = self.operand(x, value_ty)?;
+                let [w0, w1] = self.pad(x);
+                Ok(self
+                    .runtime2(RuntimeFn::ValueShow, vec![handle, w0, w1])
+                    .to_vec())
             }
             (Intrinsic::ListAppend, [list, value]) => {
                 let list_ty = self.operand_ty(list, ty);
@@ -1973,9 +2018,16 @@ impl<'a, 'db> Lower<'a, 'db> {
         Ok(out)
     }
 
-    /// Strings joined, each part borrowed: a string, or a number written
-    /// as text. The result has a reference of its own.
-    fn concat(&mut self, parts: &[Operand<'db>]) -> Result<Vec<VReg>, Unsupported> {
+    /// Strings joined, each part borrowed: a string, bytes joined into
+    /// bytes, a number written as text, or any other value as `show`
+    /// writes it by its structure. The result has a reference of its own.
+    fn concat(
+        &mut self,
+        parts: &[Operand<'db>],
+        result: Ty<'db>,
+    ) -> Result<Vec<VReg>, Unsupported> {
+        // Bytes join as they are into bytes, but are shown in a string.
+        let raw_bytes = matches!(result.as_builtin(self.db), Some((Builtin::Bytes, _)));
         let db = self.db;
         let str_ty = Ty::builtin(db, Builtin::Str);
         // The text so far, and whether this code owns a reference to it.
@@ -1983,17 +2035,27 @@ impl<'a, 'db> Lower<'a, 'db> {
         for part in parts {
             let ty = self.operand_ty(part, str_ty);
             let words = self.operand(part, ty)?;
-            let (words, owned) = match ty.as_builtin(db) {
-                Some((Builtin::Str | Builtin::Bytes, _)) => (words, false),
-                Some((b, _)) => {
-                    let number = crate::shape::number(b).ok_or("interpolations of this type")?;
+            let number = ty.as_builtin(db).and_then(|(b, _)| crate::shape::number(b));
+            let (words, owned) = match (ty.as_builtin(db), number) {
+                (Some((Builtin::Str, _)), _) => (words, false),
+                (Some((Builtin::Bytes, _)), _) if raw_bytes => (words, false),
+                (_, Some(number)) => {
                     let code = self.constant(number.code() as i64);
                     (
                         self.runtime2(RuntimeFn::TextShow, vec![word(&words)?, code]),
                         true,
                     )
                 }
-                None => return Err("interpolations of this type"),
+                // Any other value as `show` writes it by its structure.
+                _ => {
+                    let handle = self.value_shapes(ty)?;
+                    let [w0, w1] = self.pad(words);
+                    (
+                        self.runtime2(RuntimeFn::ValueShow, vec![handle, w0, w1])
+                            .to_vec(),
+                        true,
+                    )
+                }
             };
             text = Some(match text {
                 None => (words, owned),

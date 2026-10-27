@@ -72,10 +72,10 @@ pub mod side_stack;
 mod signals;
 pub mod stack;
 mod stdio;
-mod strings;
 mod stm;
 mod stream;
 pub mod stress;
+mod strings;
 mod sync;
 pub mod teardown;
 #[cfg(test)]
@@ -83,6 +83,7 @@ mod testing;
 pub mod text;
 pub mod timer;
 pub mod unwind;
+mod values;
 
 pub use cancel::CancelHandle;
 pub use codec::{DecodeError, NotSolid, decode_value, encode_value};
@@ -191,6 +192,9 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::TextSlice => strings::rt_text_slice as *const () as usize,
         RuntimeFn::CodePointOp => strings::rt_code_point as *const () as usize,
         RuntimeFn::TextParse => strings::rt_text_parse as *const () as usize,
+        RuntimeFn::ValueShapes => values::rt_value_shapes as *const () as usize,
+        RuntimeFn::ValueOp => values::rt_value_op as *const () as usize,
+        RuntimeFn::ValueShow => values::rt_value_show as *const () as usize,
     }
 }
 

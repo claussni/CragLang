@@ -268,25 +268,39 @@ fn dominates<'db>(db: &'db dyn Db, program: Program, a: &Ranked<'db>, b: &Ranked
 
 /// The candidates no other candidate is more specific than, by index; the
 /// modules of the candidates if they come from several, which are never
-/// ranked.
+/// ranked. A candidate of the prelude that another module's candidate is
+/// more specific than drops out first, so a type's own `equals` or `show`
+/// is chosen over the prelude's generic one (Specification §19.11).
 pub fn most_specific<'db>(
     db: &'db dyn Db,
     program: Program,
     candidates: &[Ranked<'db>],
 ) -> Result<Vec<usize>, Vec<ModuleId>> {
+    let prelude = |c: &Ranked<'db>| c.module.path(db) == crag_hir::PRELUDE;
+    let left: Vec<usize> = (0..candidates.len())
+        .filter(|&i| {
+            !prelude(&candidates[i])
+                || !candidates
+                    .iter()
+                    .any(|other| !prelude(other) && dominates(db, program, other, &candidates[i]))
+        })
+        .collect();
     let mut modules: Vec<ModuleId> = Vec::new();
-    for c in candidates {
-        if !modules.contains(&c.module) {
-            modules.push(c.module);
+    for &i in &left {
+        if !modules.contains(&candidates[i].module) {
+            modules.push(candidates[i].module);
         }
     }
     if modules.len() > 1 {
         return Err(modules);
     }
-    Ok((0..candidates.len())
+    Ok(left
+        .iter()
+        .copied()
         .filter(|&i| {
-            !(0..candidates.len())
-                .any(|j| j != i && dominates(db, program, &candidates[j], &candidates[i]))
+            !left
+                .iter()
+                .any(|&j| j != i && dominates(db, program, &candidates[j], &candidates[i]))
         })
         .collect())
 }

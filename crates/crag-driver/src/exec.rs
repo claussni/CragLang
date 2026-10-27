@@ -259,6 +259,7 @@ pub fn trap_message(kind: TrapKind) -> &'static str {
         TrapKind::Cancelled => "was cancelled",
         TrapKind::Cycle => "a lazy value needed itself",
         TrapKind::Fault => "the environment failed, as writing to a closed output does",
+        TrapKind::Unordered => "compared values that have no order",
     }
 }
 

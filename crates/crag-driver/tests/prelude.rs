@@ -40,7 +40,10 @@ fn check(cases: &[(&str, &str)]) {
             Err(errors) => errors,
         };
         if shown.trim_end() != *expected {
-            wrong.push(format!("{input}\n  expected {expected}\n  shown    {}", shown.trim_end()));
+            wrong.push(format!(
+                "{input}\n  expected {expected}\n  shown    {}",
+                shown.trim_end()
+            ));
         }
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
@@ -85,16 +88,34 @@ fn strings() {
 fn positions_in_strings() {
     check(&[
         (r#"let s = "Grüße, Crag""#, ""),
-        (r#"s.indexOf(",").then { at -> s.substring(before: at) }"#, r#""Grüße""#),
+        (
+            r#"s.indexOf(",").then { at -> s.substring(before: at) }"#,
+            r#""Grüße""#,
+        ),
         (r#"s.indexOf("x")"#, "Empty"),
-        (r#"s.lastIndexOf("r").then { at -> s.substring(from: at) }"#, r#""rag""#),
-        (r#"s.substring(from: s.start(), before: s.end())"#, r#""Grüße, Crag""#),
+        (
+            r#"s.lastIndexOf("r").then { at -> s.substring(from: at) }"#,
+            r#""rag""#,
+        ),
+        (
+            r#"s.substring(from: s.start(), before: s.end())"#,
+            r#""Grüße, Crag""#,
+        ),
         (r#"s.codePointAt(s.start())"#, "'G'"),
-        (r#"s.after(s.start()).then { at -> s.codePointAt(at) }"#, "'r'"),
+        (
+            r#"s.after(s.start()).then { at -> s.codePointAt(at) }"#,
+            "'r'",
+        ),
         (r#"s.before(s.start())"#, "Empty"),
         (r#"s.after(s.end())"#, "Empty"),
-        (r#"s.indexOf("ü").then { at -> s.after(at) }.then { at -> s.substring(from: at) }"#, r#""ße, Crag""#),
-        (r#"s.indexOf("r", from: s.indexOf("C").orElse(s.start())).then { at -> s.substring(from: at) }"#, r#""rag""#),
+        (
+            r#"s.indexOf("ü").then { at -> s.after(at) }.then { at -> s.substring(from: at) }"#,
+            r#""ße, Crag""#,
+        ),
+        (
+            r#"s.indexOf("r", from: s.indexOf("C").orElse(s.start())).then { at -> s.substring(from: at) }"#,
+            r#""rag""#,
+        ),
         (r#"s.start().compare(s.end())"#, "Less"),
     ]);
 }
@@ -121,7 +142,10 @@ fn numbers_from_text() {
         (r#"Int.parse("1_000")"#, r#"ParseError(text: "1_000")"#),
         (r#"Int.parse(" 1")"#, r#"ParseError(text: " 1")"#),
         (r#"Int.parse("")"#, r#"ParseError(text: "")"#),
-        (r#"Int.parse("99999999999999999999")"#, r#"ParseError(text: "99999999999999999999")"#),
+        (
+            r#"Int.parse("99999999999999999999")"#,
+            r#"ParseError(text: "99999999999999999999")"#,
+        ),
         (r#"Float.parse("1.5")"#, "1.5"),
         (r#"Float.parse("-2e3")"#, "-2000.0"),
         (r#"Float.parse("inf")"#, r#"ParseError(text: "inf")"#),
@@ -165,4 +189,61 @@ fn bytes() {
         (r#"b"a" + b"b""#, r#"b"ab""#),
         (r#"b"a".compare(b"b")"#, "Less"),
     ]);
+}
+
+#[test]
+fn values_compare_hash_and_show_by_their_structure() {
+    check(&[
+        ("type P(x: Int, name: Str)", ""),
+        (r#"P(x: 1, name: "a") == P(x: 1, name: "a")"#, "True"),
+        (r#"P(x: 1, name: "a") != P(x: 2, name: "a")"#, "True"),
+        (r#"P(x: 1, name: "b") < P(x: 2, name: "a")"#, "True"),
+        (r#"P(x: 1, name: "a").compare(P(x: 1, name: "b"))"#, "Less"),
+        (r#"P(x: 1, name: "q").show()"#, r#""P(x: 1, name: \"q\")""#),
+        (
+            r#"P(x: 1, name: "a").hash() == P(x: 1, name: "a").hash()"#,
+            "True",
+        ),
+        ("[1, 2] == [1, 2]", "True"),
+        ("[1, 2] < [1, 3]", "True"),
+        ("[1, 2] < [1, 2, 0]", "True"),
+        (r#"["a": 1, "b": 2] == ["b": 2, "a": 1]"#, "True"),
+        (r#"["a": 1].hash() == ["a": 1].hash()"#, "True"),
+        ("(0.0).hash() == (-0.0).hash()", "True"),
+        ("3.compare(4)", "Less"),
+        ("(1.5).show()", r#""1.5""#),
+        (r#""x".show()"#, r#""\"x\"""#),
+        ("type Odd", ""),
+        (
+            "fn half(n: Int) -> Int | Odd { if n % 2 == 0 { n / 2 } else { Odd } }",
+            "",
+        ),
+        ("half(3) == half(5)", "True"),
+        ("half(2) < half(3)", "True"),
+    ]);
+}
+
+#[test]
+fn a_type_of_its_own_wins_over_the_structure() {
+    check(&[
+        ("type Q(n: Int)", ""),
+        ("fn compare(x: Q, y: Q) -> Ordering { Greater }", ""),
+        ("fn show(q: Q) -> Str { \"a Q\" }", ""),
+        ("Q(n: 1).compare(Q(n: 2))", "Greater"),
+        ("Q(n: 1) < Q(n: 2)", "False"),
+        ("Q(n: 3).show()", r#""a Q""#),
+    ]);
+}
+
+#[test]
+fn maps_have_no_order() {
+    let mut r = repl();
+    let out = r
+        .eval_input(r#"["a": 1].compare(["a": 1])"#)
+        .unwrap()
+        .render();
+    assert!(
+        out.contains("trap: compared values that have no order"),
+        "{out}"
+    );
 }

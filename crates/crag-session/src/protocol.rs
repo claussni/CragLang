@@ -27,9 +27,8 @@
 use std::io::{self, Read, Write};
 
 use crag_abi::{
-    CallHandler, CodeObject, CountedField, ElementLayout, FuncId, Number, Reloc, RelocKind,
-    RelocTarget, RuntimeFn, Shape, ShapeField, Shapes, SlotKey, StackCheck, StackMap, TrapKind,
-    TypeDescriptor,
+    CallHandler, CodeObject, CountedField, ElementLayout, FuncId, Reloc, RelocKind, RelocTarget,
+    RuntimeFn, Shapes, SlotKey, StackCheck, StackMap, TrapKind, TypeDescriptor,
 };
 
 /// The version of the protocol, raised whenever a message changes, or
@@ -589,83 +588,7 @@ impl Writer {
     }
 
     fn shapes(&mut self, shapes: &Shapes) {
-        self.seq(&shapes.shapes, |w, s| w.shape(s));
-        self.seq(&shapes.records, |w, &(index, shape)| {
-            w.u32(index);
-            w.u32(shape);
-        });
-        self.seq(&shapes.boxes, |w, &(shape, index, size)| {
-            w.u32(shape);
-            w.u32(index);
-            w.u32(size);
-        });
-    }
-
-    fn shape(&mut self, shape: &Shape) {
-        match shape {
-            Shape::Unit => self.u8(0),
-            Shape::Tag(name) => {
-                self.u8(1);
-                self.text(name);
-            }
-            Shape::Number(n) => {
-                self.u8(2);
-                match n {
-                    Number::Signed => self.u8(0),
-                    Number::Unsigned => self.u8(1),
-                    Number::Float => self.u8(2),
-                    Number::Fixed(digits) => {
-                        self.u8(3);
-                        self.u32(*digits);
-                    }
-                    Number::CodePoint => self.u8(4),
-                }
-            }
-            Shape::Union { members, words } => {
-                self.u8(3);
-                self.seq(members, |w, &(index, shape)| {
-                    w.u32(index);
-                    w.u32(shape);
-                });
-                self.u32(*words);
-            }
-            Shape::Record { name, fields } => {
-                self.u8(4);
-                match name {
-                    None => self.u8(0),
-                    Some(name) => {
-                        self.u8(1);
-                        self.text(name);
-                    }
-                }
-                self.seq(fields, |w, f| {
-                    w.text(&f.name);
-                    w.u32(f.offset);
-                    w.u32(f.shape);
-                });
-            }
-            Shape::List(element) => {
-                self.u8(5);
-                self.u32(*element);
-            }
-            Shape::Set(element) => {
-                self.u8(6);
-                self.u32(*element);
-            }
-            Shape::Map(key, value) => {
-                self.u8(7);
-                self.u32(*key);
-                self.u32(*value);
-            }
-            Shape::Function => self.u8(8),
-            Shape::Opaque { name, words } => {
-                self.u8(9);
-                self.text(name);
-                self.u32(*words);
-            }
-            Shape::Str => self.u8(10),
-            Shape::Bytes => self.u8(11),
-        }
+        self.seq(&shapes.encode(), |w, b| w.u8(*b));
     }
 
     fn descriptor(&mut self, d: &TypeDescriptor) {
@@ -850,72 +773,7 @@ impl Reader<'_> {
     }
 
     fn shapes(&mut self) -> io::Result<Shapes> {
-        let shapes = Shapes {
-            shapes: self.seq(Reader::shape)?,
-            records: self.seq(|r| Ok((r.u32()?, r.u32()?)))?,
-            boxes: self.seq(|r| Ok((r.u32()?, r.u32()?, r.u32()?)))?,
-        };
-        // Every shape a shape names is in the table.
-        let n = shapes.shapes.len() as u32;
-        let inside = |i: &u32| *i < n;
-        let named = shapes.shapes.iter().all(|s| match s {
-            Shape::Union { members, .. } => members.iter().map(|m| &m.1).all(inside),
-            Shape::Record { fields, .. } => fields.iter().map(|f| &f.shape).all(inside),
-            Shape::List(e) | Shape::Set(e) => inside(e),
-            Shape::Map(k, v) => inside(k) && inside(v),
-            _ => true,
-        });
-        if !named
-            || !shapes.records.iter().map(|r| &r.1).all(inside)
-            || !shapes.boxes.iter().map(|b| &b.0).all(inside)
-        {
-            return Err(invalid("a shape that names no shape of its table".into()));
-        }
-        Ok(shapes)
-    }
-
-    fn shape(&mut self) -> io::Result<Shape> {
-        Ok(match self.u8()? {
-            0 => Shape::Unit,
-            1 => Shape::Tag(self.text()?),
-            2 => Shape::Number(match self.u8()? {
-                0 => Number::Signed,
-                1 => Number::Unsigned,
-                2 => Number::Float,
-                3 => Number::Fixed(self.u32()?),
-                4 => Number::CodePoint,
-                tag => return Err(invalid(format!("a number with the tag {tag}"))),
-            }),
-            3 => Shape::Union {
-                members: self.seq(|r| Ok((r.u32()?, r.u32()?)))?,
-                words: self.u32()?,
-            },
-            4 => Shape::Record {
-                name: match self.u8()? {
-                    0 => None,
-                    1 => Some(self.text()?),
-                    tag => return Err(invalid(format!("an option with the tag {tag}"))),
-                },
-                fields: self.seq(|r| {
-                    Ok(ShapeField {
-                        name: r.text()?,
-                        offset: r.u32()?,
-                        shape: r.u32()?,
-                    })
-                })?,
-            },
-            5 => Shape::List(self.u32()?),
-            6 => Shape::Set(self.u32()?),
-            7 => Shape::Map(self.u32()?, self.u32()?),
-            8 => Shape::Function,
-            9 => Shape::Opaque {
-                name: self.text()?,
-                words: self.u32()?,
-            },
-            10 => Shape::Str,
-            11 => Shape::Bytes,
-            tag => return Err(invalid(format!("a shape with the tag {tag}"))),
-        })
+        Shapes::decode(&self.seq(Reader::u8)?).map_err(invalid)
     }
 
     fn descriptor(&mut self) -> io::Result<TypeDescriptor> {
@@ -969,6 +827,7 @@ impl Reader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crag_abi::{Number, Shape, ShapeField};
 
     fn all() -> Vec<Message> {
         vec![

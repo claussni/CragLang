@@ -180,7 +180,10 @@ unsafe extern "C" fn find_entry(
         LAST_INDEX_OF => match part.len() {
             0 => bytes.len() as u64,
             n if n > bytes.len() => NONE,
-            n => bytes.windows(n).rposition(|w| w == part).map_or(NONE, |i| i as u64),
+            n => bytes
+                .windows(n)
+                .rposition(|w| w == part)
+                .map_or(NONE, |i| i as u64),
         },
         STARTS_WITH => u64::from(bytes.starts_with(part)),
         ENDS_WITH => u64::from(bytes.ends_with(part)),
@@ -261,13 +264,18 @@ unsafe extern "C" fn parse_entry(
     let s = as_str(unsafe { bytes_of(&words) });
     match op as u8 {
         PARSE_INT => match base {
-            2..=36 => i64::from_str_radix(s, base as u32)
-                .map_or(Words(0, 0), |n| Words(n as u64, 1)),
+            2..=36 => {
+                i64::from_str_radix(s, base as u32).map_or(Words(0, 0), |n| Words(n as u64, 1))
+            }
             _ => Words(0, 0),
         },
         // Rust also reads "inf" and "NaN", which Crag does not (§3.1.4).
         _ => match s.parse::<f64>() {
-            Ok(f) if f.is_finite() && s.bytes().all(|b| b.is_ascii_digit() || b".+-eE".contains(&b)) => {
+            Ok(f)
+                if f.is_finite()
+                    && s.bytes()
+                        .all(|b| b.is_ascii_digit() || b".+-eE".contains(&b)) =>
+            {
                 Words(f.to_bits(), 1)
             }
             _ => Words(0, 0),

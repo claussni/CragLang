@@ -808,6 +808,38 @@ pub enum RuntimeFn {
     /// A number from text: `PARSE_INT` in the base, or `PARSE_FLOAT` as
     /// its bits; `ok` is 0 when the text is no such number.
     TextParse = 89,
+
+    /// `rt_value_shapes(ctx, w0, w1) -> handle`.
+    ///
+    /// The runtime's handle of a type's shapes: the bytes of
+    /// `Shapes::encode` after the root shape's index, four bytes little
+    /// endian, decoded once for each distinct table.
+    ValueShapes = 90,
+
+    /// `rt_value_op(ctx, packed, a0, a1, b0, b1) -> n`.
+    ///
+    /// Equality, order or the hash of values by their shape (Specification
+    /// §19.11): `packed` holds the operation of [`value_op`] in its low 8
+    /// bits and a handle of `ValueShapes` above them. `EQUALS` gives 1 or
+    /// 0, `COMPARE` 0, 1 or 2 for less, equal and greater, or `UNORDERED`,
+    /// and `HASH` the hash of the first value.
+    ValueOp = 91,
+
+    /// `rt_value_show(ctx, handle, w0, w1) -> (w0, w1)`.
+    ///
+    /// A value written as source, as the REPL shows it.
+    ValueShow = 92,
+}
+
+/// The operations of `RuntimeFn::ValueOp`.
+pub mod value_op {
+    pub const EQUALS: u8 = 0;
+    pub const COMPARE: u8 = 1;
+    pub const HASH: u8 = 2;
+
+    /// What `COMPARE` gives for values without an order: functions, maps
+    /// and sets.
+    pub const UNORDERED: u64 = 3;
 }
 
 /// The operations of the text runtime functions.
@@ -944,7 +976,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 90] = [
+    pub const ALL: [RuntimeFn; 93] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -1035,6 +1067,9 @@ impl RuntimeFn {
         RuntimeFn::TextSlice,
         RuntimeFn::CodePointOp,
         RuntimeFn::TextParse,
+        RuntimeFn::ValueShapes,
+        RuntimeFn::ValueOp,
+        RuntimeFn::ValueShow,
     ];
 
     /// The symbol the loader looks up.
@@ -1130,6 +1165,9 @@ impl RuntimeFn {
             RuntimeFn::TextSlice => "rt_text_slice",
             RuntimeFn::CodePointOp => "rt_code_point",
             RuntimeFn::TextParse => "rt_text_parse",
+            RuntimeFn::ValueShapes => "rt_value_shapes",
+            RuntimeFn::ValueOp => "rt_value_op",
+            RuntimeFn::ValueShow => "rt_value_show",
         }
     }
 
@@ -1168,10 +1206,13 @@ pub enum TrapKind {
     /// The environment failed an operation that has no error value, such
     /// as writing to a closed standard output (Specification §8.3, §15.6).
     Fault = 11,
+    /// Values without an order were compared: functions, maps or sets
+    /// (Specification §19.11).
+    Unordered = 12,
 }
 
 impl TrapKind {
-    pub const ALL: [TrapKind; 12] = [
+    pub const ALL: [TrapKind; 13] = [
         TrapKind::Overflow,
         TrapKind::DivideByZero,
         TrapKind::Index,
@@ -1184,6 +1225,7 @@ impl TrapKind {
         TrapKind::Cancelled,
         TrapKind::Cycle,
         TrapKind::Fault,
+        TrapKind::Unordered,
     ];
 
     /// The kind with this discriminant, if any.
@@ -1605,6 +1647,210 @@ impl Shapes {
             .iter()
             .find(|b| b.0 == shape)
             .map(|&(_, index, size)| (index, size))
+    }
+
+    /// The table as bytes, as the session protocol sends it and generated
+    /// code keeps it for the runtime's value functions.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let u32 = |out: &mut Vec<u8>, n: u32| out.extend_from_slice(&n.to_le_bytes());
+        let text = |out: &mut Vec<u8>, t: &str| {
+            u32(out, t.len() as u32);
+            out.extend_from_slice(t.as_bytes());
+        };
+        u32(&mut out, self.shapes.len() as u32);
+        for shape in &self.shapes {
+            match shape {
+                Shape::Unit => out.push(0),
+                Shape::Tag(name) => {
+                    out.push(1);
+                    text(&mut out, name);
+                }
+                Shape::Number(n) => {
+                    out.push(2);
+                    match n {
+                        Number::Signed => out.push(0),
+                        Number::Unsigned => out.push(1),
+                        Number::Float => out.push(2),
+                        Number::Fixed(digits) => {
+                            out.push(3);
+                            u32(&mut out, *digits);
+                        }
+                        Number::CodePoint => out.push(4),
+                    }
+                }
+                Shape::Union { members, words } => {
+                    out.push(3);
+                    u32(&mut out, members.len() as u32);
+                    for &(index, shape) in members {
+                        u32(&mut out, index);
+                        u32(&mut out, shape);
+                    }
+                    u32(&mut out, *words);
+                }
+                Shape::Record { name, fields } => {
+                    out.push(4);
+                    match name {
+                        None => out.push(0),
+                        Some(name) => {
+                            out.push(1);
+                            text(&mut out, name);
+                        }
+                    }
+                    u32(&mut out, fields.len() as u32);
+                    for f in fields {
+                        text(&mut out, &f.name);
+                        u32(&mut out, f.offset);
+                        u32(&mut out, f.shape);
+                    }
+                }
+                Shape::List(element) => {
+                    out.push(5);
+                    u32(&mut out, *element);
+                }
+                Shape::Set(element) => {
+                    out.push(6);
+                    u32(&mut out, *element);
+                }
+                Shape::Map(key, value) => {
+                    out.push(7);
+                    u32(&mut out, *key);
+                    u32(&mut out, *value);
+                }
+                Shape::Function => out.push(8),
+                Shape::Opaque { name, words } => {
+                    out.push(9);
+                    text(&mut out, name);
+                    u32(&mut out, *words);
+                }
+                Shape::Str => out.push(10),
+                Shape::Bytes => out.push(11),
+            }
+        }
+        u32(&mut out, self.records.len() as u32);
+        for &(index, shape) in &self.records {
+            u32(&mut out, index);
+            u32(&mut out, shape);
+        }
+        u32(&mut out, self.boxes.len() as u32);
+        for &(shape, index, size) in &self.boxes {
+            u32(&mut out, shape);
+            u32(&mut out, index);
+            u32(&mut out, size);
+        }
+        out
+    }
+
+    /// The table `encode` wrote, checked: every shape a shape names is in
+    /// it.
+    pub fn decode(bytes: &[u8]) -> Result<Shapes, String> {
+        let mut r = ShapeReader { bytes, at: 0 };
+        let shapes = Shapes {
+            shapes: r.seq(ShapeReader::shape)?,
+            records: r.seq(|r| Ok((r.u32()?, r.u32()?)))?,
+            boxes: r.seq(|r| Ok((r.u32()?, r.u32()?, r.u32()?)))?,
+        };
+        if r.at != bytes.len() {
+            return Err("bytes after the shapes".into());
+        }
+        let n = shapes.shapes.len() as u32;
+        let inside = |i: &u32| *i < n;
+        let named = shapes.shapes.iter().all(|s| match s {
+            Shape::Union { members, .. } => members.iter().map(|m| &m.1).all(inside),
+            Shape::Record { fields, .. } => fields.iter().map(|f| &f.shape).all(inside),
+            Shape::List(e) | Shape::Set(e) => inside(e),
+            Shape::Map(k, v) => inside(k) && inside(v),
+            _ => true,
+        });
+        if !named
+            || !shapes.records.iter().map(|r| &r.1).all(inside)
+            || !shapes.boxes.iter().map(|b| &b.0).all(inside)
+        {
+            return Err("a shape that names no shape of its table".into());
+        }
+        Ok(shapes)
+    }
+}
+
+/// Reads what `Shapes::encode` wrote.
+struct ShapeReader<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl ShapeReader<'_> {
+    fn u8(&mut self) -> Result<u8, String> {
+        let b = *self.bytes.get(self.at).ok_or("the shapes end early")?;
+        self.at += 1;
+        Ok(b)
+    }
+
+    fn u32(&mut self) -> Result<u32, String> {
+        let end = self.at + 4;
+        let b = self.bytes.get(self.at..end).ok_or("the shapes end early")?;
+        self.at = end;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn seq<T>(
+        &mut self,
+        mut item: impl FnMut(&mut Self) -> Result<T, String>,
+    ) -> Result<Vec<T>, String> {
+        let n = self.u32()? as usize;
+        // Each item takes a byte at least.
+        if n > self.bytes.len() - self.at {
+            return Err("the shapes end early".into());
+        }
+        (0..n).map(|_| item(self)).collect()
+    }
+
+    fn text(&mut self) -> Result<String, String> {
+        let bytes = self.seq(ShapeReader::u8)?;
+        String::from_utf8(bytes).map_err(|_| "text that is not UTF-8".to_string())
+    }
+
+    fn shape(&mut self) -> Result<Shape, String> {
+        Ok(match self.u8()? {
+            0 => Shape::Unit,
+            1 => Shape::Tag(self.text()?),
+            2 => Shape::Number(match self.u8()? {
+                0 => Number::Signed,
+                1 => Number::Unsigned,
+                2 => Number::Float,
+                3 => Number::Fixed(self.u32()?),
+                4 => Number::CodePoint,
+                tag => return Err(format!("a number with the tag {tag}")),
+            }),
+            3 => Shape::Union {
+                members: self.seq(|r| Ok((r.u32()?, r.u32()?)))?,
+                words: self.u32()?,
+            },
+            4 => Shape::Record {
+                name: match self.u8()? {
+                    0 => None,
+                    1 => Some(self.text()?),
+                    tag => return Err(format!("an option with the tag {tag}")),
+                },
+                fields: self.seq(|r| {
+                    Ok(ShapeField {
+                        name: r.text()?,
+                        offset: r.u32()?,
+                        shape: r.u32()?,
+                    })
+                })?,
+            },
+            5 => Shape::List(self.u32()?),
+            6 => Shape::Set(self.u32()?),
+            7 => Shape::Map(self.u32()?, self.u32()?),
+            8 => Shape::Function,
+            9 => Shape::Opaque {
+                name: self.text()?,
+                words: self.u32()?,
+            },
+            10 => Shape::Str,
+            11 => Shape::Bytes,
+            tag => return Err(format!("a shape with the tag {tag}")),
+        })
     }
 }
 

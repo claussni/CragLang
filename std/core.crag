@@ -115,6 +115,48 @@ pub type RangeFrom[T](first: T)
 // What `main` may return for the exit status (§19.7.1).
 pub type ExitCode(code: Int) where code >= 0 and code <= 255
 
+// Forms (Specification §19.11)
+
+pub form Eq[T] {
+  equals(a: T, b: T) -> Bool
+}
+
+pub form Ordered[T] {
+  compare(a: T, b: T) -> Ordering
+}
+
+pub form Hash[T] {
+  hash(x: T) -> Int
+}
+
+pub form Show[T] {
+  show(x: T) -> Str
+}
+
+// Every value is equal, ordered, hashed and shown by its structure, unless
+// its type has a function of its own, which is more specific.
+pub fn equals[T](a: T, b: T) -> Bool { valueEquals(a, b) == 1 }
+
+pub fn compare[T](a: T, b: T) -> Ordering {
+  let n = valueCompare(a, b)
+  if n == 3 { trapUnordered() }
+  ordering(n)
+}
+
+pub fn hash[T](x: T) -> Int { valueHash(x) }
+pub fn show[T](x: T) -> Str { valueShow(x) }
+
+pub fn lessThan[T: Ordered](a: T, b: T) -> Bool { compare(a, b) is Less }
+pub fn lessOrEqual[T: Ordered](a: T, b: T) -> Bool { not (compare(a, b) is Greater) }
+pub fn greaterThan[T: Ordered](a: T, b: T) -> Bool { compare(a, b) is Greater }
+pub fn greaterOrEqual[T: Ordered](a: T, b: T) -> Bool { not (compare(a, b) is Less) }
+
+fn valueEquals[T](a: T, b: T) -> Int
+fn valueCompare[T](a: T, b: T) -> Int
+fn valueHash[T](x: T) -> Int
+fn valueShow[T](x: T) -> Str
+fn trapUnordered() -> ()
+
 // Int
 
 pub fn add(a: Int, b: Int) -> Int
@@ -286,14 +328,6 @@ pub opaque type StrIndex(at: Int)
 
 pub fn start(s: Str) -> StrIndex { StrIndex(at: 0) }
 pub fn end(s: Str) -> StrIndex { StrIndex(at: textByteCount(s)) }
-
-pub fn equals(a: StrIndex, b: StrIndex) -> Bool { a.at == b.at }
-
-pub fn compare(a: StrIndex, b: StrIndex) -> Ordering {
-  if a.at < b.at { return Less }
-  if a.at == b.at { return Equal }
-  Greater
-}
 
 // The offset of a position, which must be a boundary in `s`.
 fn offset(s: Str, i: StrIndex) -> Int {

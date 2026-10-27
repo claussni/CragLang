@@ -144,15 +144,6 @@ fn capture_name<'db>(db: &'db dyn Db, i: usize) -> Name<'db> {
     Name::new(db, format!("{i}"))
 }
 
-/// Whether interpolation writes values of a type as text without a `Show`
-/// form, which does not exist yet: the numbers and code points.
-fn shown_as_text<'db>(db: &'db dyn Db, ty: Ty<'db>) -> bool {
-    ty.as_builtin(db).is_some_and(|(b, _)| {
-        b.int_range().is_some()
-            || matches!(b, Builtin::Float | Builtin::Fixed(_) | Builtin::CodePoint)
-    })
-}
-
 /// Whether values of a type are reference-counted: everything on the heap.
 /// Numbers, tags and `()` are not.
 pub(crate) fn counted<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
@@ -1550,7 +1541,23 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         "textUtf8" => Intrinsic::TextUtf8,
                         "textOfBytes" | "bytesOfText" => Intrinsic::TextCast,
                         "listAppend" => Intrinsic::ListAppend,
+                        "valueEquals" => Intrinsic::ValueOp {
+                            op: crag_abi::value_op::EQUALS,
+                            ty: *instance.args.first()?,
+                        },
+                        "valueCompare" => Intrinsic::ValueOp {
+                            op: crag_abi::value_op::COMPARE,
+                            ty: *instance.args.first()?,
+                        },
+                        "valueHash" => Intrinsic::ValueOp {
+                            op: crag_abi::value_op::HASH,
+                            ty: *instance.args.first()?,
+                        },
+                        "valueShow" => Intrinsic::ValueShow {
+                            ty: *instance.args.first()?,
+                        },
                         "trapIndex" => Intrinsic::TrapWith(crag_abi::TrapKind::Index as u8),
+                        "trapUnordered" => Intrinsic::TrapWith(crag_abi::TrapKind::Unordered as u8),
                         "bytesCount" => Intrinsic::TextMeasure(BYTE_COUNT),
                         "bytesAt" => Intrinsic::TextAt(BYTE_AT),
                         "bytesSlice" => Intrinsic::TextSlice,
@@ -1995,18 +2002,13 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                             ops.push(Operand::Const(Constant::Str(text.clone())))
                         }
                         StrPart::Expr(e) if self.ty(*e) == ty => ops.push(self.expr(*e)),
-                        // A number is written as text; in a local, so its
-                        // type stays known.
-                        StrPart::Expr(e) if shown_as_text(db, self.ty(*e)) => {
+                        // Any other value is written as text, a number as
+                        // such and the rest as `show` writes it by its
+                        // structure; in a local, so its type stays known.
+                        StrPart::Expr(e) => {
                             let part_ty = self.ty(*e);
                             let op = self.expr(*e);
                             ops.push(Operand::Local(self.materialize(op, part_ty)));
-                        }
-                        StrPart::Expr(e) => {
-                            return self.unsupported(
-                                *e,
-                                "interpolations of other types than Str and numbers",
-                            );
                         }
                     }
                 }

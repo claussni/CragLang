@@ -408,6 +408,15 @@ pub enum Intrinsic<'db> {
     ListAppend,
     /// Traps with the kind, a `crag_abi::TrapKind` by its number.
     TrapWith(u8),
+    /// Equality, order or hash of values of the type by its shape
+    /// (`crag_abi::value_op`), and a value written as source.
+    ValueOp {
+        op: u8,
+        ty: Ty<'db>,
+    },
+    ValueShow {
+        ty: Ty<'db>,
+    },
     /// Emits the signal (§11.2), with the qualifier of
     /// `crag_abi::SIGNAL_PLAIN` to `SIGNAL_RETRY`: held in a block, else
     /// delivered at once.
