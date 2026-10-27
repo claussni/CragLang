@@ -1,6 +1,7 @@
 // Loads a web page over plain HTTP and prints the server's response: the
 // status line, the headers and the page.
 
+import std.env
 import std.io
 import std.stream
 
@@ -31,8 +32,15 @@ fn readAll(c: Connection, sofar: Bytes) -> Bytes | IoError {
   }
 }
 
+// `crag run [host [path]]`; without them, http://example.com/.
 fn main() -> ExitCode {
-  case fetch("example.com", 80, "/") {
+  let given: List[Str] = case args() {
+    a: List[Str] -> a
+    _ -> []
+  }
+  let host = given.get(0).orElse("example.com")
+  let path = given.get(1).orElse("/")
+  case fetch(host, 80, path) {
     page: Str -> {
       print(page)
       ExitCode(code: 0)

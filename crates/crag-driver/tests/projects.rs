@@ -554,3 +554,111 @@ fn fmt_formats_every_module_in_place_and_check_lists_the_rest() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+const ASSERTIONS: &str = r#"import std.test
+
+test "passes" {
+  assertEqual(1 + 1, 2)
+  assert("abc".startsWith("a"))
+}
+
+test "fails twice and goes on" {
+  assertEqual(1 + 1, 3)
+  let reached = True
+  assert(False, "this is false")
+  assertEqual([1, 2], [1, 2])
+}
+
+test "fails at its end" {
+  assertClose(1.0, 1.5, within: 0.1)
+}
+
+test "fails in a case" {
+  case Int.parse("x") {
+    n: Int -> assertEqual(n, 1)
+    e: ParseError -> fail("not a number: {e.text}")
+  }
+}
+"#;
+
+#[test]
+fn assertions_are_recorded_and_the_test_goes_on() {
+    let root = project(
+        "assertions",
+        &[
+            (
+                "package.crag",
+                "package demo 0.1\nruntime 0.0\nmain demo.app\n",
+            ),
+            ("app.crag", "fn main() {\n}\n"),
+            ("test/app_test.crag", ASSERTIONS),
+        ],
+    );
+    let mut out = Vec::new();
+    let report = crag_test(&root, None, &mut out);
+    let out = text(out);
+    assert_eq!(report.passed, ["test/app_test.crag \"passes\""], "{out}");
+    let failed: Vec<(&str, &str)> = report
+        .failed
+        .iter()
+        .map(|(n, r)| (n.as_str(), r.as_str()))
+        .collect();
+    assert_eq!(
+        failed,
+        [
+            (
+                "test/app_test.crag \"fails twice and goes on\"",
+                "assertion failed: expected 3, got 2\n --> test/app_test.crag:9:3\n  |\n9 |   assertEqual(1 + 1, 3)\n  |   ^\n\
+                 assertion failed: this is false\n  --> test/app_test.crag:11:3\n   |\n11 |   assert(False, \"this is false\")\n   |   ^\n"
+            ),
+            (
+                "test/app_test.crag \"fails at its end\"",
+                "assertion failed: expected 1.5 within 0.1, got 1.0\n  --> test/app_test.crag:16:3\n   |\n16 |   assertClose(1.0, 1.5, within: 0.1)\n   |   ^\n"
+            ),
+            (
+                "test/app_test.crag \"fails in a case\"",
+                "assertion failed: not a number: x\n  --> test/app_test.crag:22:22\n   |\n22 |     e: ParseError -> fail(\"not a number: {e.text}\")\n   |                      ^\n"
+            ),
+        ],
+        "{out}"
+    );
+}
+
+#[test]
+fn a_program_reads_its_arguments_and_environment() {
+    let root = project(
+        "env",
+        &[
+            (
+                "package.crag",
+                "package demo 0.1\nruntime 0.0\nmain demo.app\n",
+            ),
+            (
+                "app.crag",
+                r#"import std.io
+import std.env
+
+fn main() {
+  printLine("{args()}")
+  printLine("{env("CRAG_TEST_VAR")}")
+  printLine("{env("CRAG_NO_SUCH_VAR")}")
+  printLine("{vars()["CRAG_TEST_VAR"]}")
+  printLine("{os() == Linux or os() == MacOs}")
+}
+"#,
+            ),
+        ],
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_crag"))
+        .args(["run", "a", "b c"])
+        .current_dir(&root)
+        .env("CRAG_TEST_VAR", "hello")
+        .env_remove("CRAG_NO_SUCH_VAR")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", text(output.stderr));
+    assert_eq!(
+        text(output.stdout),
+        "[\"a\", \"b c\"]\n\"hello\"\nEmpty\n\"hello\"\nTrue\n"
+    );
+}

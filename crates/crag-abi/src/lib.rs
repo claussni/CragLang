@@ -855,6 +855,75 @@ pub enum RuntimeFn {
     /// reference of its own. It borrows the map and takes the list's
     /// reference.
     MapList = 96,
+
+    /// `rt_test_record(ctx, w0, w1, position)`.
+    ///
+    /// Records a failed assertion of a test, its message and the byte
+    /// offset of the assertion in its module (Specification §19.12).
+    TestRecord = 97,
+
+    /// `rt_env_args(ctx, list) -> list`.
+    ///
+    /// The list of bytes values with the program's arguments after its
+    /// elements, without the program's name (Specification §19.7). It takes
+    /// the list's reference.
+    EnvArgs = 98,
+
+    /// `rt_env_var(ctx, w0, w1, out) -> found`.
+    ///
+    /// Whether the environment has the variable the string names: 1, with
+    /// its value's bytes written at `out`, or 0.
+    EnvVar = 99,
+
+    /// `rt_env_vars(ctx, map) -> map`.
+    ///
+    /// The map of strings with the environment's variables bound, those
+    /// whose name or value is not UTF-8 left out. It takes the map's
+    /// reference.
+    EnvVars = 100,
+
+    /// `rt_env_platform(ctx, which) -> code`.
+    ///
+    /// The system for `which` 0, by the order of `Os` in `std.env`, or the
+    /// processor for 1, by the order of `Arch`.
+    EnvPlatform = 101,
+
+    /// `rt_bytes_read(ctx, packed, w0, w1, at) -> (value, ok)`.
+    ///
+    /// The number of the kind of [`bytes_kind`] in the low 8 bits of
+    /// `packed`, big-endian when bit 8 is set, at the byte offset: an
+    /// integer sign- or zero-extended, a float as the bits of a `Float`;
+    /// `ok` is 0 when it does not fit before the end, or a float is not
+    /// finite.
+    BytesRead = 102,
+
+    /// `rt_bytes_write(ctx, packed, w0, w1, at, value) -> (w0, w1)`.
+    ///
+    /// New bytes with the number written at the offset, as `BytesRead`
+    /// reads it; the offset is inside the bytes.
+    BytesWrite = 103,
+
+    /// `rt_bytes_of_list(ctx, list) -> (w0, w1)`.
+    ///
+    /// The bytes of a list of `UInt8` values. It borrows the list.
+    BytesOfList = 104,
+}
+
+/// The kinds of numbers of `BytesRead` and `BytesWrite`.
+pub mod bytes_kind {
+    pub const INT8: u8 = 0;
+    pub const INT16: u8 = 1;
+    pub const INT32: u8 = 2;
+    pub const INT64: u8 = 3;
+    pub const UINT8: u8 = 4;
+    pub const UINT16: u8 = 5;
+    pub const UINT32: u8 = 6;
+    pub const UINT64: u8 = 7;
+    pub const FLOAT32: u8 = 8;
+    pub const FLOAT64: u8 = 9;
+
+    /// Set in `packed` for big-endian.
+    pub const BIG: u64 = 1 << 8;
 }
 
 /// The operations of `RuntimeFn::ValueOp`.
@@ -904,6 +973,8 @@ pub mod text_op {
 
     pub const PARSE_INT: u8 = 0;
     pub const PARSE_FLOAT: u8 = 1;
+    /// An unsigned 64-bit integer, as the word's bits.
+    pub const PARSE_UINT: u8 = 2;
 }
 
 /// The error of `IoConnectHost` for a host name without an address, above
@@ -1002,7 +1073,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 97] = [
+    pub const ALL: [RuntimeFn; 105] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -1100,6 +1171,14 @@ impl RuntimeFn {
         RuntimeFn::ListConcat,
         RuntimeFn::MapRemove,
         RuntimeFn::MapList,
+        RuntimeFn::TestRecord,
+        RuntimeFn::EnvArgs,
+        RuntimeFn::EnvVar,
+        RuntimeFn::EnvVars,
+        RuntimeFn::EnvPlatform,
+        RuntimeFn::BytesRead,
+        RuntimeFn::BytesWrite,
+        RuntimeFn::BytesOfList,
     ];
 
     /// The symbol the loader looks up.
@@ -1202,6 +1281,14 @@ impl RuntimeFn {
             RuntimeFn::ListConcat => "rt_list_concat",
             RuntimeFn::MapRemove => "rt_map_remove",
             RuntimeFn::MapList => "rt_map_list",
+            RuntimeFn::TestRecord => "rt_test_record",
+            RuntimeFn::EnvArgs => "rt_env_args",
+            RuntimeFn::EnvVar => "rt_env_var",
+            RuntimeFn::EnvVars => "rt_env_vars",
+            RuntimeFn::EnvPlatform => "rt_env_platform",
+            RuntimeFn::BytesRead => "rt_bytes_read",
+            RuntimeFn::BytesWrite => "rt_bytes_write",
+            RuntimeFn::BytesOfList => "rt_bytes_of_list",
         }
     }
 

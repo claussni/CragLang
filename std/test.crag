@@ -1,0 +1,86 @@
+// This file is part of Crag.
+//
+// Copyright (C) 2026 Ralf Claussnitzer
+//
+// Crag is free software: you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the Free Software
+// Foundation, either version 3 of the License, or (at your option) any later
+// version.
+//
+// Crag is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+// A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// Crag. If not, see <https://www.gnu.org/licenses/>.
+
+// Assertions for tests (Specification §19.12). An assertion never traps:
+// it gives `()` when it holds and an `AssertionFailed` when it does not.
+// In a test block an assertion written as a statement needs no handling;
+// `crag test` records each failure with its position, and the test goes
+// on.
+
+pub type AssertionFailed(..Error, message: Str, actual: Str = "", expected: Str = "")
+
+pub fn assert(condition: Bool, message: Str = "") -> () | AssertionFailed {
+  if condition { return () }
+  AssertionFailed(message: if message == "" { "the condition does not hold" } else { message })
+}
+
+pub fn assertEqual[T](actual: T, expected: T) -> () | AssertionFailed {
+  if actual == expected { return () }
+  let a = actual.show()
+  let e = expected.show()
+  AssertionFailed(message: "expected {e}, got {a}", actual: a, expected: e)
+}
+
+// Strings also tell where they first differ.
+pub fn assertEqual(actual: Str, expected: Str) -> () | AssertionFailed {
+  if actual == expected { return () }
+  let a = actual.show()
+  let e = expected.show()
+  let same = commonPrefix(actual.codePoints(), expected.codePoints())
+  AssertionFailed(
+    message: "expected {e}, got {a}; they differ from code point {same}",
+    actual: a,
+    expected: e,
+  )
+}
+
+fn commonPrefix(a: List[CodePoint], b: List[CodePoint]) -> Int {
+  var n = 0
+  for c in a {
+    if n >= b.count() or b[n] != c { return n }
+    n = n + 1
+  }
+  n
+}
+
+pub fn assertNotEqual[T](actual: T, unexpected: T) -> () | AssertionFailed {
+  if actual != unexpected { return () }
+  AssertionFailed(message: "expected anything but {unexpected.show()}")
+}
+
+pub fn assertClose(actual: Float, expected: Float, within: Float) -> () | AssertionFailed {
+  let gap = if actual > expected { actual - expected } else { expected - actual }
+  if gap <= within { return () }
+  AssertionFailed(
+    message: "expected {expected} within {within}, got {actual}",
+    actual: "{actual}",
+    expected: "{expected}",
+  )
+}
+
+// A failure for a test to return or record.
+pub fn fail(message: Str) -> AssertionFailed { AssertionFailed(message: message) }
+
+// What a test block does with an assertion's result: records a failure
+// with the position of the assertion, for `crag test`.
+pub fn testRecord(result: () | AssertionFailed, at: Int) -> () {
+  case result {
+    f: AssertionFailed -> testFailure(f.message, at)
+    _ -> ()
+  }
+}
+
+fn testFailure(message: Str, at: Int) -> ()

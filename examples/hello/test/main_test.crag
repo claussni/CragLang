@@ -1,5 +1,5 @@
+import std.test
+
 import hello.main
 
-test "greets by name" {
-  if greeting("Ada") != "Hello, Ada!" { ??? }
-}
+test "greets by name" { assertEqual(greeting("Ada"), "Hello, Ada!") }

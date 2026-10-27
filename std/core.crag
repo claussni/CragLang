@@ -459,6 +459,61 @@ pub fn parse(s: Str, base: Int = 10) -> Int | ParseError {
   textParsedInt()
 }
 
+// The sized integers parse as `Int` does, within their range.
+fn parseWithin(s: Str, base: Int, low: Int, high: Int) -> Int | ParseError {
+  case Int.parse(s, base) {
+    n: Int -> if n < low or n > high { ParseError(text: s) } else { n }
+    e: ParseError -> e
+  }
+}
+
+pub fn parse(s: Str, base: Int = 10) -> Int8 | ParseError {
+  case parseWithin(s, base, -128, 127) {
+    n: Int -> wordAs[Int8](n)
+    e: ParseError -> e
+  }
+}
+
+pub fn parse(s: Str, base: Int = 10) -> Int16 | ParseError {
+  case parseWithin(s, base, -32768, 32767) {
+    n: Int -> wordAs[Int16](n)
+    e: ParseError -> e
+  }
+}
+
+pub fn parse(s: Str, base: Int = 10) -> Int32 | ParseError {
+  case parseWithin(s, base, -2147483648, 2147483647) {
+    n: Int -> wordAs[Int32](n)
+    e: ParseError -> e
+  }
+}
+
+pub fn parse(s: Str, base: Int = 10) -> UInt8 | ParseError {
+  case parseWithin(s, base, 0, 255) {
+    n: Int -> wordAs[UInt8](n)
+    e: ParseError -> e
+  }
+}
+
+pub fn parse(s: Str, base: Int = 10) -> UInt16 | ParseError {
+  case parseWithin(s, base, 0, 65535) {
+    n: Int -> wordAs[UInt16](n)
+    e: ParseError -> e
+  }
+}
+
+pub fn parse(s: Str, base: Int = 10) -> UInt32 | ParseError {
+  case parseWithin(s, base, 0, 4294967295) {
+    n: Int -> wordAs[UInt32](n)
+    e: ParseError -> e
+  }
+}
+
+pub fn parse(s: Str, base: Int = 10) -> UInt64 | ParseError {
+  if textParseUInt(s, base) == 0 { return ParseError(text: s) }
+  wordAs[UInt64](textParsedInt())
+}
+
 pub fn parse(s: Str) -> Float | ParseError {
   if textParseFloat(s) == 0 { return ParseError(text: s) }
   textParsedFloat()
@@ -517,6 +572,104 @@ pub fn slice(b: Bytes, range: Range[Int]) -> Bytes {
 // Two lower-case hexadecimal digits a byte.
 pub fn hex(b: Bytes) -> Str { bytesHex(b) }
 
+pub fn bytes(values: List[UInt8]) -> Bytes { bytesOfList(values) }
+
+pub type Big
+pub type Little
+pub type Endian = Big | Little
+
+// A number of a kind of `crag_abi::bytes_kind` at an offset, if it fits
+// before the end.
+fn readWord(b: Bytes, kind: Int, endian: Endian, at: Int) -> Option[Int] {
+  let big = if endian is Big { 256 } else { 0 }
+  if at < 0 or bytesRead(b, kind + big, at) == 0 { return Empty }
+  textParsedInt()
+}
+
+fn writeWord(b: Bytes, kind: Int, width: Int, endian: Endian, at: Int, value: Int) -> Bytes {
+  if at < 0 or at + width > bytesCount(b) { trapIndex() }
+  let big = if endian is Big { 256 } else { 0 }
+  bytesWrite(b, kind + big, at, value)
+}
+
+pub fn readInt8(b: Bytes, at: Int) -> Option[Int8] {
+  readWord(b, 0, Little, at).then { w -> wordAs[Int8](w) }
+}
+
+pub fn readInt16(b: Bytes, at: Int, endian: Endian) -> Option[Int16] {
+  readWord(b, 1, endian, at).then { w -> wordAs[Int16](w) }
+}
+
+pub fn readInt32(b: Bytes, at: Int, endian: Endian) -> Option[Int32] {
+  readWord(b, 2, endian, at).then { w -> wordAs[Int32](w) }
+}
+
+pub fn readInt64(b: Bytes, at: Int, endian: Endian) -> Option[Int] { readWord(b, 3, endian, at) }
+
+pub fn readUInt8(b: Bytes, at: Int) -> Option[UInt8] {
+  readWord(b, 4, Little, at).then { w -> wordAs[UInt8](w) }
+}
+
+pub fn readUInt16(b: Bytes, at: Int, endian: Endian) -> Option[UInt16] {
+  readWord(b, 5, endian, at).then { w -> wordAs[UInt16](w) }
+}
+
+pub fn readUInt32(b: Bytes, at: Int, endian: Endian) -> Option[UInt32] {
+  readWord(b, 6, endian, at).then { w -> wordAs[UInt32](w) }
+}
+
+pub fn readUInt64(b: Bytes, at: Int, endian: Endian) -> Option[UInt64] {
+  readWord(b, 7, endian, at).then { w -> wordAs[UInt64](w) }
+}
+
+pub fn readFloat32(b: Bytes, at: Int, endian: Endian) -> Option[Float] {
+  readWord(b, 8, endian, at).then { w -> wordAs[Float](w) }
+}
+
+pub fn readFloat64(b: Bytes, at: Int, endian: Endian) -> Option[Float] {
+  readWord(b, 9, endian, at).then { w -> wordAs[Float](w) }
+}
+
+pub fn writeInt8(b: Bytes, at: Int, value: Int8) -> Bytes {
+  writeWord(b, 0, 1, Little, at, wordOf(value))
+}
+
+pub fn writeInt16(b: Bytes, at: Int, value: Int16, endian: Endian) -> Bytes {
+  writeWord(b, 1, 2, endian, at, wordOf(value))
+}
+
+pub fn writeInt32(b: Bytes, at: Int, value: Int32, endian: Endian) -> Bytes {
+  writeWord(b, 2, 4, endian, at, wordOf(value))
+}
+
+pub fn writeInt64(b: Bytes, at: Int, value: Int, endian: Endian) -> Bytes {
+  writeWord(b, 3, 8, endian, at, value)
+}
+
+pub fn writeUInt8(b: Bytes, at: Int, value: UInt8) -> Bytes {
+  writeWord(b, 4, 1, Little, at, wordOf(value))
+}
+
+pub fn writeUInt16(b: Bytes, at: Int, value: UInt16, endian: Endian) -> Bytes {
+  writeWord(b, 5, 2, endian, at, wordOf(value))
+}
+
+pub fn writeUInt32(b: Bytes, at: Int, value: UInt32, endian: Endian) -> Bytes {
+  writeWord(b, 6, 4, endian, at, wordOf(value))
+}
+
+pub fn writeUInt64(b: Bytes, at: Int, value: UInt64, endian: Endian) -> Bytes {
+  writeWord(b, 7, 8, endian, at, wordOf(value))
+}
+
+pub fn writeFloat32(b: Bytes, at: Int, value: Float, endian: Endian) -> Bytes {
+  writeWord(b, 8, 4, endian, at, wordOf(value))
+}
+
+pub fn writeFloat64(b: Bytes, at: Int, value: Float, endian: Endian) -> Bytes {
+  writeWord(b, 9, 8, endian, at, wordOf(value))
+}
+
 fn ordering(n: Int) -> Ordering {
   if n == 0 { return Less }
   if n == 1 { return Equal }
@@ -565,6 +718,12 @@ fn cpToUpper(c: CodePoint) -> CodePoint
 fn cpToLower(c: CodePoint) -> CodePoint
 fn u8Of(n: Int) -> UInt8
 fn trapIndex() -> ()
+fn textParseUInt(s: Str, base: Int) -> Int
+fn wordAs[T](n: Int) -> T
+fn wordOf[T](x: T) -> Int
+fn bytesRead(b: Bytes, packed: Int, at: Int) -> Int
+fn bytesWrite(b: Bytes, packed: Int, at: Int, value: Int) -> Bytes
+fn bytesOfList(values: List[UInt8]) -> Bytes
 
 // Lists (Specification §19.11)
 

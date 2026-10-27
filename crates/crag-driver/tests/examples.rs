@@ -102,7 +102,21 @@ fn files_prints_the_poem() {
     let out = crag("files", &["run"], "");
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     let poem = std::fs::read_to_string(example("files").join("poem.txt")).unwrap();
-    assert_eq!(stdout(&out), poem);
+    let numbered: String = poem
+        .lines()
+        .enumerate()
+        .map(|(i, l)| format!("{}  {l}\n", i + 1))
+        .collect();
+    assert_eq!(stdout(&out), numbered);
+    // A file named on the command line.
+    let out = crag("files", &["run", "../hello/package.crag"], "");
+    assert_eq!(
+        stdout(&out),
+        "1  package hello 0.1\n2  runtime 0.0\n3  \n4  main hello.main\n"
+    );
+    let out = crag("files", &["run", "missing.txt"], "");
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "cannot read missing.txt: error 2\n");
     tested_and_formatted("files");
 }
 

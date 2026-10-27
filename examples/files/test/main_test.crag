@@ -1,15 +1,20 @@
 import std.io
+import std.test
+
+import files.main
 
 test "the poem is there" {
   case readText("poem.txt") {
-    text: Str -> if text == "" { ??? }
-    _ -> ???
+    text: Str -> assertEqual(text.lines().count(), 4)
+    _ -> fail("cannot read poem.txt")
   }
 }
 
 test "a missing file is an error" {
   case readText("missing.txt") {
-    e: IoError -> if e.code != 2 { ??? }
-    _ -> ???
+    e: IoError -> assertEqual(e.code, 2)
+    _ -> fail("missing.txt was read")
   }
 }
+
+test "lines are numbered" { assertEqual(numbered("a\nb\n"), ["1  a", "2  b"]) }

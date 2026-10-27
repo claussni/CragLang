@@ -1,5 +1,6 @@
 import std.io
 import std.task
+import std.test
 
 import web.main
 
@@ -21,18 +22,15 @@ test "fetches a page from a local server" {
         g.start { -> answer(l) }
         fetch("localhost", l.port(), "/")
       }
-      case response {
-        page: Str -> if page != "HTTP/1.0 200 OK\r\n\r\nhello" { ??? }
-        _ -> ???
-      }
+      assertEqual(response, "HTTP/1.0 200 OK\r\n\r\nhello")
     }
-    _ -> ???
+    _ -> fail("cannot listen")
   }
 }
 
 test "a host without an address is an error" {
   case fetch("no-such-host.invalid", 80, "/") {
-    e: UnknownHost -> if e.name != "no-such-host.invalid" { ??? }
-    _ -> ???
+    e: UnknownHost -> assertEqual(e.name, "no-such-host.invalid")
+    _ -> fail("the host was found")
   }
 }

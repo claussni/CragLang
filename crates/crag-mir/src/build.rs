@@ -1498,6 +1498,12 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 ("std.io", "ioRead") => Intrinsic::IoRead,
                 ("std.io", "ioReadBytes") => Intrinsic::IoReadBytes,
                 ("std.io", "ioWrite") => Intrinsic::IoWrite,
+                ("std.test", "testFailure") => Intrinsic::TestFailure,
+                ("std.env", "envArgs") => Intrinsic::EnvArgs,
+                ("std.env", "envVar") => Intrinsic::EnvVar,
+                ("std.env", "envVarBytes") => Intrinsic::IoReadBytes,
+                ("std.env", "envVars") => Intrinsic::EnvVars,
+                ("std.env", "envPlatform") => Intrinsic::EnvPlatform,
                 ("std.io", "ioPrint") => Intrinsic::IoPrint,
                 ("std.io", "ioFault") => Intrinsic::IoFault,
                 ("std.io", "ioReadFile") => Intrinsic::IoReadFile,
@@ -1537,7 +1543,11 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         "textParseInt" => Intrinsic::TextParse(PARSE_INT),
                         "textParseFloat" => Intrinsic::TextParse(PARSE_FLOAT),
                         "textParsedInt" | "textParsedFloat" => Intrinsic::TextParsed,
-                        "cpOf" | "cpValue" => Intrinsic::Word,
+                        "cpOf" | "cpValue" | "wordAs" | "wordOf" => Intrinsic::Word,
+                        "textParseUInt" => Intrinsic::TextParse(PARSE_UINT),
+                        "bytesRead" => Intrinsic::BytesRead,
+                        "bytesWrite" => Intrinsic::BytesWrite,
+                        "bytesOfList" => Intrinsic::BytesOfList,
                         "textUtf8" => Intrinsic::TextUtf8,
                         "textOfBytes" | "bytesOfText" => Intrinsic::TextCast,
                         "listAppend" => Intrinsic::ListAppend,
@@ -1878,9 +1888,63 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
 
     // Expressions.
 
+    /// Whether a value of the type is an assertion's result: `()` or an
+    /// `AssertionFailed` of `std.test`, and the latter possible.
+    fn is_assertion(&self, ty: Ty<'db>) -> bool {
+        let db = self.db;
+        let failed = |m: Ty<'db>| {
+            matches!(m.kind(db), TyKind::Named(item, _)
+                if item.module(db).path(db) == "std.test" && item.name(db).text(db) == "AssertionFailed")
+        };
+        let members = ty.members(db);
+        members.iter().any(|&m| failed(m))
+            && members.iter().all(|&m| failed(m) || m == Ty::unit(db))
+    }
+
+    /// Hands an assertion's result in a test to `std.test`'s `testRecord`,
+    /// with where the assertion is.
+    fn record_assertion(&mut self, op: Operand<'db>, ty: Ty<'db>, expr: ExprId) {
+        let db = self.db;
+        let index = crag_hir::module_index(db, self.program);
+        let Some(item) = index.modules.get("std.test").and_then(|m| {
+            crag_hir::item_tree(db, *m)
+                .items
+                .iter()
+                .map(|i| i.id)
+                .find(|id| {
+                    *id.kind(db) == ItemKind::Function && id.name(db).text(db) == "testRecord"
+                })
+        }) else {
+            return;
+        };
+        let param = signature(db, self.program, item).params[0].ty;
+        let op = self.coerce(op, ty, param);
+        let int = self.int();
+        let site = self.assign(int, Rvalue::Intrinsic(Intrinsic::Site(expr), Vec::new()));
+        let key = InstanceKey::body(db, Owner::Item(item));
+        let unit = Ty::unit(db);
+        self.call_code(key, vec![op, site], unit, expr);
+    }
+
     /// Evaluates an expression into `dest`.
     fn eval(&mut self, expr: ExprId, dest: Dest) {
         let body = self.body;
+        // An assertion in a test is recorded, and the test goes on; a
+        // block, `if` or `case` passes it to the expression that gives it.
+        if self.test
+            && matches!(dest, Dest::Discard | Dest::Return)
+            && !matches!(
+                body.expr(expr),
+                Expr::Block { .. } | Expr::If { .. } | Expr::Case { .. }
+            )
+            && self.is_assertion(self.ty(expr))
+        {
+            let ty = self.ty(expr);
+            let op = self.expr(expr);
+            self.record_assertion(op, ty, expr);
+            let unit = Ty::unit(self.db);
+            return self.finish_dest(self.unit(), unit, dest);
+        }
         match body.expr(expr) {
             Expr::Block { stmts, tail } => {
                 // A block with signal handlers forgets them when it ends.

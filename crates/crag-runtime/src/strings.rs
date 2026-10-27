@@ -16,8 +16,8 @@
 
 //! The text functions of the prelude (Specification §19.10) that need the
 //! runtime: counting, stepping by code points, searching, case mapping,
-//! the Unicode classes and parsing numbers. The rest of them are written
-//! in Crag over these.
+//! the Unicode classes, parsing numbers, and reading and writing numbers
+//! in bytes. The rest of them are written in Crag over these.
 //!
 //! A string's bytes are valid UTF-8, which the compiler and `text`
 //! guarantee; the same functions serve bytes values, where only the byte
@@ -269,6 +269,12 @@ unsafe extern "C" fn parse_entry(
             }
             _ => Words(0, 0),
         },
+        PARSE_UINT => match base {
+            2..=36 if !s.starts_with('+') => {
+                u64::from_str_radix(s, base as u32).map_or(Words(0, 0), |n| Words(n, 1))
+            }
+            _ => Words(0, 0),
+        },
         // Rust also reads "inf" and "NaN", which Crag does not (§3.1.4).
         _ => match s.parse::<f64>() {
             Ok(f)
@@ -281,4 +287,127 @@ unsafe extern "C" fn parse_entry(
             _ => Words(0, 0),
         },
     }
+}
+
+system_stack_fn! {
+    /// `rt_bytes_read(ctx, packed, w0, w1, at)`: see
+    /// `crag_abi::RuntimeFn::BytesRead`.
+    fn rt_bytes_read(ctx: *const TaskContext, packed: u64, w0: u64, w1: u64, at: u64) -> Words
+        => read_entry
+}
+
+system_stack_fn! {
+    /// `rt_bytes_write(ctx, packed, w0, w1, at, value)`: see
+    /// `crag_abi::RuntimeFn::BytesWrite`.
+    fn rt_bytes_write(ctx: *const TaskContext, packed: u64, w0: u64, w1: u64, at: u64, value: u64)
+        -> TextWords => write_entry
+}
+
+system_stack_fn! {
+    /// `rt_bytes_of_list(ctx, list)`: see `crag_abi::RuntimeFn::BytesOfList`.
+    fn rt_bytes_of_list(ctx: *const TaskContext, list: *mut u8) -> TextWords => of_list_entry
+}
+
+/// The width in bytes of a kind of `crag_abi::bytes_kind`.
+fn width(kind: u8) -> usize {
+    use crag_abi::bytes_kind::*;
+    match kind {
+        INT8 | UINT8 => 1,
+        INT16 | UINT16 => 2,
+        INT32 | UINT32 | FLOAT32 => 4,
+        _ => 8,
+    }
+}
+
+/// See `measure_entry`.
+unsafe extern "C" fn read_entry(
+    _ctx: *const TaskContext,
+    packed: u64,
+    w0: u64,
+    w1: u64,
+    at: u64,
+) -> Words {
+    use crag_abi::bytes_kind::*;
+    let words = [w0, w1];
+    // SAFETY: as the caller promises.
+    let bytes = unsafe { bytes_of(&words) };
+    let kind = packed as u8;
+    let n = width(kind);
+    let Some(field) = usize::try_from(at as i64)
+        .ok()
+        .and_then(|at| bytes.get(at..at.checked_add(n)?))
+    else {
+        return Words(0, 0);
+    };
+    let mut raw = [0u8; 8];
+    match packed & BIG {
+        0 => raw[..n].copy_from_slice(field),
+        _ => {
+            for (i, &b) in field.iter().rev().enumerate() {
+                raw[i] = b;
+            }
+        }
+    }
+    let unsigned = u64::from_le_bytes(raw);
+    let value = match kind {
+        INT8 => unsigned as u8 as i8 as i64 as u64,
+        INT16 => unsigned as u16 as i16 as i64 as u64,
+        INT32 => unsigned as u32 as i32 as i64 as u64,
+        FLOAT32 => {
+            let f = f64::from(f32::from_bits(unsigned as u32));
+            if !f.is_finite() {
+                return Words(0, 0);
+            }
+            f.to_bits()
+        }
+        FLOAT64 if !f64::from_bits(unsigned).is_finite() => return Words(0, 0),
+        _ => unsigned,
+    };
+    Words(value, 1)
+}
+
+/// See `measure_entry`.
+unsafe extern "C" fn write_entry(
+    ctx: *const TaskContext,
+    packed: u64,
+    w0: u64,
+    w1: u64,
+    at: u64,
+    value: u64,
+) -> TextWords {
+    use crag_abi::bytes_kind::*;
+    let words = [w0, w1];
+    // SAFETY: as the caller promises.
+    let mut bytes = unsafe { bytes_of(&words) }.to_vec();
+    let kind = packed as u8;
+    let n = width(kind);
+    let raw = match kind {
+        FLOAT32 => u64::from((f64::from_bits(value) as f32).to_bits()),
+        _ => value,
+    }
+    .to_le_bytes();
+    let at = at as usize;
+    if let Some(field) = bytes.get_mut(at..at + n) {
+        match packed & BIG {
+            0 => field.copy_from_slice(&raw[..n]),
+            _ => {
+                for (i, b) in field.iter_mut().rev().enumerate() {
+                    *b = raw[i];
+                }
+            }
+        }
+    }
+    text(ctx, &bytes)
+}
+
+/// See `measure_entry`.
+unsafe extern "C" fn of_list_entry(ctx: *const TaskContext, list: *mut u8) -> TextWords {
+    // SAFETY: as the caller promises: a live list of `UInt8` words.
+    let bytes: Vec<u8> = unsafe {
+        let (_, types) = worker_of(ctx);
+        (0..crate::list::length(list))
+            .map(|i| *crate::list::get(types, list, i) as u8)
+            .collect()
+    };
+    text(ctx, &bytes)
 }

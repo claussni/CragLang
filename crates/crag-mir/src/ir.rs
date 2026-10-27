@@ -408,6 +408,24 @@ pub enum Intrinsic<'db> {
     ListAppend,
     /// Traps with the kind, a `crag_abi::TrapKind` by its number.
     TrapWith(u8),
+    /// Records a failed assertion of a test: its message and the byte
+    /// offset of the assertion (§19.12).
+    TestFailure,
+    /// The byte offset of the expression in its module, an `Int`.
+    Site(ExprId),
+    /// A number read from bytes: whether it fits, with its word for
+    /// `TextParsed`; new bytes with a number written; the bytes of a list
+    /// of `UInt8`s.
+    BytesRead,
+    BytesWrite,
+    BytesOfList,
+    /// The program's arguments as a list of bytes; whether an environment
+    /// variable is set, with its bytes for `IoReadBytes`; the variables as
+    /// a map; the system or the processor by its code.
+    EnvArgs,
+    EnvVar,
+    EnvVars,
+    EnvPlatform,
     /// The number of elements of a list, map or set.
     CollCount,
     /// The list with an element replaced, which consumes the list and the

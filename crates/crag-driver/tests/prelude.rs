@@ -391,3 +391,52 @@ fn positions_outside_a_list_trap() {
         assert!(out.contains("trap: index out of range"), "{input}: {out}");
     }
 }
+
+#[test]
+fn numbers_in_bytes() {
+    check(&[
+        ("let b = bytes([1, 2, 3, 255])", ""),
+        ("b", r#"b"\x01\x02\x03\xff""#),
+        ("b.readUInt8(3)", "255"),
+        ("b.readInt8(3)", "-1"),
+        ("b.readUInt16(0, Little)", "513"),
+        ("b.readUInt16(0, Big)", "258"),
+        ("b.readInt32(0, Big)", "16909311"),
+        ("b.readUInt32(1, Big)", "Empty"),
+        ("b.readUInt8(-1)", "Empty"),
+        ("b.writeUInt16(1, 4660, Big)", r#"b"\x01\x124\xff""#),
+        ("let z = bytes([0, 0, 0, 0, 0, 0, 0, 0])", ""),
+        (
+            "z.writeFloat64(0, 1.5, Little).readFloat64(0, Little)",
+            "1.5",
+        ),
+        ("z.writeFloat32(0, 0.25, Big).readFloat32(0, Big)", "0.25"),
+        ("z.writeInt64(0, -2, Little).readInt64(0, Little)", "-2"),
+        (
+            "z.writeUInt64(0, 18446744073709551615, Big).readUInt64(0, Big)",
+            "18446744073709551615",
+        ),
+        (r#"Int8.parse("-128")"#, "-128"),
+        (r#"Int8.parse("128")"#, r#"ParseError(text: "128")"#),
+        (r#"UInt8.parse("ff", base: 16)"#, "255"),
+        (r#"UInt32.parse("-1")"#, r#"ParseError(text: "-1")"#),
+        (
+            r#"UInt64.parse("18446744073709551615")"#,
+            "18446744073709551615",
+        ),
+        (
+            r#"UInt64.parse("18446744073709551616")"#,
+            r#"ParseError(text: "18446744073709551616")"#,
+        ),
+    ]);
+}
+
+#[test]
+fn a_write_past_the_end_traps() {
+    let mut r = repl();
+    let out = r
+        .eval_input("bytes([1]).writeUInt16(0, 1, Big)")
+        .unwrap()
+        .render();
+    assert!(out.contains("trap: index out of range"), "{out}");
+}

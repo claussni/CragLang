@@ -36,7 +36,7 @@ const USAGE: &str = "usage: crag
        crag package
        crag publish <registry>
        crag registry new <name> <folder> | add <name> <folder> | list | remove <name>
-       crag run
+       crag run [argument...]
        crag test [filter]
        crag fmt [--check] [all | - | file...]
        crag lsp
@@ -61,7 +61,11 @@ fn main() -> ExitCode {
             ExitCode::from(crag_driver::crag_ui(root))
         }
         [] => ExitCode::from(crag_repl(root)),
-        ["run"] => ExitCode::from(crag_run(root, &mut std::io::stderr())),
+        ["run", ref rest @ ..] => {
+            // The program sees what follows `run` as its arguments (§19.7).
+            crag_runtime::set_program_args(rest.iter().map(|a| a.as_bytes().to_vec()).collect());
+            ExitCode::from(crag_run(root, &mut std::io::stderr()))
+        }
         ["test"] => test(root, None),
         ["test", filter] => test(root, Some(filter)),
         ["fmt", ref rest @ ..] => ExitCode::from(crag_fmt(root, rest, &mut std::io::stderr())),

@@ -6,7 +6,7 @@ with a `package.crag`, its `main` module and tests under `test/`.
 | Example | What it shows |
 | --- | --- |
 | `hello` | Printing a line, a function with string interpolation |
-| `files` | Reading a text file and handling each way it can fail |
+| `files` | Reading a text file and printing its lines numbered, handling each way it can fail |
 | `web` | Loading a web page over HTTP: a connection, a request, reading the response until the server closes it |
 
 Build the `crag` command first (see the main README), then go into an
@@ -18,9 +18,11 @@ example's directory.
     crag run
     crag test
 
-`files` prints `poem.txt` from the directory it runs in. `web` loads
-`http://example.com/`; its test serves a page from a local server
-instead, so it needs no network.
+`crag run notes.txt` in `files` prints that file, and without an argument
+`poem.txt`. `crag run example.org /` in `web` loads that page, and without
+arguments `http://example.com/`; its test serves a page from a local
+server instead, so it needs no network. The tests use the assertions of
+`std.test`.
 
 ## In the editor and the REPL
 
@@ -47,5 +49,3 @@ shows in the REPL. In `web`, try another page:
 - Only plain HTTP: TLS is not built yet, so a site that only answers on
   HTTPS sends a redirect.
 - File functions take the path as a `Str` until `std.path` exists.
-- Programs cannot read their arguments yet, so the file and the page
-  are fixed in the code.

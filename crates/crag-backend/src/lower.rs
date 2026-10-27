@@ -1717,6 +1717,69 @@ impl<'a, 'db> Lower<'a, 'db> {
                     .runtime2(RuntimeFn::ValueShow, vec![handle, w0, w1])
                     .to_vec())
             }
+            (Intrinsic::TestFailure, [message, at]) => {
+                let [w0, w1] = self.text_words(message, ty)?;
+                let at = word(&self.operand(at, int)?)?;
+                self.push(Inst::CallRuntime {
+                    func: RuntimeFn::TestRecord,
+                    args: vec![w0, w1, at],
+                    dsts: Vec::new(),
+                });
+                Ok(Vec::new())
+            }
+            (Intrinsic::Site(expr), []) => {
+                let at = self
+                    .positions
+                    .get(expr.index())
+                    .map_or(NO_POSITION as i64, |r| i64::from(r.start));
+                Ok(vec![self.constant(at)])
+            }
+            (Intrinsic::BytesRead, [bytes, packed, at]) => {
+                let [w0, w1] = self.text_words(bytes, ty)?;
+                let packed = word(&self.operand(packed, int)?)?;
+                let at = word(&self.operand(at, int)?)?;
+                let out = self.runtime2(RuntimeFn::BytesRead, vec![packed, w0, w1, at]);
+                // The value waits in the scratch words for `TextParsed`.
+                let scratch = self.scratch();
+                self.push(Inst::Store {
+                    src: out[0],
+                    addr: scratch,
+                    offset: 0,
+                });
+                Ok(vec![out[1]])
+            }
+            (Intrinsic::BytesWrite, [bytes, packed, at, value]) => {
+                let [w0, w1] = self.text_words(bytes, ty)?;
+                let packed = word(&self.operand(packed, int)?)?;
+                let at = word(&self.operand(at, int)?)?;
+                let value = word(&self.operand(value, int)?)?;
+                let args = vec![packed, w0, w1, at, value];
+                Ok(self.runtime2(RuntimeFn::BytesWrite, args).to_vec())
+            }
+            (Intrinsic::BytesOfList, [list]) => {
+                let list_ty = self.operand_ty(list, ty);
+                self.describe(list_ty)?;
+                let list = word(&self.operand(list, list_ty)?)?;
+                Ok(self.runtime2(RuntimeFn::BytesOfList, vec![list]).to_vec())
+            }
+            (Intrinsic::EnvArgs, []) => {
+                let list = self.empty(ty, LIST_SIZE)?;
+                Ok(vec![self.runtime(RuntimeFn::EnvArgs, vec![list])])
+            }
+            (Intrinsic::EnvVar, [name]) => {
+                let [w0, w1] = self.text_words(name, ty)?;
+                // The value waits in the scratch words for `IoReadBytes`.
+                let scratch = self.scratch();
+                Ok(vec![self.runtime(RuntimeFn::EnvVar, vec![w0, w1, scratch])])
+            }
+            (Intrinsic::EnvVars, []) => {
+                let map = self.empty(ty, MAP_SIZE)?;
+                Ok(vec![self.runtime(RuntimeFn::EnvVars, vec![map])])
+            }
+            (Intrinsic::EnvPlatform, [which]) => {
+                let which = word(&self.operand(which, int)?)?;
+                Ok(vec![self.runtime(RuntimeFn::EnvPlatform, vec![which])])
+            }
             (Intrinsic::CollCount, [c]) => {
                 let c_ty = self.operand_ty(c, ty);
                 let ptr = word(&self.operand(c, c_ty)?)?;

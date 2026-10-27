@@ -259,7 +259,8 @@ pub fn crag_repl(root: &Path) -> u8 {
 pub struct TestReport {
     /// The tests that passed, by module and label.
     pub passed: Vec<String>,
-    /// The tests that failed, each with its trap report.
+    /// The tests that failed, each with its failed assertions and its trap
+    /// report.
     pub failed: Vec<(String, String)>,
     /// Whether the project had errors, so no test ran.
     pub errors: bool,
@@ -273,8 +274,8 @@ impl TestReport {
 
 /// `crag test [filter]`: runs every test of the project at `root` whose
 /// label contains `filter`, each in a fiber of its own, and prints how each
-/// went. A test passes when its block completes and fails when it traps
-/// (Specification §5.7).
+/// went. A test passes when its block completes and fails when one of its
+/// assertions failed or it traps (Specification §5.7, §19.12).
 pub fn crag_test(root: &Path, filter: Option<&str>, out: &mut dyn Write) -> TestReport {
     let mut report = TestReport::default();
     let Some(project) = checked(root, out) else {
@@ -289,11 +290,11 @@ pub fn crag_test(root: &Path, filter: Option<&str>, out: &mut dyn Write) -> Test
             let label = test.label(db);
             if filter.is_none_or(|f| label.contains(f)) {
                 let key = InstanceKey::body(db, owner);
-                tests.push((format!("{} {label}", file.shown), key));
+                tests.push((format!("{} {label}", file.shown), key, file.module));
             }
         }
     }
-    let keys: Vec<InstanceKey> = tests.iter().map(|(_, key)| *key).collect();
+    let keys: Vec<InstanceKey> = tests.iter().map(|(_, key, _)| *key).collect();
     let mut image = match Image::build(&project, &keys) {
         Ok(image) => image,
         Err(e) => {
@@ -302,15 +303,30 @@ pub fn crag_test(root: &Path, filter: Option<&str>, out: &mut dyn Write) -> Test
             return report;
         }
     };
-    for (name, key) in tests {
-        match image.run(func_id(key)) {
-            Ok(_) => {
+    for (name, key, module) in tests {
+        let outcome = image.run(func_id(key));
+        // The assertions that failed, where they are (§19.12).
+        let failures: String = crag_runtime::take_test_failures()
+            .into_iter()
+            .map(|(message, position)| {
+                let (file, source, at) = exec::Sources::locate(&project, module, position as u32);
+                diagnostics::render_at("assertion failed", &message, &file, source, at..at)
+            })
+            .collect();
+        match outcome {
+            Ok(_) if failures.is_empty() => {
                 let _ = writeln!(out, "test {name} ... ok");
                 report.passed.push(name);
             }
+            Ok(_) => {
+                let _ = writeln!(out, "test {name} ... FAILED");
+                report.failed.push((name, failures));
+            }
             Err(trap) => {
                 let _ = writeln!(out, "test {name} ... FAILED");
-                report.failed.push((name, image.report(&project, &trap)));
+                report
+                    .failed
+                    .push((name, failures + &image.report(&project, &trap)));
             }
         }
     }

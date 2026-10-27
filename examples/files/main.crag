@@ -1,15 +1,25 @@
-// Reads a text file and prints it, telling what went wrong when it
-// cannot.
+// Reads a text file and prints it with its lines numbered, telling what
+// went wrong when it cannot. Run it as `crag run [file]`; without a file
+// it prints `poem.txt`.
 
+import std.env
 import std.io
 
-// The file to print, relative to the directory the program runs in.
-let path = "poem.txt"
+// The lines of a text, each after its number, the numbers right-aligned.
+pub fn numbered(text: Str) -> List[Str] {
+  let lines = text.lines()
+  let width = "{lines.count()}".codePointCount()
+  lines.indexed().map { l -> "{"{l.index + 1}".padStart(width)}  {l.value}" }
+}
 
 fn main() -> ExitCode {
+  let path = case args() {
+    given: List[Str] -> given.first().orElse("poem.txt")
+    _ -> "poem.txt"
+  }
   case readText(path) {
     text: Str -> {
-      print(text)
+      for line in numbered(text) { printLine(line) }
       ExitCode(code: 0)
     }
     e: IoError -> {

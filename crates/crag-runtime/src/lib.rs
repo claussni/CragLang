@@ -46,11 +46,14 @@ compile_error!("the runtime is written for x86-64 Linux only: its context switch
 #[macro_use]
 mod system;
 
+mod assertions;
+
 mod cancel;
 pub mod codec;
 mod collections;
 pub mod debug;
 mod deque;
+mod env;
 mod epoch;
 mod ext;
 pub mod fiber;
@@ -86,8 +89,10 @@ pub mod timer;
 pub mod unwind;
 mod values;
 
+pub use assertions::take_test_failures;
 pub use cancel::CancelHandle;
 pub use codec::{DecodeError, NotSolid, decode_value, encode_value};
+pub use env::set_program_args;
 pub use fiber::{Fiber, FiberConfig, FiberState, TaskContext, Worker};
 pub use heap::{Heap, alloc_box};
 pub use meter::Meter;
@@ -200,6 +205,14 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::ListConcat => collections::rt_list_concat as *const () as usize,
         RuntimeFn::MapRemove => collections::rt_map_remove as *const () as usize,
         RuntimeFn::MapList => collections::rt_map_list as *const () as usize,
+        RuntimeFn::TestRecord => assertions::rt_test_record as *const () as usize,
+        RuntimeFn::EnvArgs => env::rt_env_args as *const () as usize,
+        RuntimeFn::EnvVar => env::rt_env_var as *const () as usize,
+        RuntimeFn::EnvVars => env::rt_env_vars as *const () as usize,
+        RuntimeFn::EnvPlatform => env::rt_env_platform as *const () as usize,
+        RuntimeFn::BytesRead => strings::rt_bytes_read as *const () as usize,
+        RuntimeFn::BytesWrite => strings::rt_bytes_write as *const () as usize,
+        RuntimeFn::BytesOfList => strings::rt_bytes_of_list as *const () as usize,
     }
 }
 

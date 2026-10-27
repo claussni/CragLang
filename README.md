@@ -30,7 +30,7 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-eval` | Compile-time evaluation of constants, `embed`s among them, in the metered tier (M3) |
 | `crates/crag-fmt` | The formatter: the canonical layout of source files (M5) |
 | `crates/crag-package` | Packages: manifests, versions, folder registries, resolution and the SBOM (M6) |
-| `std` | The standard library: the prelude `std.core` (M1), `std.time`, `std.task`, `std.stream` and `std.io` (M4) |
+| `std` | The standard library: the prelude `std.core` with its functions on text, bytes and collections, `std.time`, `std.task`, `std.stream`, `std.io`, `std.env` and `std.test` |
 | `examples` | Small programs to run and explore: hello world, reading a file, loading a web page |
 
 ## Build
@@ -59,9 +59,14 @@ directory with a `package.crag` naming the package and its `main` module:
 
     ./cargo build -p crag-driver
     cd my-project
-    /path/to/target/debug/crag run
+    /path/to/target/debug/crag run [argument...]
     /path/to/target/debug/crag test [filter]
     /path/to/target/debug/crag fmt [--check] [all | - | file...]
+
+`crag run` passes what follows it to the program, which reads it with
+`args()` of `std.env`. A test checks with the assertions of `std.test`;
+`crag test` reports every one that failed, at its line, and the test goes
+on after it.
 
 `crag fmt` formats every module of the project in place, or the files
 named; `-` formats standard input to standard output, and `--check` only
