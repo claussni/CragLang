@@ -23,7 +23,12 @@ image=crag-dev
 docker image inspect "$image" >/dev/null 2>&1 || docker build -q -t "$image" "$root" >/dev/null
 mkdir -p "$root/.cargo-home"
 tty=; [ -t 0 ] && [ -t 1 ] && tty=-it
-exec docker run --rm $tty \
+# Podman runs rootless: keep-id maps the host user into the container so
+# the files it writes stay the user's. SELinux labels would hide the
+# mounted tree from the container, so labelling is off for this run.
+userns=; docker --version 2>/dev/null | grep -qi podman && userns=--userns=keep-id
+exec docker run --rm $tty $userns \
+  --security-opt label=disable \
   --user "$(id -u):$(id -g)" \
   -v "$root:$root" -w "$PWD" \
   -e CARGO_HOME="$root/.cargo-home" \
