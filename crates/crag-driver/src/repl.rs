@@ -80,6 +80,8 @@ pub struct Repl {
     fresh: Option<usize>,
     /// The text of each file as the app runs it, while it runs.
     app: Option<Vec<(String, String)>>,
+    /// The type of the value the last input showed.
+    shown_type: Option<String>,
 }
 
 /// The session's definitions, as the text of one module.
@@ -261,7 +263,48 @@ impl Repl {
             input: None,
             fresh: None,
             app: None,
+            shown_type: None,
         }
+    }
+
+    /// The project, to change its sources as an editor does.
+    pub fn project_mut(&mut self) -> &mut Project {
+        &mut self.project
+    }
+
+    /// The type of the value the last input showed.
+    pub fn shown_type(&self) -> Option<&str> {
+        self.shown_type.as_deref()
+    }
+
+    /// The text of a file as the app runs it, while it runs.
+    pub fn app_text(&self, shown: &str) -> Option<&str> {
+        self.app
+            .as_ref()?
+            .iter()
+            .find(|(s, _)| s == shown)
+            .map(|(_, text)| text.as_str())
+    }
+
+    /// The app's breakpoints, by file and line from one.
+    pub fn breakpoints(&self) -> Vec<(String, u32)> {
+        self.scratch.breakpoints().to_vec()
+    }
+
+    /// Sets the app's breakpoints: for each, how many functions have a
+    /// statement there.
+    pub fn set_breakpoints(&mut self, breakpoints: &[(String, u32)]) -> Result<Vec<usize>, String> {
+        self.scratch.set_breakpoints(&self.project, breakpoints)
+    }
+
+    /// The app's stopped tasks.
+    pub fn pauses(&mut self) -> Result<Vec<crate::debug::Pause>, String> {
+        self.scratch.pauses(&self.project)
+    }
+
+    /// Whether the app runs.
+    pub fn app_runs(&self) -> bool {
+        self.scratch.app_runs()
     }
 
     pub fn project(&self) -> &Project {
@@ -275,6 +318,7 @@ impl Repl {
     /// Takes one input: a definition, an expression or a command. The
     /// errors come rendered, and leave the session as it was.
     pub fn eval_input(&mut self, text: &str) -> Result<EvalOutput, String> {
+        self.shown_type = None;
         let text = text.trim();
         if text.is_empty() {
             return Ok(EvalOutput::Nothing);
@@ -612,6 +656,7 @@ impl Repl {
             .as_ref()
             .expect("the input's function has a body")
             .result;
+        self.shown_type = (ty != Ty::unit(db)).then(|| ty.display(db));
         // `()` shows nothing.
         let ran = match ty == Ty::unit(db) {
             true => self.scratch.execute(&self.project, key),

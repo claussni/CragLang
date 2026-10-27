@@ -31,6 +31,7 @@ pub mod lsp;
 pub mod project;
 pub mod repl;
 pub mod scratch;
+pub mod ui;
 
 use std::io::Write;
 use std::path::Path;
@@ -159,6 +160,47 @@ pub fn main_instance(project: &Project) -> Result<InstanceKey<'_>, String> {
 /// `crag` without arguments: the REPL, in the project at `root` if there is
 /// one, until the input ends or `:quit`. The terminal's Ctrl-C reaches the
 /// scratch image, which stops the run; the host ignores it.
+/// `crag` without arguments on a terminal: the UI (Specification §20.8),
+/// with the editor and the REPL, in the project at `root` if there is one.
+/// Unlike the plain REPL it opens a project with errors, to fix them.
+pub fn crag_ui(root: &Path) -> u8 {
+    let project = if root.join("package.crag").exists() {
+        match Project::load(root) {
+            Ok(project) => project,
+            Err(e) => {
+                println!("error: {e}");
+                return 1;
+            }
+        }
+    } else {
+        Project::bare()
+    };
+    // SAFETY: ignoring a signal changes no state but its disposition.
+    unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+    let command = match crag_session::ImageCommand::current() {
+        Ok(command) => command,
+        Err(e) => {
+            println!("error: cannot find the crag binary: {e}");
+            return 1;
+        }
+    };
+    let scratch = match Scratch::start(command) {
+        Ok(scratch) => scratch,
+        Err(e) => {
+            println!("error: cannot start the scratch image: {e}");
+            return 1;
+        }
+    };
+    let ui = ui::Ui::new(Repl::new(project, scratch));
+    match ui::run(ui) {
+        Ok(status) => status,
+        Err(e) => {
+            println!("error: the terminal failed: {e}");
+            1
+        }
+    }
+}
+
 pub fn crag_repl(root: &Path) -> u8 {
     let project = if root.join("package.crag").exists() {
         match checked(root, &mut std::io::stdout()) {

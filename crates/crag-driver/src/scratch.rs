@@ -82,6 +82,11 @@ impl Scratch {
         self.constants
     }
 
+    /// Whether the app runs.
+    pub fn app_runs(&self) -> bool {
+        self.session.app().is_some()
+    }
+
     pub fn session(&mut self) -> &mut Session {
         &mut self.session
     }

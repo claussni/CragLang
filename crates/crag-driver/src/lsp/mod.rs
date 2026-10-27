@@ -28,7 +28,7 @@
 //! The server ends when the client sends `exit` or closes its end of the
 //! input.
 
-mod analysis;
+pub(crate) mod analysis;
 pub(crate) mod rpc;
 mod server;
 mod text;

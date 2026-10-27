@@ -20,6 +20,7 @@
 //! for people: the session manager starts images with it (Implementation
 //! Plan §11.6.1).
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 use crag_driver::{crag_fmt, crag_repl, crag_run, crag_test};
@@ -31,6 +32,10 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let root = std::path::Path::new(".");
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        // On a terminal the UI; else the plain REPL, as scripts use it.
+        [] if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
+            ExitCode::from(crag_driver::crag_ui(root))
+        }
         [] => ExitCode::from(crag_repl(root)),
         ["run"] => ExitCode::from(crag_run(root, &mut std::io::stderr())),
         ["test"] => test(root, None),

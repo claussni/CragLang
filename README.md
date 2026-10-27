@@ -25,7 +25,7 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-types` | Types and core inference (M1) |
 | `crates/crag-mir` | MIR builder (M1) |
 | `crates/crag-backend` | Code generation from MIR (M1) |
-| `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1); the app image, hot reload, the debugger, the language server `crag lsp` and the debug adapter `crag dap` (M5) |
+| `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1); the UI with the built-in editor, the app image, hot reload, the debugger, the language server `crag lsp` and the debug adapter `crag dap` (M5) |
 | `crates/crag-session` | Session manager: image processes, their protocol and supervision (M3) |
 | `crates/crag-eval` | Compile-time evaluation of constants, `embed`s among them, in the metered tier (M3) |
 | `crates/crag-fmt` | The formatter: the canonical layout of source files (M5) |
@@ -73,8 +73,14 @@ starts it in the project's directory, or names the project as its root.
 With `CRAG_MIR=1`, `crag` also writes the MIR of what it compiles to
 standard error, with what code generation does not support yet.
 
-Without arguments, `crag` opens the REPL, in the project of the current
-directory if there is one. `:help` lists its commands. In a project,
+Without arguments on a terminal, `crag` opens the UI: the editor over the
+REPL, buffers and files on the left, problems, tasks and watches on the
+right. Ctrl+P switches files, Ctrl+K lists commands, F1, F12 and Shift+F12
+tell about, go to and find a name, Ctrl+E evaluates the line in the
+scratch image, F9 sets a breakpoint, Alt+R reloads the app and Ctrl+Q
+quits. Without a terminal, `crag` is the plain REPL.
+
+`:help` lists the REPL's commands. In a project,
 `:start` runs the app in an image of its own; after editing its files,
 `:reload` swaps the changed code into the running app, which keeps its
 state and connections, and `:stop` ends it. `:break file:line` stops the
