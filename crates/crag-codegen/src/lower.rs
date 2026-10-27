@@ -20,8 +20,8 @@
 use std::collections::HashMap;
 
 use crag_abi::{
-    FRAME_BUDGET, FUEL_OFFSET, NO_POSITION, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET,
-    STACK_LIMIT_OFFSET,
+    CELL_STATE_OFFSET, FRAME_BUDGET, FUEL_OFFSET, NO_POSITION, RuntimeFn, SIDE_END_OFFSET,
+    SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET,
 };
 use cranelift_codegen::binemit::Reloc as ClifReloc;
 use cranelift_codegen::control::ControlPlane;
@@ -31,7 +31,7 @@ use cranelift_codegen::ir::types::{F64, I64};
 use cranelift_codegen::ir::{
     AbiParam, AtomicRmwOp, BlockArg, ExceptionTableData, ExceptionTableItem, ExtFuncData,
     ExternalName, FuncRef, Function, GlobalValue, GlobalValueData, InstBuilder, MemFlagsData,
-    Signature, TrapCode, UserExternalName, UserFuncName, Value,
+    Signature, StackSlotData, StackSlotKind, TrapCode, UserExternalName, UserFuncName, Value,
 };
 use cranelift_codegen::isa::{self, CallConv, OwnedTargetIsa, TargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
@@ -518,6 +518,47 @@ fn emit_stack_check(b: &mut FunctionBuilder, imports: &mut Imports, ctx: Value, 
     b.switch_to_block(done);
 }
 
+/// Emits a statement's step at the current position and leaves the builder
+/// in the block that follows it: a load of the step's flag and, when it is
+/// set, a call of `rt_step` with the values' words copied to a slot of the
+/// frame. The call is a safepoint like any other.
+fn emit_step(
+    b: &mut FunctionBuilder,
+    imports: &mut Imports,
+    ctx: Value,
+    conv: CallConv,
+    func: FuncId,
+    step: u32,
+    values: &[Value],
+) {
+    let cell = imports.symbol(b, NS_CELL, crag_abi::step_cell(func, step));
+    let cell = b.ins().symbol_value(I64, cell);
+    let flag = b
+        .ins()
+        .load(I64, MemFlagsData::trusted(), cell, CELL_STATE_OFFSET);
+    let slow = b.create_block();
+    let done = b.create_block();
+    b.set_cold_block(slow);
+    b.ins().brif(flag, slow, &[], done, &[]);
+
+    b.switch_to_block(slow);
+    let size = (values.len() as u32 * 8).max(8);
+    let slot = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, size, 3));
+    for (i, &v) in values.iter().enumerate() {
+        b.ins().stack_store(I64, v, slot, i as i32 * 8);
+    }
+    let words = b.ins().stack_addr(I64, slot, 0);
+    let fp = b.ins().get_frame_pointer(I64);
+    let callee = imports.runtime(b, conv, RuntimeFn::Step, 5, 0);
+    let func = b.ins().iconst(I64, i64::from(func.0));
+    let step = b.ins().iconst(I64, i64::from(step));
+    let count = b.ins().iconst(I64, values.len() as i64);
+    b.ins().call(callee, &[ctx, func, step, words, count, fp]);
+    b.ins().jump(done, &[]);
+
+    b.switch_to_block(done);
+}
+
 /// Emits the fuel check of metered code at the current position and leaves
 /// the builder in the block that follows it: one step off the fuel, and a
 /// call of `rt_refuel` when it went negative. The call is a safepoint, so
@@ -890,6 +931,22 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa, metered: bool) -> (Functio
                     if metered {
                         emit_fuel_check(&mut b, &mut imports, ctx);
                     }
+                }
+                Inst::Step { .. } if metered => {}
+                Inst::Step { func, step, values } => {
+                    let values: Vec<Value> = values
+                        .iter()
+                        .map(|r| b.use_var(vars[r.0 as usize]))
+                        .collect();
+                    emit_step(
+                        &mut b,
+                        &mut imports,
+                        ctx,
+                        isa.default_call_conv(),
+                        *func,
+                        *step,
+                        &values,
+                    );
                 }
             }
         }

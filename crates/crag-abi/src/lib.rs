@@ -720,6 +720,15 @@ pub enum RuntimeFn {
     /// The root's handler of a signal no handler takes: writes the name of
     /// its type to standard error.
     SignalDefault = 76,
+
+    /// `rt_step(ctx, func, step, words, count, fp)`.
+    ///
+    /// A statement's step, called while its flag is set (Implementation
+    /// Plan §11.8.6): `func` and `step` name it, the `count` words at
+    /// `words` are those of its locals, and `fp` is the frame pointer of
+    /// the calling frame. The debugger may stop the task here; it returns
+    /// once the task is resumed.
+    Step = 77,
 }
 
 /// A status of the stream functions: sent, or a value taken.
@@ -814,7 +823,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 77] = [
+    pub const ALL: [RuntimeFn; 78] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -892,6 +901,7 @@ impl RuntimeFn {
         RuntimeFn::SignalFind,
         RuntimeFn::SignalLeave,
         RuntimeFn::SignalDefault,
+        RuntimeFn::Step,
     ];
 
     /// The symbol the loader looks up.
@@ -974,6 +984,7 @@ impl RuntimeFn {
             RuntimeFn::SignalFind => "rt_signal_find",
             RuntimeFn::SignalLeave => "rt_signal_leave",
             RuntimeFn::SignalDefault => "rt_signal_default",
+            RuntimeFn::Step => "rt_step",
         }
     }
 
@@ -1287,6 +1298,20 @@ pub struct SlotKey {
 pub const CELL_SIZE: usize = 32;
 pub const CELL_STATE_OFFSET: i32 = 0;
 pub const CELL_VALUE_OFFSET: i32 = 8;
+
+/// The cells of a function's steps: the function's id with this bit and
+/// the step's index as the signature. A slot's signature never has the
+/// bit. A step's cell holds its flag in the state word: zero while the
+/// debugger needs nothing there.
+pub const STEP_CELL: u32 = 1 << 31;
+
+/// The key of the cell of a step of `func`.
+pub fn step_cell(func: FuncId, step: u32) -> SlotKey {
+    SlotKey {
+        func,
+        signature: STEP_CELL | step,
+    }
+}
 
 /// The states of a cell: no value yet, or holding the value. A value that
 /// needs itself is a compile error, so a value is never read while it is

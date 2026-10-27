@@ -426,6 +426,14 @@ pub enum Statement<'db> {
     Release(Local),
     /// A point on a loop's back-edge where the runtime may stop the fiber.
     Poll,
+    /// The start of a statement, where the debugger may stop the task
+    /// (Implementation Plan §11.8.6): the expression it begins with, and
+    /// the named locals that hold values there. It uses none of them, so
+    /// it never keeps a value alive; liveness leaves only those that are.
+    Step {
+        at: Option<ExprId>,
+        locals: Vec<Local>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
@@ -607,6 +615,7 @@ impl<'db> Statement<'db> {
             }
             Statement::Retain(l) | Statement::Release(l) => vec![l],
             Statement::Poll => Vec::new(),
+            Statement::Step { locals, .. } => locals.iter_mut().collect(),
         }
     }
 }
@@ -712,6 +721,13 @@ fn statement_text<'db>(db: &'db dyn Db, statement: &Statement<'db>) -> String {
         Statement::Retain(local) => format!("retain _{}", local.0),
         Statement::Release(local) => format!("release _{}", local.0),
         Statement::Poll => "poll".into(),
+        Statement::Step { at, locals } => {
+            let locals: Vec<String> = locals.iter().map(|l| format!("_{}", l.0)).collect();
+            match at {
+                Some(at) => format!("step e{} [{}]", at.0, locals.join(", ")),
+                None => format!("step [{}]", locals.join(", ")),
+            }
+        }
     }
 }
 

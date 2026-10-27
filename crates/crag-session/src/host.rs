@@ -45,7 +45,7 @@ use crag_abi::{FuncId, Shapes, SlotKey, TypeDescriptor};
 use crag_runtime::Trap;
 
 use crate::protocol::{
-    Fill, Message, PROTOCOL_VERSION, ShippedFunction, Stub, read_message, write_message,
+    Fill, Message, PROTOCOL_VERSION, PausedTask, ShippedFunction, Stub, read_message, write_message,
 };
 
 /// How long an image may take to connect and say `Hello`.
@@ -636,6 +636,44 @@ impl Session {
         })
     }
 
+    /// Sets the app's breakpoints: steps by function and index.
+    pub fn set_breaks(&mut self, breaks: Vec<(FuncId, u32)>) -> Result<(), SessionError> {
+        self.done(Message::Breaks(breaks))
+    }
+
+    /// The app's tasks stopped at steps.
+    pub fn pauses(&mut self) -> Result<Vec<PausedTask>, SessionError> {
+        match self.request_to(ImageKind::App, &Message::Pauses)? {
+            Message::Paused(tasks) => Ok(tasks),
+            other => Err(unexpected(other, "Pauses")),
+        }
+    }
+
+    /// Resumes a stopped task of the app: continuing (0), or stepping into
+    /// (1), over (2) or out (3).
+    pub fn resume(&mut self, task: u64, how: u8) -> Result<(), SessionError> {
+        self.done(Message::Resume { task, how })
+    }
+
+    /// The values of a stopped task's locals, as text.
+    pub fn locals(
+        &mut self,
+        task: u64,
+        locals: Vec<(Shapes, u32)>,
+    ) -> Result<Vec<String>, SessionError> {
+        match self.request_to(ImageKind::App, &Message::Locals { task, locals })? {
+            Message::Texts(texts) => Ok(texts),
+            other => Err(unexpected(other, "Locals")),
+        }
+    }
+
+    fn done(&mut self, message: Message) -> Result<(), SessionError> {
+        match self.request_to(ImageKind::App, &message)? {
+            Message::Done => Ok(()),
+            other => Err(unexpected(other, "a debugger request")),
+        }
+    }
+
     /// Stops the app and ends its image, killing it if the app does not
     /// stop in time.
     pub fn stop_app(&mut self) -> Result<(), SessionError> {
@@ -705,6 +743,14 @@ impl Session {
         };
         self.scratch = spawn_image(&self.command, exit.kind)?;
         Ok(exit)
+    }
+}
+
+/// The error for an answer that does not fit the request.
+fn unexpected(answer: Message, request: &str) -> SessionError {
+    match answer {
+        Message::Failed(why) => SessionError::Refused(why),
+        other => SessionError::Refused(format!("the image answered {other:?} to {request}")),
     }
 }
 

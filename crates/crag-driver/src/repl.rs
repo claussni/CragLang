@@ -36,6 +36,7 @@ use crag_session::RunResult;
 use crag_syntax::{TokenKind, lex};
 use crag_types::Ty;
 
+use crate::debug::{Pause, Resume};
 use crate::diagnostics::{check, render_at};
 use crate::exec::Sources;
 use crate::project::Project;
@@ -54,6 +55,13 @@ Enter a definition to add it to the session, or an expression to run it.
   :reload               read changed files and swap their code into the app
   :status               how the app runs, and the files that differ from it
   :stop                 stop the app
+  :break [file:line]    stop the app's tasks at a line; alone, list them
+  :clear                remove every breakpoint
+  :paused               the app's stopped tasks, numbered
+  :locals [n]           the locals of stopped task n, the first by default
+  :continue [n]         let stopped task n go on
+  :step, :next, :out [n]  go on to the next statement: anywhere, in this
+                        function or its caller, or in its caller
   :help                 show this
   :quit                 leave; so does Ctrl-D
 An input continues on the next line until it is complete; an empty line
@@ -293,6 +301,19 @@ impl Repl {
             "start" => self.start_app(),
             "reload" => self.reload(),
             "status" => self.status(),
+            "break" => self.breakpoint(rest.trim()),
+            "clear" => {
+                self.scratch
+                    .set_breakpoints(&self.project, &[])
+                    .map_err(|e| format!("error: {e}\n"))?;
+                Ok(EvalOutput::Text("no breakpoints\n".into()))
+            }
+            "paused" => self.paused(),
+            "locals" => self.show_locals(rest.trim()),
+            "continue" | "c" => self.go_on(rest.trim(), Resume::Continue),
+            "step" | "s" => self.go_on(rest.trim(), Resume::Into),
+            "next" | "n" => self.go_on(rest.trim(), Resume::Over),
+            "out" => self.go_on(rest.trim(), Resume::Out),
             "stop" => {
                 self.scratch
                     .stop_app()
@@ -303,6 +324,130 @@ impl Repl {
             _ => Err(format!(
                 "error: there is no command :{name}; :help lists them\n"
             )),
+        }
+    }
+
+    fn breakpoint(&mut self, place: &str) -> Result<EvalOutput, String> {
+        let mut breakpoints = self.scratch.breakpoints().to_vec();
+        if place.is_empty() {
+            let mut out = String::new();
+            for (file, line) in &breakpoints {
+                out += &format!("{file}:{line}\n");
+            }
+            if out.is_empty() {
+                out = "no breakpoints\n".into();
+            }
+            return Ok(EvalOutput::Text(out));
+        }
+        let (file, line) = place
+            .rsplit_once(':')
+            .and_then(|(f, l)| Some((f.to_string(), l.parse::<u32>().ok()?)))
+            .ok_or("error: a breakpoint is file:line\n")?;
+        if !breakpoints.contains(&(file.clone(), line)) {
+            breakpoints.push((file.clone(), line));
+        }
+        let placed = self
+            .scratch
+            .set_breakpoints(&self.project, &breakpoints)
+            .map_err(|e| format!("error: {e}\n"))?;
+        let k = breakpoints
+            .iter()
+            .position(|b| *b == (file.clone(), line))
+            .unwrap_or(0);
+        Ok(EvalOutput::Text(match placed.get(k) {
+            Some(0) | None if self.scratch.session().app().is_some() => {
+                format!("{file}:{line} has no statement the app runs; it is kept for later\n")
+            }
+            _ => format!("breakpoint at {file}:{line}\n"),
+        }))
+    }
+
+    /// The app's stopped tasks; an error when there are none.
+    fn stopped(&mut self) -> Result<Vec<Pause>, String> {
+        let pauses = self
+            .scratch
+            .pauses(&self.project)
+            .map_err(|e| format!("error: {e}\n"))?;
+        if pauses.is_empty() {
+            return Err("no task is stopped\n".into());
+        }
+        Ok(pauses)
+    }
+
+    /// The stopped task an argument numbers, from one; the first by default.
+    fn chosen(&mut self, arg: &str) -> Result<Pause, String> {
+        let pauses = self.stopped()?;
+        let n = match arg {
+            "" => 1,
+            n => n
+                .parse::<usize>()
+                .map_err(|_| format!("error: `{n}` numbers no task\n"))?,
+        };
+        pauses
+            .get(n.wrapping_sub(1))
+            .cloned()
+            .ok_or_else(|| match pauses.len() {
+                1 => "error: only 1 task is stopped\n".to_string(),
+                n => format!("error: only {n} tasks are stopped\n"),
+            })
+    }
+
+    fn paused(&mut self) -> Result<EvalOutput, String> {
+        let mut out = String::new();
+        for (i, p) in self.stopped()?.iter().enumerate() {
+            out += &format!("{}: {} at {}:{}", i + 1, p.function, p.file, p.line);
+            if !p.callers.is_empty() {
+                out += &format!(", called from {}", p.callers.join(", "));
+            }
+            out += "\n";
+        }
+        Ok(EvalOutput::Text(out))
+    }
+
+    fn show_locals(&mut self, arg: &str) -> Result<EvalOutput, String> {
+        let pause = self.chosen(arg)?;
+        let locals = self
+            .scratch
+            .locals(pause.task)
+            .map_err(|e| format!("error: {e}\n"))?;
+        let mut out = String::new();
+        for (name, value) in locals {
+            out += &format!("{name} = {value}\n");
+        }
+        if out.is_empty() {
+            out = "no locals hold values here\n".into();
+        }
+        Ok(EvalOutput::Text(out))
+    }
+
+    fn go_on(&mut self, arg: &str, how: Resume) -> Result<EvalOutput, String> {
+        let pause = self.chosen(arg)?;
+        self.scratch
+            .resume(pause.task, how)
+            .map_err(|e| format!("error: {e}\n"))?;
+        if how == Resume::Continue {
+            return Ok(EvalOutput::Nothing);
+        }
+        // Stepping ends at the next statement, which comes soon unless the
+        // task waits; then `:paused` shows it later.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let now = self
+                .scratch
+                .pauses(&self.project)
+                .map_err(|e| format!("error: {e}\n"))?;
+            if let Some(p) = now.iter().find(|p| p.task == pause.task) {
+                return Ok(EvalOutput::Text(format!(
+                    "{} at {}:{}\n",
+                    p.function, p.file, p.line
+                )));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(EvalOutput::Text(
+                    "the task runs on; :paused shows it once it stops\n".into(),
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 

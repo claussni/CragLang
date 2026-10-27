@@ -53,7 +53,7 @@ use crag_codegen::{
 };
 use crag_db::Db;
 use crag_db::plumbing::AsId;
-use crag_hir::{Owner, Program, hir_body, lower_body};
+use crag_hir::{Name, Owner, Program, hir_body, lower_body};
 use crag_mir::{
     BinOp, BlockId, ClosurePlacement, CmpOp, Constant, Entry, InstanceKey, Intrinsic, Local,
     MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,
@@ -75,6 +75,16 @@ pub struct Lowered<'db> {
     /// The types of the boxes it allocates, by type index, with their
     /// descriptors.
     pub types: Vec<(u32, TypeDescriptor)>,
+    /// Its steps, by index (Implementation Plan §11.8.6).
+    pub steps: Vec<StepInfo<'db>>,
+}
+
+/// A statement's step, for the debugger: where the statement starts and
+/// the named locals whose words `rt_step` gets, in order.
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct StepInfo<'db> {
+    pub position: Option<u32>,
+    pub locals: Vec<(Name<'db>, Ty<'db>)>,
 }
 
 /// The function an instance is loaded as.
@@ -84,13 +94,14 @@ pub fn func_id(instance: InstanceKey<'_>) -> FuncId {
 
 type Unsupported = &'static str;
 
-/// Lowers the MIR of a body of `owner`, whose source map gives the
-/// positions of traps. The code of a module-level value keeps the value in
-/// `cell` (§11.6.2).
+/// Lowers the MIR of a body of `owner`, loaded as `func`, whose source map
+/// gives the positions of traps and steps. The code of a module-level
+/// value keeps the value in `cell` (§11.6.2).
 pub fn lower_to_lir<'db>(
     db: &'db dyn Db,
     program: Program,
     owner: Owner<'db>,
+    func: FuncId,
     mir: &MirBody<'db>,
     cell: Option<SlotKey>,
 ) -> Lowered<'db> {
@@ -116,6 +127,8 @@ pub fn lower_to_lir<'db>(
         false_index: named("False").map_or(-1, type_index),
         cell,
         scratch: None,
+        func,
+        steps: Vec::new(),
     };
     for (i, decl) in mir.locals.iter().enumerate() {
         let layout = layout(db, program, decl.ty);
@@ -196,6 +209,7 @@ pub fn lower_to_lir<'db>(
         unsupported: l.unsupported,
         calls: l.calls,
         types: l.types,
+        steps: l.steps,
     }
 }
 
@@ -226,6 +240,9 @@ struct Lower<'a, 'db> {
     /// Three words on the side stack that the runtime's reads put what they
     /// read in, pushed at the entry once the code reads anything.
     scratch: Option<VReg>,
+    /// The function the code is loaded as, and its steps so far.
+    func: FuncId,
+    steps: Vec<StepInfo<'db>>,
 }
 
 impl<'a, 'db> Lower<'a, 'db> {
@@ -401,6 +418,33 @@ impl<'a, 'db> Lower<'a, 'db> {
             }
             Statement::Poll => {
                 self.push(Inst::Poll);
+                Ok(())
+            }
+            Statement::Step { at, locals } => {
+                let step = self.steps.len() as u32;
+                let position = at
+                    .and_then(|e| self.positions.get(e.index()))
+                    .map(|r| r.start);
+                let mut values = Vec::new();
+                let mut named = Vec::new();
+                for &local in locals {
+                    let decl = &self.mir.locals[local.index()];
+                    // A local without a layout has no words to show.
+                    if let (Some((_, name)), Some(_)) = (decl.binding, self.layouts[local.index()])
+                    {
+                        values.extend(self.locals[local.index()].iter().copied());
+                        named.push((name, decl.ty));
+                    }
+                }
+                self.steps.push(StepInfo {
+                    position,
+                    locals: named,
+                });
+                self.push(Inst::Step {
+                    func: self.func,
+                    step,
+                    values,
+                });
                 Ok(())
             }
         }

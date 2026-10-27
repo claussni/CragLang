@@ -59,7 +59,7 @@ use crag_runtime::{
 
 use crate::host::ImageKind;
 use crate::protocol::{
-    Fill, Message, PROTOCOL_VERSION, ShippedFunction, Stub, read_message, write_message,
+    Fill, Message, PROTOCOL_VERSION, PausedTask, ShippedFunction, Stub, read_message, write_message,
 };
 
 /// The address range reserved for an image's code.
@@ -119,6 +119,12 @@ pub struct Image {
     worker: Worker,
     /// The app that runs, in the app image.
     app: Option<App>,
+    /// The cells of the steps of the code loaded, and the breakpoints:
+    /// the cells whose flags are set while no task steps.
+    steps: Vec<SlotKey>,
+    breaks: Vec<SlotKey>,
+    /// Whether every step's flag is set, for a task that steps.
+    all_steps: bool,
 }
 
 /// The app's run: its scheduler, which keeps running while the image
@@ -145,11 +151,81 @@ impl Image {
             code_map: Arc::new(CodeMap::new()),
             worker: Worker::new(),
             app: None,
+            steps: Vec::new(),
+            breaks: Vec::new(),
+            all_steps: false,
         })
     }
 
     /// Answers one message from the host; none for `Shutdown`.
     pub fn answer(&mut self, message: Message) -> Option<Message> {
+        let reply = self.reply(message);
+        self.sync_steps();
+        reply
+    }
+
+    /// Sets every step's flag while a task steps, and only the breakpoints'
+    /// otherwise.
+    fn sync_steps(&mut self) {
+        self.set_all_steps(crag_runtime::debug::stepping());
+    }
+
+    fn set_all_steps(&mut self, all: bool) {
+        if all == self.all_steps {
+            return;
+        }
+        self.all_steps = all;
+        let cells = self.symbols.cells();
+        for &key in &self.steps {
+            let on = all || self.breaks.contains(&key);
+            cells.set_state(key, u64::from(on));
+        }
+    }
+
+    /// Sets the breakpoints: the flags of their steps' cells.
+    fn set_breaks(&mut self, breaks: Vec<(FuncId, u32)>) -> Message {
+        let cells = self.symbols.cells();
+        for &key in &self.breaks {
+            cells.set_state(key, u64::from(self.all_steps));
+        }
+        self.breaks = breaks
+            .iter()
+            .map(|&(f, s)| crag_abi::step_cell(f, s))
+            .collect();
+        for &key in &self.breaks {
+            cells.set_state(key, 1);
+        }
+        crag_runtime::debug::set_breakpoints(breaks);
+        Message::Done
+    }
+
+    /// Prints the locals of a stopped task's step.
+    fn locals(&mut self, task: u64, locals: &[(Shapes, u32)]) -> Message {
+        let Some(paused) = crag_runtime::debug::paused()
+            .into_iter()
+            .find(|p| p.task == task)
+        else {
+            return Message::Failed(format!("task {task:x} is not stopped"));
+        };
+        let types = self.worker.types();
+        let mut texts = Vec::new();
+        let mut at = 0;
+        for (shapes, root) in locals {
+            let root = *root;
+            let words = shapes.shapes[root as usize].words() as usize;
+            let Some(slice) = paused.words.get(at..at + words) else {
+                return Message::Failed("the locals have fewer words than their shapes".into());
+            };
+            // SAFETY: the stopped frame holds the values, which the host
+            // describes with the shapes of their types.
+            let text = unsafe { print_value(slice, shapes, root, &types, PrintLimits::default()) };
+            texts.push(text);
+            at += words;
+        }
+        Message::Texts(texts)
+    }
+
+    fn reply(&mut self, message: Message) -> Option<Message> {
         Some(match message {
             Message::Ping(n) => Message::Pong(n),
             Message::Shutdown => return None,
@@ -179,6 +255,34 @@ impl Image {
             Message::Start(func) => self.start(func),
             Message::Status => self.status(),
             Message::Stop => self.stop(),
+            Message::Breaks(breaks) => self.set_breaks(breaks),
+            Message::Pauses => Message::Paused(
+                crag_runtime::debug::paused()
+                    .into_iter()
+                    .map(|p| PausedTask {
+                        task: p.task,
+                        func: p.func,
+                        step: p.step,
+                        callers: p.callers,
+                    })
+                    .collect(),
+            ),
+            Message::Resume { task, how } => match crag_runtime::debug::Resume::from_index(how) {
+                Some(how) => {
+                    // The next step may come right away, so a task that
+                    // steps finds every flag set before it runs.
+                    if how != crag_runtime::debug::Resume::Continue {
+                        self.set_all_steps(true);
+                    }
+                    if crag_runtime::debug::resume(task, how) {
+                        Message::Done
+                    } else {
+                        Message::Failed(format!("task {task:x} is not stopped"))
+                    }
+                }
+                None => Message::Failed(format!("no way of resuming is numbered {how}")),
+            },
+            Message::Locals { task, locals } => self.locals(task, &locals),
             other => Message::Failed(format!("an image does not take {other:?}")),
         })
     }
@@ -242,6 +346,17 @@ impl Image {
         let entries = staged.entries();
         for (f, entry) in functions.iter().zip(&entries) {
             self.code.push((f.id, entry.addr(), f.object.clone()));
+            for reloc in &f.object.relocs {
+                if let crag_abi::RelocTarget::Cell(key) = reloc.target
+                    && key.signature & crag_abi::STEP_CELL != 0
+                    && !self.steps.contains(&key)
+                {
+                    // A new step's flag starts as the others are.
+                    let on = self.all_steps || self.breaks.contains(&key);
+                    self.symbols.cells().set_state(key, u64::from(on));
+                    self.steps.push(key);
+                }
+            }
         }
         for t in types {
             if !self.types.contains(&t) {
@@ -326,6 +441,8 @@ impl Image {
         let Some(app) = &self.app else {
             return Message::Stopped;
         };
+        // Stopped tasks go on, to be cancelled.
+        crag_runtime::debug::release_all();
         app.cancel.cancel();
         match app.scheduler.wait_timeout(STOP_WAIT) {
             Some(_) => {

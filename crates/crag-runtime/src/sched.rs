@@ -80,6 +80,8 @@ pub enum WaitReason {
     Ext,
     /// A lazy value another task computes (§11.7.11).
     Lazy,
+    /// The debugger, which stopped it at a step (§11.8.6).
+    Debug,
 }
 
 /// How a scheduler runs.

@@ -191,6 +191,16 @@ impl CellTable {
         true
     }
 
+    /// Sets the state word of a key's cell, as the debugger sets the flag
+    /// of a step's cell; whether the key has a cell.
+    pub fn set_state(&self, key: SlotKey, state: u64) -> bool {
+        let Some(&index) = self.index.get(&key) else {
+            return false;
+        };
+        self.cell(index)[0].store(state, Ordering::Release);
+        true
+    }
+
     /// Empties a key's cell, so the value is computed again when it is next
     /// read. The value it held is not released.
     pub fn reset(&self, key: SlotKey) {

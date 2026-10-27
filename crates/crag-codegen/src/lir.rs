@@ -240,6 +240,15 @@ pub enum Inst {
     /// The stack check without a frame: a point where the runtime may stop
     /// the fiber. Producers place one on every loop back-edge.
     Poll,
+    /// The start of a statement (Implementation Plan §11.8.6): while the
+    /// first word of the cell `crag_abi::step_cell(func, step)` is not
+    /// zero, the code copies `values` to its frame and calls `rt_step` with
+    /// them. Metered code has no steps.
+    Step {
+        func: FuncId,
+        step: u32,
+        values: Vec<VReg>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -352,6 +361,12 @@ impl LirFunction {
                     }
                     Inst::Select { dst, cond, a, b } => {
                         [dst, cond, a, b].into_iter().try_for_each(reg)?;
+                    }
+                    Inst::Step { step, values, .. } => {
+                        if *step & crag_abi::STEP_CELL != 0 {
+                            return Err(format!("step {step} out of range"));
+                        }
+                        values.iter().try_for_each(reg)?;
                     }
                     Inst::CallRuntime { args, dsts, .. } => {
                         if dsts.len() > 2 {

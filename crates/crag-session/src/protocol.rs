@@ -34,7 +34,7 @@ use crag_abi::{
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -106,6 +106,36 @@ pub enum Message {
     Stop,
     /// From the image: the app was stopped, or had already ended.
     Stopped,
+    /// From the host: the breakpoints, steps by function and index
+    /// (§11.8.6); they replace those set before.
+    Breaks(Vec<(FuncId, u32)>),
+    /// From the image: done as asked.
+    Done,
+    /// From the host: which tasks are stopped.
+    Pauses,
+    /// From the image: the tasks stopped at steps.
+    Paused(Vec<PausedTask>),
+    /// From the host: resumes a stopped task, continuing (0), or stepping
+    /// into (1), over (2) or out (3).
+    Resume { task: u64, how: u8 },
+    /// From the host: shows the locals of a stopped task's step, whose
+    /// words follow each other: each of the shape `root` of its `shapes`.
+    Locals {
+        task: u64,
+        locals: Vec<(Shapes, u32)>,
+    },
+    /// From the image: the values `Locals` asked for, as text.
+    Texts(Vec<String>),
+}
+
+/// A task stopped at a step: the task, the function and step, and the
+/// functions of the frames that called it, innermost first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PausedTask {
+    pub task: u64,
+    pub func: FuncId,
+    pub step: u32,
+    pub callers: Vec<FuncId>,
 }
 
 /// A function's code, shipped to an image.
@@ -159,6 +189,13 @@ const STATUS: u8 = 15;
 const RUNNING: u8 = 16;
 const STOP: u8 = 17;
 const STOPPED: u8 = 18;
+const BREAKS: u8 = 19;
+const DONE: u8 = 20;
+const PAUSES: u8 = 21;
+const PAUSED: u8 = 22;
+const RESUME: u8 = 23;
+const LOCALS: u8 = 24;
+const TEXTS: u8 = 25;
 
 impl Message {
     /// The body of the message's frame.
@@ -254,6 +291,41 @@ impl Message {
             Message::Running => w.u8(RUNNING),
             Message::Stop => w.u8(STOP),
             Message::Stopped => w.u8(STOPPED),
+            Message::Breaks(breaks) => {
+                w.u8(BREAKS);
+                w.seq(breaks, |w, (f, s)| {
+                    w.u32(f.0);
+                    w.u32(*s);
+                });
+            }
+            Message::Done => w.u8(DONE),
+            Message::Pauses => w.u8(PAUSES),
+            Message::Paused(tasks) => {
+                w.u8(PAUSED);
+                w.seq(tasks, |w, t| {
+                    w.u64(t.task);
+                    w.u32(t.func.0);
+                    w.u32(t.step);
+                    w.seq(&t.callers, |w, f| w.u32(f.0));
+                });
+            }
+            Message::Resume { task, how } => {
+                w.u8(RESUME);
+                w.u64(*task);
+                w.u8(*how);
+            }
+            Message::Locals { task, locals } => {
+                w.u8(LOCALS);
+                w.u64(*task);
+                w.seq(locals, |w, (shapes, root)| {
+                    w.shapes(shapes);
+                    w.u32(*root);
+                });
+            }
+            Message::Texts(texts) => {
+                w.u8(TEXTS);
+                w.seq(texts, |w, t| w.text(t));
+            }
         }
         w.0
     }
@@ -327,6 +399,33 @@ impl Message {
             RUNNING => Message::Running,
             STOP => Message::Stop,
             STOPPED => Message::Stopped,
+            BREAKS => Message::Breaks(r.seq(|r| Ok((FuncId(r.u32()?), r.u32()?)))?),
+            DONE => Message::Done,
+            PAUSES => Message::Pauses,
+            PAUSED => Message::Paused(r.seq(|r| {
+                Ok(PausedTask {
+                    task: r.u64()?,
+                    func: FuncId(r.u32()?),
+                    step: r.u32()?,
+                    callers: r.seq(|r| Ok(FuncId(r.u32()?)))?,
+                })
+            })?),
+            RESUME => Message::Resume {
+                task: r.u64()?,
+                how: r.u8()?,
+            },
+            LOCALS => {
+                let task = r.u64()?;
+                let locals = r.seq(|r| {
+                    let (shapes, root) = (r.shapes()?, r.u32()?);
+                    if root as usize >= shapes.shapes.len() {
+                        return Err(invalid(format!("the shape {root} of a shorter table")));
+                    }
+                    Ok((shapes, root))
+                })?;
+                Message::Locals { task, locals }
+            }
+            TEXTS => Message::Texts(r.seq(|r| r.text())?),
             tag => return Err(invalid(format!("a message with the unknown tag {tag}"))),
         };
         match r.0.len() {
@@ -956,6 +1055,17 @@ mod tests {
             Message::Running,
             Message::Stop,
             Message::Stopped,
+            Message::Breaks(vec![(FuncId(3), 4), (FuncId(5), 0)]),
+            Message::Done,
+            Message::Pauses,
+            Message::Paused(vec![PausedTask {
+                task: 0x7f00_1234,
+                func: FuncId(3),
+                step: 2,
+                callers: vec![FuncId(4), FuncId(9)],
+            }]),
+            Message::Resume { task: 7, how: 2 },
+            Message::Texts(vec!["1".into(), "Point(x: 1)".into()]),
             Message::Finished(vec![0, u64::MAX]),
             Message::Trapped {
                 kind: TrapKind::Overflow,

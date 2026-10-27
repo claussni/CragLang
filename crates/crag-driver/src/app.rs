@@ -78,6 +78,10 @@ impl Scratch {
         self.app = Shipped::default();
         let compiled = compile(project, &[main])?;
         let shipment = self.ship_to(ImageKind::App, project, &compiled, &[main], true)?;
+        if !self.breakpoints.is_empty() {
+            let breakpoints = self.breakpoints.clone();
+            self.set_breakpoints(project, &breakpoints)?;
+        }
         self.session
             .start_app(func_id(main))
             .map_err(|e| e.to_string())?;
@@ -117,8 +121,15 @@ impl Scratch {
         }
         // Values the compiler computed are not filled in: code that reads
         // their cells runs. They are computed again when next read.
-        self.ship_to(ImageKind::App, project, &compiled, &[main], false)
-            .map_err(|e| format!("the reload is rejected; the app runs on unchanged: {e}"))
+        let shipment = self
+            .ship_to(ImageKind::App, project, &compiled, &[main], false)
+            .map_err(|e| format!("the reload is rejected; the app runs on unchanged: {e}"))?;
+        // The breakpoints move with the lines of the new code.
+        if !self.breakpoints.is_empty() {
+            let breakpoints = self.breakpoints.clone();
+            self.set_breakpoints(project, &breakpoints)?;
+        }
+        Ok(shipment)
     }
 
     /// How the app is doing, in words: `None` while it runs.

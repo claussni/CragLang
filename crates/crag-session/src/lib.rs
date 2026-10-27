@@ -31,5 +31,5 @@ pub use host::{
 };
 pub use image::{Image, serve};
 pub use protocol::{
-    Fill, Message, PROTOCOL_VERSION, ShippedFunction, Stub, read_message, write_message,
+    Fill, Message, PROTOCOL_VERSION, PausedTask, ShippedFunction, Stub, read_message, write_message,
 };

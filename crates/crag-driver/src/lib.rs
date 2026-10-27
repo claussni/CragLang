@@ -21,6 +21,7 @@
 //! (§11.6.3).
 
 pub mod app;
+pub mod debug;
 pub mod diagnostics;
 pub mod exec;
 pub mod fmt;

@@ -48,6 +48,7 @@ mod system;
 
 mod cancel;
 pub mod codec;
+pub mod debug;
 mod deque;
 mod epoch;
 mod ext;
@@ -175,6 +176,7 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::SignalFind => signals::rt_signal_find as *const () as usize,
         RuntimeFn::SignalLeave => signals::rt_signal_leave as *const () as usize,
         RuntimeFn::SignalDefault => signals::rt_signal_default as *const () as usize,
+        RuntimeFn::Step => debug::rt_step as *const () as usize,
     }
 }
 

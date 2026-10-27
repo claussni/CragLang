@@ -195,7 +195,7 @@ fn statement_uses(body: &MirBody<'_>, holds: &[LocalSet], statement: &Statement<
         }
         Statement::Retain(l) => uses.borrowed.push(*l),
         Statement::Release(l) => uses.consumed.push(*l),
-        Statement::Poll => {}
+        Statement::Poll | Statement::Step { .. } => {}
     }
     uses.counted(body, holds)
 }
@@ -335,7 +335,19 @@ pub fn insert_rc_ops(body: &mut MirBody<'_>, live: &Liveness) {
                 }
             }
             reversed.extend(after.into_iter().rev());
-            reversed.push(statement.clone());
+            match statement {
+                // A step shows what holds a value: a counted local only
+                // while it is live, since it may be released before.
+                Statement::Step { at, locals } => reversed.push(Statement::Step {
+                    at: *at,
+                    locals: locals
+                        .iter()
+                        .copied()
+                        .filter(|l| !body.locals[l.index()].counted || set.contains(l))
+                        .collect(),
+                }),
+                _ => reversed.push(statement.clone()),
+            }
             reversed.extend(before.into_iter().rev());
             if let Some(def) = uses.def {
                 set.remove(&def);

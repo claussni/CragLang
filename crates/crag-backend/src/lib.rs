@@ -58,7 +58,7 @@ use crag_types::{Ty, TyKind};
 pub use layout::{
     FieldSlot, Layout, element_layout, layout, record_layout, type_descriptor, type_index,
 };
-pub use lower::{Lowered, func_id, lower_to_lir};
+pub use lower::{Lowered, StepInfo, func_id, lower_to_lir};
 pub use shape::shapes;
 
 /// The code of an instance, ready for the loader.
@@ -79,6 +79,8 @@ pub struct Code<'db> {
     pub types: Vec<(u32, TypeDescriptor)>,
     /// What it could not compile; each traps where it is reached.
     pub unsupported: Vec<&'static str>,
+    /// Its steps, for the debugger.
+    pub steps: Vec<StepInfo<'db>>,
 }
 
 /// The target code is generated for: the host's.
@@ -113,8 +115,8 @@ fn slot_signature<'db>(db: &'db dyn Db, program: Program, instance: InstanceKey<
         },
     );
     let hash = structure(db, program, ty, &mut Vec::new(), &mut HashMap::new());
-    // Zero is for what has no signature.
-    ((hash >> 32) as u32 ^ hash as u32).max(1)
+    // Zero is for what has no signature, and the top bit for steps.
+    (((hash >> 32) as u32 ^ hash as u32) & !crag_abi::STEP_CELL).max(1)
 }
 
 /// A hash of a type as it is laid out: a declared type by its name and its
@@ -223,7 +225,7 @@ pub fn code<'db>(
     let value = matches!(owner, Owner::Item(item) if item.kind(db).is_value());
     let cell =
         (value && *instance.entry(db) == Entry::Body).then(|| slot_key(db, program, instance));
-    let lowered = lower_to_lir(db, program, owner, body, cell);
+    let lowered = lower_to_lir(db, program, owner, func_id(instance), body, cell);
     let settings = CodegenSettings {
         target: host().clone(),
         opt: OptLevel::None,
@@ -240,6 +242,7 @@ pub fn code<'db>(
                 calls: lowered.calls,
                 types: lowered.types,
                 unsupported: lowered.unsupported,
+                steps: lowered.steps,
             })
             .map_err(|e| e.to_string()),
     )

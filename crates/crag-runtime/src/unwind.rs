@@ -224,6 +224,30 @@ unsafe fn unwind(worker: *mut Worker, mut ret: *const usize, mut fp: usize) -> V
     }
 }
 
+/// The functions of the frames that called the frame whose frame pointer is
+/// `fp`, innermost first, as far as the code map knows them.
+///
+/// # Safety
+///
+/// `fp` is the frame pointer of a frame of a fiber's stack whose frames
+/// are suspended at calls.
+pub(crate) unsafe fn callers(code: &CodeMap, mut fp: usize) -> Vec<FuncId> {
+    let mut out = Vec::new();
+    // SAFETY: as the caller promises, the chain of frame pointers ends at
+    // the fiber's first frame, whose saved frame pointer is zero.
+    unsafe {
+        while fp != 0 {
+            let ret = ((fp + 8) as *const usize).read();
+            let Some(func) = code.function_at(ret) else {
+                break;
+            };
+            out.push(func);
+            fp = (fp as *const usize).read();
+        }
+    }
+    out
+}
+
 /// `rt_tx_throw(ctx)`: see `crag_abi::RuntimeFn::TxThrow`.
 ///
 /// Passes where the throwing frame's return address lies and its frame

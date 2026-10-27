@@ -60,6 +60,8 @@ pub struct Scratch {
     pub(crate) app: Shipped,
     /// How many values the compiler computed were sent to their cells.
     constants: usize,
+    /// The app's breakpoints, by file and line, which reloads keep.
+    pub(crate) breakpoints: Vec<(String, u32)>,
 }
 
 impl Scratch {
@@ -70,6 +72,7 @@ impl Scratch {
             scratch: Shipped::default(),
             app: Shipped::default(),
             constants: 0,
+            breakpoints: Vec::new(),
         })
     }
 

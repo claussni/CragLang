@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crag_abi::{CELL_FULL, FuncId, RuntimeFn, SlotKey, TrapKind, TypeDescriptor};
+use crag_abi::{CELL_FULL, FuncId, RuntimeFn, Shapes, SlotKey, TrapKind, TypeDescriptor};
 use crag_backend::{code, func_id, shapes};
 use crag_codegen::{CodeObject, CodegenSettings, OptLevel, compile_entry_stub, target_for};
 use crag_eval::{EvalSite, const_eval};
@@ -66,6 +66,24 @@ pub struct Function {
     /// The cell it keeps its value in, for the code of a module-level
     /// value.
     pub cell: Option<SlotKey>,
+    /// Its steps, by index, for the debugger.
+    pub steps: Vec<StepView>,
+}
+
+/// A statement's step: where it starts in the module, and the locals whose
+/// words a stopped task has there, in order.
+#[derive(Clone, Debug)]
+pub struct StepView {
+    pub position: Option<u32>,
+    pub locals: Vec<LocalView>,
+}
+
+/// A local at a step: its name and the shapes its value is printed by.
+#[derive(Clone, Debug)]
+pub struct LocalView {
+    pub name: String,
+    pub shapes: std::sync::Arc<Shapes>,
+    pub root: u32,
 }
 
 /// The code of what some roots reach.
@@ -116,6 +134,8 @@ pub fn compile<'a>(
         functions: HashMap::new(),
         values: Vec::new(),
     };
+    // Steps name the same types again and again.
+    let mut shaped: HashMap<crag_types::Ty, (std::sync::Arc<Shapes>, u32)> = HashMap::new();
     for instance in collect_instances(db, program, roots, Tier::Baseline) {
         let owner = *instance.owner(db);
         let name = match instance.entry(db) {
@@ -167,6 +187,31 @@ pub fn compile<'a>(
                 module: owner.module(db),
                 calls: code.calls.iter().map(|&c| func_id(c)).collect(),
                 cell: (value && *instance.entry(db) == Entry::Body).then_some(code.slot),
+                steps: code
+                    .steps
+                    .iter()
+                    .map(|step| StepView {
+                        position: step.position,
+                        locals: step
+                            .locals
+                            .iter()
+                            .map(|&(name, ty)| {
+                                let (shapes, root) = shaped
+                                    .entry(ty)
+                                    .or_insert_with(|| {
+                                        let (shapes, root) = crag_backend::shapes(db, program, ty);
+                                        (std::sync::Arc::new(shapes), root)
+                                    })
+                                    .clone();
+                                LocalView {
+                                    name: name.text(db).clone(),
+                                    shapes,
+                                    root,
+                                }
+                            })
+                            .collect(),
+                    })
+                    .collect(),
             },
         );
     }

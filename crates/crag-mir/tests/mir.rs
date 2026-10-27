@@ -52,7 +52,7 @@ pub fn update[T, R](r: Ref[T], f: (T) -> R) -> () | Errs[R]
 
 /// The type errors of the module, then the MIR of every function, test
 /// and value of the module after a line with its name.
-fn mir_of(text: &str) -> String {
+fn mir_of(text: &str, steps: bool) -> String {
     let db = RootDatabase::new();
     let core = ModuleId::new(
         &db,
@@ -96,7 +96,14 @@ fn mir_of(text: &str) -> String {
                 false => key_name(&db, key),
             };
             let body = mir(&db, program, key, Tier::Baseline).as_ref().unwrap();
-            out += &format!("{label}\n{}", body.pretty(&db));
+            let pretty = body.pretty(&db);
+            // The tests of other things leave the debugger's steps out.
+            let pretty: String = pretty
+                .lines()
+                .filter(|line| steps || !line.trim_start().starts_with("step "))
+                .map(|line| format!("{line}\n"))
+                .collect();
+            out += &format!("{label}\n{pretty}");
             for (_, what) in &body.unsupported {
                 out += &format!("unsupported: {what}\n");
             }
@@ -130,7 +137,7 @@ fn key_name(db: &RootDatabase, key: InstanceKey<'_>) -> String {
 }
 
 fn check(text: &str, expected: &str) {
-    let found = mir_of(text);
+    let found = mir_of(text, false);
     if found != expected {
         panic!("MIR differs; found:\n{found}");
     }
@@ -1316,10 +1323,38 @@ fn reruns(k: Int) -> () {
   n.update { v -> k - v }
 }
 "#,
+        false,
     );
     let (counts, reruns) = out.split_once("reruns").unwrap();
     assert_eq!(counts.matches("RefApply").count(), 3, "{out}");
     assert!(!counts.contains("RefCommit"), "{out}");
     assert!(!reruns.contains("RefApply"), "{out}");
     assert!(reruns.contains("RefCommit"), "{out}");
+}
+
+#[test]
+fn steps_show_the_named_locals_that_hold_values() {
+    // A step starts each statement, with the named locals made so far
+    // that hold values. `s`, a string, is counted: the call takes it, so
+    // the steps after it leave it out.
+    let found = mir_of(
+        "fn f(n: Int) -> Int {\n  let s = \"x\"\n  let k = s.width()\n  let m = n + k\n  m\n}\n\nfn width(s: Str) -> Int { 1 }\n",
+        true,
+    );
+    let steps: Vec<&str> = found
+        .lines()
+        .take_while(|l| *l != "width")
+        .map(str::trim)
+        .filter(|l| l.starts_with("step "))
+        .collect();
+    assert_eq!(
+        steps,
+        [
+            "step e0 [_0]",
+            "step e2 [_0, _1]",
+            "step e6 [_0, _3]",
+            "step e7 [_0, _3, _5]"
+        ],
+        "{found}"
+    );
 }

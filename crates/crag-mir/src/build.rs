@@ -1826,7 +1826,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     self.stmt(stmt);
                 }
                 match tail {
-                    Some(tail) => self.eval(*tail, dest),
+                    Some(tail) => {
+                        self.step(Some(*tail));
+                        self.eval(*tail, dest)
+                    }
                     None => {
                         let unit = Ty::unit(self.db);
                         self.finish_dest(self.unit(), unit, dest);
@@ -3134,8 +3137,35 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
 
     // Statements.
 
+    /// A step where the debugger may stop before what starts at `at`, with
+    /// every named local made so far; liveness keeps those that hold
+    /// values there.
+    fn step(&mut self, at: Option<ExprId>) {
+        let locals = (0..self.locals.len())
+            .filter(|&i| self.locals[i].binding.is_some())
+            .map(|i| Local(i as u32))
+            .collect();
+        self.push(Statement::Step { at, locals });
+    }
+
     fn stmt(&mut self, stmt: &Stmt) {
         let body = self.body;
+        let at = match stmt {
+            Stmt::Expr(e)
+            | Stmt::Let { value: e, .. }
+            | Stmt::LetElse { value: e, .. }
+            | Stmt::Bind { value: e, .. }
+            | Stmt::Assign { value: e, .. }
+            | Stmt::For { iterable: e, .. }
+            | Stmt::Return(Some(e))
+            | Stmt::Emit { value: e, .. }
+            | Stmt::On { handler: e, .. } => Some(Some(*e)),
+            Stmt::Return(None) => Some(None),
+            Stmt::Fn { .. } => None,
+        };
+        if let Some(at) = at {
+            self.step(at);
+        }
         match stmt {
             Stmt::Expr(e) => self.eval(*e, Dest::Discard),
             Stmt::Let { pat, value, .. } => {
