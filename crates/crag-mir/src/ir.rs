@@ -390,6 +390,24 @@ pub enum Intrinsic<'db> {
     TextUtf8,
     /// The same text as another type: bytes as a string.
     TextCast,
+    /// The text functions of the runtime (`crag_abi::text_op`): a count,
+    /// what is at an offset, a search, a new string, the bytes between two
+    /// offsets, a code point's property or mapping, and a number parsed,
+    /// whose value waits for `TextParsed`.
+    TextMeasure(u8),
+    TextAt(u8),
+    TextFind(u8),
+    TextMap(u8),
+    TextSlice,
+    CodePointOp(u8),
+    TextParse(u8),
+    TextParsed,
+    /// The same word as another one-word type: a code point's value.
+    Word,
+    /// The list with the element after its last, which it consumes.
+    ListAppend,
+    /// Traps with the kind, a `crag_abi::TrapKind` by its number.
+    TrapWith(u8),
     /// Emits the signal (§11.2), with the qualifier of
     /// `crag_abi::SIGNAL_PLAIN` to `SIGNAL_RETRY`: held in a block, else
     /// delivered at once.
@@ -414,6 +432,7 @@ impl Intrinsic<'_> {
         match self {
             Intrinsic::RefCommit => index == 2,
             Intrinsic::RefSwap | Intrinsic::ScopeStart | Intrinsic::ExtStore => index == 1,
+            Intrinsic::ListAppend => index <= 1,
             Intrinsic::RefNew
             | Intrinsic::ExtNew
             | Intrinsic::LazyNew

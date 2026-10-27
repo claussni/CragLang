@@ -1113,6 +1113,15 @@ impl<'a, 'db> Lower<'a, 'db> {
         out
     }
 
+    /// The two words of a string or bytes operand.
+    fn text_words(&mut self, op: &Operand<'db>, ty: Ty<'db>) -> Result<[VReg; 2], Unsupported> {
+        let op_ty = self.operand_ty(op, ty);
+        match self.operand(op, op_ty)?[..] {
+            [w0, w1] => Ok([w0, w1]),
+            _ => Err("this operation of the runtime"),
+        }
+    }
+
     /// The runtime handle in the box of a `RuntimeStream` or `RuntimeHub`.
     fn handle_of(&mut self, handle: &Operand<'db>) -> Result<VReg, Unsupported> {
         let ptr = self.box_of(handle)?;
@@ -1548,8 +1557,11 @@ impl<'a, 'db> Lower<'a, 'db> {
                     self.runtime(RuntimeFn::IoPrint, vec![w0, w1, newline]),
                 ])
             }
-            (Intrinsic::IoFault, []) => {
-                let kind = self.constant(AbiTrap::Fault as i64);
+            (Intrinsic::IoFault | Intrinsic::TrapWith(_), []) => {
+                let kind = match intrinsic {
+                    Intrinsic::TrapWith(kind) => self.constant(i64::from(kind)),
+                    _ => self.constant(AbiTrap::Fault as i64),
+                };
                 let position = self.constant(crag_abi::NO_POSITION as i64);
                 // `rt_trap` does not return.
                 self.push(Inst::CallRuntime {
@@ -1592,6 +1604,83 @@ impl<'a, 'db> Lower<'a, 'db> {
                 Ok(vec![self.runtime(RuntimeFn::TextUtf8, vec![w0, w1])])
             }
             (Intrinsic::TextCast, [text]) => self.concat(std::slice::from_ref(text)),
+            (Intrinsic::TextMeasure(op), [text]) => {
+                let [w0, w1] = self.text_words(text, ty)?;
+                let op = self.constant(i64::from(op));
+                Ok(vec![self.runtime(RuntimeFn::TextMeasure, vec![op, w0, w1])])
+            }
+            (Intrinsic::TextAt(op), [text, at]) => {
+                let [w0, w1] = self.text_words(text, ty)?;
+                let at = word(&self.operand(at, int)?)?;
+                let op = self.constant(i64::from(op));
+                Ok(vec![self.runtime(RuntimeFn::TextAt, vec![op, w0, w1, at])])
+            }
+            (Intrinsic::TextFind(op), [text, part, from @ ..]) => {
+                let [a0, a1] = self.text_words(text, ty)?;
+                let [b0, b1] = self.text_words(part, ty)?;
+                let op = self.constant(i64::from(op));
+                let packed = match from {
+                    [from] => {
+                        let from = word(&self.operand(from, int)?)?;
+                        let three = self.constant(3);
+                        let shifted = self.bin(LirBin::Shl, from, three);
+                        self.bin(LirBin::Or, shifted, op)
+                    }
+                    _ => op,
+                };
+                Ok(vec![self.runtime(RuntimeFn::TextFind, vec![a0, a1, b0, b1, packed])])
+            }
+            (Intrinsic::TextMap(op), [text]) => {
+                let [w0, w1] = self.text_words(text, ty)?;
+                let op = self.constant(i64::from(op));
+                Ok(self.runtime2(RuntimeFn::TextMap, vec![op, w0, w1]).to_vec())
+            }
+            (Intrinsic::TextSlice, [text, from, to]) => {
+                let [w0, w1] = self.text_words(text, ty)?;
+                let from = word(&self.operand(from, int)?)?;
+                let to = word(&self.operand(to, int)?)?;
+                Ok(self.runtime2(RuntimeFn::TextSlice, vec![w0, w1, from, to]).to_vec())
+            }
+            (Intrinsic::CodePointOp(op), [c]) => {
+                let c_ty = self.operand_ty(c, ty);
+                let c = word(&self.operand(c, c_ty)?)?;
+                let op = self.constant(i64::from(op));
+                Ok(vec![self.runtime(RuntimeFn::CodePointOp, vec![op, c])])
+            }
+            (Intrinsic::TextParse(op), [text, base @ ..]) => {
+                let [w0, w1] = self.text_words(text, ty)?;
+                let base = match base {
+                    [base] => word(&self.operand(base, int)?)?,
+                    _ => self.constant(10),
+                };
+                let op = self.constant(i64::from(op));
+                let out = self.runtime2(RuntimeFn::TextParse, vec![op, w0, w1, base]);
+                // The value waits in the scratch words for `TextParsed`.
+                let scratch = self.scratch();
+                self.push(Inst::Store {
+                    src: out[0],
+                    addr: scratch,
+                    offset: 0,
+                });
+                Ok(vec![out[1]])
+            }
+            (Intrinsic::TextParsed, []) => {
+                let scratch = self.scratch();
+                Ok(vec![self.load(scratch, 0)])
+            }
+            (Intrinsic::Word, [x]) => {
+                let x_ty = self.operand_ty(x, ty);
+                Ok(vec![word(&self.operand(x, x_ty)?)?])
+            }
+            (Intrinsic::ListAppend, [list, value]) => {
+                let list_ty = self.operand_ty(list, ty);
+                let element = element_of(self.db, list_ty)?;
+                self.describe(list_ty)?;
+                let list = word(&self.operand(list, list_ty)?)?;
+                let words = self.operand(value, element)?;
+                let [w0, w1] = self.pad(words);
+                Ok(vec![self.runtime(RuntimeFn::ListPush, vec![list, w0, w1])])
+            }
             (Intrinsic::SignalMark, []) => {
                 Ok(vec![self.runtime(RuntimeFn::SignalMark, Vec::new())])
             }

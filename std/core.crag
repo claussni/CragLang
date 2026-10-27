@@ -45,6 +45,23 @@ pub type False
 pub type Bool = True | False
 pub type Empty[T]
 pub type Option[T] = T | Empty[T]
+
+// The function of the value, or `Empty` (Specification §3.6).
+pub fn then[T, U](o: Option[T], f: (T) -> U) -> Option[U] {
+  case o {
+    e: Empty[T] -> Empty
+    x: T -> f(x)
+  }
+}
+
+// The value, or the fallback for `Empty`.
+pub fn orElse[T](o: Option[T], fallback: T) -> T {
+  case o {
+    e: Empty[T] -> fallback
+    x: T -> x
+  }
+}
+
 pub type Less
 pub type Equal
 pub type Greater
@@ -254,7 +271,7 @@ pub fn lessOrEqual(a: CodePoint, b: CodePoint) -> Bool
 pub fn greaterThan(a: CodePoint, b: CodePoint) -> Bool
 pub fn greaterOrEqual(a: CodePoint, b: CodePoint) -> Bool
 
-// Str
+// Str (Specification §19.10)
 
 pub fn equals(a: Str, b: Str) -> Bool
 // The two strings joined: `a + b`.
@@ -262,7 +279,265 @@ pub fn add(a: Str, b: Str) -> Str
 // The string's UTF-8 bytes.
 pub fn bytes(s: Str) -> Bytes
 
+pub fn compare(a: Str, b: Str) -> Ordering { ordering(textCompare(a, b)) }
+
+// A position in a string: the byte offset of a code point boundary.
+pub opaque type StrIndex(at: Int)
+
+pub fn start(s: Str) -> StrIndex { StrIndex(at: 0) }
+pub fn end(s: Str) -> StrIndex { StrIndex(at: textByteCount(s)) }
+
+pub fn equals(a: StrIndex, b: StrIndex) -> Bool { a.at == b.at }
+
+pub fn compare(a: StrIndex, b: StrIndex) -> Ordering {
+  if a.at < b.at { return Less }
+  if a.at == b.at { return Equal }
+  Greater
+}
+
+// The offset of a position, which must be a boundary in `s`.
+fn offset(s: Str, i: StrIndex) -> Int {
+  if textIsBoundary(s, i.at) == 0 { trapIndex() }
+  i.at
+}
+
+fn offsetOr(s: Str, i: Option[StrIndex], none: Int) -> Int {
+  case i {
+    at: StrIndex -> offset(s, at)
+    _ -> none
+  }
+}
+
+fn index(at: Int) -> Option[StrIndex] {
+  if at < 0 { return Empty }
+  StrIndex(at: at)
+}
+
+pub fn indexOf(s: Str, part: Str, from: Option[StrIndex] = Empty) -> Option[StrIndex] {
+  index(textIndexOf(s, part, offsetOr(s, from, 0)))
+}
+
+pub fn lastIndexOf(s: Str, part: Str) -> Option[StrIndex] { index(textLastIndexOf(s, part)) }
+
+// The position past the code point at `at`.
+pub fn after(s: Str, at: StrIndex) -> Option[StrIndex] { index(textNext(s, offset(s, at))) }
+
+// The position of the code point before `at`.
+pub fn before(s: Str, at: StrIndex) -> Option[StrIndex] { index(textPrevious(s, offset(s, at))) }
+
+pub fn codePointAt(s: Str, at: StrIndex) -> Option[CodePoint] {
+  let c = textCodePointAt(s, offset(s, at))
+  if c < 0 { return Empty }
+  cpOf(c)
+}
+
+pub fn substring(s: Str, from: Option[StrIndex] = Empty, before: Option[StrIndex] = Empty) -> Str {
+  let a = offsetOr(s, from, 0)
+  let b = offsetOr(s, before, textByteCount(s))
+  if a > b { trapIndex() }
+  textSlice(s, a, b)
+}
+
+pub fn byteCount(s: Str) -> Int { textByteCount(s) }
+pub fn codePointCount(s: Str) -> Int { textCodePointCount(s) }
+pub fn isEmpty(s: Str) -> Bool { textByteCount(s) == 0 }
+
+pub fn codePoints(s: Str) -> List[CodePoint] { codePointsFrom(s, 0, []) }
+
+fn codePointsFrom(s: Str, at: Int, sofar: List[CodePoint]) -> List[CodePoint] {
+  let c = textCodePointAt(s, at)
+  if c < 0 { return sofar }
+  codePointsFrom(s, textNext(s, at), listAppend(sofar, cpOf(c)))
+}
+
+// The parts between the separators; an empty separator splits into code
+// points.
+pub fn split(s: Str, separator: Str) -> List[Str] {
+  if textByteCount(separator) == 0 { return codePoints(s).map { c -> c.text() } }
+  splitFrom(s, separator, 0, [])
+}
+
+fn splitFrom(s: Str, separator: Str, from: Int, sofar: List[Str]) -> List[Str] {
+  let at = textIndexOf(s, separator, from)
+  if at < 0 { return listAppend(sofar, textSlice(s, from, textByteCount(s))) }
+  let next = at + textByteCount(separator)
+  splitFrom(s, separator, next, listAppend(sofar, textSlice(s, from, at)))
+}
+
+// The lines, split at `\n` and `\r\n`; a final line end adds no empty line.
+pub fn lines(s: Str) -> List[Str] {
+  let n = textByteCount(s)
+  if n == 0 { return [] }
+  let body = if textEndsWith(s, "\n") == 1 { textSlice(s, 0, n - 1) } else { s }
+  var out: List[Str] = []
+  for line in split(body, "\n") {
+    let m = textByteCount(line)
+    let cut = if textEndsWith(line, "\r") == 1 { textSlice(line, 0, m - 1) } else { line }
+    out = listAppend(out, cut)
+  }
+  out
+}
+
+pub fn join(parts: List[Str], separator: Str = "") -> Str {
+  var out = ""
+  var i = 0
+  for part in parts {
+    out = if i == 0 { part } else { out + separator + part }
+    i = i + 1
+  }
+  out
+}
+
+pub fn contains(s: Str, part: Str) -> Bool { textIndexOf(s, part, 0) >= 0 }
+pub fn startsWith(s: Str, part: Str) -> Bool { textStartsWith(s, part) == 1 }
+pub fn endsWith(s: Str, part: Str) -> Bool { textEndsWith(s, part) == 1 }
+pub fn trim(s: Str) -> Str { textTrim(s) }
+pub fn trimStart(s: Str) -> Str { textTrimStart(s) }
+pub fn trimEnd(s: Str) -> Str { textTrimEnd(s) }
+pub fn toUpper(s: Str) -> Str { textToUpper(s) }
+pub fn toLower(s: Str) -> Str { textToLower(s) }
+
+// Every occurrence of `part` replaced.
+pub fn replace(s: Str, part: Str, with: Str) -> Str {
+  if textByteCount(part) == 0 { return s }
+  join(split(s, part), with)
+}
+
+pub fn repeat(s: Str, times: Int) -> Str {
+  var out = ""
+  for i in 1..times { out = out + s }
+  out
+}
+
+// Padded to `width` code points.
+pub fn padStart(s: Str, width: Int, with: CodePoint = ' ') -> Str {
+  repeat(with.text(), width - textCodePointCount(s)) + s
+}
+
+pub fn padEnd(s: Str, width: Int, with: CodePoint = ' ') -> Str {
+  s + repeat(with.text(), width - textCodePointCount(s))
+}
+
+pub type ParseError(..Error, text: Str)
+
+pub fn parse(s: Str, base: Int = 10) -> Int | ParseError {
+  if textParseInt(s, base) == 0 { return ParseError(text: s) }
+  textParsedInt()
+}
+
+pub fn parse(s: Str) -> Float | ParseError {
+  if textParseFloat(s) == 0 { return ParseError(text: s) }
+  textParsedFloat()
+}
+
+// CodePoint
+
+pub type InvalidCodePoint(..Error, value: Int)
+
+pub fn codePoint(value: Int) -> CodePoint | InvalidCodePoint {
+  if cpIsValid(value) == 0 { return InvalidCodePoint(value: value) }
+  cpOf(value)
+}
+
+pub fn value(c: CodePoint) -> Int { cpValue(c) }
+pub fn isLetter(c: CodePoint) -> Bool { cpIsLetter(c) == 1 }
+// The ASCII digits 0 to 9.
+pub fn isDigit(c: CodePoint) -> Bool { cpIsDigit(c) == 1 }
+// A number of any script.
+pub fn isNumeric(c: CodePoint) -> Bool { cpIsNumeric(c) == 1 }
+pub fn isWhitespace(c: CodePoint) -> Bool { cpIsWhitespace(c) == 1 }
+pub fn isUpper(c: CodePoint) -> Bool { cpIsUpper(c) == 1 }
+pub fn isLower(c: CodePoint) -> Bool { cpIsLower(c) == 1 }
+pub fn toUpper(c: CodePoint) -> CodePoint { cpToUpper(c) }
+pub fn toLower(c: CodePoint) -> CodePoint { cpToLower(c) }
+pub fn text(c: CodePoint) -> Str { "{c}" }
+
 // Bytes
 
 pub fn equals(a: Bytes, b: Bytes) -> Bool
 pub fn add(a: Bytes, b: Bytes) -> Bytes
+pub fn compare(a: Bytes, b: Bytes) -> Ordering { ordering(bytesCompare(a, b)) }
+
+pub type NotUtf8(..Error)
+
+// The bytes as a string, if they are UTF-8.
+pub fn text(b: Bytes) -> Str | NotUtf8 {
+  if textUtf8(b) == 0 { return NotUtf8() }
+  textOfBytes(b)
+}
+
+pub fn count(b: Bytes) -> Int { bytesCount(b) }
+pub fn isEmpty(b: Bytes) -> Bool { bytesCount(b) == 0 }
+
+pub fn get(b: Bytes, at: Int) -> Option[UInt8] {
+  let v = bytesAt(b, at)
+  if v < 0 { return Empty }
+  u8Of(v)
+}
+
+pub fn slice(b: Bytes, range: Range[Int]) -> Bytes {
+  if range.first < 0 or range.last >= bytesCount(b) { trapIndex() }
+  bytesSlice(b, range.first, range.last + 1)
+}
+
+// Two lower-case hexadecimal digits a byte.
+pub fn hex(b: Bytes) -> Str { bytesHex(b) }
+
+fn ordering(n: Int) -> Ordering {
+  if n == 0 { return Less }
+  if n == 1 { return Equal }
+  Greater
+}
+
+// The runtime's text functions (crag_abi::text_op).
+fn textByteCount(s: Str) -> Int
+fn textCodePointCount(s: Str) -> Int
+fn textIsBoundary(s: Str, at: Int) -> Int
+fn textNext(s: Str, at: Int) -> Int
+fn textPrevious(s: Str, at: Int) -> Int
+fn textCodePointAt(s: Str, at: Int) -> Int
+fn textIndexOf(s: Str, part: Str, from: Int) -> Int
+fn textLastIndexOf(s: Str, part: Str) -> Int
+fn textStartsWith(s: Str, part: Str) -> Int
+fn textEndsWith(s: Str, part: Str) -> Int
+fn textCompare(a: Str, b: Str) -> Int
+fn textTrim(s: Str) -> Str
+fn textTrimStart(s: Str) -> Str
+fn textTrimEnd(s: Str) -> Str
+fn textToUpper(s: Str) -> Str
+fn textToLower(s: Str) -> Str
+fn textSlice(s: Str, from: Int, to: Int) -> Str
+fn textParseInt(s: Str, base: Int) -> Int
+fn textParsedInt() -> Int
+fn textParseFloat(s: Str) -> Int
+fn textParsedFloat() -> Float
+fn textUtf8(b: Bytes) -> Int
+fn textOfBytes(b: Bytes) -> Str
+fn bytesCount(b: Bytes) -> Int
+fn bytesAt(b: Bytes, at: Int) -> Int
+fn bytesSlice(b: Bytes, from: Int, to: Int) -> Bytes
+fn bytesHex(b: Bytes) -> Str
+fn bytesCompare(a: Bytes, b: Bytes) -> Int
+fn cpOf(n: Int) -> CodePoint
+fn cpValue(c: CodePoint) -> Int
+fn cpIsValid(n: Int) -> Int
+fn cpIsLetter(c: CodePoint) -> Int
+fn cpIsDigit(c: CodePoint) -> Int
+fn cpIsNumeric(c: CodePoint) -> Int
+fn cpIsWhitespace(c: CodePoint) -> Int
+fn cpIsUpper(c: CodePoint) -> Int
+fn cpIsLower(c: CodePoint) -> Int
+fn cpToUpper(c: CodePoint) -> CodePoint
+fn cpToLower(c: CodePoint) -> CodePoint
+fn u8Of(n: Int) -> UInt8
+fn trapIndex() -> ()
+
+// Lists (Specification §19.11)
+
+fn listAppend[T](xs: List[T], x: T) -> List[T]
+
+pub fn map[T, U](xs: List[T], f: (T) -> U) -> List[U] {
+  var out: List[U] = []
+  for x in xs { out = listAppend(out, f(x)) }
+  out
+}

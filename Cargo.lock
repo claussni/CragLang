@@ -228,6 +228,7 @@ dependencies = [
 name = "crag-mir"
 version = "0.0.0"
 dependencies = [
+ "crag-abi",
  "crag-db",
  "crag-hir",
  "crag-types",

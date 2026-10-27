@@ -763,6 +763,89 @@ pub enum RuntimeFn {
     ///
     /// Whether the bytes of a value are valid UTF-8.
     TextUtf8 = 82,
+
+    /// `rt_text_measure(ctx, op, w0, w1) -> n`.
+    ///
+    /// A count of a string or bytes value, by the operation of
+    /// [`text_op`]: `BYTE_COUNT` or `CODE_POINT_COUNT`.
+    TextMeasure = 83,
+
+    /// `rt_text_at(ctx, op, w0, w1, at) -> n`.
+    ///
+    /// What is at a byte offset: `IS_BOUNDARY`, `NEXT`, `PREVIOUS`,
+    /// `CODE_POINT_AT` or `BYTE_AT` of [`text_op`]; -1 where there is
+    /// nothing.
+    TextAt = 84,
+
+    /// `rt_text_find(ctx, a0, a1, b0, b1, packed) -> n`.
+    ///
+    /// Looks for the second value in the first. `packed` holds the
+    /// operation of [`text_op`] in its low 3 bits and the offset to
+    /// search from above them: `INDEX_OF` and `LAST_INDEX_OF` give a byte
+    /// offset or -1, `STARTS_WITH` and `ENDS_WITH` 1 or 0, and `COMPARE`
+    /// 0, 1 or 2 for less, equal and greater, by the bytes.
+    TextFind = 85,
+
+    /// `rt_text_map(ctx, op, w0, w1) -> (w0, w1)`.
+    ///
+    /// A new string from one: `TRIM`, `TRIM_START`, `TRIM_END`,
+    /// `TO_UPPER`, `TO_LOWER` or `HEX` of [`text_op`].
+    TextMap = 86,
+
+    /// `rt_text_slice(ctx, w0, w1, from, to) -> (w0, w1)`.
+    ///
+    /// The bytes from `from` up to `to`, both clamped to the value.
+    TextSlice = 87,
+
+    /// `rt_code_point(ctx, op, value) -> n`.
+    ///
+    /// A property or mapping of a code point, by the `CP_…` operations of
+    /// [`text_op`].
+    CodePointOp = 88,
+
+    /// `rt_text_parse(ctx, op, w0, w1, base) -> (value, ok)`.
+    ///
+    /// A number from text: `PARSE_INT` in the base, or `PARSE_FLOAT` as
+    /// its bits; `ok` is 0 when the text is no such number.
+    TextParse = 89,
+}
+
+/// The operations of the text runtime functions.
+pub mod text_op {
+    pub const BYTE_COUNT: u8 = 0;
+    pub const CODE_POINT_COUNT: u8 = 1;
+
+    pub const IS_BOUNDARY: u8 = 0;
+    pub const NEXT: u8 = 1;
+    pub const PREVIOUS: u8 = 2;
+    pub const CODE_POINT_AT: u8 = 3;
+    pub const BYTE_AT: u8 = 4;
+
+    pub const INDEX_OF: u8 = 0;
+    pub const LAST_INDEX_OF: u8 = 1;
+    pub const STARTS_WITH: u8 = 2;
+    pub const ENDS_WITH: u8 = 3;
+    pub const COMPARE: u8 = 4;
+
+    pub const TRIM: u8 = 0;
+    pub const TRIM_START: u8 = 1;
+    pub const TRIM_END: u8 = 2;
+    pub const TO_UPPER: u8 = 3;
+    pub const TO_LOWER: u8 = 4;
+    pub const HEX: u8 = 5;
+
+    pub const CP_IS_LETTER: u8 = 0;
+    pub const CP_IS_DIGIT: u8 = 1;
+    pub const CP_IS_WHITESPACE: u8 = 2;
+    pub const CP_IS_UPPER: u8 = 3;
+    pub const CP_IS_LOWER: u8 = 4;
+    pub const CP_TO_UPPER: u8 = 5;
+    pub const CP_TO_LOWER: u8 = 6;
+    pub const CP_IS_VALID: u8 = 7;
+    pub const CP_IS_NUMERIC: u8 = 8;
+
+    pub const PARSE_INT: u8 = 0;
+    pub const PARSE_FLOAT: u8 = 1;
 }
 
 /// The error of `IoConnectHost` for a host name without an address, above
@@ -861,7 +944,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 83] = [
+    pub const ALL: [RuntimeFn; 90] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -945,6 +1028,13 @@ impl RuntimeFn {
         RuntimeFn::IoSocketAny,
         RuntimeFn::IoConnectHost,
         RuntimeFn::TextUtf8,
+        RuntimeFn::TextMeasure,
+        RuntimeFn::TextAt,
+        RuntimeFn::TextFind,
+        RuntimeFn::TextMap,
+        RuntimeFn::TextSlice,
+        RuntimeFn::CodePointOp,
+        RuntimeFn::TextParse,
     ];
 
     /// The symbol the loader looks up.
@@ -1033,6 +1123,13 @@ impl RuntimeFn {
             RuntimeFn::IoSocketAny => "rt_io_socket_any",
             RuntimeFn::IoConnectHost => "rt_io_connect_host",
             RuntimeFn::TextUtf8 => "rt_text_utf8",
+            RuntimeFn::TextMeasure => "rt_text_measure",
+            RuntimeFn::TextAt => "rt_text_at",
+            RuntimeFn::TextFind => "rt_text_find",
+            RuntimeFn::TextMap => "rt_text_map",
+            RuntimeFn::TextSlice => "rt_text_slice",
+            RuntimeFn::CodePointOp => "rt_code_point",
+            RuntimeFn::TextParse => "rt_text_parse",
         }
     }
 

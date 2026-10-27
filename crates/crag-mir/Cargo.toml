@@ -11,6 +11,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+crag-abi = { path = "../crag-abi" }
 crag-db = { path = "../crag-db" }
 crag-hir = { path = "../crag-hir" }
 crag-types = { path = "../crag-types" }

@@ -33,9 +33,6 @@ pub type IoError(..Error, code: Int)
 // A host name that has no address.
 pub type UnknownHost(..Error, name: Str)
 
-// Bytes that are not UTF-8, where a string was wanted.
-pub type NotUtf8(..Error)
-
 // Writes the text to standard output. Failing to write is a `Fault` trap.
 pub fn print(text: Str) -> () {
   if ioPrint(text, 0) != 0 { ioFault() }
@@ -44,12 +41,6 @@ pub fn print(text: Str) -> () {
 // Writes the text and a newline to standard output, as one write.
 pub fn printLine(text: Str) -> () {
   if ioPrint(text, 1) != 0 { ioFault() }
-}
-
-// The bytes as a string, if they are UTF-8.
-pub fn text(bytes: Bytes) -> Str | NotUtf8 {
-  if ioUtf8(bytes) == 0 { return NotUtf8() }
-  ioText(bytes)
 }
 
 // The bytes of the file at `path`, a path of the system, relative to the
@@ -133,8 +124,6 @@ fn writeRest(socket: RuntimeSocket, bytes: Bytes, left: Int) -> () | IoError {
 fn ioPrint(text: Str, newline: Int) -> Int
 fn ioFault() -> ()
 fn ioReadFile(path: Str) -> Int
-fn ioUtf8(bytes: Bytes) -> Int
-fn ioText(bytes: Bytes) -> Str
 // The runtime's sockets: a descriptor, or minus the error number.
 fn ioListen(port: Int) -> Int
 fn ioOwn(fd: Int) -> RuntimeSocket

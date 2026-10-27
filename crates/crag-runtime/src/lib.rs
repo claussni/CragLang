@@ -72,6 +72,7 @@ pub mod side_stack;
 mod signals;
 pub mod stack;
 mod stdio;
+mod strings;
 mod stm;
 mod stream;
 pub mod stress;
@@ -183,6 +184,13 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::IoSocketAny => net::rt_io_socket_any as *const () as usize,
         RuntimeFn::IoConnectHost => net::rt_io_connect_host as *const () as usize,
         RuntimeFn::TextUtf8 => text::rt_text_utf8 as *const () as usize,
+        RuntimeFn::TextMeasure => strings::rt_text_measure as *const () as usize,
+        RuntimeFn::TextAt => strings::rt_text_at as *const () as usize,
+        RuntimeFn::TextFind => strings::rt_text_find as *const () as usize,
+        RuntimeFn::TextMap => strings::rt_text_map as *const () as usize,
+        RuntimeFn::TextSlice => strings::rt_text_slice as *const () as usize,
+        RuntimeFn::CodePointOp => strings::rt_code_point as *const () as usize,
+        RuntimeFn::TextParse => strings::rt_text_parse as *const () as usize,
     }
 }
 
