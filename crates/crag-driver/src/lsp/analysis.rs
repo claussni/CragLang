@@ -441,7 +441,7 @@ pub fn valid_name(name: &str) -> bool {
 }
 
 /// The declaration's text without its body, on one line: a signature.
-fn signature_text(db: &dyn Db, item: ItemId<'_>) -> Option<String> {
+pub(crate) fn signature_text(db: &dyn Db, item: ItemId<'_>) -> Option<String> {
     let module = *item.module(db);
     let decl = item_decl(db, item)?;
     let node = root(db, module).children().nth(decl as usize)?;

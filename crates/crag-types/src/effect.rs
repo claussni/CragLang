@@ -169,6 +169,11 @@ impl EffectSet {
         }
     }
 
+    /// The parameters whose functions it calls, by index.
+    pub fn called_params(self) -> Vec<usize> {
+        (0..64).filter(|i| self.params & (1 << i) != 0).collect()
+    }
+
     /// Its effects and entries as text, as `io, param 0, slot 1`; `none`
     /// when it has neither.
     pub fn describe(self) -> String {

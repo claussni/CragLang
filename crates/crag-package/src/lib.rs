@@ -17,6 +17,7 @@
 //! Packages (Specification §14.5, §20.4 to §20.6): manifests, versions,
 //! folder registries, resolution, package content and the SBOM.
 
+pub mod api;
 pub mod content;
 pub mod home;
 pub mod manifest;

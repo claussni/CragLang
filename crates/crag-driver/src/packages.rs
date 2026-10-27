@@ -450,14 +450,14 @@ pub fn crag_outdated(root: &Path, args: &Args, out: &mut dyn Write) -> u8 {
         let _ = writeln!(out, "everything is up to date");
     }
     for (name, v, same, major) in rows {
-        let mut line = format!("{name} {v}");
+        let mut news = Vec::new();
         if let Some(same) = same {
-            line.push_str(&format!(": {same} available"));
+            news.push(format!("{same} available"));
         }
         if let Some(major) = major {
-            line.push_str(&format!(", new major {major}"));
+            news.push(format!("new major {major}"));
         }
-        let _ = writeln!(out, "{line}");
+        let _ = writeln!(out, "{name} {v}: {}", news.join(", "));
     }
     0
 }
@@ -574,4 +574,248 @@ pub fn crag_sbom(root: &Path, args: &Args, out: &mut dyn Write) -> u8 {
         let _ = writeln!(out, "{line}");
     }
     0
+}
+
+pub const PUBLISH: Spec = Spec::NONE;
+
+/// `publish <registry>`: runs the publishing checks (§20.5), builds the
+/// package folder and places it into the registry.
+pub fn crag_publish(root: &Path, args: &Args, out: &mut dyn Write) -> u8 {
+    let [name] = &args.positional[..] else {
+        return usage(out, "crag publish <registry>");
+    };
+    let registries = match registries() {
+        Ok(r) => r,
+        Err(e) => return fail(out, e),
+    };
+    let Some(registry) = registries.iter().find(|r| &r.name == name) else {
+        let names: Vec<&str> = registries.iter().map(|r| r.name.as_str()).collect();
+        return fail(
+            out,
+            format!(
+                "no registry is named `{name}`; the settings name {}",
+                match names.is_empty() {
+                    true => "none".to_string(),
+                    false => names.join(", "),
+                }
+            ),
+        );
+    };
+    let (dir, manifest) = match prepare(root, Some(registry), out) {
+        Ok(prepared) => prepared,
+        Err(status) => return status,
+    };
+    let version = manifest.version.expect("checked");
+    let result = registry.publish(&manifest.package, &version, &dir);
+    let _ = fs::remove_dir_all(&dir);
+    match result {
+        Ok(_) => {
+            let _ = writeln!(
+                out,
+                "published {} {version} to {}",
+                manifest.package, registry.name
+            );
+            0
+        }
+        Err(e) => fail(out, e),
+    }
+}
+
+/// `package` for a library: the folder `publish` would place, in
+/// `target/package/`, after every publishing check; compared with the
+/// default registry's previous version when there is one.
+pub fn crag_package(root: &Path, _args: &Args, out: &mut dyn Write) -> u8 {
+    let registries = match registries() {
+        Ok(r) => r,
+        Err(e) => return fail(out, e),
+    };
+    match prepare(root, registries.first(), out) {
+        Ok((dir, manifest)) => {
+            let _ = writeln!(
+                out,
+                "packaged {} {} in {}",
+                manifest.package,
+                manifest.version.expect("checked"),
+                dir.display()
+            );
+            0
+        }
+        Err(status) => status,
+    }
+}
+
+/// Checks the project for publishing and builds its package folder: the
+/// folder and the manifest, or the status of the failure, whose reasons
+/// were printed.
+fn prepare(
+    root: &Path,
+    registry: Option<&Registry>,
+    out: &mut dyn Write,
+) -> Result<(std::path::PathBuf, Manifest), u8> {
+    let (text, manifest) = manifest(root, out)?;
+    let mut problems = Vec::new();
+    if manifest.runtime.is_none() {
+        problems.push("the manifest states no `runtime` version".to_string());
+    }
+    if manifest.main.is_some() {
+        problems.push("an application is not published; a library has no `main`".to_string());
+    }
+    let Some(version) = manifest.version else {
+        return Err(fail(out, "the manifest states no version"));
+    };
+    if !problems.is_empty() {
+        for p in problems {
+            let _ = writeln!(out, "error: {p}");
+        }
+        return Err(1);
+    }
+    // Every import resolves and the code compiles.
+    let Some(project) = crate::checked(root, out) else {
+        return Err(1);
+    };
+    let db = &project.db;
+    let shipped: Vec<_> = project
+        .own()
+        .iter()
+        .filter(|f| !crag_package::content::is_dev_module(&manifest.package, f.module.path(db)))
+        .collect();
+    let mut problems = Vec::new();
+    // No type holes (§6.11).
+    for f in &shipped {
+        let source = project.source(f.module);
+        for token in crag_syntax::lex(source)
+            .iter()
+            .filter(|t| t.kind == crag_syntax::TokenKind::Hole)
+        {
+            let (line, _) = crate::diagnostics::line_col(source, token.start);
+            problems.push(format!(
+                "{}:{line}: a type hole `???` is not published",
+                f.shown
+            ));
+        }
+    }
+    // Exports name the package's own modules, none of them a test's or a
+    // tool's, so no development import reaches the public API.
+    for export in &manifest.exports {
+        let owned: Vec<_> = shipped
+            .iter()
+            .filter(|f| crate::api::exported(std::slice::from_ref(export), f.module.path(db)))
+            .collect();
+        if owned.is_empty() {
+            problems.push(format!(
+                "`export {export}` names no module of the package outside test and tools"
+            ));
+        }
+    }
+    if !problems.is_empty() {
+        for p in problems {
+            let _ = writeln!(out, "error: {p}");
+        }
+        return Err(1);
+    }
+    // Every test passes.
+    let report = crate::crag_test(root, None, out);
+    if !report.success() {
+        return Err(fail(out, "the tests do not pass, so nothing is published"));
+    }
+    let api = crate::api::public_api(&project);
+    if let Some(registry) = registry {
+        if registry.version_dir(&manifest.package, &version).is_some() {
+            return Err(fail(
+                out,
+                format!(
+                    "{} {version} is already in registry `{}`",
+                    manifest.package, registry.name
+                ),
+            ));
+        }
+        // The previous version of the same major line, if any.
+        let previous = registry
+            .versions(&manifest.package)
+            .into_iter()
+            .rfind(|(v, _)| v.major == version.major && *v < version);
+        if let Some((previous, dir)) = previous {
+            let old = fs::read_to_string(dir.join("api.crag"))
+                .map_err(|e| e.to_string())
+                .and_then(|t| crag_package::api::ApiFile::parse(&t));
+            let old = match old {
+                Ok(old) => old,
+                Err(e) => {
+                    return Err(fail(
+                        out,
+                        format!("cannot read the api.crag of {previous}: {e}"),
+                    ));
+                }
+            };
+            let changes = crag_package::api::diff_api(&old, &api);
+            let bump = crag_package::api::required_bump(&changes);
+            if !crag_package::api::allows(&previous, &version, bump) {
+                let step = match bump {
+                    crag_package::api::Bump::Major => "a new major version",
+                    crag_package::api::Bump::Minor => "at least a new minor version",
+                    crag_package::api::Bump::Patch => "a newer version",
+                };
+                let _ = writeln!(
+                    out,
+                    "error: from {previous}, the API changed so that it needs {step}:"
+                );
+                for c in changes {
+                    let _ = writeln!(out, "  {c}");
+                }
+                return Err(1);
+            }
+        }
+    }
+    // The contents are built twice and must come out the same.
+    let base = root.join("target").join("package");
+    let dir = base.join(format!("{}-{version}", manifest.package));
+    let again = base.join(format!("{}-{version}.check", manifest.package));
+    let built = build_folder(&project, &shipped, &text, &api, &dir)
+        .and_then(|()| build_folder(&project, &shipped, &text, &api, &again));
+    if let Err(e) = built {
+        return Err(fail(out, format!("cannot build the package folder: {e}")));
+    }
+    let same = crag_package::content::content_hash(&dir).ok()
+        == crag_package::content::content_hash(&again).ok();
+    let _ = fs::remove_dir_all(&again);
+    if !same {
+        return Err(fail(
+            out,
+            "the package contents are not reproducible from the sources",
+        ));
+    }
+    Ok((dir, manifest))
+}
+
+/// Writes the package folder of §20.4: the manifest, the shipped modules in
+/// `src/`, their `embed` sources in `res/`, `api.crag` and `sbom.crag`.
+fn build_folder(
+    project: &Project,
+    shipped: &[&crate::project::ModuleFile],
+    manifest: &str,
+    api: &crag_package::api::ApiFile,
+    dir: &Path,
+) -> Result<(), String> {
+    let root = project.root.clone().unwrap_or_default();
+    let _ = fs::remove_dir_all(dir);
+    let io = |e: std::io::Error| e.to_string();
+    fs::create_dir_all(dir.join("src")).map_err(io)?;
+    fs::write(dir.join("package.crag"), manifest).map_err(io)?;
+    fs::write(dir.join("api.crag"), api.write()).map_err(io)?;
+    if let Ok(sbom) = fs::read_to_string(root.join("sbom.crag")) {
+        fs::write(dir.join("sbom.crag"), sbom).map_err(io)?;
+    }
+    let db = &project.db;
+    for f in shipped {
+        let target = dir.join("src").join(&f.shown);
+        fs::create_dir_all(target.parent().expect("a file has a parent")).map_err(io)?;
+        fs::write(&target, project.source(f.module)).map_err(io)?;
+        for source in crag_hir::embed_sources(db, f.module) {
+            let path = crate::project::resource_path(&f.dir, &source)?;
+            let target = dir.join("res").join(&path);
+            fs::create_dir_all(target.parent().expect("a file has a parent")).map_err(io)?;
+            fs::copy(root.join(&path), &target).map_err(io)?;
+        }
+    }
+    Ok(())
 }

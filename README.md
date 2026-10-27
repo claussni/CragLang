@@ -79,6 +79,13 @@ highest version any manifest requires; the committed `sbom.crag` pins the
 content hash of every package, and a build refuses a mismatch until `crag
 sbom regenerate` accepts it on purpose. `crag sbom diff` shows the change.
 
+`crag publish <registry>` checks a library and places it into a registry:
+its tests pass, it has no type holes, and its `api.crag`, the public
+declarations with their inferred errors, effects and escaping parameters,
+needs no larger version step than the one taken since the previous
+version of its major. `crag package` builds the same folder in
+`target/package/` without publishing it.
+
 `crag lsp` is the language server, for editors that speak the Language
 Server Protocol: diagnostics as you type, hover, go to definition,
 references, rename, completion, formatting and the outline. An editor

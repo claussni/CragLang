@@ -318,3 +318,133 @@ fn new_projects_build_run_and_test() {
     assert_eq!(out.status.code(), Some(1));
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn a_library_is_checked_published_and_used() {
+    watchdog();
+    let root = temp("publish");
+    let (home, team) = home(&root);
+    crag(&home, &root, &["new", "geo", "--lib"]);
+    let geo = root.join("geo");
+    // An embed source travels with the package, into res/.
+    fs::create_dir_all(geo.join("data")).unwrap();
+    fs::write(geo.join("data/unit.txt"), "metre").unwrap();
+    fs::write(
+        geo.join("greeting.crag"),
+        "pub fn greeting() -> Str { \"Hello\" }\n\nembed unit: Str from \"data/unit.txt\"\n\npub fn unitName() -> Str { unit }\n\npub fn area(w: Int, h: Int) -> Int { w * h }\n",
+    )
+    .unwrap();
+    let out = crag(&home, &geo, &["publish"]);
+    assert_eq!(out.status.code(), Some(2));
+    let out = crag(&home, &geo, &["publish", "elsewhere"]);
+    assert!(
+        text(&out).contains("no registry is named `elsewhere`; the settings name team"),
+        "{}",
+        text(&out)
+    );
+    let out = crag(&home, &geo, &["publish", "team"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        text(&out).contains("published geo 0.1 to team"),
+        "{}",
+        text(&out)
+    );
+    let published = team.dir.join("geo/0.1");
+    for file in [
+        "package.crag",
+        "api.crag",
+        "content.hash",
+        "src/greeting.crag",
+        "res/data/unit.txt",
+    ] {
+        assert!(published.join(file).is_file(), "{file}");
+    }
+    assert!(
+        !published.join("src/test").exists(),
+        "tests are not shipped"
+    );
+    let api = fs::read_to_string(published.join("api.crag")).unwrap();
+    assert!(
+        api.contains("module geo.greeting\npub fn area(w: Int, h: Int) -> Int\npub fn greeting() -> Str\npub fn unitName() -> Str\n"),
+        "{api}"
+    );
+
+    // An application uses it, embed and all.
+    crag(&home, &root, &["new", "app"]);
+    let app = root.join("app");
+    let out = crag(&home, &app, &["add", "geo"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    fs::write(
+        app.join("main.crag"),
+        "import geo.greeting\n\nfn main() -> ExitCode {\n  let metre = if unitName() == \"metre\" { 5 } else { 0 }\n  ExitCode(code: area(2, 3) + metre)\n}\n",
+    )
+    .unwrap();
+    let out = crag(&home, &app, &["run"]);
+    assert_eq!(out.status.code(), Some(11), "{}", text(&out));
+
+    // Removing a function needs a new major.
+    let manifest = fs::read_to_string(geo.join("package.crag")).unwrap();
+    fs::write(
+        geo.join("package.crag"),
+        manifest.replace("geo 0.1", "geo 0.2"),
+    )
+    .unwrap();
+    fs::write(
+        geo.join("greeting.crag"),
+        "pub fn greeting() -> Str { \"Hello\" }\n\nembed unit: Str from \"data/unit.txt\"\n\npub fn unitName() -> Str { unit }\n",
+    )
+    .unwrap();
+    let out = crag(&home, &geo, &["publish", "team"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out).contains("from 0.1, the API changed so that it needs a new major version:\n  removed or changed in geo.greeting: pub fn area(w: Int, h: Int) -> Int"),
+        "{}",
+        text(&out)
+    );
+    // A type hole is not published, nor is a failing test.
+    fs::write(
+        geo.join("package.crag"),
+        manifest.replace("geo 0.1", "geo 1.0"),
+    )
+    .unwrap();
+    fs::write(
+        geo.join("greeting.crag"),
+        "pub fn greeting() -> Str { ??? }\n",
+    )
+    .unwrap();
+    let out = crag(&home, &geo, &["publish", "team"]);
+    assert!(
+        text(&out).contains("greeting.crag:1: a type hole `???` is not published"),
+        "{}",
+        text(&out)
+    );
+    fs::write(
+        geo.join("greeting.crag"),
+        "pub fn greeting() -> Str { \"Hello\" }\n",
+    )
+    .unwrap();
+    fs::write(
+        geo.join("test/greeting_test.crag"),
+        "test \"fails\" {\n  let xs = [1]\n  let y = xs[3]\n}\n",
+    )
+    .unwrap();
+    let out = crag(&home, &geo, &["publish", "team"]);
+    assert!(
+        text(&out).contains("the tests do not pass, so nothing is published"),
+        "{}",
+        text(&out)
+    );
+    fs::remove_file(geo.join("test/greeting_test.crag")).unwrap();
+    let out = crag(&home, &geo, &["package"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(geo.join("target/package/geo-1.0/api.crag").is_file());
+    let out = crag(&home, &geo, &["publish", "team"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = crag(&home, &app, &["outdated"]);
+    assert!(
+        text(&out).contains("geo 0.1: new major 1.0"),
+        "{}",
+        text(&out)
+    );
+    let _ = fs::remove_dir_all(&root);
+}

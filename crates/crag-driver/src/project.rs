@@ -356,23 +356,7 @@ fn read_resource(
     source: &str,
 ) -> Result<Arc<[u8]>, String> {
     let outside = || format!("`{source}` is outside the package");
-    let mut path = PathBuf::new();
-    for part in dir.join(source).components() {
-        match part {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !path.pop() {
-                    return Err(outside());
-                }
-            }
-            Component::Normal(name) => path.push(name),
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(format!(
-                    "`{source}` is absolute; an `embed` names a file relative to its module"
-                ));
-            }
-        }
-    }
+    let path = resource_path(dir, source)?;
     let full = layout.resource(root, &path);
     // A link may lead out of the package.
     let real = full.canonicalize();
@@ -386,6 +370,29 @@ fn read_resource(
         Ok(bytes) => Ok(Arc::from(bytes)),
         Err(e) => Err(format!("cannot read `{source}`: {e}")),
     }
+}
+
+/// Where an `embed` source of a module in the directory `dir` lies,
+/// relative to its package's root; an error when that is outside it.
+pub fn resource_path(dir: &Path, source: &str) -> Result<PathBuf, String> {
+    let mut path = PathBuf::new();
+    for part in dir.join(source).components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !path.pop() {
+                    return Err(format!("`{source}` is outside the package"));
+                }
+            }
+            Component::Normal(name) => path.push(name),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "`{source}` is absolute; an `embed` names a file relative to its module"
+                ));
+            }
+        }
+    }
+    Ok(path)
 }
 
 /// The manifest of the project at `root`.

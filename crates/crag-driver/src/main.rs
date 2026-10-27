@@ -33,6 +33,8 @@ const USAGE: &str = "usage: crag
        crag outdated [--json]
        crag deps [--json]
        crag sbom diff [--json] | crag sbom regenerate
+       crag package
+       crag publish <registry>
        crag run
        crag test [filter]
        crag fmt [--check] [all | - | file...]
@@ -55,7 +57,8 @@ fn main() -> ExitCode {
         ["test", filter] => test(root, Some(filter)),
         ["fmt", ref rest @ ..] => ExitCode::from(crag_fmt(root, rest, &mut std::io::stderr())),
         [
-            command @ ("new" | "add" | "remove" | "upgrade" | "outdated" | "deps" | "sbom"),
+            command @ ("new" | "add" | "remove" | "upgrade" | "outdated" | "deps" | "sbom"
+            | "package" | "publish"),
             ref rest @ ..,
         ] => package_command(root, command, rest),
         ["lsp"] => ExitCode::from(crag_driver::lsp::serve(std::io::stdin(), std::io::stdout())),
@@ -78,6 +81,8 @@ fn package_command(root: &std::path::Path, command: &str, rest: &[&str]) -> Exit
         "upgrade" => (UPGRADE, crag_upgrade),
         "outdated" => (LIST, crag_outdated),
         "deps" => (LIST, crag_deps),
+        "publish" => (PUBLISH, crag_publish),
+        "package" => (PUBLISH, crag_package),
         _ => (LIST, crag_sbom),
     };
     let args = match Args::shell(rest, spec) {

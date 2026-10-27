@@ -20,6 +20,7 @@
 //! runs them on fibers. `Scratch` runs code in the scratch image instead
 //! (§11.6.3).
 
+pub mod api;
 pub mod app;
 pub mod commands;
 pub mod dap;
@@ -55,7 +56,7 @@ pub const EXIT_TRAP: u8 = 70;
 
 /// Loads the project and prints its diagnostics; the project if it has
 /// none.
-fn checked(root: &Path, out: &mut dyn Write) -> Option<Project> {
+pub(crate) fn checked(root: &Path, out: &mut dyn Write) -> Option<Project> {
     let project = match Project::load(root) {
         Ok(project) => project,
         Err(e) => {
