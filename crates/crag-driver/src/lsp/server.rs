@@ -454,6 +454,13 @@ impl Server {
                         editable: false,
                     };
                 }
+                if let Some(dependency) = &file.dependency {
+                    return FileEntry {
+                        module: file.module,
+                        uri: path_uri(&dependency.file),
+                        editable: false,
+                    };
+                }
                 let uri = match &root {
                     Some(root) if !path.starts_with("editor.") => path_uri(&root.join(&file.shown)),
                     _ => path.strip_prefix("editor.").unwrap_or(path).to_string(),

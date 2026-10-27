@@ -172,6 +172,7 @@ dependencies = [
  "crag-hir",
  "crag-loader",
  "crag-mir",
+ "crag-package",
  "crag-runtime",
  "crag-session",
  "crag-syntax",
@@ -229,6 +230,15 @@ dependencies = [
  "crag-db",
  "crag-hir",
  "crag-types",
+]
+
+[[package]]
+name = "crag-package"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "crag-hir",
+ "crag-syntax",
 ]
 
 [[package]]

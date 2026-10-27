@@ -78,6 +78,9 @@ pub enum PathError {
     Unknown(String),
     /// The path goes on after an element of a module.
     PastElement(String),
+    /// The module is in a package this module may not import from, or
+    /// one that does not export it (§14.5).
+    Hidden { path: String, reason: String },
 }
 
 /// Resolves a dotted import path from the left: directories lead to the
@@ -205,7 +208,15 @@ pub fn imports<'db>(db: &'db dyn Db, program: Program, module: ModuleId) -> Impo
         };
         // An empty path was reported by the parser.
         if !path.is_empty()
-            && let Err(error) = import_targets(db, index, *decl, path, *alias, items, &mut imports)
+            && let Err(error) = import_targets(
+                db,
+                (index, program.packages(db), module.path(db)),
+                *decl,
+                path,
+                *alias,
+                items,
+                &mut imports,
+            )
         {
             imports.errors.push(error);
         }
@@ -213,9 +224,11 @@ pub fn imports<'db>(db: &'db dyn Db, program: Program, module: ModuleId) -> Impo
     imports
 }
 
+/// The modules an import names, as the importer may see them: the index
+/// of the program, its packages and the importing module's path.
 fn import_targets<'db>(
     db: &'db dyn Db,
-    index: &ModuleIndex,
+    (index, packages, importer): (&ModuleIndex, &crate::Packages, &str),
     decl: u32,
     path: &[Name<'db>],
     alias: Option<Name<'db>>,
@@ -223,6 +236,17 @@ fn import_targets<'db>(
     imports: &mut Imports<'db>,
 ) -> Result<(), NameError<'db>> {
     let target = resolve_path(db, index, path).map_err(|error| NameError::Path { decl, error })?;
+    let hidden = |module: ModuleId| {
+        packages
+            .hidden(importer, module.path(db))
+            .map(|reason| NameError::Path {
+                decl,
+                error: PathError::Hidden {
+                    path: module.path(db).clone(),
+                    reason,
+                },
+            })
+    };
     let renamed = || NameError::ModuleRenamed {
         decl,
         path: join(db, path),
@@ -239,6 +263,9 @@ fn import_targets<'db>(
         PathTarget::Module(module) => {
             if alias.is_some() {
                 return Err(renamed());
+            }
+            if let Some(error) = hidden(module) {
+                return Err(error);
             }
             let selection = match items {
                 None => Selection::All,
@@ -257,6 +284,9 @@ fn import_targets<'db>(
                     decl,
                     error: PathError::PastElement(join(db, path)),
                 });
+            }
+            if let Some(error) = hidden(module) {
+                return Err(error);
             }
             push(
                 module,
@@ -279,6 +309,8 @@ fn import_targets<'db>(
                                 .is_some_and(|rest| !rest.contains('.'))
                         })
                         .map(|(p, &m)| (p, m))
+                        // A directory import takes what this module may see.
+                        .filter(|&(_, m)| hidden(m).is_none())
                         .collect();
                     modules.sort_by_key(|&(p, _)| p);
                     for (_, module) in modules {
@@ -291,6 +323,10 @@ fn import_targets<'db>(
                         if item.alias.is_some() {
                             imports.errors.push(NameError::ModuleRenamed { decl, path });
                         } else if let Some(&module) = index.modules.get(&path) {
+                            if let Some(error) = hidden(module) {
+                                imports.errors.push(error);
+                                continue;
+                            }
                             imports.targets.push(ImportTarget {
                                 origin,
                                 module,

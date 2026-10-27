@@ -29,6 +29,7 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-session` | Session manager: image processes, their protocol and supervision (M3) |
 | `crates/crag-eval` | Compile-time evaluation of constants, `embed`s among them, in the metered tier (M3) |
 | `crates/crag-fmt` | The formatter: the canonical layout of source files (M5) |
+| `crates/crag-package` | Packages: manifests, versions, folder registries, resolution and the SBOM (M6) |
 | `std` | The standard library: the prelude `std.core` (M1), `std.time`, `std.task`, `std.stream` and `std.io` (M4) |
 
 ## Build
@@ -64,6 +65,19 @@ directory with a `package.crag` naming the package and its `main` module:
 `crag fmt` formats every module of the project in place, or the files
 named; `-` formats standard input to standard output, and `--check` only
 lists the files that are not formatted.
+
+Packages come from folder registries, which `registries.crag` in the
+settings directory (`$CRAG_HOME`, else `~/.crag`) lists, the first being
+the default:
+
+    registry team "/srv/crag"
+
+`crag new <name> [--lib]` creates a project; `crag add <package>
+[version]`, `remove`, `upgrade <package> [--version=V] | all`, `outdated`
+and `deps` manage its imports. Each major of a package settles on the
+highest version any manifest requires; the committed `sbom.crag` pins the
+content hash of every package, and a build refuses a mismatch until `crag
+sbom regenerate` accepts it on purpose. `crag sbom diff` shows the change.
 
 `crag lsp` is the language server, for editors that speak the Language
 Server Protocol: diagnostics as you type, hover, go to definition,

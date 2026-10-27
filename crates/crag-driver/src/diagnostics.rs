@@ -194,6 +194,10 @@ fn name_error(db: &dyn Db, error: &NameError) -> String {
             error: PathError::PastElement(path),
             ..
         } => format!("`{path}` goes on past an element of a module"),
+        NameError::Path {
+            error: PathError::Hidden { reason, .. },
+            ..
+        } => reason.clone(),
         NameError::ModuleRenamed { path, .. } => {
             format!("`as` renames elements only, not the module or directory `{path}`")
         }

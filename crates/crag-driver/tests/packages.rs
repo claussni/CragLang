@@ -1,0 +1,320 @@
+// This file is part of Crag.
+//
+// Copyright (C) 2026 Ralf Claussnitzer
+//
+// Crag is free software: you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the Free Software
+// Foundation, either version 3 of the License, or (at your option) any later
+// version.
+//
+// Crag is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+// A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// Crag. If not, see <https://www.gnu.org/licenses/>.
+
+//! Packages from folder registries, through the `crag` command
+//! (Specification §14.5, §20.4, §20.6). Each test has a settings directory
+//! of its own, named by `CRAG_HOME`.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::Once;
+use std::time::Duration;
+
+use crag_package::{Registry, Version};
+
+fn watchdog() {
+    static START: Once = Once::new();
+    START.call_once(|| {
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(120));
+            eprintln!("the package tests hung");
+            std::process::abort();
+        });
+    });
+}
+
+fn temp(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("crag-packages-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// A settings directory with the registry `team`.
+fn home(root: &Path) -> (PathBuf, Registry) {
+    let home = root.join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("registries.crag"), "registry team \"team\"\n").unwrap();
+    let registry = Registry::create("team", &home.join("team")).unwrap();
+    (home, registry)
+}
+
+/// Publishes a package with the given manifest lines and modules.
+fn publish(registry: &Registry, name: &str, version: &str, lines: &str, modules: &[(&str, &str)]) {
+    let dir = registry.dir.join(format!("source-{name}-{version}"));
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("package.crag"),
+        format!("package {name} {version}\nruntime 0.0\n{lines}"),
+    )
+    .unwrap();
+    for (file, text) in modules {
+        fs::write(dir.join("src").join(file), text).unwrap();
+    }
+    registry
+        .publish(name, &Version::parse(version).unwrap(), &dir)
+        .unwrap();
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+fn crag(home: &Path, dir: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_crag"))
+        .args(args)
+        .current_dir(dir)
+        .env("CRAG_HOME", home)
+        .output()
+        .unwrap()
+}
+
+fn text(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+const SHAPE: &str = "pub fn area(w: Int, h: Int) -> Int { w * h }\n";
+const INTERNAL: &str = "pub fn secret() -> Int { 42 }\n";
+
+#[test]
+fn a_project_adds_uses_and_upgrades_a_package() {
+    watchdog();
+    let root = temp("use");
+    let (home, team) = home(&root);
+    let geo = "export geo.shape\n";
+    publish(
+        &team,
+        "geo",
+        "1.0",
+        geo,
+        &[("shape.crag", SHAPE), ("internal.crag", INTERNAL)],
+    );
+    publish(
+        &team,
+        "geo",
+        "1.1",
+        geo,
+        &[("shape.crag", SHAPE), ("internal.crag", INTERNAL)],
+    );
+    publish(&team, "geo", "2.0", geo, &[("shape.crag", SHAPE)]);
+
+    let out = crag(&home, &root, &["new", "app"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let app = root.join("app");
+    assert!(app.join("main.crag").is_file() && app.join("test/main_test.crag").is_file());
+    // Bare, a command that changes the project only explains itself.
+    let out = crag(&home, &app, &["add"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(text(&out).contains("usage: crag add <package> [version]"));
+
+    // Without a version, the newest; the SBOM follows.
+    let out = crag(&home, &app, &["add", "geo"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        text(&out).contains("sbom.crag: + geo 2.0") && text(&out).contains("added geo 2.0"),
+        "{}",
+        text(&out)
+    );
+    let out = crag(&home, &app, &["upgrade", "geo", "--version=1.0"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        text(&out).contains("sbom.crag: ~ geo 2.0 -> 1.0"),
+        "{}",
+        text(&out)
+    );
+    let manifest = fs::read_to_string(app.join("package.crag")).unwrap();
+    assert!(
+        manifest.ends_with("main app.main\nimport geo 1.0\n"),
+        "{manifest}"
+    );
+
+    fs::write(
+        app.join("main.crag"),
+        "import geo.shape\n\nfn main() -> ExitCode {\n  ExitCode(code: area(2, 3))\n}\n",
+    )
+    .unwrap();
+    let out = crag(&home, &app, &["run"]);
+    assert_eq!(out.status.code(), Some(6), "{}", text(&out));
+
+    // What geo does not export stays hidden.
+    fs::write(
+        app.join("main.crag"),
+        "import geo.internal\n\nfn main() -> ExitCode {\n  ExitCode(code: secret())\n}\n",
+    )
+    .unwrap();
+    let out = crag(&home, &app, &["run"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out).contains("package geo does not export `geo.internal`"),
+        "{}",
+        text(&out)
+    );
+    fs::write(
+        app.join("main.crag"),
+        "import geo.shape\n\nfn main() -> ExitCode {\n  ExitCode(code: area(2, 3))\n}\n",
+    )
+    .unwrap();
+
+    // Code still imports geo.
+    let out = crag(&home, &app, &["remove", "geo"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out).contains("geo is still imported by main.crag"),
+        "{}",
+        text(&out)
+    );
+
+    let out = crag(&home, &app, &["outdated"]);
+    assert!(
+        text(&out).contains("geo 1.0: 1.1 available, new major 2.0"),
+        "{}",
+        text(&out)
+    );
+    let out = crag(&home, &app, &["upgrade", "geo"]);
+    assert!(
+        text(&out).contains("upgraded geo 1.0 -> 1.1"),
+        "{}",
+        text(&out)
+    );
+    let out = crag(&home, &app, &["deps"]);
+    assert_eq!(text(&out), "app\n  geo 1.1\n");
+
+    // A manifest edited by hand no longer matches the SBOM, until it is
+    // regenerated on purpose.
+    let manifest = fs::read_to_string(app.join("package.crag")).unwrap();
+    fs::write(
+        app.join("package.crag"),
+        manifest.replace("geo 1.1", "geo 1.0"),
+    )
+    .unwrap();
+    let out = crag(&home, &app, &["run"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out).contains("sbom.crag does not match") && text(&out).contains("~ geo 1.1 -> 1.0"),
+        "{}",
+        text(&out)
+    );
+    let out = crag(&home, &app, &["sbom", "diff"]);
+    assert_eq!(text(&out), "~ geo 1.1 -> 1.0\n");
+    let out = crag(&home, &app, &["sbom", "regenerate"]);
+    assert_eq!(text(&out), "sbom.crag: ~ geo 1.1 -> 1.0\n");
+    let out = crag(&home, &app, &["run"]);
+    assert_eq!(out.status.code(), Some(6), "{}", text(&out));
+
+    // A published version that changed is refused.
+    fs::write(team.dir.join("geo/1.0/src/shape.crag"), INTERNAL).unwrap();
+    let out = crag(&home, &app, &["run"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out).contains("does not match its content hash"),
+        "{}",
+        text(&out)
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn development_imports_are_for_tests_and_yanked_versions_are_refused() {
+    watchdog();
+    let root = temp("dev");
+    let (home, team) = home(&root);
+    publish(
+        &team,
+        "testkit",
+        "1.0",
+        "export testkit.check\n",
+        &[(
+            "check.crag",
+            "pub fn same(a: Int, b: Int) -> Bool { a == b }\n",
+        )],
+    );
+    publish(
+        &team,
+        "geo",
+        "1.0",
+        "export geo.shape\n",
+        &[("shape.crag", SHAPE)],
+    );
+    fs::write(team.dir.join("geo/1.0/yanked"), "wrong areas").unwrap();
+    crag(&home, &root, &["new", "app"]);
+    let app = root.join("app");
+    let manifest = fs::read_to_string(app.join("package.crag")).unwrap();
+    fs::write(
+        app.join("package.crag"),
+        format!("{manifest}import dev testkit 1.0\n"),
+    )
+    .unwrap();
+    let out = crag(&home, &app, &["sbom", "regenerate"]);
+    assert_eq!(text(&out), "sbom.crag: + testkit 1.0\n");
+    fs::write(
+        app.join("test/main_test.crag"),
+        "import testkit.check\n\ntest \"one is one\" {\n  same(1, 1)\n}\n",
+    )
+    .unwrap();
+    let out = crag(&home, &app, &["test"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    fs::write(
+        app.join("main.crag"),
+        "import testkit.check\n\nfn main() {\n}\n",
+    )
+    .unwrap();
+    let out = crag(&home, &app, &["run"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out).contains("testkit is a development import of app; only test and tool modules"),
+        "{}",
+        text(&out)
+    );
+    // A yanked version is not taken anew.
+    let out = crag(&home, &app, &["add", "geo", "1.0"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out).contains("geo 1.0 was yanked (wrong areas); choose another version"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        !fs::read_to_string(app.join("package.crag"))
+            .unwrap()
+            .contains("geo")
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn new_projects_build_run_and_test() {
+    watchdog();
+    let root = temp("new");
+    let (home, _) = home(&root);
+    for (name, args) in [
+        ("app", &["new", "app"][..]),
+        ("lib", &["new", "lib", "--lib"][..]),
+    ] {
+        let out = crag(&home, &root, args);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        let dir = root.join(name);
+        let out = crag(&home, &dir, &["test"]);
+        assert_eq!(out.status.code(), Some(0), "{name}: {}", text(&out));
+        assert!(text(&out).contains("... ok"), "{name}: {}", text(&out));
+    }
+    let out = crag(&home, &root.join("app"), &["run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = crag(&home, &root, &["new", "app"]);
+    assert_eq!(out.status.code(), Some(1));
+    let _ = fs::remove_dir_all(&root);
+}

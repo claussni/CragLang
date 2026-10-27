@@ -21,6 +21,7 @@
 //! (§11.6.3).
 
 pub mod app;
+pub mod commands;
 pub mod dap;
 pub mod debug;
 pub mod diagnostics;
@@ -28,6 +29,7 @@ pub mod exec;
 pub mod fmt;
 pub mod line;
 pub mod lsp;
+pub mod packages;
 pub mod project;
 pub mod repl;
 pub mod scratch;
@@ -61,6 +63,9 @@ fn checked(root: &Path, out: &mut dyn Write) -> Option<Project> {
             return None;
         }
     };
+    for warning in &project.warnings {
+        let _ = writeln!(out, "warning: {warning}");
+    }
     let diagnostics = check(&project);
     for d in &diagnostics {
         let file = &project.file(d.module).shown;

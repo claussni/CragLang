@@ -582,22 +582,24 @@ impl Ui {
             self.current = i;
         } else {
             let project = self.repl.project();
-            let Some(module) = project
+            let Some((module, dependency)) = project
                 .files
                 .iter()
                 .find(|f| f.shown == file)
-                .map(|f| f.module)
+                .map(|f| (f.module, f.dependency.is_some()))
             else {
                 self.message = Some(format!("{file} is no file of the project"));
                 return;
             };
             let text = project.source(module).to_string();
+            // A dependency's module is a published package's, never edited.
             let path = project
                 .root
                 .as_ref()
+                .filter(|_| !dependency)
                 .map(|r| r.join(file))
                 .filter(|p| p.is_file());
-            let readonly = path.is_none() && file.ends_with("(bundled)");
+            let readonly = dependency || (path.is_none() && file.ends_with("(bundled)"));
             let mut buffer = Buffer::new(file, &text, path);
             buffer.readonly = readonly;
             self.pushed.push((file.to_string(), 0));

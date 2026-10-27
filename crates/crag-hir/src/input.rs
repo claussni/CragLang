@@ -21,6 +21,8 @@ use std::sync::Arc;
 
 use crag_syntax::{GreenNode, ParseError, lex};
 
+use crate::package::Packages;
+
 /// The text of one source file, as a buffer or a file on disk shows it.
 #[crag_db::input(debug)]
 pub struct SourceFile {
@@ -47,6 +49,11 @@ pub struct Program {
     /// the source as written, and what the driver read (§18.4.1).
     #[returns(ref)]
     pub resources: Vec<(ModuleId, String, Resource)>,
+    /// The packages the modules belong to, which limit what each module
+    /// may import (§14.5); none for a program of loose modules.
+    #[default]
+    #[returns(ref)]
+    pub packages: Packages,
 }
 
 /// The content of a resource an `embed` names, as the driver read it, or

@@ -25,7 +25,20 @@ use std::process::ExitCode;
 
 use crag_driver::{crag_fmt, crag_repl, crag_run, crag_test};
 
-const USAGE: &str = "usage: crag\n       crag run\n       crag test [filter]\n       crag fmt [--check] [all | - | file...]\n       crag lsp\n       crag dap\n";
+const USAGE: &str = "usage: crag
+       crag new <name> [--lib]
+       crag add <package> [version]
+       crag remove <package>
+       crag upgrade <package> [--version=V] | crag upgrade all
+       crag outdated [--json]
+       crag deps [--json]
+       crag sbom diff [--json] | crag sbom regenerate
+       crag run
+       crag test [filter]
+       crag fmt [--check] [all | - | file...]
+       crag lsp
+       crag dap
+";
 
 fn main() -> ExitCode {
     crag_runtime::abort_on_panic();
@@ -41,6 +54,10 @@ fn main() -> ExitCode {
         ["test"] => test(root, None),
         ["test", filter] => test(root, Some(filter)),
         ["fmt", ref rest @ ..] => ExitCode::from(crag_fmt(root, rest, &mut std::io::stderr())),
+        [
+            command @ ("new" | "add" | "remove" | "upgrade" | "outdated" | "deps" | "sbom"),
+            ref rest @ ..,
+        ] => package_command(root, command, rest),
         ["lsp"] => ExitCode::from(crag_driver::lsp::serve(std::io::stdin(), std::io::stdout())),
         ["dap"] => dap(),
         [crag_session::host::IMAGE_ARG, kind, socket] => image(kind, socket),
@@ -49,6 +66,28 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// A command of the package manager, with the shell's arguments.
+fn package_command(root: &std::path::Path, command: &str, rest: &[&str]) -> ExitCode {
+    use crag_driver::packages::*;
+    let (spec, run): (_, PackageCommand) = match command {
+        "new" => (NEW, crag_new),
+        "add" => (ADD, crag_add),
+        "remove" => (REMOVE, crag_remove),
+        "upgrade" => (UPGRADE, crag_upgrade),
+        "outdated" => (LIST, crag_outdated),
+        "deps" => (LIST, crag_deps),
+        _ => (LIST, crag_sbom),
+    };
+    let args = match Args::shell(rest, spec) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    ExitCode::from(run(root, &args, &mut std::io::stdout()))
 }
 
 fn test(root: &std::path::Path, filter: Option<&str>) -> ExitCode {

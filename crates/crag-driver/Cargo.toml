@@ -25,6 +25,7 @@ crag-db = { path = "../crag-db" }
 crag-eval = { path = "../crag-eval" }
 crag-fmt = { path = "../crag-fmt" }
 crag-hir = { path = "../crag-hir" }
+crag-package = { path = "../crag-package" }
 crag-loader = { path = "../crag-loader" }
 crag-mir = { path = "../crag-mir" }
 crag-runtime = { path = "../crag-runtime" }

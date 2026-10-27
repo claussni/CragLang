@@ -90,6 +90,7 @@ fn errors(db: &dyn Db, program: Program, module: ModuleId) -> Vec<String> {
             NameError::Path { decl, error } => match error {
                 PathError::Unknown(p) => format!("@{decl}: no module or directory {p}"),
                 PathError::PastElement(p) => format!("@{decl}: {p} goes on past an element"),
+                PathError::Hidden { reason, .. } => format!("@{decl}: {reason}"),
             },
             NameError::ModuleRenamed { decl, path } => format!("@{decl}: {path} renamed"),
             NameError::UnknownElement { decl, module, name } => {

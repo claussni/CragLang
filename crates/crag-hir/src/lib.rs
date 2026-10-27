@@ -33,8 +33,9 @@ mod embed;
 mod hir;
 mod input;
 mod items;
-mod literal;
+pub mod literal;
 mod lower;
+mod package;
 mod patterns;
 mod pretty;
 mod scope;
@@ -50,6 +51,7 @@ pub use items::{
 };
 pub use literal::Literal;
 pub use lower::{BodySourceMap, LowerError};
+pub use package::{PackageScope, Packages};
 pub use pretty::pretty;
 pub use scope::{
     Entries, Entry, ImportCycle, ImportGraph, ImportTarget, Imports, ModuleIndex, ModuleScope,

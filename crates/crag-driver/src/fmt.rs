@@ -66,14 +66,13 @@ pub fn crag_fmt(root: &Path, args: &[&str], out: &mut dyn Write) -> u8 {
             let _ = writeln!(out, "error: no package.crag here; name the files to format");
             return 2;
         }
-        let mut paths = Vec::new();
-        if let Err(e) = crate::project::collect(root, &mut paths) {
-            let _ = writeln!(out, "error: cannot read {}: {e}", root.display());
-            return 1;
+        match crag_package::content::module_files(root) {
+            Ok(paths) => paths.into_iter().map(|p| root.join(p)).collect(),
+            Err(e) => {
+                let _ = writeln!(out, "error: cannot read {}: {e}", root.display());
+                return 1;
+            }
         }
-        paths.sort();
-        paths.retain(|p| p.strip_prefix(root).unwrap_or(p) != Path::new("package.crag"));
-        paths
     } else {
         args.iter().map(PathBuf::from).collect()
     };
