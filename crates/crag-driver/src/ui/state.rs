@@ -20,6 +20,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::debug::{Pause, Resume};
@@ -28,6 +29,7 @@ use crate::lsp::analysis;
 use crate::repl::{EvalOutput, Repl, is_complete};
 
 use super::buffer::{Buffer, Cursor, EditKind};
+use super::highlight::Highlights;
 use super::keys::{Command, key_name};
 
 /// How long typing pauses before buffers reach the compiler (§11.8.2).
@@ -386,6 +388,8 @@ pub struct Ui {
     /// What Ctrl+E imported into the session.
     imported: HashSet<String>,
     pub quit: bool,
+    /// The current buffer's highlighting, by its place, name and version.
+    highlight: Option<(usize, String, u64, Rc<Highlights>)>,
     /// Whether the hint line shows the keys that matter now.
     pub hints: bool,
     /// The lines the editor shows, for paging.
@@ -440,6 +444,7 @@ impl Ui {
             imported: HashSet::new(),
             quit: false,
             hints: true,
+            highlight: None,
             page: 20,
         };
         ui.expanded.insert(String::new());
@@ -736,6 +741,24 @@ impl Ui {
             (b.name.clone(), b.line_col(b.cursor.pos).0)
         };
         self.inline.retain(|(n, l, _)| !(*n == name && *l == line));
+    }
+
+    /// The highlighting of the current buffer, lexed again only when it
+    /// changed.
+    pub fn highlights(&mut self) -> Rc<Highlights> {
+        let b = &self.buffers[self.current];
+        match &self.highlight {
+            Some((at, name, version, h))
+                if *at == self.current && *name == b.name && *version == b.version =>
+            {
+                h.clone()
+            }
+            _ => {
+                let h = Rc::new(Highlights::of(&b.text()));
+                self.highlight = Some((self.current, b.name.clone(), b.version, h.clone()));
+                h
+            }
+        }
     }
 
     /// Carries out a command.

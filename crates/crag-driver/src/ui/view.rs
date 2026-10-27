@@ -30,6 +30,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use super::highlight::{Class, Highlights};
 use super::state::{Focus, Hint, Mode, OutKind, Overlay, RightView, Ui};
 
 /// Below these the screen is narrow or short.
@@ -112,6 +113,33 @@ impl Theme {
         match focused {
             true => self.accent(),
             false => self.dim(),
+        }
+    }
+
+    /// The colour of a class of source text.
+    fn class(&self, class: Class) -> Style {
+        match class {
+            Class::Keyword => self.fg(
+                self.colour((198, 120, 221), 176, Color::Magenta),
+                Modifier::BOLD,
+            ),
+            Class::Type => self.fg(
+                self.colour((229, 192, 123), 180, Color::Yellow),
+                Modifier::empty(),
+            ),
+            Class::Function => self.fg(
+                self.colour((97, 175, 239), 75, Color::Blue),
+                Modifier::empty(),
+            ),
+            Class::Str => self.fg(
+                self.colour((152, 195, 121), 114, Color::Green),
+                Modifier::empty(),
+            ),
+            Class::Number => self.fg(
+                self.colour((209, 154, 102), 173, Color::Cyan),
+                Modifier::empty(),
+            ),
+            Class::Comment => self.dim().add_modifier(Modifier::ITALIC),
         }
     }
 
@@ -294,6 +322,7 @@ fn draw_editor(frame: &mut Frame, ui: &mut Ui, theme: &Theme, area: Rect) {
         .filter(|p| p.file == name)
         .cloned()
         .collect();
+    let highlights = ui.highlights();
     let b = ui.buffer();
     let (cursor_line, cursor_col) = b.line_col(b.cursor.pos);
     let digits = b.lines().to_string().len().max(2);
@@ -334,7 +363,9 @@ fn draw_editor(frame: &mut Frame, ui: &mut Ui, theme: &Theme, area: Rect) {
         for (col, &ch) in text.iter().enumerate().skip(hscroll).take(width) {
             let pos = start + col;
             let byte = b.byte_of(pos);
-            let mut style = Style::default();
+            let mut style = highlights
+                .at(byte as usize)
+                .map_or_else(Style::default, |c| theme.class(c));
             if problems
                 .iter()
                 .any(|p| p.start <= byte && byte < p.end.max(p.start + 1))
@@ -389,16 +420,18 @@ fn draw_repl(frame: &mut Frame, ui: &Ui, theme: &Theme, area: Rect) {
     let skip = rows.len().saturating_sub(room);
     let shown = rows.len() - skip;
     let mut lines: Vec<Line> = rows.into_iter().skip(skip).collect();
+    let highlights = Highlights::of(&ui.input.text());
+    let mut offset = 0;
     for (i, text) in input_lines.iter().enumerate() {
         let lead = if i == 0 {
             prompt.clone()
         } else {
             " ".repeat(prompt.chars().count())
         };
-        lines.push(Line::from(vec![
-            Span::styled(lead, theme.accent()),
-            Span::raw(text.clone()),
-        ]));
+        let mut spans = vec![Span::styled(lead, theme.accent())];
+        spans.extend(highlighted(text, offset, &highlights, theme));
+        offset += text.len() + 1;
+        lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), inner);
     if focused && ui.overlay.is_none() {
@@ -496,6 +529,34 @@ fn draw_status(frame: &mut Frame, ui: &Ui, theme: &Theme, area: Rect) {
         spans.push(Span::raw(message.clone()));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// A line that starts at byte `offset` of the highlighted text, in the
+/// colours of its classes, as runs of one class each.
+fn highlighted<'a>(
+    text: &'a str,
+    offset: usize,
+    highlights: &Highlights,
+    theme: &Theme,
+) -> Vec<Span<'a>> {
+    let mut spans = Vec::new();
+    let mut run = 0;
+    let mut class = None;
+    for (at, _) in text.char_indices().chain([(text.len(), ' ')]) {
+        let here = match at < text.len() {
+            true => highlights.at(offset + at),
+            false => None,
+        };
+        if at == text.len() || here != class {
+            if run < at {
+                let style = class.map_or_else(Style::default, |c| theme.class(c));
+                spans.push(Span::styled(&text[run..at], style));
+            }
+            run = at;
+            class = here;
+        }
+    }
+    spans
 }
 
 /// The hint line: the keys that always work on the right, and as many of

@@ -372,6 +372,40 @@ fn an_empty_editor_shows_the_keys_to_begin_with() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[test]
+fn the_editor_colours_code_by_its_tokens() {
+    let root = project("colours");
+    let mut ui = ui(&root);
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    let theme = Theme::new(Colours::Sixteen);
+    terminal.draw(|frame| draw(frame, &mut ui, &theme)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    // The colour of the first cell showing `word` on a row with `line`.
+    let colour = |line: &str, word: &str| {
+        (0..40)
+            .find_map(|y| {
+                let row: String = (0..120)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect();
+                if !row.contains(line) {
+                    return None;
+                }
+                let x = row.chars().collect::<Vec<_>>();
+                let at =
+                    (0..x.len()).find(|&i| x[i..].iter().collect::<String>().starts_with(word))?;
+                Some(buffer[(at as u16, y)].fg)
+            })
+            .unwrap()
+    };
+    use ratatui::style::Color;
+    assert_eq!(colour("fn main()", "fn"), Color::Magenta);
+    assert_eq!(colour("fn main()", "main"), Color::Blue);
+    assert_eq!(colour("fn main()", "Int"), Color::Yellow);
+    assert_eq!(colour("let p = Point", "2"), Color::Cyan);
+    assert_eq!(colour("let p = Point", "p ="), Color::Reset);
+    let _ = fs::remove_dir_all(&root);
+}
+
 const SERVER: &str = r#"import std.io
 
 fn reply(c: Connection, n: Int) -> () {

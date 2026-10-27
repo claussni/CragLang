@@ -18,10 +18,12 @@
 //! over the project's queries in the same process.
 //!
 //! `state` holds what the UI shows and does, `keys` maps keys to commands,
-//! `view` draws, and `run` is the terminal's event loop, which puts the
-//! terminal back as it was when it ends, also on a panic.
+//! `highlight` classes source text for its colours, `view` draws, and
+//! `run` is the terminal's event loop, which puts the terminal back as it
+//! was when it ends, also on a panic.
 
 pub mod buffer;
+pub mod highlight;
 pub mod keys;
 pub mod state;
 pub mod view;
