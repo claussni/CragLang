@@ -25,7 +25,7 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-types` | Types and core inference (M1) |
 | `crates/crag-mir` | MIR builder (M1) |
 | `crates/crag-backend` | Code generation from MIR (M1) |
-| `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1); the language server `crag lsp` (M5) |
+| `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1); the app image, hot reload, the debugger, the language server `crag lsp` and the debug adapter `crag dap` (M5) |
 | `crates/crag-session` | Session manager: image processes, their protocol and supervision (M3) |
 | `crates/crag-eval` | Compile-time evaluation of constants, `embed`s among them, in the metered tier (M3) |
 | `crates/crag-fmt` | The formatter: the canonical layout of source files (M5) |
@@ -77,7 +77,13 @@ Without arguments, `crag` opens the REPL, in the project of the current
 directory if there is one. `:help` lists its commands. In a project,
 `:start` runs the app in an image of its own; after editing its files,
 `:reload` swaps the changed code into the running app, which keeps its
-state and connections, and `:stop` ends it.
+state and connections, and `:stop` ends it. `:break file:line` stops the
+app's tasks at a line; `:paused`, `:locals`, `:step`, `:next`, `:out` and
+`:continue` inspect and drive them.
+
+`crag dap` is the debug adapter, for editors that speak the Debug Adapter
+Protocol: `launch` with `"project"` naming the project's directory runs
+the app, with line breakpoints, stepping and locals.
 
     /path/to/target/debug/crag
 

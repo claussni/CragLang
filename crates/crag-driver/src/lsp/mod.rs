@@ -29,7 +29,7 @@
 //! input.
 
 mod analysis;
-mod rpc;
+pub(crate) mod rpc;
 mod server;
 mod text;
 

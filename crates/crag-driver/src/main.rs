@@ -24,7 +24,7 @@ use std::process::ExitCode;
 
 use crag_driver::{crag_fmt, crag_repl, crag_run, crag_test};
 
-const USAGE: &str = "usage: crag\n       crag run\n       crag test [filter]\n       crag fmt [--check] [all | - | file...]\n       crag lsp\n";
+const USAGE: &str = "usage: crag\n       crag run\n       crag test [filter]\n       crag fmt [--check] [all | - | file...]\n       crag lsp\n       crag dap\n";
 
 fn main() -> ExitCode {
     crag_runtime::abort_on_panic();
@@ -37,6 +37,7 @@ fn main() -> ExitCode {
         ["test", filter] => test(root, Some(filter)),
         ["fmt", ref rest @ ..] => ExitCode::from(crag_fmt(root, rest, &mut std::io::stderr())),
         ["lsp"] => ExitCode::from(crag_driver::lsp::serve(std::io::stdin(), std::io::stdout())),
+        ["dap"] => dap(),
         [crag_session::host::IMAGE_ARG, kind, socket] => image(kind, socket),
         _ => {
             eprint!("{USAGE}");
@@ -48,6 +49,31 @@ fn main() -> ExitCode {
 fn test(root: &std::path::Path, filter: Option<&str>) -> ExitCode {
     let report = crag_test(root, filter, &mut std::io::stdout());
     ExitCode::from(if report.success() { 0 } else { 1 })
+}
+
+/// `crag dap`. The protocol keeps the standard output it was started with;
+/// file descriptor 1 then refers to standard error, so the images the
+/// adapter starts, which inherit it, cannot write into the protocol.
+fn dap() -> ExitCode {
+    use std::os::fd::FromRawFd;
+    let command = match crag_session::ImageCommand::current() {
+        Ok(command) => command,
+        Err(e) => {
+            eprintln!("crag dap: cannot find the crag binary: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // SAFETY: duplicating and replacing descriptors of this process, which
+    // nothing else uses yet.
+    let protocol = unsafe {
+        let protocol = libc::dup(1);
+        if protocol < 0 || libc::dup2(2, 1) < 0 {
+            eprintln!("crag dap: {}", std::io::Error::last_os_error());
+            return ExitCode::from(1);
+        }
+        std::fs::File::from_raw_fd(protocol)
+    };
+    ExitCode::from(crag_driver::dap::serve(std::io::stdin(), protocol, command))
 }
 
 fn image(kind: &str, socket: &str) -> ExitCode {
