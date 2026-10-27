@@ -448,3 +448,115 @@ fn a_library_is_checked_published_and_used() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+/// The counts `CRAG_CACHE_STATS` prints: reused and compiled.
+fn cache_stats(home: &Path, dir: &Path, args: &[&str], stdin: &str) -> (usize, usize, String) {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_crag"))
+        .args(args)
+        .current_dir(dir)
+        .env("CRAG_HOME", home)
+        .env("CRAG_CACHE_STATS", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let all = text(&out);
+    let line = all
+        .lines()
+        .find_map(|l| l.strip_prefix("cache: "))
+        .unwrap_or_else(|| panic!("no cache line in {all}"))
+        .to_string();
+    let numbers: Vec<usize> = line
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.parse().unwrap())
+        .collect();
+    (numbers[0], numbers[1], all)
+}
+
+#[test]
+fn compiled_code_is_kept_for_the_next_session_and_command() {
+    watchdog();
+    let root = temp("cache");
+    let (home, _) = home(&root);
+    crag(&home, &root, &["new", "app"]);
+    let app = root.join("app");
+    let main = "pub fn double(n: Int) -> Int { n * 2 }\n\nfn triple(n: Int) -> Int { n * 3 }\n\nfn main() -> ExitCode {\n  ExitCode(code: double(2) + triple(1))\n}\n\ntest \"doubles\" {\n  double(1)\n}\n";
+    fs::write(app.join("main.crag"), main).unwrap();
+    let (reused, compiled, out) = cache_stats(&home, &app, &["run"], "");
+    assert!(reused == 0 && compiled > 0, "{out}");
+    // A second run compiles nothing.
+    let (again, none, out) = cache_stats(&home, &app, &["run"], "");
+    assert_eq!((again, none), (compiled, 0), "{out}");
+    // An edit compiles what it changed only.
+    fs::write(app.join("main.crag"), main.replace("n * 3", "n * 4")).unwrap();
+    let (reused, recompiled, out) = cache_stats(&home, &app, &["run"], "");
+    assert!(
+        reused > 0 && recompiled > 0 && recompiled < compiled,
+        "{out}"
+    );
+    // The tests and a REPL session share it.
+    let (reused, _, out) = cache_stats(&home, &app, &["test"], "");
+    assert!(reused > 0, "{out}");
+    let (_, compiled, out) = cache_stats(&home, &app, &[], "import app.main\ndouble(21)\n");
+    assert!(out.contains("42"), "{out}");
+    let (reused, recompiled, out) = cache_stats(&home, &app, &[], "import app.main\ndouble(21)\n");
+    assert!(reused > 0 && recompiled < compiled.max(1), "{out}");
+    // The project's roots are recorded, for garbage collection.
+    let roots = fs::read_dir(home.join("cache/roots")).unwrap().count();
+    assert_eq!(roots, 1);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_repl_adds_a_package_and_uses_it_at_once() {
+    use std::io::Write;
+    watchdog();
+    let root = temp("repl");
+    let (home, team) = home(&root);
+    publish(
+        &team,
+        "geo",
+        "1.0",
+        "export geo.shape\n",
+        &[("shape.crag", SHAPE)],
+    );
+    crag(&home, &root, &["new", "app"]);
+    let app = root.join("app");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_crag"))
+        .current_dir(&app)
+        .env("CRAG_HOME", &home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b":add\n:add geo\nimport geo.shape\narea(6, 7)\n:deps\n:upgrade geo version: 3.0\n",
+        )
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let all = text(&out);
+    assert!(all.contains("usage: crag add <package> [version]"), "{all}");
+    assert!(all.contains("sbom.crag: + geo 1.0\nadded geo 1.0"), "{all}");
+    assert!(all.contains("42"), "{all}");
+    assert!(all.contains("app\n  geo 1.0\n"), "{all}");
+    assert!(
+        all.contains("geo 3.0 is not in registry `team`, which has 1.0"),
+        "{all}"
+    );
+    let _ = fs::remove_dir_all(&root);
+}

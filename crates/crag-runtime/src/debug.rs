@@ -139,21 +139,21 @@ pub fn release_all() {
 }
 
 suspending_fn! {
-    /// `rt_step(ctx, func, step, words, count, fp)`: see
+    /// `rt_step(ctx, cell, words, count, fp)`: see
     /// `crag_abi::RuntimeFn::Step`.
-    fn rt_step(ctx: *const TaskContext, func: u64, step: u64, words: *const u64, count: u64, fp: u64) => step_entry
+    fn rt_step(ctx: *const TaskContext, cell: *const u64, words: *const u64, count: u64, fp: u64) => step_entry
 }
 
 /// The Rust half of `rt_step`: stops the task if it is to.
 ///
 /// # Safety
 ///
-/// Called only by `rt_step`: `words` holds `count` words in the calling
-/// frame, whose frame pointer is `fp`, on the fiber of `ctx`.
+/// Called only by `rt_step`: `cell` is a step's cell, `words` holds
+/// `count` words in the calling frame, whose frame pointer is `fp`, on the
+/// fiber of `ctx`.
 unsafe extern "C" fn step_entry(
     ctx: *const TaskContext,
-    func: u64,
-    step: u64,
+    cell: *const u64,
     words: *const u64,
     count: u64,
     fp: u64,
@@ -161,7 +161,9 @@ unsafe extern "C" fn step_entry(
     // SAFETY: as the caller promises.
     let ctx_ref = unsafe { &*ctx };
     let task = ctx as u64;
-    let (func, step) = (FuncId(func as u32), step as u32);
+    // SAFETY: a step's cell has its name in its second word.
+    let word = unsafe { std::ptr::read_volatile(cell.add(1)) };
+    let (func, step) = crag_abi::step_of_cell_word(word);
     // SAFETY: a worker runs the fiber of `ctx`.
     let top = unsafe {
         (*ctx_ref.fiber.load(std::sync::atomic::Ordering::Relaxed))

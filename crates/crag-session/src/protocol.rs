@@ -478,6 +478,24 @@ fn invalid(message: String) -> io::Error {
 }
 
 /// A body, written from the front.
+/// A code object as the messages carry it, for the persisted store
+/// (Implementation Plan §11.9.5).
+pub fn encode_object(object: &CodeObject) -> Vec<u8> {
+    let mut w = Writer(Vec::new());
+    w.object(object);
+    w.0
+}
+
+/// The code object `encode_object` gave the bytes of.
+pub fn decode_object(bytes: &[u8]) -> io::Result<CodeObject> {
+    let mut r = Reader(bytes);
+    let object = r.object()?;
+    match r.0.is_empty() {
+        true => Ok(object),
+        false => Err(invalid("bytes after a code object".into())),
+    }
+}
+
 struct Writer(Vec<u8>);
 
 impl Writer {

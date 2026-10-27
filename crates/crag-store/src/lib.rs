@@ -28,7 +28,14 @@
 //! ```text
 //! <dir>/ab/cdef...   one file per artifact, named by its key in hex
 //! <dir>/tmp/         files being written
+//! <dir>/roots/       for each project, the artifacts its last builds used
+//! <dir>/lock         the file lock
 //! ```
+//!
+//! Processes that build share the store under a shared lock; garbage
+//! collection takes it exclusively, so it never removes what a build is
+//! about to name in its roots (Implementation Plan §11.9.6). Readers need
+//! no lock, since every write is an atomic rename.
 //!
 //! A file holds the BLAKE3 hash of the payload, then the payload. Writers
 //! fill a temporary file and rename it into place. Renaming is atomic, so a
@@ -37,10 +44,12 @@
 //! only a recompilation; the hash catches a file a crash left incomplete,
 //! and `get` then reports the artifact as missing.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 const HASH_BYTES: usize = blake3::OUT_LEN;
 
@@ -192,5 +201,152 @@ impl Store {
         }
         data.drain(..HASH_BYTES);
         Ok(Some(data))
+    }
+}
+
+/// How a process holds the store's lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockMode {
+    /// For building: several processes at once.
+    Shared,
+    /// For garbage collection: no one else.
+    Exclusive,
+}
+
+/// The store's lock, held until it is dropped.
+pub struct StoreGuard {
+    _file: fs::File,
+}
+
+/// What a garbage collection did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GcReport {
+    pub kept: usize,
+    pub removed: usize,
+    /// The roots of projects that no longer exist, removed.
+    pub stale_roots: usize,
+}
+
+impl Store {
+    /// Takes the store's lock, waiting for it.
+    pub fn lock(&self, mode: LockMode) -> io::Result<StoreGuard> {
+        self.take_lock(mode, true)
+            .map(|guard| guard.expect("a blocking lock is taken"))
+    }
+
+    /// Takes the store's lock if no other process holds it in a way that
+    /// excludes `mode`.
+    pub fn try_lock(&self, mode: LockMode) -> io::Result<Option<StoreGuard>> {
+        self.take_lock(mode, false)
+    }
+
+    fn take_lock(&self, mode: LockMode, wait: bool) -> io::Result<Option<StoreGuard>> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.dir.join("lock"))?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut op = match mode {
+                LockMode::Shared => libc::LOCK_SH,
+                LockMode::Exclusive => libc::LOCK_EX,
+            };
+            if !wait {
+                op |= libc::LOCK_NB;
+            }
+            // SAFETY: flock on a descriptor this function owns.
+            if unsafe { libc::flock(file.as_raw_fd(), op) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(None);
+                }
+                return Err(error);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (mode, wait);
+        Ok(Some(StoreGuard { _file: file }))
+    }
+
+    fn roots_file(&self, project: &Path) -> PathBuf {
+        let name = blake3::hash(project.to_string_lossy().as_bytes()).to_hex();
+        self.dir.join("roots").join(&name[..32])
+    }
+
+    /// Records the artifacts a project's builds use, replacing what was
+    /// recorded for it before. `project` is its root, made absolute.
+    pub fn set_roots(&self, project: &Path, keys: &[ArtifactKey]) -> io::Result<()> {
+        fs::create_dir_all(self.dir.join("roots"))?;
+        let mut text = format!("{}\n", project.display());
+        let mut hexes: Vec<String> = keys.iter().map(ArtifactKey::to_hex).collect();
+        hexes.sort();
+        hexes.dedup();
+        for hex in hexes {
+            text.push_str(&hex);
+            text.push('\n');
+        }
+        let temp = self.dir.join("tmp").join(format!(
+            "roots-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&temp, text)?;
+        fs::rename(&temp, self.roots_file(project))
+    }
+
+    /// Removes the artifacts no project's roots name and that are older
+    /// than `min_age`, and the roots of projects that no longer exist: a
+    /// directory without `package.crag`. The caller holds the exclusive
+    /// lock.
+    pub fn collect_garbage(&self, min_age: Duration) -> io::Result<GcReport> {
+        let mut report = GcReport::default();
+        let mut live: HashSet<String> = HashSet::new();
+        if let Ok(entries) = fs::read_dir(self.dir.join("roots")) {
+            for entry in entries.flatten() {
+                let text = fs::read_to_string(entry.path()).unwrap_or_default();
+                let mut lines = text.lines();
+                let project = lines.next().unwrap_or_default();
+                if !Path::new(project).join("package.crag").is_file() {
+                    fs::remove_file(entry.path())?;
+                    report.stale_roots += 1;
+                    continue;
+                }
+                live.extend(lines.map(str::to_string));
+            }
+        }
+        let now = SystemTime::now();
+        let old = |path: &Path| {
+            fs::metadata(path)
+                .and_then(|m| m.modified())
+                .map(|t| now.duration_since(t).unwrap_or_default() >= min_age)
+                .unwrap_or(false)
+        };
+        for entry in fs::read_dir(&self.dir)?.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if name == "tmp" {
+                for temp in fs::read_dir(&path)?.flatten() {
+                    if old(&temp.path()) {
+                        let _ = fs::remove_file(temp.path());
+                    }
+                }
+                continue;
+            }
+            if name.len() != 2 || !path.is_dir() {
+                continue;
+            }
+            for file in fs::read_dir(&path)?.flatten() {
+                let hex = format!("{name}{}", file.file_name().to_string_lossy());
+                if live.contains(&hex) || !old(&file.path()) {
+                    report.kept += 1;
+                } else {
+                    fs::remove_file(file.path())?;
+                    report.removed += 1;
+                }
+            }
+        }
+        Ok(report)
     }
 }

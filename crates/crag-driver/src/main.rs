@@ -46,7 +46,15 @@ fn main() -> ExitCode {
     crag_runtime::abort_on_panic();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let root = std::path::Path::new(".");
-    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+    // What compiles keeps its code in the persisted store.
+    let compiles = matches!(
+        args.first().map(String::as_str),
+        None | Some("run" | "test" | "dap" | "package" | "publish")
+    );
+    if compiles {
+        crag_driver::persist::install();
+    }
+    let status = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         // On a terminal the UI; else the plain REPL, as scripts use it.
         [] if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
             ExitCode::from(crag_driver::crag_ui(root))
@@ -68,22 +76,18 @@ fn main() -> ExitCode {
             eprint!("{USAGE}");
             ExitCode::from(2)
         }
+    };
+    if compiles {
+        crag_driver::persist::finish(root);
     }
+    status
 }
 
 /// A command of the package manager, with the shell's arguments.
 fn package_command(root: &std::path::Path, command: &str, rest: &[&str]) -> ExitCode {
-    use crag_driver::packages::*;
-    let (spec, run): (_, PackageCommand) = match command {
-        "new" => (NEW, crag_new),
-        "add" => (ADD, crag_add),
-        "remove" => (REMOVE, crag_remove),
-        "upgrade" => (UPGRADE, crag_upgrade),
-        "outdated" => (LIST, crag_outdated),
-        "deps" => (LIST, crag_deps),
-        "publish" => (PUBLISH, crag_publish),
-        "package" => (PUBLISH, crag_package),
-        _ => (LIST, crag_sbom),
+    use crag_driver::packages::{Args, command as command_of};
+    let Some((spec, run)) = command_of(command) else {
+        unreachable!("main matches the commands");
     };
     let args = match Args::shell(rest, spec) {
         Ok(args) => args,

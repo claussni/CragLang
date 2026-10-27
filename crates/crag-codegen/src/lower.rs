@@ -549,11 +549,9 @@ fn emit_step(
     }
     let words = b.ins().stack_addr(I64, slot, 0);
     let fp = b.ins().get_frame_pointer(I64);
-    let callee = imports.runtime(b, conv, RuntimeFn::Step, 5, 0);
-    let func = b.ins().iconst(I64, i64::from(func.0));
-    let step = b.ins().iconst(I64, i64::from(step));
+    let callee = imports.runtime(b, conv, RuntimeFn::Step, 4, 0);
     let count = b.ins().iconst(I64, values.len() as i64);
-    b.ins().call(callee, &[ctx, func, step, words, count, fp]);
+    b.ins().call(callee, &[ctx, cell, words, count, fp]);
     b.ins().jump(done, &[]);
 
     b.switch_to_block(done);

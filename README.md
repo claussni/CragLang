@@ -19,7 +19,7 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-codegen` | Cranelift facade |
 | `crates/crag-loader` | Code loader |
 | `crates/crag-db` | Salsa facade |
-| `crates/crag-store` | Artifact store skeleton |
+| `crates/crag-store` | Artifact store: content-hashed artifacts, the file lock, project roots and garbage collection (M6) |
 | `crates/crag-syntax` | Lexer, parser and syntax tree (M1) |
 | `crates/crag-hir` | Item trees, names and imports, and HIR lowering (M1) |
 | `crates/crag-types` | Types and core inference (M1) |
@@ -84,7 +84,13 @@ its tests pass, it has no type holes, and its `api.crag`, the public
 declarations with their inferred errors, effects and escaping parameters,
 needs no larger version step than the one taken since the previous
 version of its major. `crag package` builds the same folder in
-`target/package/` without publishing it.
+`target/package/` without publishing it. In the REPL, `:add`, `:remove`,
+`:upgrade`, `:outdated`, `:deps`, `:sbom`, `:package` and `:publish` do the
+same, and the session can use an added package at once.
+
+Compiled code is kept in the settings directory's `cache/`, so a second
+run, `crag test` or a new session compiles only what changed;
+`CRAG_CACHE_STATS=1` prints how much was reused.
 
 `crag lsp` is the language server, for editors that speak the Language
 Server Protocol: diagnostics as you type, hover, go to definition,

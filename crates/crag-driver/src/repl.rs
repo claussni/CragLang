@@ -62,6 +62,9 @@ Enter a definition to add it to the session, or an expression to run it.
   :continue [n]         let stopped task n go on
   :step, :next, :out [n]  go on to the next statement: anywhere, in this
                         function or its caller, or in its caller
+  :add <package> [version], :remove <package>, :upgrade <package> [version: V]
+  :outdated, :deps, :sbom diff | regenerate, :package, :publish <registry>
+                        manage the project's packages, as the shell does
   :help                 show this
   :quit                 leave; so does Ctrl-D
 An input continues on the next line until it is complete; an empty line
@@ -358,6 +361,9 @@ impl Repl {
             "step" | "s" => self.go_on(rest.trim(), Resume::Into),
             "next" | "n" => self.go_on(rest.trim(), Resume::Over),
             "out" => self.go_on(rest.trim(), Resume::Out),
+            "add" | "remove" | "upgrade" | "outdated" | "deps" | "sbom" | "publish" | "package" => {
+                self.package_command(name, rest)
+            }
             "stop" => {
                 self.scratch
                     .stop_app()
@@ -369,6 +375,34 @@ impl Repl {
                 "error: there is no command :{name}; :help lists them\n"
             )),
         }
+    }
+
+    /// A command of the package manager (§20.6), with the REPL's
+    /// arguments. After one that changed the packages, the session uses the
+    /// new ones at once; the app gets them at its next reload.
+    fn package_command(&mut self, name: &str, rest: &str) -> Result<EvalOutput, String> {
+        let root = self
+            .project
+            .root
+            .clone()
+            .ok_or("error: package commands work in a project\n")?;
+        let (spec, run) = crate::packages::command(name).expect("a package command");
+        let args = crate::commands::Args::repl(rest, spec).map_err(|e| format!("error: {e}\n"))?;
+        let mut out = Vec::new();
+        let status = run(&root, &args, &mut out);
+        let mut text = String::from_utf8_lossy(&out).into_owned();
+        if status != 0 {
+            return Err(text);
+        }
+        if crate::packages::changes_packages(name, &args) {
+            self.project
+                .reload_dependencies()
+                .map_err(|e| format!("{text}error: {e}\n"))?;
+            for warning in &self.project.warnings {
+                text += &format!("warning: {warning}\n");
+            }
+        }
+        Ok(EvalOutput::Text(text))
     }
 
     fn breakpoint(&mut self, place: &str) -> Result<EvalOutput, String> {

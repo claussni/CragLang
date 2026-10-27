@@ -136,31 +136,9 @@ impl Project {
             fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
         };
         // The dependencies' modules, then the project's own.
-        for p in &resolution.packages {
-            let dir = p.layout.modules_dir(&p.dir);
-            let paths =
-                module_files(&dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-            for relative in paths {
-                let path = module_path(&p.name, &relative);
-                // A dependency's tests and tools are its own business.
-                if is_dev_module(&p.name, &path) {
-                    continue;
-                }
-                let text = read(&dir.join(&relative))?;
-                let module = ModuleId::new(&project.db, path, SourceFile::new(&project.db, text));
-                project.files.push(ModuleFile {
-                    module,
-                    shown: format!("{} {}/{}", p.name, p.version, relative.display()),
-                    dir: relative.parent().map(Path::to_path_buf).unwrap_or_default(),
-                    dependency: Some(DependencyFile {
-                        package_dir: p.dir.clone(),
-                        layout: p.layout,
-                        file: dir.join(&relative),
-                    }),
-                });
-                project.dependencies += 1;
-            }
-        }
+        let dependencies = dependency_files(&mut project.db, &resolution, &[])?;
+        project.dependencies = dependencies.len();
+        project.files.extend(dependencies);
         let paths =
             module_files(root).map_err(|e| format!("cannot read {}: {e}", root.display()))?;
         for relative in paths {
@@ -190,6 +168,46 @@ impl Project {
         project.warnings = warnings;
         project.read_resources();
         Ok(project)
+    }
+
+    /// Reads the manifest again and puts the modules of the packages it now
+    /// resolves to in place of the old ones, keeping those of packages
+    /// that did not change, as after `add`, `remove` or `upgrade`. The
+    /// database stays, so code already compiled from it keeps its ids.
+    pub fn reload_dependencies(&mut self) -> Result<(), String> {
+        let root = self.root.clone().ok_or("no project is loaded")?;
+        let manifest = read_manifest(&root)?;
+        let resolution = resolve(&root, &manifest)?;
+        verify_sbom(&root, &resolution)?;
+        let range = STD.len()..STD.len() + self.dependencies;
+        let old: Vec<ModuleFile> = self.files[range.clone()].to_vec();
+        let new = dependency_files(&mut self.db, &resolution, &old)?;
+        self.dependencies = new.len();
+        self.files.splice(range, new);
+        let modules = self.files.iter().map(|f| f.module).collect();
+        self.program.set_modules(&mut self.db).to(modules);
+        let packages = match resolution.packages.is_empty() {
+            true => Packages::default(),
+            false => packages(&manifest, &resolution),
+        };
+        if *self.program.packages(&self.db) != packages {
+            self.program.set_packages(&mut self.db).to(packages);
+        }
+        self.warnings = resolution
+            .packages
+            .iter()
+            .filter_map(|p| {
+                let reason = p.yanked.as_ref()?;
+                Some(format!(
+                    "{} {} was yanked ({reason}); the SBOM keeps it, but upgrade soon",
+                    p.name, p.version
+                ))
+            })
+            .collect();
+        self.manifest = Some(manifest);
+        self.resolution = resolution;
+        self.read_resources();
+        Ok(())
     }
 
     /// A program of `std` alone, as the REPL has outside a project.
@@ -393,6 +411,57 @@ pub fn resource_path(dir: &Path, source: &str) -> Result<PathBuf, String> {
         }
     }
     Ok(path)
+}
+
+/// The modules of the resolved packages, leaving out their test and tool
+/// modules; a module of `old` that is the same file of the same package
+/// folder is kept, with its text brought up to date.
+fn dependency_files(
+    db: &mut RootDatabase,
+    resolution: &Resolution,
+    old: &[ModuleFile],
+) -> Result<Vec<ModuleFile>, String> {
+    let mut files = Vec::new();
+    for p in &resolution.packages {
+        let dir = p.layout.modules_dir(&p.dir);
+        let paths =
+            module_files(&dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        for relative in paths {
+            let path = module_path(&p.name, &relative);
+            // A dependency's tests and tools are its own business.
+            if is_dev_module(&p.name, &path) {
+                continue;
+            }
+            let location = dir.join(&relative);
+            let text = fs::read_to_string(&location)
+                .map_err(|e| format!("cannot read {}: {e}", location.display()))?;
+            let kept = old.iter().find(|f| {
+                f.dependency.as_ref().is_some_and(|d| d.file == location)
+                    && f.module.path(db) == &path
+            });
+            let module = match kept {
+                Some(f) => {
+                    let file = f.module.file(db);
+                    if *file.text(db) != text {
+                        file.set_text(db).to(text);
+                    }
+                    f.module
+                }
+                None => ModuleId::new(db, path, SourceFile::new(db, text)),
+            };
+            files.push(ModuleFile {
+                module,
+                shown: format!("{} {}/{}", p.name, p.version, relative.display()),
+                dir: relative.parent().map(Path::to_path_buf).unwrap_or_default(),
+                dependency: Some(DependencyFile {
+                    package_dir: p.dir.clone(),
+                    layout: p.layout,
+                    file: location,
+                }),
+            });
+        }
+    }
+    Ok(files)
 }
 
 /// The manifest of the project at `root`.

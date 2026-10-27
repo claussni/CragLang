@@ -176,3 +176,37 @@ fn concurrent_writers_and_readers_see_only_whole_artifacts() {
     assert_eq!(store.get(key).unwrap().as_deref(), Some(&payload[..]));
     assert_eq!(temp_files(&store), 0);
 }
+
+#[test]
+fn garbage_collection_keeps_what_projects_reach() {
+    use crag_store::LockMode;
+    use std::time::Duration;
+    let dir = TempDir::new();
+    let store = Store::open(&dir.0, "v1").unwrap();
+    let project = dir.0.join("project");
+    fs::create_dir_all(&project).unwrap();
+    fs::write(project.join("package.crag"), "package p 0.1\n").unwrap();
+    let gone = dir.0.join("gone");
+    let used = store.key("code").str("used").finish();
+    let unused = store.key("code").str("unused").finish();
+    let orphan = store.key("code").str("of a project that is gone").finish();
+    for key in [used, unused, orphan] {
+        store.put(key, b"code").unwrap();
+    }
+    store.set_roots(&project, &[used]).unwrap();
+    store.set_roots(&gone, &[orphan]).unwrap();
+    // Builds share the lock; collection waits for them.
+    let build = store.lock(LockMode::Shared).unwrap();
+    assert!(store.try_lock(LockMode::Shared).unwrap().is_some());
+    assert!(store.try_lock(LockMode::Exclusive).unwrap().is_none());
+    drop(build);
+    let _gc = store.lock(LockMode::Exclusive).unwrap();
+    // New artifacts are kept, whatever names them: a build may not have
+    // written its roots yet.
+    let report = store.collect_garbage(Duration::from_secs(3600)).unwrap();
+    assert_eq!((report.kept, report.removed, report.stale_roots), (3, 0, 1));
+    let report = store.collect_garbage(Duration::ZERO).unwrap();
+    assert_eq!((report.kept, report.removed), (1, 2));
+    assert!(store.get(used).unwrap().is_some());
+    assert!(store.get(unused).unwrap().is_none() && store.get(orphan).unwrap().is_none());
+}

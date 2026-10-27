@@ -721,10 +721,12 @@ pub enum RuntimeFn {
     /// its type to standard error.
     SignalDefault = 76,
 
-    /// `rt_step(ctx, func, step, words, count, fp)`.
+    /// `rt_step(ctx, cell, words, count, fp)`.
     ///
     /// A statement's step, called while its flag is set (Implementation
-    /// Plan §11.8.6): `func` and `step` name it, the `count` words at
+    /// Plan §11.8.6): `cell` is the step's cell, whose second word names
+    /// it (`step_cell_word`), so code holds no function id outside its
+    /// relocations and can be kept across programs; the `count` words at
     /// `words` are those of its locals, and `fp` is the frame pointer of
     /// the calling frame. The debugger may stop the task here; it returns
     /// once the task is resumed.
@@ -1311,6 +1313,17 @@ pub fn step_cell(func: FuncId, step: u32) -> SlotKey {
         func,
         signature: STEP_CELL | step,
     }
+}
+
+/// What the loader writes into the second word of a step's cell: the
+/// function and the step it belongs to.
+pub fn step_cell_word(key: SlotKey) -> u64 {
+    (u64::from(key.func.0) << 32) | u64::from(key.signature & !STEP_CELL)
+}
+
+/// The function and step a step cell's second word names.
+pub fn step_of_cell_word(word: u64) -> (FuncId, u32) {
+    (FuncId((word >> 32) as u32), word as u32)
 }
 
 /// The states of a cell: no value yet, or holding the value. A value that

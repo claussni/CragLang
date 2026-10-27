@@ -30,6 +30,7 @@ crag-loader = { path = "../crag-loader" }
 crag-mir = { path = "../crag-mir" }
 crag-runtime = { path = "../crag-runtime" }
 crag-session = { path = "../crag-session" }
+crag-store = { path = "../crag-store" }
 crag-syntax = { path = "../crag-syntax" }
 crag-types = { path = "../crag-types" }
 libc = "0.2.190"

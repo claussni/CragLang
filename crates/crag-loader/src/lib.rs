@@ -158,6 +158,10 @@ impl CellTable {
                 [const { [const { AtomicU64::new(0) }; CELL_SIZE / 8] }; CELL_CHUNK],
             ));
         }
+        // A step's cell names its step, for `rt_step`.
+        if index == next && key.signature & crag_abi::STEP_CELL != 0 {
+            self.cell(index)[1].store(crag_abi::step_cell_word(key), Ordering::Relaxed);
+        }
         index
     }
 

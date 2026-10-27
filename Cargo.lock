@@ -175,6 +175,7 @@ dependencies = [
  "crag-package",
  "crag-runtime",
  "crag-session",
+ "crag-store",
  "crag-syntax",
  "crag-types",
  "crossterm",
@@ -268,6 +269,7 @@ name = "crag-store"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "libc",
 ]
 
 [[package]]

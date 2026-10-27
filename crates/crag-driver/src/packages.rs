@@ -578,6 +578,29 @@ pub fn crag_sbom(root: &Path, args: &Args, out: &mut dyn Write) -> u8 {
 
 pub const PUBLISH: Spec = Spec::NONE;
 
+/// The commands of this module by name, with what they accept, for both
+/// surfaces; `new` is the shell's alone, since it makes another project.
+pub fn command(name: &str) -> Option<(Spec, PackageCommand)> {
+    Some(match name {
+        "new" => (NEW, crag_new),
+        "add" => (ADD, crag_add),
+        "remove" => (REMOVE, crag_remove),
+        "upgrade" => (UPGRADE, crag_upgrade),
+        "outdated" => (LIST, crag_outdated),
+        "deps" => (LIST, crag_deps),
+        "sbom" => (LIST, crag_sbom),
+        "publish" => (PUBLISH, crag_publish),
+        "package" => (PUBLISH, crag_package),
+        _ => return None,
+    })
+}
+
+/// Whether a command that succeeded changed the project's packages.
+pub fn changes_packages(name: &str, args: &Args) -> bool {
+    matches!(name, "add" | "remove" | "upgrade")
+        || (name == "sbom" && args.positional.first().is_some_and(|w| w == "regenerate"))
+}
+
 /// `publish <registry>`: runs the publishing checks (§20.5), builds the
 /// package folder and places it into the registry.
 pub fn crag_publish(root: &Path, args: &Args, out: &mut dyn Write) -> u8 {
