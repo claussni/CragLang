@@ -28,7 +28,7 @@ use crate::lsp::analysis;
 use crate::repl::{EvalOutput, Repl, is_complete};
 
 use super::buffer::{Buffer, Cursor, EditKind};
-use super::keys::Command;
+use super::keys::{Command, key_name};
 
 /// How long typing pauses before buffers reach the compiler (§11.8.2).
 pub const PUSH_PAUSE: Duration = Duration::from_millis(300);
@@ -131,27 +131,71 @@ pub enum PaletteCommand {
     Reload,
     StopApp,
     View(RightView),
+    /// Shows or hides the hint line.
+    Hints,
+    /// What a key does, for those who look for it here.
+    Key(Command),
     Quit,
     /// Quits although buffers have unsaved changes; asked for first.
     QuitNow,
 }
 
 impl PaletteCommand {
-    const ALL: [PaletteCommand; 11] = [
-        PaletteCommand::Save,
-        PaletteCommand::SaveAll,
-        PaletteCommand::Format,
-        PaletteCommand::StartApp,
-        PaletteCommand::Reload,
-        PaletteCommand::StopApp,
-        PaletteCommand::View(RightView::Problems),
-        PaletteCommand::View(RightView::Tasks),
-        PaletteCommand::View(RightView::Watches),
-        PaletteCommand::View(RightView::Tests),
-        PaletteCommand::Quit,
-    ];
+    const ALL: [PaletteCommand; 35] = {
+        use Command as C;
+        use PaletteCommand as P;
+        [
+            P::Key(C::QuickSwitch),
+            P::Save,
+            P::SaveAll,
+            P::Format,
+            P::Key(C::Find),
+            P::Key(C::Undo),
+            P::Key(C::Redo),
+            P::Key(C::ToggleComment),
+            P::Key(C::Complete),
+            P::Key(C::Info),
+            P::Key(C::Definition),
+            P::Key(C::References),
+            P::Key(C::Back),
+            P::Key(C::Forward),
+            P::Key(C::NextProblem),
+            P::Key(C::Evaluate),
+            P::StartApp,
+            P::Reload,
+            P::StopApp,
+            P::Key(C::Breakpoint),
+            P::Key(C::Continue),
+            P::Key(C::StepOver),
+            P::Key(C::StepInto),
+            P::Key(C::StepOut),
+            P::Key(C::HistorySearch),
+            P::Key(C::ClearRepl),
+            P::Key(C::CycleFocus),
+            P::Key(C::ToggleLeft),
+            P::Key(C::ToggleRight),
+            P::View(RightView::Problems),
+            P::View(RightView::Tasks),
+            P::View(RightView::Watches),
+            P::View(RightView::Tests),
+            P::Hints,
+            P::Quit,
+        ]
+    };
+
+    /// The key that does the same, if one does.
+    pub fn key(self) -> Option<&'static str> {
+        match self {
+            PaletteCommand::Save => key_name(Command::Save),
+            PaletteCommand::Reload => key_name(Command::Reload),
+            PaletteCommand::Quit => key_name(Command::Quit),
+            PaletteCommand::Key(c) => key_name(c),
+            _ => None,
+        }
+    }
 
     fn label(self) -> String {
+        use Command as C;
         match self {
             PaletteCommand::Save => "Save the buffer".into(),
             PaletteCommand::SaveAll => "Save every buffer".into(),
@@ -160,6 +204,34 @@ impl PaletteCommand {
             PaletteCommand::Reload => "Reload the app".into(),
             PaletteCommand::StopApp => "Stop the app".into(),
             PaletteCommand::View(view) => format!("Show {}", view.name()),
+            PaletteCommand::Hints => "Show or hide the key hints".into(),
+            PaletteCommand::Key(c) => match c {
+                C::QuickSwitch => "Open a file",
+                C::Find => "Find and replace",
+                C::Undo => "Undo",
+                C::Redo => "Redo",
+                C::ToggleComment => "Comment or uncomment the lines",
+                C::Complete => "Complete the name",
+                C::Info => "Tell about the name",
+                C::Definition => "Go to the definition",
+                C::References => "Find the references",
+                C::Back => "Go back",
+                C::Forward => "Go forward",
+                C::NextProblem => "Go to the next problem",
+                C::Evaluate => "Evaluate the line",
+                C::Breakpoint => "Set or clear a breakpoint",
+                C::Continue => "Continue the paused tasks",
+                C::StepOver => "Step over",
+                C::StepInto => "Step into",
+                C::StepOut => "Step out",
+                C::HistorySearch => "Search the REPL's history",
+                C::ClearRepl => "Clear the REPL",
+                C::CycleFocus => "Move to the next panel",
+                C::ToggleLeft => "Show or hide the left panels",
+                C::ToggleRight => "Show or hide the right panel",
+                _ => "",
+            }
+            .into(),
             PaletteCommand::Quit | PaletteCommand::QuitNow => "Quit".into(),
         }
     }
@@ -269,6 +341,9 @@ struct Place {
     pos: usize,
 }
 
+/// A key and what it does, for the hint line.
+pub type Hint = (&'static str, &'static str);
+
 /// The mode the status bar shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -311,6 +386,8 @@ pub struct Ui {
     /// What Ctrl+E imported into the session.
     imported: HashSet<String>,
     pub quit: bool,
+    /// Whether the hint line shows the keys that matter now.
+    pub hints: bool,
     /// The lines the editor shows, for paging.
     pub page: usize,
 }
@@ -362,6 +439,7 @@ impl Ui {
             repl_error: None,
             imported: HashSet::new(),
             quit: false,
+            hints: true,
             page: 20,
         };
         ui.expanded.insert(String::new());
@@ -674,7 +752,7 @@ impl Ui {
                     .iter()
                     .map(|&c| PickItem {
                         label: c.label(),
-                        detail: String::new(),
+                        detail: c.key().unwrap_or_default().into(),
                         target: Target::Command(c),
                     })
                     .collect();
@@ -902,9 +980,96 @@ impl Ui {
                 self.right_open = true;
                 self.right_selected = 0;
             }
+            PaletteCommand::Hints => self.hints = !self.hints,
+            PaletteCommand::Key(c) => {
+                // Commands of the editor or the REPL act there.
+                match c {
+                    Command::HistorySearch | Command::ClearRepl => self.focus = Focus::Repl,
+                    Command::Undo
+                    | Command::Redo
+                    | Command::Find
+                    | Command::ToggleComment
+                    | Command::Complete
+                    | Command::Info
+                    | Command::Definition
+                    | Command::References
+                    | Command::Evaluate
+                    | Command::Breakpoint => self.focus = Focus::Editor,
+                    _ => {}
+                }
+                self.command(c);
+            }
             PaletteCommand::Quit => self.ask_quit(),
             PaletteCommand::QuitNow => self.quit = true,
         }
+    }
+
+    /// The keys that matter now, with what they do, for the hint line:
+    /// those of what lies over the screen, else of a debugging session,
+    /// else of the part that has the focus; then those that always work,
+    /// which the line keeps when it has to drop others.
+    pub fn hints(&self) -> (Vec<Hint>, Vec<Hint>) {
+        let close = ("Esc", "Close");
+        let only = |hints: Vec<Hint>| (hints, Vec::new());
+        match &self.overlay {
+            Some(Overlay::Pick(_)) => {
+                return only(vec![("↑↓", "Choose"), ("Enter", "Take"), close]);
+            }
+            Some(Overlay::Find { .. }) => {
+                return only(vec![("Enter", "Next"), ("Tab", "Replace"), close]);
+            }
+            Some(Overlay::Completion { .. }) => {
+                return only(vec![("↑↓", "Choose"), ("Enter", "Insert"), close]);
+            }
+            Some(Overlay::Confirm { .. }) => return only(vec![("y", "Yes"), ("n", "No")]),
+            Some(Overlay::Info(_)) => return only(vec![close]),
+            None => {}
+        }
+        let key = |c| key_name(c).unwrap_or_default();
+        let always = vec![
+            (key(Command::Palette), "Commands"),
+            (key(Command::Quit), "Quit"),
+        ];
+        let mut hints = if !self.pauses.is_empty() {
+            vec![
+                (key(Command::Continue), "Continue"),
+                (key(Command::StepOver), "Over"),
+                (key(Command::StepInto), "Into"),
+                (key(Command::StepOut), "Out"),
+                (key(Command::Breakpoint), "Breakpoint"),
+            ]
+        } else {
+            match self.focus {
+                Focus::Editor => vec![
+                    (key(Command::Save), "Save"),
+                    (key(Command::QuickSwitch), "Open"),
+                    (key(Command::Info), "Info"),
+                    (key(Command::Definition), "Definition"),
+                    (key(Command::Complete), "Complete"),
+                    (key(Command::Evaluate), "Evaluate"),
+                    (key(Command::Breakpoint), "Breakpoint"),
+                ],
+                Focus::Repl => vec![
+                    ("Enter", "Run"),
+                    (key(Command::LineBreak), "New line"),
+                    ("↑↓", "History"),
+                    (key(Command::HistorySearch), "Search"),
+                    (key(Command::ClearRepl), "Clear"),
+                    ("Esc", "Editor"),
+                ],
+                Focus::Buffers | Focus::Files => {
+                    vec![("↑↓", "Choose"), ("Enter", "Open"), ("Esc", "Editor")]
+                }
+                Focus::Right => vec![
+                    ("↑↓", "Choose"),
+                    ("Enter", "Go to"),
+                    ("←→", "Other view"),
+                    ("Esc", "Editor"),
+                ],
+            }
+        };
+        hints.push((key(Command::CycleFocus), "Next panel"));
+        (hints, always)
     }
 
     /// Quits, asking first when that would lose unsaved changes.

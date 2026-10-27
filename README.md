@@ -78,7 +78,9 @@ REPL, buffers and files on the left, problems, tasks and watches on the
 right. Ctrl+P switches files, Ctrl+K lists commands, F1, F12 and Shift+F12
 tell about, go to and find a name, Ctrl+E evaluates the line in the
 scratch image, F9 sets a breakpoint, Alt+R reloads the app and Ctrl+Q
-quits. Without a terminal, `crag` is the plain REPL.
+quits. The line at the bottom shows the keys that matter where the focus
+is, and the command palette names the key of each command. Without a
+terminal, `crag` is the plain REPL.
 
 `:help` lists the REPL's commands. In a project,
 `:start` runs the app in an image of its own; after editing its files,

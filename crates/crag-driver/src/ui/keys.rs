@@ -182,6 +182,55 @@ pub fn command(key: KeyEvent) -> Option<Command> {
     })
 }
 
+/// The key of a command, as the hint line and the command palette name
+/// it; none for commands whose key depends on where the focus is.
+pub fn key_name(command: Command) -> Option<&'static str> {
+    use Command as C;
+    Some(match command {
+        C::QuickSwitch => "Ctrl+P",
+        C::Palette => "Ctrl+K",
+        C::CycleFocus => "F6",
+        C::FocusLeft => "Alt+1",
+        C::FocusEditor => "Alt+2",
+        C::FocusRepl => "Alt+3",
+        C::FocusRight => "Alt+4",
+        C::ToggleLeft => "Ctrl+B",
+        C::ToggleRight => "Alt+B",
+        C::Escape => "Esc",
+        C::Quit => "Ctrl+Q",
+        C::Enter => "Enter",
+        C::LineBreak => "Alt+Enter",
+        C::Indent => "Tab",
+        C::Save => "Ctrl+S",
+        C::Undo => "Ctrl+Z",
+        C::Redo => "Ctrl+Y",
+        C::Cut => "Ctrl+X",
+        C::CopyOrInterrupt => "Ctrl+C",
+        C::Paste => "Ctrl+V",
+        C::SelectAll => "Ctrl+A",
+        C::Find => "Ctrl+F",
+        C::ToggleComment => "Ctrl+/",
+        C::Complete => "Ctrl+Space",
+        C::Info => "F1",
+        C::Definition => "F12",
+        C::References => "Shift+F12",
+        C::Back => "Alt+,",
+        C::Forward => "Alt+.",
+        C::NextProblem => "F8",
+        C::Evaluate => "Ctrl+E",
+        C::Reload => "Alt+R",
+        C::HistorySearch => "Ctrl+R",
+        C::ClearRepl => "Ctrl+L",
+        C::Breakpoint => "F9",
+        C::Continue => "F5",
+        C::Pause => "Shift+F5",
+        C::StepOver => "F10",
+        C::StepInto => "F11",
+        C::StepOut => "Shift+F11",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +263,84 @@ mod tests {
             Some(Command::Char('x'))
         );
         assert_eq!(key(KeyCode::Char('j'), ctrl), None);
+    }
+
+    /// The key a name spells.
+    fn parse(name: &str) -> KeyEvent {
+        let mut modifiers = KeyModifiers::NONE;
+        let mut rest = name;
+        for (prefix, m) in [
+            ("Ctrl+", KeyModifiers::CONTROL),
+            ("Alt+", KeyModifiers::ALT),
+            ("Shift+", KeyModifiers::SHIFT),
+        ] {
+            if let Some(r) = rest.strip_prefix(prefix) {
+                modifiers |= m;
+                rest = r;
+            }
+        }
+        let code = match rest {
+            "Esc" => KeyCode::Esc,
+            "Enter" => KeyCode::Enter,
+            "Tab" => KeyCode::Tab,
+            "Space" => KeyCode::Char(' '),
+            f if f.len() > 1 && f.starts_with('F') => KeyCode::F(f[1..].parse().unwrap()),
+            c => KeyCode::Char(c.chars().next().unwrap().to_ascii_lowercase()),
+        };
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn the_named_keys_are_the_keys_of_their_commands() {
+        use Command as C;
+        for command in [
+            C::QuickSwitch,
+            C::Palette,
+            C::CycleFocus,
+            C::FocusLeft,
+            C::FocusEditor,
+            C::FocusRepl,
+            C::FocusRight,
+            C::ToggleLeft,
+            C::ToggleRight,
+            C::Escape,
+            C::Quit,
+            C::Enter,
+            C::LineBreak,
+            C::Indent,
+            C::Save,
+            C::Undo,
+            C::Redo,
+            C::Cut,
+            C::CopyOrInterrupt,
+            C::Paste,
+            C::SelectAll,
+            C::Find,
+            C::ToggleComment,
+            C::Complete,
+            C::Info,
+            C::Definition,
+            C::References,
+            C::Back,
+            C::Forward,
+            C::NextProblem,
+            C::Evaluate,
+            C::Reload,
+            C::HistorySearch,
+            C::ClearRepl,
+            C::Breakpoint,
+            C::Continue,
+            C::Pause,
+            C::StepOver,
+            C::StepInto,
+            C::StepOut,
+        ] {
+            let name = key_name(command).unwrap();
+            assert_eq!(command_of(name), Some(command), "{name}");
+        }
+    }
+
+    fn command_of(name: &str) -> Option<Command> {
+        command(parse(name))
     }
 }

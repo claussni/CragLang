@@ -30,7 +30,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
-use super::state::{Focus, Mode, OutKind, Overlay, RightView, Ui};
+use super::state::{Focus, Hint, Mode, OutKind, Overlay, RightView, Ui};
 
 /// Below these the screen is narrow or short.
 const NARROW: u16 = 100;
@@ -130,9 +130,14 @@ fn block<'a>(title: &'a str, focused: bool, theme: &Theme) -> Block<'a> {
 /// Draws the whole UI.
 pub fn draw(frame: &mut Frame, ui: &mut Ui, theme: &Theme) {
     let area = frame.area();
+    let hints = u16::from(ui.hints);
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(hints),
+        ])
         .split(area);
     let (body, status) = (rows[0], rows[1]);
     let narrow = area.width < NARROW;
@@ -197,6 +202,9 @@ pub fn draw(frame: &mut Frame, ui: &mut Ui, theme: &Theme) {
         }
     }
     draw_status(frame, ui, theme, status);
+    if ui.hints {
+        draw_hints(frame, ui, theme, rows[2]);
+    }
     draw_overlay(frame, ui, theme, body);
 }
 
@@ -344,6 +352,9 @@ fn draw_editor(frame: &mut Frame, ui: &mut Ui, theme: &Theme, area: Rect) {
         lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), inner);
+    if b.is_empty() {
+        draw_welcome(frame, theme, inner);
+    }
     if focused && ui.overlay.is_none() && cursor_line >= b.scroll && cursor_line < b.scroll + height
     {
         let x = inner.x + (gutter + cursor_col - hscroll) as u16;
@@ -487,6 +498,72 @@ fn draw_status(frame: &mut Frame, ui: &Ui, theme: &Theme, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// The hint line: the keys that always work on the right, and as many of
+/// those that matter now as fit before them.
+fn draw_hints(frame: &mut Frame, ui: &Ui, theme: &Theme, area: Rect) {
+    let (now, always) = ui.hints();
+    let width = |(key, what): &Hint| key.chars().count() + what.chars().count() + 3;
+    let room = area.width as usize;
+    let right: usize = always.iter().map(width).sum();
+    let spans_of = |hints: &[Hint], room: usize| {
+        let mut spans = Vec::new();
+        let mut used = 0;
+        for hint in hints {
+            if used + width(hint) > room {
+                break;
+            }
+            used += width(hint);
+            spans.push(Span::styled(
+                format!(" {}", hint.0),
+                theme.accent().add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(format!(" {} ", hint.1), theme.dim()));
+        }
+        (spans, used)
+    };
+    let (mut spans, used) = spans_of(&now, room.saturating_sub(right));
+    let (end, end_used) = spans_of(&always, room - used);
+    spans.push(Span::raw(" ".repeat(room - used - end_used)));
+    spans.extend(end);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// What an empty editor shows: the keys to begin with.
+const WELCOME: [(&str, &str); 6] = [
+    ("Ctrl+P", "Open a file"),
+    ("Ctrl+K", "Every command, with its key"),
+    ("Ctrl+E", "Evaluate the line in the REPL"),
+    ("F6", "Move to the next panel"),
+    ("F1", "Tell about the name at the cursor"),
+    ("Ctrl+Q", "Quit"),
+];
+
+/// The column the welcome's explanations start at.
+const KEY: usize = 8;
+
+fn draw_welcome(frame: &mut Frame, theme: &Theme, area: Rect) {
+    let width = WELCOME
+        .iter()
+        .map(|(k, w)| k.len().max(KEY) + w.len())
+        .max()
+        .unwrap_or(0) as u16;
+    let height = WELCOME.len() as u16 + 2;
+    if area.width < width || area.height < height + 2 {
+        return;
+    }
+    let mut lines = vec![
+        Line::styled("Crag", theme.accent().add_modifier(Modifier::BOLD)),
+        Line::raw(""),
+    ];
+    for (key, what) in WELCOME {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{key:<KEY$}"), theme.accent()),
+            Span::styled(what, theme.dim()),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), centred(area, width, height));
+}
+
 fn centred(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
@@ -537,7 +614,12 @@ fn draw_overlay(frame: &mut Frame, ui: &Ui, theme: &Theme, area: Rect) {
                 };
                 let mut spans = vec![Span::styled(item.label.clone(), style)];
                 if !item.detail.is_empty() {
-                    spans.push(Span::styled(format!("  {}", item.detail), theme.dim()));
+                    // Details stand at the right, where they line up.
+                    let gap = (columns[0].width as usize - 1)
+                        .saturating_sub(item.label.chars().count() + item.detail.chars().count())
+                        .max(2);
+                    spans.push(Span::raw(" ".repeat(gap)));
+                    spans.push(Span::styled(item.detail.clone(), theme.dim()));
                 }
                 lines.push(Line::from(spans));
             }

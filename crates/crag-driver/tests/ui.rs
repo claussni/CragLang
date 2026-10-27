@@ -304,6 +304,74 @@ fn quitting_with_unsaved_changes_asks_first() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[test]
+fn the_hint_line_and_the_palette_tell_the_keys() {
+    let root = project("hints");
+    let mut ui = ui(&root);
+    let s = screen(&mut ui, 160, 40);
+    let last = s.last().unwrap();
+    for text in [
+        "Ctrl+S Save",
+        "F12 Definition",
+        "Ctrl+K Commands",
+        "Ctrl+Q Quit",
+    ] {
+        assert!(last.contains(text), "{text} missing:\n{}", s.join("\n"));
+    }
+    // The hints follow the focus.
+    ui.command(Command::FocusRepl);
+    let s = screen(&mut ui, 160, 40);
+    assert!(s.last().unwrap().contains("Enter Run"), "{}", s.join("\n"));
+    // A narrow screen keeps what fits, and always the way to quit.
+    ui.command(Command::FocusEditor);
+    let s = screen(&mut ui, 50, 30);
+    let last = s.last().unwrap();
+    assert!(
+        last.contains("Ctrl+S Save") && last.trim_end().ends_with("Ctrl+Q Quit"),
+        "{}",
+        s.join("\n")
+    );
+    // The palette names each command's key and runs it.
+    ui.command(Command::Palette);
+    typing(&mut ui, "definition");
+    let s = screen(&mut ui, 160, 40);
+    assert!(
+        s.iter()
+            .any(|row| row.contains("Go to the definition") && row.contains(" F12 │")),
+        "{}",
+        s.join("\n")
+    );
+    assert!(s.last().unwrap().contains("Enter Take"), "{}", s.join("\n"));
+    ui.command(Command::Escape);
+    ui.command(Command::Palette);
+    typing(&mut ui, "key hints");
+    ui.command(Command::Enter);
+    assert!(!ui.hints);
+    let s = screen(&mut ui, 160, 40);
+    assert!(!shows(&s, "Ctrl+Q Quit"), "{}", s.join("\n"));
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn an_empty_editor_shows_the_keys_to_begin_with() {
+    let root = project("welcome");
+    fs::write(root.join("app.crag"), "").unwrap();
+    let mut ui = ui(&root);
+    let s = screen(&mut ui, 120, 40);
+    for text in [
+        "Ctrl+P  Open a file",
+        "Ctrl+K  Every command",
+        "Ctrl+Q  Quit",
+        "F1      Tell about the name at the cursor",
+    ] {
+        assert!(shows(&s, text), "{text} missing:\n{}", s.join("\n"));
+    }
+    typing(&mut ui, "x");
+    let s = screen(&mut ui, 120, 40);
+    assert!(!shows(&s, "Open a file"), "{}", s.join("\n"));
+    let _ = fs::remove_dir_all(&root);
+}
+
 const SERVER: &str = r#"import std.io
 
 fn reply(c: Connection, n: Int) -> () {
