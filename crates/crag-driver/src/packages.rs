@@ -15,7 +15,8 @@
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
 //! The commands that manage a project's packages (Specification §20.6):
-//! `new`, `add`, `remove`, `upgrade`, `outdated`, `deps` and `sbom`. Each
+//! `new`, `add`, `remove`, `upgrade`, `outdated`, `deps` and `sbom`, and
+//! `registry`, which edits the user's list of registries. Each
 //! returns its exit status, 0 for success, 1 for a failure and 2 for a
 //! usage error, and a command that would change something prints its
 //! usage when run bare. Those that edit the manifest change only the
@@ -85,7 +86,8 @@ fn registry_of<'a>(name: &str, registries: &'a [Registry]) -> Result<&'a Registr
     match having[..] {
         [one] => Ok(one),
         [] if registries.is_empty() => Err(format!(
-            "no registry is set up; list them in registries.crag in the settings directory ({})",
+            "no registry is set up; `crag registry new` makes one, `crag registry add` names one \
+             that exists, in registries.crag in the settings directory ({})",
             crag_package::home::crag_home()
                 .map(|h| h.display().to_string())
                 .unwrap_or_else(|| "CRAG_HOME".into())
@@ -591,8 +593,91 @@ pub fn command(name: &str) -> Option<(Spec, PackageCommand)> {
         "sbom" => (LIST, crag_sbom),
         "publish" => (PUBLISH, crag_publish),
         "package" => (PUBLISH, crag_package),
+        "registry" => (REGISTRY, crag_registry),
         _ => return None,
     })
+}
+
+pub const REGISTRY: Spec = Spec::NONE;
+
+/// `registry new <name> <folder>` makes a new, empty registry and adds it
+/// to the settings; `registry add <name> <folder>` adds one that exists,
+/// as a team shares it; `registry list` lists them and `registry remove
+/// <name>` takes one out of the settings, leaving its folder. A relative
+/// folder is relative to `dir`, the current directory.
+pub fn crag_registry(dir: &Path, args: &Args, out: &mut dyn Write) -> u8 {
+    const USAGE: &str = "crag registry new <name> <folder> | crag registry add <name> <folder> \
+                         | crag registry list | crag registry remove <name>";
+    let Some(home) = crag_package::home::crag_home() else {
+        return fail(out, "there is no settings directory; set CRAG_HOME");
+    };
+    let words: Vec<&str> = args.positional.iter().map(String::as_str).collect();
+    match words[..] {
+        ["list"] => {
+            let entries = match crag_package::home::registry_entries(&home) {
+                Ok(e) => e,
+                Err(e) => return fail(out, e),
+            };
+            if entries.is_empty() {
+                let _ = writeln!(out, "no registries; `crag registry new` makes one");
+            }
+            for e in entries {
+                let state = match Registry::open(&e.name, &e.dir) {
+                    Ok(_) => String::new(),
+                    Err(problem) => format!("  ({problem})"),
+                };
+                let _ = writeln!(out, "{} {}{state}", e.name, e.dir.display());
+            }
+            0
+        }
+        ["remove", name] => match crag_package::home::remove_registry(&home, name) {
+            Ok(true) => {
+                let _ = writeln!(out, "removed registry {name} from the settings");
+                0
+            }
+            Ok(false) => fail(out, format!("the settings name no registry `{name}`")),
+            Err(e) => fail(out, e),
+        },
+        [verb @ ("new" | "add"), name, folder] => {
+            if !valid_name(name) || name.contains('.') {
+                return fail(out, format!("`{name}` is not a name for a registry"));
+            }
+            match crag_package::home::registry_entries(&home) {
+                Ok(entries) if entries.iter().any(|e| e.name == name) => {
+                    return fail(
+                        out,
+                        format!("the settings name a registry `{name}` already"),
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => return fail(out, e),
+            }
+            let folder = dir.join(folder);
+            if verb == "new" {
+                let empty = fs::read_dir(&folder).map_or(true, |mut d| d.next().is_none());
+                if folder.exists() && !(folder.is_dir() && empty) {
+                    return fail(out, format!("{} exists and is not empty", folder.display()));
+                }
+                if let Err(e) = Registry::create(name, &folder) {
+                    return fail(out, format!("cannot create {}: {e}", folder.display()));
+                }
+            }
+            let folder = match folder.canonicalize() {
+                Ok(f) => f,
+                Err(e) => return fail(out, format!("{}: {e}", folder.display())),
+            };
+            if let Err(e) = Registry::open(name, &folder) {
+                return fail(out, e);
+            }
+            if let Err(e) = crag_package::home::add_registry(&home, name, &folder) {
+                return fail(out, e);
+            }
+            let made = if verb == "new" { "made" } else { "added" };
+            let _ = writeln!(out, "{made} registry {name} at {}", folder.display());
+            0
+        }
+        _ => usage(out, USAGE),
+    }
 }
 
 /// Whether a command that succeeded changed the project's packages.

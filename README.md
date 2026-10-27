@@ -67,10 +67,14 @@ named; `-` formats standard input to standard output, and `--check` only
 lists the files that are not formatted.
 
 Packages come from folder registries, which `registries.crag` in the
-settings directory (`$CRAG_HOME`, else `~/.crag`) lists, the first being
-the default:
+settings directory (`$CRAG_HOME`, else `~/.crag`) lists:
 
     registry team "/srv/crag"
+
+`crag registry new <name> <folder>` makes an empty registry and adds it
+there; `crag registry add <name> <folder>` adds one that exists, such as a
+team's shared folder. `crag registry list` and `crag registry remove
+<name>` show and edit the list; removing leaves the folder as it is.
 
 `crag new <name> [--lib]` creates a project; `crag add <package>
 [version]`, `remove`, `upgrade <package> [--version=V] | all`, `outdated`

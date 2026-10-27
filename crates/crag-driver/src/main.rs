@@ -35,6 +35,7 @@ const USAGE: &str = "usage: crag
        crag sbom diff [--json] | crag sbom regenerate
        crag package
        crag publish <registry>
+       crag registry new <name> <folder> | add <name> <folder> | list | remove <name>
        crag run
        crag test [filter]
        crag fmt [--check] [all | - | file...]
@@ -66,7 +67,7 @@ fn main() -> ExitCode {
         ["fmt", ref rest @ ..] => ExitCode::from(crag_fmt(root, rest, &mut std::io::stderr())),
         [
             command @ ("new" | "add" | "remove" | "upgrade" | "outdated" | "deps" | "sbom"
-            | "package" | "publish"),
+            | "package" | "publish" | "registry"),
             ref rest @ ..,
         ] => package_command(root, command, rest),
         ["lsp"] => ExitCode::from(crag_driver::lsp::serve(std::io::stdin(), std::io::stdout())),

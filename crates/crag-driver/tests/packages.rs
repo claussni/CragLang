@@ -560,3 +560,57 @@ fn the_repl_adds_a_package_and_uses_it_at_once() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn registries_are_made_added_listed_and_removed() {
+    watchdog();
+    let root = temp("registry");
+    let home = root.join("home");
+    let out = crag(&home, &root, &["registry", "list"]);
+    assert!(text(&out).contains("no registries"), "{}", text(&out));
+
+    let out = crag(&home, &root, &["registry", "new", "team", "shared"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let shared = root.join("shared").canonicalize().unwrap();
+    assert!(Registry::open("team", &shared).is_ok());
+    // A folder that holds something already is not made a registry.
+    fs::create_dir_all(root.join("full")).unwrap();
+    fs::write(root.join("full/file"), "").unwrap();
+    let out = crag(&home, &root, &["registry", "new", "other", "full"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let out = crag(&home, &root, &["registry", "new", "team", "elsewhere"]);
+    assert!(text(&out).contains("already"), "{}", text(&out));
+    assert!(!root.join("elsewhere").exists());
+    // `add` takes a registry that exists, under a name of the user's own.
+    let out = crag(&home, &root, &["registry", "add", "mine", "full"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let out = crag(&home, &root, &["registry", "add", "mine", "shared"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+
+    let out = crag(&home, &root, &["registry", "list"]);
+    let listed = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(
+        listed,
+        format!("team {0}\nmine {0}\n", shared.display()),
+        "{}",
+        text(&out)
+    );
+
+    // A library published to the new registry is found by another project.
+    let out = crag(&home, &root, &["new", "geo", "--lib"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = crag(&home, &root.join("geo"), &["publish", "team"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = crag(&home, &root, &["registry", "remove", "mine"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = crag(&home, &root, &["new", "app"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let out = crag(&home, &root.join("app"), &["add", "geo"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+
+    let out = crag(&home, &root, &["registry", "remove", "mine"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let out = crag(&home, &root, &["registry"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    fs::remove_dir_all(&root).unwrap();
+}

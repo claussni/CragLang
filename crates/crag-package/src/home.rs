@@ -115,3 +115,89 @@ pub fn registries(home: &Path) -> Result<Vec<Registry>, String> {
         .map(|e| Registry::open(&e.name, &e.dir))
         .collect()
 }
+
+/// The folder `dir` as a string literal of `registries.crag`.
+fn quote(dir: &Path) -> Result<String, String> {
+    let text = dir
+        .to_str()
+        .filter(|t| !t.chars().any(char::is_control))
+        .ok_or_else(|| format!("{} cannot be named in the settings", dir.display()))?;
+    let mut quoted = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '\\' | '"' => quoted.extend(['\\', c]),
+            '{' | '}' => quoted.extend([c, c]),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    Ok(quoted)
+}
+
+/// Adds the registry `name` in `dir` to the end of `registries.crag`,
+/// creating the settings directory and the file when they are missing.
+pub fn add_registry(home: &Path, name: &str, dir: &Path) -> Result<(), String> {
+    if registry_entries(home)?.iter().any(|e| e.name == name) {
+        return Err(format!("the settings name a registry `{name}` already"));
+    }
+    let file = home.join("registries.crag");
+    let mut text = match fs::read_to_string(&file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("cannot read {}: {e}", file.display())),
+    };
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text += &format!("registry {name} {}\n", quote(dir)?);
+    fs::create_dir_all(home)
+        .and_then(|()| fs::write(&file, text))
+        .map_err(|e| format!("cannot write {}: {e}", file.display()))
+}
+
+/// Removes the registry `name` from `registries.crag`, keeping the other
+/// lines as they are; whether the settings named it.
+pub fn remove_registry(home: &Path, name: &str) -> Result<bool, String> {
+    registry_entries(home)?;
+    let file = home.join("registries.crag");
+    let Ok(text) = fs::read_to_string(&file) else {
+        return Ok(false);
+    };
+    let names = |line: &str| {
+        let tokens = lex(line);
+        tokens.len() > 1 && tokens[0].text(line) == "registry" && tokens[1].text(line) == name
+    };
+    let kept: String = text
+        .split_inclusive('\n')
+        .filter(|line| !names(line))
+        .collect();
+    if kept.len() == text.len() {
+        return Ok(false);
+    }
+    fs::write(&file, kept).map_err(|e| format!("cannot write {}: {e}", file.display()))?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registries_are_added_and_removed_and_read_back() {
+        let home = std::env::temp_dir().join(format!("crag-home-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let odd = Path::new("/srv/a \"b\" {c}\\d");
+        add_registry(&home, "team", odd).unwrap();
+        add_registry(&home, "local", Path::new("local")).unwrap();
+        assert!(add_registry(&home, "team", Path::new("x")).is_err());
+        let entries = registry_entries(&home).unwrap();
+        assert_eq!(entries[0].dir, odd);
+        assert_eq!(entries[1].dir, home.join("local"));
+        assert!(remove_registry(&home, "team").unwrap());
+        assert!(!remove_registry(&home, "team").unwrap());
+        let entries = registry_entries(&home).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "local");
+        fs::remove_dir_all(&home).unwrap();
+    }
+}
