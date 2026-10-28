@@ -205,3 +205,23 @@ fn generic_records_take_their_type_arguments_from_their_fields() {
     eval(&mut r, "let s = Step(x: 2, f: { n -> n + 1 })");
     assert_eq!(eval(&mut r, "s.f(s.x)"), "3\n");
 }
+
+#[test]
+fn closures_read_a_var_as_it_is_when_they_run() {
+    // §6.4.1: a closure reads a captured `var`, never a copy of it.
+    let mut r = repl();
+    eval(
+        &mut r,
+        "fn f() -> Int {\n  var count = 0\n  let show = { -> count * 10 }\n  count = 5\n  let a = show()\n  count = count + 1\n  a + show()\n}",
+    );
+    assert_eq!(eval(&mut r, "f()"), "110\n");
+    eval(
+        &mut r,
+        "fn g() -> Int {\n  var base = 1\n  fn plus(x: Int) -> Int { x + base }\n  base = 10\n  plus(5)\n}",
+    );
+    assert_eq!(eval(&mut r, "g()"), "15\n");
+    assert!(
+        eval(&mut r, "fn h() -> () -> Int {\n  var n = 1\n  { -> n }\n}")
+            .contains("cannot capture the `var` `n`")
+    );
+}

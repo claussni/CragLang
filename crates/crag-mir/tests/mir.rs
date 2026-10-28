@@ -842,13 +842,7 @@ bb3:
 #[test]
 fn what_cannot_run_traps() {
     check(
-        r#"fn reads(n: Int) -> Int {
-  var total = n
-  let f = { -> total }
-  f()
-}
-
-fn wrong() -> Int {
+        r#"fn wrong() -> Int {
   "no"
 }
 
@@ -857,19 +851,106 @@ fn hole() -> Int {
 }
 "#,
         r#"error: expected Int, found Str
-reads
-param _0: Int (n)
-let _1: Int (total)
-bb0:
-  _1 = _0
-  trap unsupported
-unsupported: closures capturing a `var`
 wrong
 bb0:
   trap error
 hole
 bb0:
   trap hole
+"#,
+    );
+}
+
+/// A `var` a closure captures lives in a cell the frame and the closure
+/// share, so the closure reads it as it is when it runs.
+#[test]
+fn a_captured_var_lives_in_a_cell() {
+    check(
+        r#"fn reads(n: Int) -> Int {
+  var total = n
+  let f = { -> total }
+  total = total + 1
+  f()
+}
+"#,
+        r#"reads
+param _0: Int (n)
+let _1: Ref[Int] (total)
+let _2: () -> Int is Pure
+let _3: () -> Int is Pure (f)
+let _4: Int
+let _5: Int
+let _6: False | True
+let _7: ()
+let _8: Int
+let _9: ()
+let _10: Int
+let _11: Int
+let _12: Int
+let _13: False | True
+let _14: ()
+let _15: False | True
+bb0:
+  _1 = RefNew(_0)
+  retain _1
+  _2 = closure reads#3 heap(_1)
+  _3 = _2
+  _4 = RefRead(_1)
+  _5 = TxConflicted()
+  _6 = Int.eq(_5, 0)
+  branch _6 bb1 bb2
+bb1:
+  _8 = RefValue()
+  _9 = RefDone()
+  _15 = overflows Int.add(_8, 1)
+  branch _15 bb5 bb6
+bb2:
+  release _1
+  release _3
+  _7 = TxThrow()
+  trap error
+bb3:
+  tail call value _3()
+bb4:
+  release _3
+  _14 = TxThrow()
+  trap error
+bb5:
+  release _1
+  release _3
+  trap overflow
+bb6:
+  _10 = Int.add(_8, 1)
+  _11 = RefSwap(_1, _10)
+  release _1
+  _12 = TxConflicted()
+  _13 = Int.eq(_12, 0)
+  branch _13 bb3 bb4
+reads#3
+param _0: (0: Ref[Int])
+let _1: Ref[Int] (total)
+let _2: Int
+let _3: Int
+let _4: False | True
+let _5: ()
+let _6: Int
+let _7: ()
+bb0:
+  _1 = _0.0
+  retain _1
+  release _0
+  _2 = RefRead(_1)
+  release _1
+  _3 = TxConflicted()
+  _4 = Int.eq(_3, 0)
+  branch _4 bb1 bb2
+bb1:
+  _6 = RefValue()
+  _7 = RefDone()
+  return _6
+bb2:
+  _5 = TxThrow()
+  trap error
 "#,
     );
 }

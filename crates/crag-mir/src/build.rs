@@ -752,7 +752,24 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     }
 
     fn binding_ty(&self, binding: BindingId) -> Option<Ty<'db>> {
-        self.types.binding(binding).map(|t| self.subst(t))
+        let ty = self.types.binding(binding).map(|t| self.subst(t))?;
+        Some(match self.celled(binding) {
+            true => Ty::new(self.db, TyKind::Builtin(Builtin::Ref, vec![ty])),
+            false => ty,
+        })
+    }
+
+    /// Whether a binding is a `var` that a closure captures, which then
+    /// lives in a cell that the frame and the closure share, so the
+    /// closure reads it as it is when it runs (§6.4.1).
+    fn celled(&self, binding: BindingId) -> bool {
+        self.body.binding(binding).kind == BindingKind::Var
+            && self
+                .types
+                .escapes
+                .captures
+                .iter()
+                .any(|(_, captured)| captured.contains(&binding))
     }
 
     /// The type a type written in the body stands for.
@@ -1699,11 +1716,6 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let (captures, env) = self.environment(frame, own);
         let mut ops = Vec::new();
         for &binding in &captures {
-            // A closure reads a `var` as it is when it runs, which needs
-            // the variable on the side stack.
-            if self.body.binding(binding).kind == BindingKind::Var {
-                return self.unsupported(frame, "closures capturing a `var`");
-            }
             ops.push(Operand::Local(self.binding(binding)));
         }
         let level = self
@@ -2417,9 +2429,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         item: Option<&Resolution<'db>>,
     ) -> Operand<'db> {
         if let Some(binding) = local {
+            let local = self.binding(binding);
+            if self.celled(binding) {
+                let ty = self.types.binding(binding).map(|t| self.subst(t));
+                let ty = ty.unwrap_or_else(|| Ty::error(self.db));
+                let value = self.ref_get(Operand::Local(local), ty);
+                return self.coerce(value, ty, self.ty(expr));
+            }
             // A narrowed binding is read as the member a test found
             // (§3.13.4).
-            let local = self.binding(binding);
             let (from, to) = (self.locals[local.index()].ty, self.ty(expr));
             return match self.converts(from, to) {
                 true => self.assign(to, Rvalue::Convert(Operand::Local(local))),
@@ -3555,6 +3573,14 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Stmt::Bind { binding, value, .. } => {
                 let local = self.binding(*binding);
                 match body.binding(*binding).kind {
+                    BindingKind::Var if self.celled(*binding) => {
+                        let ty = self.types.binding(*binding).map(|t| self.subst(t));
+                        let ty = ty.unwrap_or_else(|| Ty::error(self.db));
+                        let op = self.expr(*value);
+                        let op = self.coerce(op, self.ty(*value), ty);
+                        let new = Rvalue::Intrinsic(Intrinsic::RefNew, vec![op]);
+                        self.push(Statement::Assign(local, new));
+                    }
                     BindingKind::Var => {
                         let op = self.expr(*value);
                         self.assign_to(local, op, self.ty(*value));
@@ -3578,6 +3604,16 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         self.trap(TrapKind::Error, Some(*value));
                     }
                 }
+            }
+            Stmt::Assign { binding, value } if self.celled(*binding) => {
+                let cell = self.binding(*binding);
+                let ty = self.types.binding(*binding).map(|t| self.subst(t));
+                let ty = ty.unwrap_or_else(|| Ty::error(self.db));
+                let op = self.expr(*value);
+                let new = self.coerce(op, self.ty(*value), ty);
+                let swap = Rvalue::Intrinsic(Intrinsic::RefSwap, vec![Operand::Local(cell), new]);
+                self.assign(ty, swap);
+                self.leave_on_conflict();
             }
             Stmt::Assign { binding, value } => {
                 let local = self.binding(*binding);
