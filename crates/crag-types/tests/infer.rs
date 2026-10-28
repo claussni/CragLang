@@ -1318,6 +1318,23 @@ fn lookup[K](k: K) -> Int where Show[K], Hash[K] { 3 }";
 }
 
 #[test]
+fn optional_access_joins_empty() {
+    // §6.8: the access sees the receiver without `Empty`, and an `Option`
+    // it gives is not nested.
+    let text = "type Address(city: Str)
+type User(name: Str, address: Option[Address])
+fn f(u: Option[User]) {
+  let a = u?.name
+  let b = u?.address?.city
+  let c = u?.name?.size()
+}";
+    assert_eq!(
+        ok(text).last().unwrap(),
+        "u: Empty[User] | User, a: Empty[Str] | Str, b: Empty[Str] | Str, c: Empty[Int] | Int, -> ()"
+    );
+}
+
+#[test]
 fn candidates_of_several_modules_are_ranked() {
     // §5.6.1: the prelude's `size(s: Str)` beats this module's generic
     // one for a string, which takes everything else.

@@ -56,7 +56,9 @@ use crate::group::{
 };
 use crate::overload::{Ranked, most_specific};
 use crate::relate::{declared_fields, fields_of, is_subtype, join, normalize};
-use crate::result::{Callee, Dispatch, DispatchArm, ErrorKind, InferenceResult, Site, TypeError};
+use crate::result::{
+    Callee, Dispatch, DispatchArm, ErrorKind, InferenceResult, Optional, Site, TypeError,
+};
 use crate::ty::{Builtin, Ty, TyKind};
 
 /// The types of one body. Runs apart from `body_types` for the queries
@@ -90,6 +92,7 @@ pub fn infer_in_group<'db>(
         narrowed: vec![None; body.bindings.len()],
         callees: Vec::new(),
         holes: Vec::new(),
+        optional: Vec::new(),
         frames: Vec::new(),
         negative: false,
         bool_ty: prelude_type(db, program, "Bool"),
@@ -173,6 +176,7 @@ pub fn infer_in_group<'db>(
         callees: cx.callees,
         result,
         holes: cx.holes,
+        optional: cx.optional,
         effects,
         escapes,
         errors: cx.lower.errors,
@@ -206,6 +210,7 @@ struct Infer<'a, 'db> {
     narrowed: Flow<'db>,
     callees: Vec<(ExprId, Callee<'db>)>,
     holes: Vec<(ExprId, Ty<'db>)>,
+    optional: Vec<(ExprId, Optional<'db>)>,
     /// The function and closures being checked, innermost last, for
     /// `return`.
     frames: Vec<Frame<'db>>,
@@ -592,39 +597,30 @@ impl<'a, 'db> Infer<'a, 'db> {
                 args,
                 fields,
             } => {
-                if *optional {
-                    self.error(Site::Expr(id), ErrorKind::Unsupported("`?.` calls"));
-                }
                 let receiver_ty = self.synth(*receiver);
-                if let Some(field) = self.field_ty(receiver_ty, *name)
-                    && let TyKind::Fn { .. } = field.kind(db)
-                {
-                    self.callees.push((id, Callee::Value));
-                    return self.call_value(id, field, args, fields.as_deref());
+                if *optional {
+                    return self.optional(id, receiver_ty, |this, present| {
+                        this.method_call(
+                            id,
+                            *receiver,
+                            present,
+                            *name,
+                            functions,
+                            args,
+                            fields.as_deref(),
+                            None,
+                        )
+                    });
                 }
-                if functions.is_empty() {
-                    self.error(
-                        Site::Expr(id),
-                        ErrorKind::NoField {
-                            ty: receiver_ty,
-                            name: *name,
-                        },
-                    );
-                    self.synth_args(args, fields.as_deref());
-                    return self.err_ty();
-                }
-                let receiver = Some(Arg::Receiver(*receiver, receiver_ty));
-                self.resolve(
+                self.method_call(
                     id,
-                    None,
+                    *receiver,
+                    receiver_ty,
                     *name,
                     functions,
-                    None,
-                    receiver,
                     args,
                     fields.as_deref(),
                     expected,
-                    None,
                 )
             }
             Expr::TypedCall {
@@ -654,37 +650,13 @@ impl<'a, 'db> Infer<'a, 'db> {
                 functions,
                 optional,
             } => {
-                if *optional {
-                    self.error(Site::Expr(id), ErrorKind::Unsupported("`?.` fields"));
-                }
                 let receiver_ty = self.synth(*receiver);
-                if let Some(field) = self.field_ty(receiver_ty, *name) {
-                    return field;
+                if *optional {
+                    return self.optional(id, receiver_ty, |this, present| {
+                        this.field(id, *receiver, present, *name, functions, None)
+                    });
                 }
-                if receiver_ty.is_error(db) {
-                    return receiver_ty;
-                }
-                if functions.is_empty() {
-                    let kind = ErrorKind::NoField {
-                        ty: receiver_ty,
-                        name: *name,
-                    };
-                    self.error(Site::Expr(id), kind);
-                    return self.err_ty();
-                }
-                let receiver = Some(Arg::Receiver(*receiver, receiver_ty));
-                self.resolve(
-                    id,
-                    None,
-                    *name,
-                    functions,
-                    None,
-                    receiver,
-                    &[],
-                    None,
-                    expected,
-                    None,
-                )
+                self.field(id, *receiver, receiver_ty, *name, functions, expected)
             }
             Expr::Index { base, args } => self.index(id, *base, args),
             Expr::TypeArgs { base, args } => match body.expr(*base) {
@@ -3110,6 +3082,133 @@ impl<'a, 'db> Infer<'a, 'db> {
                 self.err_ty()
             }
         }
+    }
+
+    /// `?.`: the access on the members of the receiver that are not
+    /// `Empty`, and `Empty` for the rest, so the result is `V | Empty[V]`
+    /// for the access's result `V` without its own `Empty` members
+    /// (§6.8).
+    fn optional(
+        &mut self,
+        id: ExprId,
+        receiver_ty: Ty<'db>,
+        access: impl FnOnce(&mut Self, Ty<'db>) -> Ty<'db>,
+    ) -> Ty<'db> {
+        let db = self.db;
+        if receiver_ty.is_error(db) {
+            return access(self, receiver_ty);
+        }
+        let empty = self.empty;
+        let is_empty = |t: &Ty<'db>| matches!(t.kind(db), TyKind::Named(i, _) if Some(*i) == empty);
+        let members = receiver_ty.members(db);
+        if !members.iter().any(is_empty) {
+            return access(self, receiver_ty);
+        }
+        let present = members
+            .into_iter()
+            .filter(|m| !is_empty(m))
+            .fold(Ty::never(db), |a, m| self.join(a, m));
+        let result = access(self, present);
+        if result.is_error(db) {
+            return result;
+        }
+        let value = result
+            .members(db)
+            .into_iter()
+            .filter(|m| !is_empty(m))
+            .fold(Ty::never(db), |a, m| self.join(a, m));
+        let empty = match self.empty {
+            Some(item) => Ty::new(db, TyKind::Named(item, vec![value])),
+            None => return self.err_ty(),
+        };
+        self.optional.push((
+            id,
+            Optional {
+                present,
+                result,
+                empty,
+            },
+        ));
+        self.join(result, empty)
+    }
+
+    /// `receiver.name(args)` with the receiver of type `receiver_ty`: a
+    /// function-valued field called, or a call through UFCS (§6.3).
+    #[allow(clippy::too_many_arguments)]
+    fn method_call(
+        &mut self,
+        id: ExprId,
+        receiver: ExprId,
+        receiver_ty: Ty<'db>,
+        name: Name<'db>,
+        functions: &[ItemId<'db>],
+        args: &[ExprId],
+        fields: Option<&[FieldArg<'db>]>,
+        expected: Option<Ty<'db>>,
+    ) -> Ty<'db> {
+        let db = self.db;
+        if let Some(field) = self.field_ty(receiver_ty, name)
+            && let TyKind::Fn { .. } = field.kind(db)
+        {
+            self.callees.push((id, Callee::Value));
+            return self.call_value(id, field, args, fields);
+        }
+        if functions.is_empty() {
+            self.error(
+                Site::Expr(id),
+                ErrorKind::NoField {
+                    ty: receiver_ty,
+                    name,
+                },
+            );
+            self.synth_args(args, fields);
+            return self.err_ty();
+        }
+        let receiver = Some(Arg::Receiver(receiver, receiver_ty));
+        self.resolve(
+            id, None, name, functions, None, receiver, args, fields, expected, None,
+        )
+    }
+
+    /// `receiver.name` with the receiver of type `receiver_ty`: a field,
+    /// or a call through UFCS (§6.3).
+    fn field(
+        &mut self,
+        id: ExprId,
+        receiver: ExprId,
+        receiver_ty: Ty<'db>,
+        name: Name<'db>,
+        functions: &[ItemId<'db>],
+        expected: Option<Ty<'db>>,
+    ) -> Ty<'db> {
+        let db = self.db;
+        if let Some(field) = self.field_ty(receiver_ty, name) {
+            return field;
+        }
+        if receiver_ty.is_error(db) {
+            return receiver_ty;
+        }
+        if functions.is_empty() {
+            let kind = ErrorKind::NoField {
+                ty: receiver_ty,
+                name,
+            };
+            self.error(Site::Expr(id), kind);
+            return self.err_ty();
+        }
+        let receiver = Some(Arg::Receiver(receiver, receiver_ty));
+        self.resolve(
+            id,
+            None,
+            name,
+            functions,
+            None,
+            receiver,
+            &[],
+            None,
+            expected,
+            None,
+        )
     }
 
     /// `Option[T]`, which is `T | Empty[T]` (§3.6.1).

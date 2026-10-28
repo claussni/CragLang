@@ -25,6 +25,17 @@ use crate::escape::{BindingsOnly, Escapes};
 use crate::generic::{FitError, Instance};
 use crate::ty::Ty;
 
+/// A `?.` access on a value that can be `Empty` (§6.8).
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct Optional<'db> {
+    /// The receiver's members that are not `Empty`, which the access sees.
+    pub present: Ty<'db>,
+    /// What the access gives.
+    pub result: Ty<'db>,
+    /// What the whole gives when the receiver is `Empty`.
+    pub empty: Ty<'db>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, crag_db::SalsaValue)]
 pub struct InferenceResult<'db> {
     /// By `ExprId`, `PatId`, `BindingId` and `TypeRefId`. What failed to
@@ -41,6 +52,8 @@ pub struct InferenceResult<'db> {
     pub result: Option<Ty<'db>>,
     /// Every `???` with the type it must have (§6.11).
     pub holes: Vec<(ExprId, Ty<'db>)>,
+    /// Every `?.` access on a value that can be `Empty` (§6.8).
+    pub optional: Vec<(ExprId, Optional<'db>)>,
     /// What the body does beyond computing (§3.14).
     pub effects: EffectSet,
     /// Where its parameters and closures go (§11.5.8).
@@ -59,6 +72,10 @@ impl<'db> InferenceResult<'db> {
 
     pub fn binding(&self, id: BindingId) -> Option<Ty<'db>> {
         self.bindings.get(id.index()).copied().flatten()
+    }
+
+    pub fn optional(&self, id: ExprId) -> Option<&Optional<'db>> {
+        self.optional.iter().find(|(e, _)| *e == id).map(|(_, o)| o)
     }
 
     pub fn callee(&self, id: ExprId) -> Option<&Callee<'db>> {

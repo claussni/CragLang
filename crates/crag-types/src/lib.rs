@@ -69,7 +69,9 @@ pub use overload::{
     FinalError, Ranked, Specificity, compare_param, final_errors, most_specific, overload_errors,
 };
 pub use relate::{declared_fields, fields_of, is_subtype, join, normalize, parent, subst};
-pub use result::{Callee, Dispatch, DispatchArm, ErrorKind, InferenceResult, Site, TypeError};
+pub use result::{
+    Callee, Dispatch, DispatchArm, ErrorKind, InferenceResult, Optional, Site, TypeError,
+};
 pub use ty::{Builtin, Ty, TyKind};
 
 /// The types of a body: a function, a module-level `let`, a test, or the

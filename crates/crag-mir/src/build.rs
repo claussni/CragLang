@@ -293,6 +293,10 @@ pub struct MirBuilder<'a, 'db> {
     blocks: Vec<(Vec<Statement<'db>>, Option<Terminator<'db>>)>,
     current: BlockId,
     bindings: HashMap<BindingId, Local>,
+    /// Expressions already evaluated, by the local holding their value
+    /// and its type: the receiver of a `?.` access narrowed to what is
+    /// not `Empty` (§6.8), and the access itself then.
+    given: HashMap<ExprId, (Option<Local>, Ty<'db>)>,
     unsupported: Vec<(ExprId, &'static str)>,
     params: usize,
     /// Whether local 0 is an environment.
@@ -358,6 +362,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             blocks: Vec::new(),
             current: BlockId(0),
             bindings: HashMap::new(),
+            given: HashMap::new(),
             unsupported: Vec::new(),
             params: 0,
             env: false,
@@ -679,7 +684,62 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     }
 
     fn expr_ty(&self, expr: ExprId) -> Option<Ty<'db>> {
+        if let Some(&(_, ty)) = self.given.get(&expr) {
+            return Some(ty);
+        }
         self.types.expr(expr).map(|t| self.subst(t))
+    }
+
+    /// Whether `expr` is a `?.` access still to branch on its receiver.
+    fn is_optional(&self, expr: ExprId) -> bool {
+        self.types.optional(expr).is_some() && !self.given.contains_key(&expr)
+    }
+
+    /// `receiver?.name` or `receiver?.name(args)`: the access on the
+    /// receiver narrowed to what is not `Empty`, else `Empty` (§6.8).
+    fn optional(&mut self, expr: ExprId) -> Operand<'db> {
+        let Some(optional) = self.types.optional(expr) else {
+            return self.trap(TrapKind::Error, Some(expr));
+        };
+        let (present, result, empty) = (
+            self.subst(optional.present),
+            self.subst(optional.result),
+            self.subst(optional.empty),
+        );
+        let receiver = match self.body.expr(expr) {
+            Expr::Field { receiver, .. } | Expr::MethodCall { receiver, .. } => *receiver,
+            _ => return self.trap(TrapKind::Error, Some(expr)),
+        };
+        let receiver_ty = self.ty(receiver);
+        let subject = self.place_of(receiver);
+        let ty = self.ty(expr);
+        let value = self.temp(ty);
+        let (some, none, join) = (self.new_block(), self.new_block(), self.new_block());
+        let cases = present
+            .members(self.db)
+            .into_iter()
+            .map(|m| (m, some))
+            .collect();
+        self.terminate(Terminator::Switch {
+            place: Place::local(subject),
+            cases,
+            otherwise: none,
+        });
+        self.switch_to(some);
+        let narrowed = self.temp(present);
+        self.assign_to(narrowed, Operand::Local(subject), receiver_ty);
+        self.given.insert(receiver, (Some(narrowed), present));
+        self.given.insert(expr, (None, result));
+        let op = self.expr(expr);
+        self.given.remove(&receiver);
+        self.given.remove(&expr);
+        self.assign_to(value, op, result);
+        self.terminate(Terminator::Jump(join));
+        self.switch_to(none);
+        self.assign_to(value, Operand::Const(Constant::Tag(empty)), empty);
+        self.terminate(Terminator::Jump(join));
+        self.switch_to(join);
+        Operand::Local(value)
     }
 
     fn binding_ty(&self, binding: BindingId) -> Option<Ty<'db>> {
@@ -2001,6 +2061,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 self.switch_to(join);
             }
             Expr::Case { subject, arms } => self.case(expr, *subject, arms, dest),
+            _ if self.is_optional(expr) => {
+                let op = self.optional(expr);
+                self.finish_dest(op, self.ty(expr), dest);
+            }
             // A tail call would leave an `atomic` block's frame.
             Expr::Call { .. } | Expr::MethodCall { .. } | Expr::TypedCall { .. }
                 if matches!(dest, Dest::Return) =>
@@ -2060,6 +2124,12 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
 
     /// Evaluates an expression into an operand.
     fn expr(&mut self, expr: ExprId) -> Operand<'db> {
+        if let Some(&(Some(local), _)) = self.given.get(&expr) {
+            return Operand::Local(local);
+        }
+        if self.is_optional(expr) {
+            return self.optional(expr);
+        }
         let db = self.db;
         let body = self.body;
         let ty = self.ty(expr);
