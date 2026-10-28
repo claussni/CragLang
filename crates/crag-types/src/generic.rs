@@ -358,20 +358,13 @@ fn expand<'db>(
 }
 
 /// The bounds of a generic function's type parameters, those of its form
-/// typed parameters included (§4.3).
+/// typed parameters included (§4.3), or of a generic type's, which its
+/// constructions must fit (§4.7).
 #[crag_db::tracked(returns(ref))]
 pub fn bounds<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> Bounds<'db> {
     let body = hir_body(db, program, Owner::Item(item));
     let mut lower = TypeLowerer::new(db, program, body, Some(item));
     let mut bounds = Bounds::default();
-    if *item.kind(db) == ItemKind::Type {
-        if let Some(req) = body.requirements.first() {
-            let kind = ErrorKind::Unsupported("bounds on type parameters of types");
-            lower.error(Site::Type(req.ty), kind);
-        }
-        bounds.errors = lower.errors;
-        return bounds;
-    }
     let own = own_type_params(db, item) as u32;
     let mut forms = Vec::new();
     for req in &body.requirements {

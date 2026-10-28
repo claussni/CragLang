@@ -1404,6 +1404,31 @@ fn f(x: A | B | Str) -> Int {
 }
 
 #[test]
+fn constructions_fit_the_bounds_of_their_type() {
+    // §4.7: a type's own type parameters may be bounded.
+    let text = "form Sized[T] {
+  size(t: T) -> Int
+}
+type Box(n: Int)
+fn size(b: Box) -> Int { b.n }
+type Holder[K: Sized](k: K)
+type Shape(x: Int)
+type Frame[S: Shape](s: S)
+fn f() {
+  let a = Holder(k: Box(n: 2))
+  let b = Holder(k: 2.5)
+  let c = Frame(s: 3)
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`Holder(k: 2.5)`: Sized[Float] does not hold: no visible function `size` has the type (Float) -> Int",
+            "`Frame(s: 3)`: Int does not fit the bound Shape of `S`",
+        ]
+    );
+}
+
+#[test]
 fn candidates_of_several_modules_are_ranked() {
     // §5.6.1: the prelude's `size(s: Str)` beats this module's generic
     // one for a string, which takes everything else.

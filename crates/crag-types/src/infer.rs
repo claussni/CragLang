@@ -2849,6 +2849,14 @@ impl<'a, 'db> Infer<'a, 'db> {
                 return self.err_ty();
             }
         };
+        // The type arguments must fit the type's bounds (§4.7).
+        if let TyKind::Named(identity, targs) = ty.kind(db)
+            && !targs.is_empty()
+            && !targs.iter().any(|t| t.is_error(db))
+            && let Err(fit) = instantiate(db, self.program, *identity, targs, self.call_site())
+        {
+            self.error(Site::Expr(id), ErrorKind::Unfit(fit));
+        }
         self.exprs[callee.index()] = Some(ty);
         self.callees.push((id, Callee::Construct(ty)));
         ty
