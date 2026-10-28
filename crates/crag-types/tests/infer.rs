@@ -1385,6 +1385,23 @@ fn f() {
 }
 
 #[test]
+fn a_rest_arm_binds_what_earlier_arms_left() {
+    // §7.2: `name: _` binds the members no earlier arm matched.
+    let text = "type A(c: Int)
+type B(d: Int)
+fn f(x: A | B | Str) -> Int {
+  case x {
+    v: A -> v.c
+    w: _ -> 0
+  }
+}";
+    assert_eq!(
+        ok(text).last().unwrap(),
+        "x: A | B | Str, v: A, w: B | Str, -> Int"
+    );
+}
+
+#[test]
 fn candidates_of_several_modules_are_ranked() {
     // §5.6.1: the prelude's `size(s: Str)` beats this module's generic
     // one for a string, which takes everything else.

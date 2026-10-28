@@ -3875,7 +3875,18 @@ impl<'a, 'db> Infer<'a, 'db> {
         let mut typed = true;
         for arm in arms {
             self.narrowed = start.clone();
-            typed &= self.pattern_checks(arm.pat, subject_ty);
+            // `name: _` and a bare name bind what no earlier arm matched
+            // (§7.2).
+            let rest = match self.body.pat(arm.pat) {
+                Pat::Bind { sub: None, .. } => true,
+                Pat::Bind { sub: Some(sub), .. } => matches!(self.body.pat(*sub), Pat::Wildcard),
+                _ => false,
+            };
+            let against = match remaining {
+                Some(r) if rest && !r.is_never(db) => r,
+                _ => subject_ty,
+            };
+            typed &= self.pattern_checks(arm.pat, against);
             // What the arm matches of what is left; an arm that never
             // matches, which is reported, narrows nothing.
             let matched = self.pats[arm.pat.index()]
