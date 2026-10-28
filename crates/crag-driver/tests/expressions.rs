@@ -235,3 +235,16 @@ fn module_lets_bind_the_parts_their_patterns_name() {
     assert_eq!(eval(&mut r, "x * 10 + y"), "12\n");
     assert_eq!(eval(&mut r, "b"), "\"s\"\n");
 }
+
+#[test]
+fn lifted_calls_fill_in_defaults() {
+    // §4.6.1: each member's overload is called as a call would call it.
+    let mut r = repl();
+    eval(&mut r, "type A(n: Int)");
+    eval(&mut r, "type B(n: Int)");
+    eval(&mut r, "fn size(a: A, k: Int = 1) -> Int { a.n * k }");
+    eval(&mut r, "fn size(b: B, k: Int = 10) -> Int { b.n * k }");
+    eval(&mut r, "fn g(x: A | B) -> Int { size(x) }");
+    assert_eq!(eval(&mut r, "g(A(n: 3))"), "3\n");
+    assert_eq!(eval(&mut r, "g(B(n: 3))"), "30\n");
+}

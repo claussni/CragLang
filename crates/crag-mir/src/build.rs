@@ -2762,8 +2762,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             let Some(instance) = self.callee_instance(&arm.callee) else {
                 return Err(self.trap(TrapKind::Error, Some(expr)));
             };
-            if self.instance_signature(&instance).params.len() != positional.len() {
-                return Err(self.unsupported(expr, "default arguments"));
+            if self.instance_signature(&instance).params.len() < positional.len() {
+                return Err(self.trap(TrapKind::Error, Some(expr)));
             }
             functions.push(instance);
         }
@@ -2813,8 +2813,16 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let function = &functions[index];
         let result = self.subst(dispatch.arms[index].result);
         let params = self.instance_signature(function).params;
-        let mut ops = Vec::new();
-        for (k, (&(local, ty), param)) in args.iter().zip(&params).enumerate() {
+        // The arguments go where a call puts them; the rest take their
+        // defaults.
+        let defaults: Vec<bool> = params.iter().map(|p| p.default).collect();
+        let taken = vec![false; params.len()];
+        let Some(places) = crag_types::place_positional(&defaults, &taken, args.len()) else {
+            self.trap(TrapKind::Error, Some(expr));
+            return;
+        };
+        let mut given: Vec<Option<Operand<'db>>> = vec![None; params.len()];
+        for (k, (&(local, ty), &place)) in args.iter().zip(&places).enumerate() {
             let (op, from) = match dispatch.args.iter().position(|&a| a == k) {
                 Some(level) => {
                     let member = self.subst(dispatch.members[level][indices[level]]);
@@ -2822,14 +2830,25 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 }
                 None => (Operand::Local(local), ty),
             };
-            ops.push(self.coerce(op, from, param.ty));
+            given[place] = Some(self.coerce(op, from, params[place].ty));
         }
         let op = match self.primitive_of(function) {
-            Some(primitive) => self.primitive_ops(expr, primitive, result, ops),
+            Some(primitive) => {
+                let ops = given.into_iter().flatten().collect();
+                self.primitive_ops(expr, primitive, result, ops)
+            }
             None => {
                 let Some(func) = self.callable(expr, function) else {
                     return;
                 };
+                if self
+                    .fill_defaults(expr, func, &params, &mut given)
+                    .is_none()
+                {
+                    self.trap(TrapKind::Error, Some(expr));
+                    return;
+                }
+                let ops = given.into_iter().flatten().collect();
                 let out = self.temp(result);
                 let target = self.new_block();
                 self.terminate(Terminator::Call {
@@ -2979,30 +2998,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 let op = self.expr(arg);
                 ops[i] = Some(self.coerce(op, self.ty(arg), params[i].ty));
             }
-            if ops.iter().any(Option::is_none) {
-                let Owner::Item(function) = *func.owner(db) else {
-                    return None;
-                };
-                let callee = hir_body(db, self.program, Owner::Item(function));
-                for i in 0..params.len() {
-                    if ops[i].is_some() {
-                        continue;
-                    }
-                    // The default and the call each take the parameters
-                    // before it.
-                    let before = (0..i)
-                        .map(|k| {
-                            let op = ops[k].clone()?;
-                            let local = self.materialize(op, params[k].ty);
-                            ops[k] = Some(Operand::Local(local));
-                            Some(Operand::Local(local))
-                        })
-                        .collect::<Option<Vec<_>>>()?;
-                    let code = func.with_entry(db, Entry::Default(callee.params.get(i)?.default?));
-                    let local = self.call_code(code, before, params[i].ty, expr);
-                    ops[i] = Some(Operand::Local(local));
-                }
-            }
+            self.fill_defaults(expr, func, params, &mut ops)?;
             return ops.into_iter().collect();
         }
         let last = params.last()?;
@@ -3019,6 +3015,42 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         }
         ops.push(self.record_value(expr, last.ty, &[], fields.unwrap_or(&[])));
         Some(ops)
+    }
+
+    /// Gives each parameter without an argument its default, which takes
+    /// the parameters before it, as the call does.
+    fn fill_defaults(
+        &mut self,
+        expr: ExprId,
+        func: InstanceKey<'db>,
+        params: &[SigParam<'db>],
+        ops: &mut [Option<Operand<'db>>],
+    ) -> Option<()> {
+        if ops.iter().all(Option::is_some) {
+            return Some(());
+        }
+        let db = self.db;
+        let Owner::Item(function) = *func.owner(db) else {
+            return None;
+        };
+        let callee = hir_body(db, self.program, Owner::Item(function));
+        for i in 0..params.len() {
+            if ops[i].is_some() {
+                continue;
+            }
+            let before = (0..i)
+                .map(|k| {
+                    let op = ops[k].clone()?;
+                    let local = self.materialize(op, params[k].ty);
+                    ops[k] = Some(Operand::Local(local));
+                    Some(Operand::Local(local))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let code = func.with_entry(db, Entry::Default(callee.params.get(i)?.default?));
+            let local = self.call_code(code, before, params[i].ty, expr);
+            ops[i] = Some(Operand::Local(local));
+        }
+        Some(())
     }
 
     /// The operation an operator function of the prelude stands for, if

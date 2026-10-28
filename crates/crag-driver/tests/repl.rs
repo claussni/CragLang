@@ -283,6 +283,23 @@ fn rebind_replaces_a_definition_and_names_its_dependents() {
 }
 
 #[test]
+fn an_overload_is_no_redefinition() {
+    // §17.3: a function of another signature is defined beside the
+    // first; one of the same signature needs `:rebind`, which replaces
+    // only it.
+    let mut r = repl();
+    assert_eq!(eval(&mut r, "fn twice(n: Int) -> Int { n * 2 }"), "");
+    assert_eq!(eval(&mut r, "fn twice(s: Str) -> Str { s + s }"), "");
+    assert_eq!(
+        eval(&mut r, "fn twice(n: Int) -> Int { n + n }"),
+        "error: twice is already defined in this session; use :rebind\n"
+    );
+    eval(&mut r, ":rebind fn twice(n: Int) -> Int { n * 20 }");
+    assert_eq!(eval(&mut r, "twice(1)"), "20\n");
+    assert_eq!(eval(&mut r, "twice(\"a\")"), "\"aa\"\n");
+}
+
+#[test]
 fn commands_and_completion() {
     let mut r = repl();
     assert!(eval(&mut r, ":help").contains(":rebind <definition>"));

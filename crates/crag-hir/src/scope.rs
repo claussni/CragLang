@@ -691,6 +691,12 @@ fn type_shape(signature: &GreenNode) -> Option<Vec<crag_syntax::GreenElement>> {
     )
 }
 
+/// Whether two function signatures clash: the same type parameters,
+/// parameter types, result type and `where` clause (§14.3).
+pub fn same_signature(a: &GreenNode, b: &GreenNode) -> bool {
+    fn_shape(a) == fn_shape(b)
+}
+
 /// A function signature as compared for clashes: its type parameters, the
 /// types of its parameters, its result type and its `where` clause, but
 /// not its name, its parameters' names or `pub`.

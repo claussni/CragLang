@@ -137,12 +137,6 @@ impl SessionModule {
         }
     }
 
-    fn defines(&self, name: &str) -> bool {
-        self.entries
-            .iter()
-            .any(|e| e.names.iter().any(|n| n == name))
-    }
-
     /// The definitions that name one of `names`, and those that name one of
     /// theirs, by their first names. A name is matched by its text, which
     /// no local binding may hide, since a local may not shadow a name of
@@ -664,14 +658,46 @@ impl Repl {
         if names.is_empty() {
             return Err("error: :rebind takes a definition\n".into());
         }
-        if let Some(name) = names.iter().find(|n| !self.session.defines(n)) {
-            return Err(format!(
-                "error: {name} is not defined in this session; define it without :rebind\n"
-            ));
-        }
         let old = self.session.entries.clone();
+        // What it redefines goes, and another overload of a name stays; a
+        // name defined once is replaced whatever its signature.
+        let mut replaced = vec![false; old.len()];
+        for name in &names {
+            let defining: Vec<usize> = (0..old.len())
+                .filter(|&i| old[i].names.iter().any(|n| n == name))
+                .collect();
+            let same: Vec<usize> = defining
+                .iter()
+                .copied()
+                .filter(|&i| self.redefines(text, &old[i], name))
+                .collect();
+            let gone = match (same.is_empty(), defining.as_slice()) {
+                (false, _) => same,
+                (true, [one]) => vec![*one],
+                (true, []) => {
+                    return Err(format!(
+                        "error: {name} is not defined in this session; define it without :rebind\n"
+                    ));
+                }
+                (true, _) => {
+                    return Err(format!(
+                        "error: {name} has several definitions, none with this signature; \
+                         rebind one with its own\n"
+                    ));
+                }
+            };
+            for i in gone {
+                replaced[i] = true;
+            }
+        }
+        let kept: Vec<Entry> = old
+            .iter()
+            .zip(&replaced)
+            .filter(|(_, r)| !**r)
+            .map(|(e, _)| e.clone())
+            .collect();
         let entries = &mut self.session.entries;
-        entries.retain(|e| !e.names.iter().any(|n| names.contains(n)));
+        *entries = kept;
         entries.push(Entry {
             text: text.into(),
             names: names.clone(),
@@ -685,7 +711,11 @@ impl Repl {
     /// Adds the declarations of an input; their names must be new.
     fn define(&mut self, text: &str) -> Result<(), String> {
         let names = self.declared(text)?;
-        if let Some(name) = names.iter().find(|n| self.session.defines(n)) {
+        let entries = self.session.entries.clone();
+        if let Some(name) = names
+            .iter()
+            .find(|n| entries.iter().any(|e| self.redefines(text, e, n)))
+        {
             return Err(format!(
                 "error: {name} is already defined in this session; use :rebind\n"
             ));
@@ -711,6 +741,34 @@ impl Repl {
             return Err(errors);
         }
         Ok(())
+    }
+
+    /// Whether the definitions of `text` redefine `name` of an entry: it
+    /// names something there that is not a function, or a function with
+    /// the same signature. A function of another signature is an overload
+    /// (§5.6.1).
+    fn redefines(&self, text: &str, entry: &Entry, name: &str) -> bool {
+        if !entry.names.iter().any(|n| n == name) {
+            return false;
+        }
+        let db = &self.project.db;
+        let items = |text: &str| {
+            let alone = ModuleId::new(db, SESSION.into(), SourceFile::new(db, text.into()));
+            item_tree(db, alone)
+                .items
+                .iter()
+                .filter(|i| i.id.name(db).text(db) == name && *i.id.kind(db) != ItemKind::Slot)
+                .map(|i| (*i.id.kind(db), i.signature.clone()))
+                .collect::<Vec<_>>()
+        };
+        let (new, old) = (items(text), items(&entry.text));
+        new.iter().any(|(kind, signature)| {
+            old.iter().any(|(old_kind, old_signature)| {
+                *kind != ItemKind::Function
+                    || *old_kind != ItemKind::Function
+                    || crag_hir::same_signature(signature, old_signature)
+            })
+        })
     }
 
     /// The names an input declares, or its syntax errors.
