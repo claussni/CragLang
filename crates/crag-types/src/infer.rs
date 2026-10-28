@@ -278,8 +278,6 @@ enum Selection {
     One(usize),
     NoneViable,
     Several(Vec<usize>),
-    /// Viable candidates of several modules, which are not ranked.
-    Modules(Vec<ModuleId>),
 }
 
 /// A lifted call's split arguments, their members, and per combination
@@ -290,7 +288,6 @@ type Lifted<'db> = (Vec<usize>, Vec<Vec<Ty<'db>>>, Vec<(usize, Vec<Arg<'db>>)>);
 enum Failure<'db> {
     None(Vec<Ty<'db>>),
     Several(Vec<ItemId<'db>>),
-    Modules(Vec<ModuleId>),
 }
 
 /// How the arguments of a call meet one candidate's parameters.
@@ -1626,11 +1623,6 @@ impl<'a, 'db> Infer<'a, 'db> {
             Selection::One(i) => Some(i),
             // A lone candidate is checked, to say what is wrong.
             _ if candidates.len() == 1 => Some(0),
-            Selection::Modules(modules) => {
-                let modules = modules.iter().map(|m| m.path(db).clone()).collect();
-                self.error(Site::Expr(id), ErrorKind::SeveralModules { name, modules });
-                None
-            }
             Selection::NoneViable => {
                 let args = positional
                     .iter()
@@ -1980,9 +1972,6 @@ impl<'a, 'db> Infer<'a, 'db> {
                     let functions = several.iter().map(|&i| candidates[i].function).collect();
                     failure.get_or_insert(Failure::Several(functions));
                 }
-                Selection::Modules(modules) => {
-                    failure.get_or_insert(Failure::Modules(modules));
-                }
             }
             // The next combination, the last argument's member fastest.
             let mut level = args.len();
@@ -2009,10 +1998,6 @@ impl<'a, 'db> Infer<'a, 'db> {
             None => Ok((args, members, chosen)),
             Some(Failure::None(members)) => Err(ErrorKind::NoLift { name, members }),
             Some(Failure::Several(candidates)) => Err(ErrorKind::Ambiguous { name, candidates }),
-            Some(Failure::Modules(modules)) => Err(ErrorKind::SeveralModules {
-                name,
-                modules: modules.iter().map(|m| m.path(db).clone()).collect(),
-            }),
         })
     }
 
@@ -2121,33 +2106,19 @@ impl<'a, 'db> Infer<'a, 'db> {
                 viable = fitting;
             }
         }
-        // The most specific of one module's candidates (§5.6.1); of
-        // those left, the ones the literals fit with their default types.
-        let mut modules = Vec::new();
+        // The most specific of the candidates (§5.6.1); of those left,
+        // the ones the literals fit with their default types.
         if viable.len() > 1 {
             let ranked: Vec<Ranked<'db>> = viable
                 .iter()
                 .map(|&i| self.ranked(&candidates[i], positional, named, builds_record))
                 .collect();
-            match most_specific(db, self.program, &ranked) {
-                Ok(best) => viable = best.into_iter().map(|k| viable[k]).collect(),
-                Err(several) => {
-                    // The literals' default types may leave one module.
-                    let defaults: Vec<usize> = (0..viable.len())
-                        .filter(|&k| self.defaults_fit(&provisional[viable[k]], positional))
-                        .collect();
-                    let ranked: Vec<Ranked<'db>> =
-                        defaults.iter().map(|&k| ranked[k].clone()).collect();
-                    match most_specific(db, self.program, &ranked) {
-                        Ok(best) if defaults.len() < viable.len() && !best.is_empty() => {
-                            viable = best.into_iter().map(|k| viable[defaults[k]]).collect()
-                        }
-                        _ => modules = several,
-                    }
-                }
-            }
+            viable = most_specific(db, self.program, &ranked)
+                .into_iter()
+                .map(|k| viable[k])
+                .collect();
         }
-        if viable.len() > 1 && modules.is_empty() {
+        if viable.len() > 1 {
             let defaults: Vec<_> = viable
                 .iter()
                 .copied()
@@ -2158,7 +2129,6 @@ impl<'a, 'db> Infer<'a, 'db> {
             }
         }
         match viable.as_slice() {
-            _ if !modules.is_empty() => Selection::Modules(modules),
             [one] => Selection::One(*one),
             [] => Selection::NoneViable,
             several => Selection::Several(several.to_vec()),

@@ -25,13 +25,14 @@
 //! named bound fits the other's, it has every form the other has, and a
 //! union of forms is weaker than each of its members.
 //!
-//! Only candidates of one module are ranked. A module must not declare two
-//! overloads with the same parameter shape and incomparable bounds unless
-//! it declares their combined overload too, so a call never meets that
-//! ambiguity inside one module.
+//! Candidates are ranked wherever they are declared. A module must not
+//! declare two overloads with the same parameter shape and incomparable
+//! bounds unless it declares their combined overload too, so a call never
+//! meets that ambiguity inside one module. No overload in scope may be
+//! more specific than a `final` function.
 
 use crag_db::Db;
-use crag_hir::{ItemId, ItemKind, ModuleId, Name, Program, item_tree};
+use crag_hir::{ItemId, ItemKind, ModuleId, Name, Origin, Program, item_tree, scope_entries};
 
 use crate::def::signature;
 use crate::generic::{FormBound, bind, bounds, mentions};
@@ -266,53 +267,110 @@ fn dominates<'db>(db: &'db dyn Db, program: Program, a: &Ranked<'db>, b: &Ranked
     strictly
 }
 
-/// The candidates no other candidate is more specific than, by index; the
-/// modules of the candidates if they come from several, which are never
-/// ranked. One kind of prelude candidate is the exception: a function a
-/// prelude form requires, such as the generic `equals` or `show` that
-/// every type fits by its structure, drops out first when another
-/// module's candidate is more specific, so a type's own is chosen
-/// (Specification §19.11).
+/// The candidates no other candidate is more specific than, by index,
+/// wherever each is declared (§5.6.1).
 pub fn most_specific<'db>(
     db: &'db dyn Db,
     program: Program,
     candidates: &[Ranked<'db>],
-) -> Result<Vec<usize>, Vec<ModuleId>> {
-    let prelude = |c: &Ranked<'db>| c.module.path(db) == crag_hir::PRELUDE;
-    let derived = |c: &Ranked<'db>| {
-        let name = c.function.name(db);
-        prelude(c)
-            && item_tree(db, c.module)
-                .slots
-                .iter()
-                .any(|slot| slot.id.name(db) == name)
-    };
-    let left: Vec<usize> = (0..candidates.len())
+) -> Vec<usize> {
+    (0..candidates.len())
         .filter(|&i| {
-            !derived(&candidates[i])
-                || !candidates
-                    .iter()
-                    .any(|other| !prelude(other) && dominates(db, program, other, &candidates[i]))
+            !(0..candidates.len())
+                .any(|j| j != i && dominates(db, program, &candidates[j], &candidates[i]))
         })
+        .collect()
+}
+
+/// An overload in a module's scope more specific than a `final` function
+/// of the same name (§5.6.1), reported where the two meet: at the
+/// declaration of `at`, or at the import that brings it.
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct FinalError<'db> {
+    pub at: ItemId<'db>,
+    pub origin: Origin,
+    pub error: TypeError<'db>,
+}
+
+/// The overloads in a module's scope that outrank a `final` function.
+/// Two functions of one other module are that module's error, not this
+/// one's.
+#[crag_db::tracked(returns(ref))]
+pub fn final_errors<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    module: ModuleId,
+) -> Vec<FinalError<'db>> {
+    let entries = &scope_entries(db, program, module).entries;
+    let functions: Vec<_> = entries
+        .iter()
+        .filter(|e| *e.item.id.kind(db) == ItemKind::Function)
         .collect();
-    let mut modules: Vec<ModuleId> = Vec::new();
-    for &i in &left {
-        if !modules.contains(&candidates[i].module) {
-            modules.push(candidates[i].module);
+    let mut errors = Vec::new();
+    for f in functions.iter().filter(|f| f.item.is_final()) {
+        for g in &functions {
+            let (a, b) = (f.item.id, g.item.id);
+            if a == b
+                || f.name != g.name
+                || (*a.module(db) == *b.module(db) && *a.module(db) != module)
+                || !outranks(db, program, b, a)
+            {
+                continue;
+            }
+            // The one this module declares, else the one imported later.
+            let (at, origin) = match (&f.origin, &g.origin) {
+                (_, Origin::Declared) => (b, Origin::Declared),
+                (Origin::Declared, _) => (a, Origin::Declared),
+                (Origin::Imported(i), Origin::Imported(j)) if i > j => (a, f.origin),
+                (_, Origin::Imported(_)) => (b, g.origin),
+                _ => (a, f.origin),
+            };
+            let kind = ErrorKind::OutranksFinal {
+                other: described(db, program, b),
+                final_fn: described(db, program, a),
+                imported: f.origin != Origin::Declared || g.origin != Origin::Declared,
+            };
+            errors.push(FinalError {
+                at,
+                origin,
+                error: TypeError {
+                    site: Site::Name,
+                    kind,
+                },
+            });
         }
     }
-    if modules.len() > 1 {
-        return Err(modules);
-    }
-    Ok(left
+    errors
+}
+
+/// Whether `b` takes the parameters of `a` and is more specific.
+fn outranks<'db>(db: &'db dyn Db, program: Program, b: ItemId<'db>, a: ItemId<'db>) -> bool {
+    let rank = |f: ItemId<'db>| Ranked {
+        function: f,
+        module: *f.module(db),
+        params: signature(db, program, f)
+            .params
+            .iter()
+            .map(|p| Some(p.ty))
+            .collect(),
+    };
+    let (ra, rb) = (rank(a), rank(b));
+    ra.params.len() == rb.params.len() && dominates(db, program, &rb, &ra)
+}
+
+/// A function as an error names it: `` `name(Types)` of module``.
+fn described(db: &dyn Db, program: Program, f: ItemId) -> String {
+    let types: Vec<String> = signature(db, program, f)
+        .params
         .iter()
-        .copied()
-        .filter(|&i| {
-            !left
-                .iter()
-                .any(|&j| j != i && dominates(db, program, &candidates[j], &candidates[i]))
-        })
-        .collect())
+        .map(|p| p.ty.display(db))
+        .collect();
+    format!(
+        "`{}({})` of `{}`",
+        f.name(db).text(db),
+        types.join(", "),
+        f.module(db).path(db)
+    )
 }
 
 /// The overloads of a module with the same parameter shape and

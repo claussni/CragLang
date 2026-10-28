@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crag_db::{Db, RootDatabase, Setter};
 use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, lower_body, owners};
-use crag_types::{body_types, module_type_errors};
+use crag_types::{body_types, final_errors, module_type_errors};
 
 const PRELUDE: &str = r#"pub type Int
 pub type Int8
@@ -153,6 +153,13 @@ fn check(text: &str) -> Checked {
                     format!("`{snippet}`: {}", error.kind.message(&db))
                 }),
         )
+        .chain(final_errors(&db, program, module).iter().map(|e| {
+            format!(
+                "`{}`: {}",
+                e.at.name(&db).text(&db),
+                e.error.kind.message(&db)
+            )
+        }))
         .collect();
     // The prelude itself must check.
     let prelude: Vec<String> = module_type_errors(&db, program, core)
@@ -1311,21 +1318,41 @@ fn lookup[K](k: K) -> Int where Show[K], Hash[K] { 3 }";
 }
 
 #[test]
-fn candidates_of_several_modules_are_not_ranked() {
-    // The prelude's `size(s: Str)` and this module's generic one both fit.
+fn candidates_of_several_modules_are_ranked() {
+    // §5.6.1: the prelude's `size(s: Str)` beats this module's generic
+    // one for a string, which takes everything else.
     let text = "type Text(s: Str)
-fn size[T](x: T) -> Int { 1 }
+fn size[T](x: T) -> Str { \"any\" }
 fn f(t: Text) {
   let a = size(\"a\")
   let b = size(t)
 }";
+    assert_eq!(ok(text).last().unwrap(), "t: Text, a: Int, b: Str, -> ()");
+}
+
+#[test]
+fn a_final_function_cannot_be_outranked() {
+    // §5.6.1: in its own module too; an overload that takes other
+    // arguments is no rival.
+    let text = "final fn verify[T](x: T) -> Int { 1 }
+fn verify(x: Str) -> Int { 0 }
+final fn tag(x: Int) -> Str { \"i\" }
+fn tag(x: Float) -> Str { \"f\" }
+fn tag(x: Int, y: Int) -> Str { \"ii\" }";
     assert_eq!(
         errors(text),
         [
-            "`size(\"a\")`: `size` has viable candidates from several modules (app, std.core); \
-          import one of them selectively"
+            "`verify`: `verify(Str)` of `app` is more specific than the final `verify(T)` of \
+             `app`, which no overload may outrank; rename one"
         ]
     );
+}
+
+#[test]
+fn only_a_function_can_be_final() {
+    let text = "final type Text(s: Str)
+fn f(x: Int) -> Int { x }";
+    assert_eq!(errors(text), ["`final`: only a function can be `final`"]);
 }
 
 #[test]

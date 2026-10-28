@@ -148,6 +148,48 @@ fn errors_are_shown_against_the_source() {
 }
 
 #[test]
+fn a_more_specific_overload_wins_unless_the_function_is_final() {
+    // §5.6.1: the app's `label(Int)` outranks the library's generic one,
+    // but no overload may outrank the final `verify`, unless renamed.
+    let lib = "pub fn label[T](x: T) -> Int { 1 }\npub final fn verify[T](x: T) -> Int { 2 }\n";
+    let app = |import: &str| {
+        format!(
+            "{import}\nfn label(x: Int) -> Int {{ 10 }}\nfn verify(x: Int) -> Int {{ 20 }}\n\
+             fn main() -> ExitCode {{\n  ExitCode(code: label(0) + verify(0))\n}}\n"
+        )
+    };
+    let root = project(
+        "final",
+        &[
+            ("package.crag", MANIFEST),
+            ("lib.crag", lib),
+            ("app.crag", &app("import demo.lib")),
+        ],
+    );
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 1);
+    let out = text(out);
+    assert!(
+        out.contains(
+            "error: `verify(Int)` of `demo.app` is more specific than the final `verify(T)` of \
+             `demo.lib`, which no overload may outrank; import one of them selectively or rename \
+             one with `as`\n --> app.crag:3:1"
+        ),
+        "{out}"
+    );
+    let root = project(
+        "final-renamed",
+        &[
+            ("package.crag", MANIFEST),
+            ("lib.crag", lib),
+            ("app.crag", &app("import demo.lib.{label, verify as vet}")),
+        ],
+    );
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 30, "{}", text(out));
+}
+
+#[test]
 fn a_trap_in_main_is_reported_with_its_stack() {
     let root = project(
         "trap",

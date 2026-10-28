@@ -290,11 +290,12 @@ pub enum ErrorKind<'db> {
         other: ItemId<'db>,
         signature: String,
     },
-    /// A call with viable candidates from several modules, which are
-    /// never ranked (§5.6.1).
-    SeveralModules {
-        name: Name<'db>,
-        modules: Vec<String>,
+    /// An overload more specific than a `final` function (§5.6.1), each
+    /// as its signature and module; `imported` when an import brings one.
+    OutranksFinal {
+        other: String,
+        final_fn: String,
+        imported: bool,
     },
     /// `check` of a value whose successes contain `Empty`, which its
     /// failure would merge with (§8.4).
@@ -493,10 +494,17 @@ impl<'db> ErrorKind<'db> {
                 "this overload and an earlier `{}` take the same parameters with incomparable bounds; add `{signature}`",
                 item(other)
             ),
-            ErrorKind::SeveralModules { name: n, modules } => format!(
-                "`{}` has viable candidates from several modules ({}); import one of them selectively",
-                name(n),
-                modules.join(", ")
+            ErrorKind::OutranksFinal {
+                other,
+                final_fn,
+                imported,
+            } => format!(
+                "{other} is more specific than the final {final_fn}, which no overload may outrank; {}",
+                if *imported {
+                    "import one of them selectively or rename one with `as`"
+                } else {
+                    "rename one"
+                }
             ),
             ErrorKind::EmptyMerges => {
                 "`check` of a value that can be `Empty` would merge success and failure".into()

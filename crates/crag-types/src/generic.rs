@@ -684,8 +684,8 @@ fn fill<'db>(
         }
     }
     let ranks: Vec<Ranked<'db>> = found.iter().map(|(_, r)| r.clone()).collect();
-    match most_specific(db, program, &ranks).as_deref() {
-        Ok([one]) => Ok(found.swap_remove(*one).0),
+    match most_specific(db, program, &ranks).as_slice() {
+        [one] => Ok(found.swap_remove(*one).0),
         _ => Err(ranks.into_iter().map(|r| r.function).collect()),
     }
 }

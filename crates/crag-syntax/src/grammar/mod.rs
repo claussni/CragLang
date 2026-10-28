@@ -56,7 +56,7 @@ pub(crate) fn module(p: &mut Parser) {
 
 fn declaration(p: &mut Parser) {
     let mut n = 0;
-    while matches!(p.nth(n), T::Pub | T::Opaque | T::Distinct) {
+    while matches!(p.nth(n), T::Pub | T::Opaque | T::Distinct | T::Final) {
         n += 1;
     }
     match p.nth(n) {
@@ -72,8 +72,20 @@ fn declaration(p: &mut Parser) {
 }
 
 fn modifiers(p: &mut Parser) {
-    while matches!(p.current(), T::Pub | T::Opaque | T::Distinct) {
+    while matches!(p.current(), T::Pub | T::Opaque | T::Distinct | T::Final) {
         p.bump();
+    }
+}
+
+/// The modifiers before a type or a form, which cannot be `final`
+/// (§5.6.1).
+fn modifiers_but_final(p: &mut Parser) {
+    loop {
+        match p.current() {
+            T::Pub | T::Opaque | T::Distinct => p.bump(),
+            T::Final => p.bump_error("only a function can be `final`"),
+            _ => break,
+        }
     }
 }
 
@@ -187,7 +199,7 @@ fn c_import(p: &mut Parser) {
 
 fn type_decl(p: &mut Parser) {
     p.start(S::TypeDecl);
-    modifiers(p);
+    modifiers_but_final(p);
     p.bump();
     p.expect(T::Ident, "a type name");
     if p.at(T::LBracket) {
@@ -317,7 +329,7 @@ fn marker(p: &mut Parser) {
 
 fn form_decl(p: &mut Parser) {
     p.start(S::FormDecl);
-    modifiers(p);
+    modifiers_but_final(p);
     p.bump();
     p.expect(T::Ident, "a form name");
     if p.at(T::LBracket) {

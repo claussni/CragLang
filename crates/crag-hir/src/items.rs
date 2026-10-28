@@ -125,6 +125,17 @@ pub struct Item<'db> {
     pub signature: GreenNode,
 }
 
+impl Item<'_> {
+    /// Whether the declaration is `final`: no overload may outrank it
+    /// (Specification §5.6.1).
+    pub fn is_final(&self) -> bool {
+        self.signature
+            .children()
+            .iter()
+            .any(|e| matches!(e, GreenElement::Token(t) if t.kind() == LeafKind::Token(T::Final)))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
 pub enum Import<'db> {
     /// `import a.b`, `import a.b as c` or `import a.b.{c, d as e}` (§14.2).

@@ -188,7 +188,7 @@ pub fn is_definition(text: &str) -> bool {
     let tokens = lex(text);
     matches!(
         tokens.first().map(|t| t.kind),
-        Some(Fn | Type | Let | Import | Pub | Form | Embed | Test | Distinct | Opaque)
+        Some(Fn | Type | Let | Import | Pub | Form | Embed | Test | Distinct | Opaque | Final)
     )
 }
 
@@ -819,10 +819,10 @@ impl Repl {
     }
 }
 
-const KEYWORDS: [&str; 30] = [
+const KEYWORDS: [&str; 31] = [
     "let", "var", "ref", "ext", "embed", "type", "form", "fn", "test", "pub", "opaque", "distinct",
-    "is", "where", "on", "if", "else", "case", "pass", "for", "in", "return", "emit", "atomic",
-    "lazy", "import", "as", "and", "or", "not",
+    "final", "is", "where", "on", "if", "else", "case", "pass", "for", "in", "return", "emit",
+    "atomic", "lazy", "import", "as", "and", "or", "not",
 ];
 
 impl Sources for Repl {

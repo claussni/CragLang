@@ -103,6 +103,14 @@ pub fn module_diagnostics(db: &dyn Db, program: Program, module: ModuleId) -> Ve
         let range = error.site.range(map).unwrap_or(0..0);
         out.push(at(range, error.kind.message(db)));
     }
+    for error in crag_types::final_errors(db, program, module) {
+        let range = match error.origin {
+            Origin::Declared => decl_range(db, module, item_decl(db, error.at)),
+            Origin::Imported(decl) => decl_range(db, module, decl),
+            Origin::Prelude => 0..0,
+        };
+        out.push(at(range, error.error.kind.message(db)));
+    }
     // Constants are evaluated at compile time (Specification §18.4),
     // and an evaluation that fails is an error at the value.
     for (item, error) in crag_eval::eval_errors(db, program, module) {
