@@ -1125,7 +1125,13 @@ impl<'a, 'db> Lowerer<'a, 'db> {
             S::BracketExpr => self.bracket(node),
             _ => Expr::Missing,
         };
-        self.alloc_expr(expr, range)
+        let signed = node.kind() == S::Literal
+            && first_token(node).is_some_and(|t| t.kind() == LeafKind::Token(T::Minus));
+        let id = self.alloc_expr(expr, range);
+        if signed {
+            self.body.negative.push(id);
+        }
+        id
     }
 
     fn arm(&mut self, node: &SyntaxNode) -> Arm {
@@ -1167,7 +1173,10 @@ impl<'a, 'db> Lowerer<'a, 'db> {
     /// A literal's value; `Some(None)` for `???`, `None` when it was
     /// reported.
     fn literal(&mut self, node: &SyntaxNode) -> Option<Option<Literal>> {
-        let token = first_token(node)?;
+        // A sign is part of the literal; the body notes it (§6.2.1).
+        let token = node
+            .tokens()
+            .find(|t| !t.is_trivia() && t.kind() != LeafKind::Token(T::Minus))?;
         let LeafKind::Token(kind) = token.kind() else {
             return None;
         };

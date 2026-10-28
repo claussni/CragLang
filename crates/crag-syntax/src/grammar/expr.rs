@@ -172,6 +172,21 @@ fn unary(p: &mut Parser, cx: Context) {
         return;
     }
     match p.current() {
+        // A sign directly before a number with nothing after it at level 1
+        // belongs to the literal (§6.2.1).
+        T::Minus
+            if matches!(p.nth(1), T::Int | T::Float)
+                && p.nth_is_joined(1)
+                && !matches!(
+                    p.nth(2),
+                    T::LParen | T::LBracket | T::Dot | T::QuestionDot | T::LBrace
+                ) =>
+        {
+            p.start(S::Literal);
+            p.bump();
+            p.bump();
+            p.finish_node();
+        }
         T::Minus => {
             p.start(S::PrefixExpr);
             p.bump();

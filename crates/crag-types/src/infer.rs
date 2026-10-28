@@ -622,7 +622,15 @@ impl<'a, 'db> Infer<'a, 'db> {
                 self.holes.push((id, ty));
                 ty
             }
-            Expr::Literal(literal) => self.literal(id, literal, expected),
+            Expr::Literal(literal) => {
+                // A literal with its sign, or one `negate` takes (§6.2.1).
+                let signed = self.body.is_negative(id);
+                let outer = self.negative;
+                self.negative = outer != signed;
+                let ty = self.literal(id, literal, expected);
+                self.negative = outer;
+                ty
+            }
             Expr::Embed => self.embed(id, expected),
             Expr::Str(parts) => {
                 // A string without interpolation is a literal (§3.10.1).
@@ -4549,7 +4557,10 @@ impl<'a, 'db> Infer<'a, 'db> {
     /// counted in units of the scale of a `Fixed` range.
     fn constant_expr(&self, id: ExprId, scale: Option<u32>) -> Option<i128> {
         match self.body.expr(id) {
-            Expr::Literal(literal) => constant(literal, scale),
+            Expr::Literal(literal) => {
+                let n = constant(literal, scale)?;
+                Some(if self.body.is_negative(id) { -n } else { n })
+            }
             Expr::Call { callee, args, .. } if args.len() == 1 && self.is_negation(*callee) => {
                 self.constant_expr(args[0], scale).map(|n| -n)
             }

@@ -111,7 +111,10 @@ fn space(prev: T, next: T, parent: S) -> bool {
         (StrStart | TripleStrStart | StrMid, _) | (_, StrMid | StrEnd) => false,
         (_, LParen | LBracket) => !ends_operand(prev),
         (Symbol, Symbol) => false,
-        (Minus, _) => !matches!(parent, S::PrefixExpr | S::LiteralPat | S::RangePat),
+        (Minus, _) => !matches!(
+            parent,
+            S::PrefixExpr | S::LiteralPat | S::RangePat | S::Literal
+        ),
         _ => true,
     }
 }

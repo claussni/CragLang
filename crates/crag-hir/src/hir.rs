@@ -74,6 +74,8 @@ pub struct Body<'db> {
     pub requirements: Vec<Requirement>,
     /// A form declaration's functions or alias target (§4.1, §4.7).
     pub form: Option<FormDecl<'db>>,
+    /// The literals written with their sign, `-5` (§6.2.1), in order.
+    pub negative: Vec<ExprId>,
 }
 
 /// A requirement on type parameters: a bound `T: B` in brackets, of the
@@ -175,6 +177,11 @@ pub struct FieldDecl<'db> {
 }
 
 impl<'db> Body<'db> {
+    /// Whether a literal is written with its sign.
+    pub fn is_negative(&self, id: ExprId) -> bool {
+        self.negative.binary_search(&id).is_ok()
+    }
+
     pub fn expr(&self, id: ExprId) -> &Expr<'db> {
         &self.exprs[id.index()]
     }

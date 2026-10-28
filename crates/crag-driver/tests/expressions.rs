@@ -298,3 +298,20 @@ fn derived_forms_follow_the_structure() {
         "error: Secret is `not Hash`, so no function may make it fit `Hash`\n --> input:1:4\n  |\n1 | fn hash(s: Secret) -> Int { 1 }\n  |    ^^^^\n"
     );
 }
+
+#[test]
+fn a_sign_before_a_bare_number_is_part_of_the_literal() {
+    // §6.2.1: `-5` is one literal, so it fits a narrow type and a
+    // conditioned alias; `x-2` stays a subtraction.
+    let mut r = repl();
+    assert_eq!(eval(&mut r, "-5"), "-5\n");
+    assert_eq!(eval(&mut r, "-1.5"), "-1.5\n");
+    assert_eq!(eval(&mut r, "3 -1"), "2\n");
+    eval(&mut r, "let x = 4");
+    assert_eq!(eval(&mut r, "x-2"), "2\n");
+    assert_eq!(eval(&mut r, "-(-5)"), "5\n");
+    eval(&mut r, "type Temp = Int where this >= -273");
+    eval(&mut r, "fn t(k: Temp) -> Temp { k }");
+    assert_eq!(eval(&mut r, "t(-10)"), "-10\n");
+    assert!(eval(&mut r, "t(-300)").contains("fails the condition"));
+}

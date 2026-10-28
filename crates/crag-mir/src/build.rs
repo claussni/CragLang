@@ -2643,7 +2643,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         match body.expr(expr) {
             Expr::Missing => self.trap(TrapKind::Error, Some(expr)),
             Expr::Hole => self.trap(TrapKind::Hole, Some(expr)),
-            Expr::Literal(literal) => Operand::Const(self.literal(literal, ty, false)),
+            Expr::Literal(literal) => {
+                Operand::Const(self.literal(literal, ty, body.is_negative(expr)))
+            }
             Expr::Embed => self.embed(expr, ty),
             Expr::Str(parts) => {
                 let mut ops = Vec::new();
@@ -3742,7 +3744,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         if let (Primitive::Negate(_), [x]) = (primitive, args)
             && let Expr::Literal(literal) = self.body.expr(*x)
         {
-            return Operand::Const(self.literal(literal, ty, true));
+            let negative = !self.body.is_negative(*x);
+            return Operand::Const(self.literal(literal, ty, negative));
         }
         let ops = args.iter().map(|&arg| self.expr(arg)).collect();
         self.primitive_ops(expr, primitive, ty, ops)
@@ -3958,7 +3961,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             {
                 let default = field.default?;
                 if let Expr::Literal(literal) = body.expr(default) {
-                    let constant = self.literal(literal, field_ty, false);
+                    let constant = self.literal(literal, field_ty, body.is_negative(default));
                     return Some(FieldDefault::Constant(constant));
                 }
                 let code = InstanceKey::new(

@@ -102,7 +102,7 @@ impl Eval<'_, '_> {
             _ => None,
         };
         match self.body.expr(id) {
-            Expr::Literal(literal) => known(literal, false),
+            Expr::Literal(literal) => known(literal, self.body.is_negative(id)),
             Expr::Str(parts) => match parts.as_slice() {
                 [crag_hir::StrPart::Text(text)] => Some(Known::Text(text.clone())),
                 [] => Some(Known::Text(String::new())),
