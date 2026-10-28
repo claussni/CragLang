@@ -225,3 +225,13 @@ fn closures_read_a_var_as_it_is_when_they_run() {
             .contains("cannot capture the `var` `n`")
     );
 }
+
+#[test]
+fn module_lets_bind_the_parts_their_patterns_name() {
+    let mut r = repl();
+    eval(&mut r, "type Point(x: Int, y: Int)");
+    eval(&mut r, "let Point(x, y) = Point(x: 1, y: 2)");
+    eval(&mut r, "let (a:, b:) = (a: 10, b: \"s\")");
+    assert_eq!(eval(&mut r, "x * 10 + y"), "12\n");
+    assert_eq!(eval(&mut r, "b"), "\"s\"\n");
+}

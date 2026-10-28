@@ -123,12 +123,19 @@ pub enum Entry {
     /// with a box of the type, or of a subtype, whose count reached zero,
     /// it calls the handler (§11.6.11).
     Dispose,
+    /// The part of a module-level `let` with a pattern that its value
+    /// binds to the item's name: the whole value, which its code keeps,
+    /// matched against the pattern.
+    Part,
 }
 
 impl Entry {
     /// Whether the code takes an environment first.
     pub fn takes_env(self) -> bool {
-        !matches!(self, Entry::Body | Entry::Default(_) | Entry::Dispose)
+        !matches!(
+            self,
+            Entry::Body | Entry::Default(_) | Entry::Dispose | Entry::Part
+        )
     }
 }
 

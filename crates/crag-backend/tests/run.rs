@@ -936,22 +936,9 @@ fn plain(n: Int) -> Int {
   n * 2
 }
 
-type Pair(a: Int, b: Int)
-
-let Pair(a:, b:) = Pair(a: 1, b: 2)
-
-fn first() -> Int {
-  a
-}
 "#,
     );
-    assert_eq!(
-        m.unsupported,
-        [
-            "label: types of parameters or results",
-            "first: module-level `let`s with patterns"
-        ]
-    );
+    assert_eq!(m.unsupported, ["label: types of parameters or results"]);
     assert_eq!(m.int("plain", &[21]), 42);
 }
 

@@ -139,7 +139,7 @@ pub fn compile<'a>(
     for instance in collect_instances(db, program, roots, Tier::Baseline) {
         let owner = *instance.owner(db);
         let name = match instance.entry(db) {
-            Entry::Body => owner_name(project, owner),
+            Entry::Body | Entry::Part => owner_name(project, owner),
             Entry::Closure(_) => format!("a closure in {}", owner_name(project, owner)),
             Entry::Function(_) => {
                 format!("a function value in {}", owner_name(project, owner))

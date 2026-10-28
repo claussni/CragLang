@@ -88,6 +88,7 @@ pub fn build<'db>(
         Entry::Function(expr) => b.function_entry(expr),
         Entry::Default(expr) => b.default_entry(expr),
         Entry::Dispose => b.dispose_entry(),
+        Entry::Part => b.part_entry(),
     };
     match start {
         Some(start) if ok => start(&mut b),
@@ -414,6 +415,29 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             }));
         }
         Some(Box::new(move |b| b.eval(root, Dest::Return)))
+    }
+
+    /// The part of a module-level `let` with a pattern bound to the item's
+    /// name: its value, which the value's code keeps, matched.
+    fn part_entry(&mut self) -> Option<Start<'a, 'db>> {
+        let db = self.db;
+        let body = self.body;
+        let Owner::Item(item) = *self.instance.owner(db) else {
+            return None;
+        };
+        let (pat, _) = body.pattern?;
+        let binding = (0..body.bindings.len() as u32)
+            .map(BindingId)
+            .find(|&b| body.binding(b).name == Some(*item.name(db)))?;
+        let whole = self.types.result.map(|t| self.subst(t))?;
+        self.result = self.binding_ty(binding)?;
+        Some(Box::new(move |b| {
+            let code = InstanceKey::body(db, Owner::Item(item));
+            let value = b.call_code(code, Vec::new(), whole, b.body.root.unwrap_or(ExprId(0)));
+            b.matched(pat, Operand::Local(value), whole, None);
+            let part = b.binding(binding);
+            b.terminate(Terminator::Return(Operand::Local(part)));
+        }))
     }
 
     /// The code of a closure literal or a local function: the environment
@@ -2379,16 +2403,21 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let single = body
             .pattern
             .is_some_and(|(pat, _)| matches!(body.pat(pat), Pat::Bind { sub: None, .. }));
-        if !single {
-            return self.unsupported(expr, "module-level `let`s with patterns");
-        }
         let Some(ty) = value_type(db, self.program, item) else {
             return self.trap(TrapKind::Error, Some(expr));
+        };
+        // A pattern binds a part of the value to the name (§5.5).
+        let (func, ty) = match single {
+            true => (InstanceKey::body(db, owner), ty),
+            false => {
+                let part = InstanceKey::new(db, owner, Vec::new(), Vec::new(), Entry::Part);
+                (part, self.ty(expr))
+            }
         };
         let dst = self.temp(ty);
         let target = self.new_block();
         self.terminate(Terminator::Call {
-            func: InstanceKey::body(db, owner),
+            func,
             args: Vec::new(),
             dst,
             target,

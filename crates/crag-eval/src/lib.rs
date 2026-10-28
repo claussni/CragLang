@@ -272,6 +272,7 @@ impl<'db> Evaluation<'db> {
                 Entry::Function(_) => format!("a function value in {name}"),
                 Entry::Default(_) => format!("a default in {name}"),
                 Entry::Dispose => format!("the dispose code of {name}"),
+                Entry::Part => name,
             };
             let value = matches!(owner, Owner::Item(i) if i.kind(db).is_value());
             if value && *instance.entry(db) == Entry::Body {
