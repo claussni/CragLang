@@ -596,17 +596,6 @@ fn f(p: Pair[Int], q: Pair, r: Fixed[Int], t: Tree) -> Int {
     );
 }
 
-#[test]
-fn not_yet_supported_is_reported() {
-    let text = "fn f(xs: List[Int]) {
-  fn local[T](x: T) -> T { x }
-}";
-    assert_eq!(
-        errors(text),
-        ["`local`: generic local functions are not supported yet"]
-    );
-}
-
 /// A query that reads the types of a body and counts its runs.
 static RUNS: AtomicUsize = AtomicUsize::new(0);
 
@@ -1328,11 +1317,10 @@ type User(name: Str, address: Option[Address])
 fn f(u: Option[User]) {
   let a = u?.name
   let b = u?.address?.city
-  let c = u?.name?.size()
 }";
     assert_eq!(
         ok(text).last().unwrap(),
-        "u: Empty[User] | User, a: Empty[Str] | Str, b: Empty[Str] | Str, c: Empty[Int] | Int, -> ()"
+        "u: Empty[User] | User, a: Empty[Str] | Str, b: Empty[Str] | Str, -> ()"
     );
 }
 
@@ -1425,6 +1413,40 @@ fn f() {
             "`Holder(k: 2.5)`: Sized[Float] does not hold: no visible function `size` has the type (Float) -> Int",
             "`Frame(s: 3)`: Int does not fit the bound Shape of `S`",
         ]
+    );
+}
+
+#[test]
+fn what_the_language_rules_out_is_an_error() {
+    // §6.8: `?.` that can never stop; §5.6.4: a generic local function;
+    // §4.1: a form's function with type parameters of its own.
+    let text = "type User(name: Str)
+form Mapper[T] {
+  apply[U](t: T, u: U) -> U
+}
+fn f(u: User) -> Int {
+  let n = u?.name
+  fn twice[T](x: T) -> T { x }
+  1
+}";
+    let found = errors(text);
+    assert!(
+        found.contains(
+            &"`u?.name`: User cannot be `Empty`, so `?.` would never stop; write `.`".to_string()
+        ),
+        "{found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|e| e.contains("a local function has no type parameters")),
+        "{found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|e| e.contains("a form's function has no type parameters of its own")),
+        "{found:?}"
     );
 }
 

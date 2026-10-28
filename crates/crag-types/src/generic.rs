@@ -321,7 +321,7 @@ pub fn form_def<'db>(db: &'db dyn Db, program: Program, form: ItemId<'db>) -> Fo
         }
         lower.lower(slot.result);
         if slot.generic {
-            let kind = ErrorKind::Unsupported("generic functions in forms");
+            let kind = ErrorKind::GenericSlot;
             lower.error(Site::Type(slot.result), kind);
         }
     }

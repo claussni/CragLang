@@ -3323,6 +3323,7 @@ impl<'a, 'db> Infer<'a, 'db> {
         let is_empty = |t: &Ty<'db>| matches!(t.kind(db), TyKind::Named(i, _) if Some(*i) == empty);
         let members = receiver_ty.members(db);
         if !members.iter().any(is_empty) {
+            self.error(Site::Expr(id), ErrorKind::NeverEmpty { ty: receiver_ty });
             return access(self, receiver_ty);
         }
         let present = members
@@ -4451,7 +4452,7 @@ impl<'a, 'db> Infer<'a, 'db> {
     fn local_fn(&mut self, binding: BindingId, function: &LocalFn) {
         let db = self.db;
         if function.generic {
-            let kind = ErrorKind::Unsupported("generic local functions");
+            let kind = ErrorKind::GenericLocalFn;
             self.error(Site::Binding(binding), kind);
         }
         let mut params = Vec::new();

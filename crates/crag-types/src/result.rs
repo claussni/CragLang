@@ -250,6 +250,14 @@ pub enum ErrorKind<'db> {
     UnknownField {
         name: Name<'db>,
     },
+    /// A local function with type parameters (§5.6.4).
+    GenericLocalFn,
+    /// A form's function with type parameters of its own (§4.1).
+    GenericSlot,
+    /// `?.` on a value that cannot be `Empty` (§6.8).
+    NeverEmpty {
+        ty: Ty<'db>,
+    },
     /// A spread in `v.update(list)`, whose list only changes fields
     /// (§6.7.1).
     SpreadInUpdate,
@@ -476,6 +484,17 @@ impl<'db> ErrorKind<'db> {
             }
             ErrorKind::MissingField { name: n } => format!("the field `{}` is missing", name(n)),
             ErrorKind::UnknownField { name: n } => format!("there is no field `{}`", name(n)),
+            ErrorKind::GenericLocalFn => {
+                "a local function has no type parameters; a generic helper belongs at module level"
+                    .into()
+            }
+            ErrorKind::GenericSlot => {
+                "a form's function has no type parameters of its own; make them the form's".into()
+            }
+            ErrorKind::NeverEmpty { ty } => format!(
+                "{} cannot be `Empty`, so `?.` would never stop; write `.`",
+                ty.display(db)
+            ),
             ErrorKind::SpreadInUpdate => {
                 "`update` changes the value's fields; a spread has no place in its list".into()
             }
