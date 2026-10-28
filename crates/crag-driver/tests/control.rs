@@ -182,3 +182,43 @@ fn constructions_check_the_conditions_of_their_types() {
     );
     assert!(eval(&mut r, "sub(3, 1)").contains("y > this.x"));
 }
+
+#[test]
+fn conditioned_aliases_take_values_through_a_check() {
+    // §3.10.1: `Percent(n)` checks `n` and gives a `Percent` or `Invalid`;
+    // a literal stands for the alias once its conditions hold for it.
+    let mut r = repl();
+    eval(&mut r, "type Percent = Int where this >= 0 and this <= 100");
+    eval(&mut r, "fn half(p: Percent) -> Int { p / 2 }");
+    assert_eq!(eval(&mut r, "half(40)"), "20\n");
+    assert!(
+        eval(&mut r, "half(140)")
+            .contains("the value fails the condition `this >= 0 and this <= 100` of Percent")
+    );
+    eval(
+        &mut r,
+        "fn check(k: Int) -> Str {\n  case Percent(k) {\n    p: Percent -> \"ok {half(p)}\"\n    i: Invalid -> \"no: {i.condition}\"\n  }\n}",
+    );
+    assert_eq!(eval(&mut r, "check(10)"), "\"ok 5\"\n");
+    assert_eq!(
+        eval(&mut r, "check(-3)"),
+        "\"no: this >= 0 and this <= 100\"\n"
+    );
+    // An `Int` is no `Percent` unchecked.
+    eval(&mut r, "let n = 30");
+    assert!(eval(&mut r, "half(n)").contains("expected Percent, found Int"));
+    // A string alias, written as its string; a condition the compiler
+    // cannot decide needs the conversion.
+    eval(
+        &mut r,
+        "type Name = Str where { named: this.byteCount() > 0 }",
+    );
+    eval(&mut r, "fn greet(who: Name) -> Str { \"hi {who}\" }");
+    assert!(eval(&mut r, "greet(\"ada\")").contains("cannot be decided here"));
+    eval(
+        &mut r,
+        "fn hello(s: Str) -> Str {\n  case Name(s) {\n    who: Name -> greet(who)\n    i: Invalid -> \"nobody: {i.condition}\"\n  }\n}",
+    );
+    assert_eq!(eval(&mut r, "hello(\"bo\")"), "\"hi bo\"\n");
+    assert_eq!(eval(&mut r, "hello(\"\")"), "\"nobody: named\"\n");
+}

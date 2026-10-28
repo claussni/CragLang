@@ -2604,6 +2604,11 @@ impl<'a, 'db> Lower<'a, 'db> {
     ) -> Result<Vec<VReg>, Unsupported> {
         let (f, t) = (self.layout_of(from)?, self.layout_of(to)?);
         let tag = type_index(self.member_of(from, to));
+        // A conditioned alias's values and its target's are the same.
+        let plain = |ty| crag_types::unrefined(self.db, self.program, ty);
+        if f == t && plain(from) == plain(to) && !matches!(f, Layout::Tag | Layout::Union) {
+            return Ok(values);
+        }
         Ok(match (f, t) {
             (Layout::Zero, Layout::Zero) => Vec::new(),
             (Layout::Zero, Layout::Tag) => vec![self.constant(tag)],

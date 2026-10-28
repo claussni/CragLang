@@ -228,6 +228,13 @@ fn fields<'db>(
                     }
                     Some(all)
                 }
+                // A conditioned alias has its target's fields.
+                TypeDefKind::Refined(target) => fields(
+                    db,
+                    program,
+                    subst(db, program, *target, *item, args),
+                    depth + 1,
+                ),
                 _ => None,
             }
         }
@@ -272,6 +279,26 @@ pub fn declared_fields<'db>(
 }
 
 /// The parent a named type spreads, with its arguments substituted.
+/// A conditioned alias's target, through any number of them; the type
+/// itself for any other. Its values are laid out as the target's
+/// (§3.10.1).
+pub fn unrefined<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Ty<'db> {
+    let mut ty = ty;
+    for _ in 0..=MAX_PARENTS {
+        let TyKind::Named(item, _) = ty.kind(db) else {
+            return ty;
+        };
+        if !matches!(type_def(db, program, *item).kind, TypeDefKind::Refined(_)) {
+            return ty;
+        }
+        match parent(db, program, ty) {
+            Some(target) => ty = target,
+            None => return ty,
+        }
+    }
+    ty
+}
+
 pub fn parent<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Ty<'db>> {
     let TyKind::Named(item, args) = ty.kind(db) else {
         return None;

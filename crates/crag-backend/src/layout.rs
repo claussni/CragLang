@@ -87,6 +87,14 @@ pub fn layout<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Lay
         TyKind::Named(item, _) => match type_def(db, program, *item).kind {
             TypeDefKind::Tag => Layout::Zero,
             TypeDefKind::Record { .. } => Layout::Box,
+            // A conditioned alias's values are its target's (§3.10.1).
+            TypeDefKind::Refined(_) => {
+                let target = crag_types::unrefined(db, program, ty);
+                if target == ty {
+                    return None;
+                }
+                return layout(db, program, target);
+            }
             _ => return None,
         },
         TyKind::Record { open: true, .. } => return None,

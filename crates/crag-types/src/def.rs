@@ -42,6 +42,9 @@ pub enum HeaderKind {
     /// type (§19.1).
     Builtin(Builtin),
     Alias,
+    /// An alias with value conditions: a type of its own, whose values are
+    /// those of its target that pass them (§3.10.1).
+    Refined,
     /// A record or a tag.
     Nominal,
     Form,
@@ -75,6 +78,7 @@ pub fn type_header<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) ->
         });
     let kind = match (builtin, decl.alias) {
         (Some((builtin, _)), _) => HeaderKind::Builtin(builtin),
+        (None, Some(_)) if !decl.conditions.is_empty() => HeaderKind::Refined,
         (None, Some(_)) => HeaderKind::Alias,
         (None, None) => HeaderKind::Nominal,
     };
@@ -106,7 +110,12 @@ fn alias_cycle<'db>(
 #[crag_db::tracked(returns(copy), cycle_result = parent_cycle)]
 pub fn type_parent<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> Option<Ty<'db>> {
     let body = hir_body(db, program, Owner::Item(item));
-    let parent = body.type_decl.as_ref()?.parent?;
+    let decl = body.type_decl.as_ref()?;
+    // A conditioned alias is its target's subtype (§3.10.1).
+    let parent = match decl.alias {
+        Some(target) if !decl.conditions.is_empty() => target,
+        _ => decl.parent?,
+    };
     let mut lower = TypeLowerer::new(db, program, body, Some(item));
     Some(lower.lower(parent))
 }
@@ -133,6 +142,8 @@ pub struct TypeDef<'db> {
 pub enum TypeDefKind<'db> {
     Builtin(Builtin),
     Alias(Ty<'db>),
+    /// A conditioned alias, and its target (§3.10.1).
+    Refined(Ty<'db>),
     Tag,
     Record {
         parent: Option<Ty<'db>>,
@@ -158,6 +169,17 @@ pub fn type_def<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> Ty
     let kind = match type_header(db, program, item).kind {
         HeaderKind::Builtin(builtin) => TypeDefKind::Builtin(builtin),
         HeaderKind::Form => TypeDefKind::Form,
+        HeaderKind::Refined => match alias_target(db, program, item) {
+            Some(target) => {
+                lower.lower(decl.alias.expect("an alias has a target"));
+                TypeDefKind::Refined(target)
+            }
+            None => {
+                let site = Site::Type(decl.alias.expect("an alias has a target"));
+                lower.error(site, ErrorKind::AliasCycle);
+                TypeDefKind::Refined(Ty::error(db))
+            }
+        },
         HeaderKind::Alias => match alias_target(db, program, item) {
             Some(target) => {
                 // Lowered again for the errors; the target is the same.

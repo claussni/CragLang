@@ -649,6 +649,7 @@ impl<'a, 'db> Walker<'a, 'db> {
                 _ => EffectSet::all(),
             },
             Callee::Construct(ty) | Callee::Update(ty) => self.transforms(call, *ty),
+            Callee::Refine(_) => EffectSet::NONE,
         }
     }
 

@@ -59,6 +59,8 @@ impl<'db> Builder<'db> {
             name: ty.display(db),
             words,
         };
+        // A conditioned alias's values are its target's (§3.10.1).
+        let ty = crag_types::unrefined(db, program, ty);
         let shape = match (layout(db, program, ty), ty.kind(db)) {
             // As source writes the value: without type arguments.
             (Some(Layout::Zero), TyKind::Named(item, _)) => {

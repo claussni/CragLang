@@ -625,6 +625,13 @@ impl<'a, 'db> Infer<'a, 'db> {
             Expr::Literal(literal) => self.literal(id, literal, expected),
             Expr::Embed => self.embed(id, expected),
             Expr::Str(parts) => {
+                // A string without interpolation is a literal (§3.10.1).
+                if let [crag_hir::StrPart::Text(text)] = parts.as_slice() {
+                    let literal = Literal::Str(text.clone());
+                    if let Some(refined) = self.refined_literal(id, &literal, expected) {
+                        return refined;
+                    }
+                }
                 for part in parts {
                     if let crag_hir::StrPart::Expr(e) = part {
                         self.synth(*e);
@@ -868,11 +875,66 @@ impl<'a, 'db> Infer<'a, 'db> {
     }
 
     fn literal(&mut self, id: ExprId, literal: &Literal, expected: Option<Ty<'db>>) -> Ty<'db> {
+        if let Some(refined) = self.refined_literal(id, literal, expected) {
+            return refined;
+        }
         let ty = self.literal_ty(literal, expected);
         if !self.literal_fits(literal, ty) {
             self.error(Site::Expr(id), ErrorKind::Literal { ty });
         }
         ty
+    }
+
+    /// A literal where only a conditioned alias of its kind is expected:
+    /// of the alias, once its conditions hold for it (§3.10.1).
+    fn refined_literal(
+        &mut self,
+        id: ExprId,
+        literal: &Literal,
+        expected: Option<Ty<'db>>,
+    ) -> Option<Ty<'db>> {
+        let db = self.db;
+        let program = self.program;
+        let members = expected?.members(db);
+        let plain = self.literal_ty(literal, expected);
+        if members.contains(&plain) {
+            return None;
+        }
+        let refined = members.into_iter().find(|&m| {
+            let TyKind::Named(item, _) = m.kind(db) else {
+                return false;
+            };
+            matches!(
+                crate::type_def(db, program, *item).kind,
+                crate::def::TypeDefKind::Refined(_)
+            ) && {
+                let target = crate::relate::unrefined(db, program, m);
+                let ty = self.literal_ty(literal, Some(target));
+                ty == target && self.literal_fits(literal, ty)
+            }
+        })?;
+        let TyKind::Named(item, _) = refined.kind(db) else {
+            return None;
+        };
+        let value = crate::refine::known(literal, self.negative)?;
+        match crate::refine::verdict(db, program, *item, &value) {
+            crate::refine::Verdict::Holds => {}
+            crate::refine::Verdict::Fails(condition) => {
+                let kind = ErrorKind::ConditionNotMet {
+                    alias: refined,
+                    condition,
+                };
+                self.error(Site::Expr(id), kind);
+            }
+            crate::refine::Verdict::Undecided(condition) => {
+                let kind = ErrorKind::ConditionUndecided {
+                    alias: refined,
+                    condition,
+                };
+                self.error(Site::Expr(id), kind);
+            }
+        }
+        Some(refined)
     }
 
     fn literal_ty(&self, literal: &Literal, expected: Option<Ty<'db>>) -> Ty<'db> {
@@ -1429,7 +1491,10 @@ impl<'a, 'db> Infer<'a, 'db> {
     /// argument is typed only once its parameter is known.
     fn is_pending(&self, id: ExprId) -> bool {
         match self.body.expr(id) {
-            Expr::Literal(Literal::Int(_) | Literal::Float(_))
+            // A string without interpolation may be a conditioned alias's
+            // (§3.10.1).
+            Expr::Str(parts) => matches!(parts.as_slice(), [crag_hir::StrPart::Text(_)]),
+            Expr::Literal(Literal::Int(_) | Literal::Float(_) | Literal::Str(_))
             | Expr::Hole
             | Expr::Closure { .. }
             | Expr::List(_)
@@ -1478,7 +1543,12 @@ impl<'a, 'db> Infer<'a, 'db> {
     /// Whether a pending argument could take the type `param`.
     fn could_fit(&self, id: ExprId, param: Ty<'db>) -> bool {
         let db = self.db;
-        let members = param.members(db);
+        // A literal may stand for a conditioned alias of its type (§3.10.1).
+        let members: Vec<Ty<'db>> = param
+            .members(db)
+            .into_iter()
+            .map(|m| crate::relate::unrefined(db, self.program, m))
+            .collect();
         let any = |f: &dyn Fn(&TyKind<'db>) -> bool| {
             members.iter().any(|m| m.is_error(db) || f(m.kind(db)))
         };
@@ -2882,6 +2952,9 @@ impl<'a, 'db> Infer<'a, 'db> {
                 self.build_record(id, ty, fields.unwrap_or_default());
                 ty
             }
+            HeaderKind::Refined if matches!((args, fields), ([_], None)) => {
+                return self.refine_alias(id, callee, item, targs, args[0]);
+            }
             HeaderKind::Builtin(builtin) if matches!((args, fields), ([_], None)) => {
                 let target = match targs {
                     Some(targs) => self.builtin_of(builtin, targs),
@@ -2911,6 +2984,43 @@ impl<'a, 'db> Infer<'a, 'db> {
         self.exprs[callee.index()] = Some(ty);
         self.callees.push((id, Callee::Construct(ty)));
         ty
+    }
+
+    /// `A(x)` for a conditioned alias `A`: `x` as the alias's target,
+    /// checked when it runs, giving an `A` or `Invalid` (§3.10.1).
+    fn refine_alias(
+        &mut self,
+        id: ExprId,
+        callee: ExprId,
+        item: ItemId<'db>,
+        targs: Option<Vec<Ty<'db>>>,
+        arg: ExprId,
+    ) -> Ty<'db> {
+        let db = self.db;
+        let program = self.program;
+        let identity = type_identity(db, program, item);
+        let arity = type_header(db, program, item).params.len();
+        let generic_target = alias_target(db, program, item).unwrap_or_else(|| Ty::error(db));
+        let args = match targs {
+            Some(targs) => targs,
+            None if arity == 0 => Vec::new(),
+            None => {
+                let found = self.synth(arg);
+                self.typed.insert(arg, found);
+                let mut args = vec![None; arity];
+                bind(db, program, item, generic_target, found, &mut args);
+                args.into_iter()
+                    .map(|a| a.unwrap_or_else(|| Ty::error(db)))
+                    .collect()
+            }
+        };
+        let ty = Ty::new(db, TyKind::Named(identity, args.clone()));
+        let target = crate::relate::subst(db, program, generic_target, item, &args);
+        self.check(arg, target);
+        self.exprs[callee.index()] = Some(ty);
+        self.callees.push((id, Callee::Refine(ty)));
+        let invalid = prelude_type(db, program, "Invalid");
+        self.join(ty, invalid)
     }
 
     /// `T(x)`: a call of the `convert` that takes `x` and whose success

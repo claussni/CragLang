@@ -537,6 +537,127 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         }
     }
 
+    /// `A(x)` for a conditioned alias `A`: `x` checked against the alias's
+    /// conditions, an `A` when all hold, else `Invalid` naming the first
+    /// that fails and where the conversion is written (§3.10.1).
+    fn refine(&mut self, expr: ExprId, ty: Ty<'db>, arg: ExprId) -> Operand<'db> {
+        let (db, program) = (self.db, self.program);
+        let TyKind::Named(item, args) = ty.kind(db) else {
+            return self.trap(TrapKind::Error, Some(expr));
+        };
+        let target = crag_types::unrefined(db, program, ty);
+        let op = self.expr(arg);
+        let op = self.coerce(op, self.ty(arg), target);
+        let value = self.materialize(op, target);
+        let int_ty = self.int();
+        let code = InstanceKey::new(
+            db,
+            Owner::Item(*item),
+            args.clone(),
+            Vec::new(),
+            Entry::Check,
+        );
+        let failed = self.call_code(code, vec![Operand::Local(value)], int_ty, expr);
+        let result = self.ty(expr);
+        let out = self.temp(result);
+        let (ok, fails, join) = (self.new_block(), self.new_block(), self.new_block());
+        let passed = self.compare(CmpOp::Eq, Builtin::Int, Operand::Local(failed), int(0));
+        self.terminate(Terminator::Branch {
+            cond: passed,
+            then: ok,
+            otherwise: fails,
+        });
+        self.switch_to(ok);
+        let checked = self.temp(ty);
+        self.assign_to(checked, Operand::Local(value), target);
+        self.assign_to(out, Operand::Local(checked), ty);
+        self.terminate(Terminator::Jump(join));
+        self.switch_to(fails);
+        let body = hir_body(db, program, Owner::Item(*item));
+        let labels: Vec<String> = body
+            .type_decl
+            .as_ref()
+            .map(|d| d.conditions.iter().map(|c| c.label(db)).collect())
+            .unwrap_or_default();
+        let invalid_item = prelude_item(db, program, "Invalid");
+        let origin_item = prelude_item(db, program, "Origin");
+        let (Some(invalid_item), Some(origin_item)) = (invalid_item, origin_item) else {
+            self.trap(TrapKind::Error, Some(expr));
+            self.switch_to(join);
+            return Operand::Local(out);
+        };
+        let invalid = Ty::new(db, TyKind::Named(invalid_item, Vec::new()));
+        let origin_ty = Ty::new(db, TyKind::Named(origin_item, Vec::new()));
+        let (module, line, column) = self.origin_of(expr);
+        for (k, label) in labels.into_iter().enumerate() {
+            let (this, next) = (self.new_block(), self.new_block());
+            let is = self.compare(
+                CmpOp::Eq,
+                Builtin::Int,
+                Operand::Local(failed),
+                int(k as i128 + 1),
+            );
+            self.terminate(Terminator::Branch {
+                cond: is,
+                then: this,
+                otherwise: next,
+            });
+            self.switch_to(this);
+            let name = |n: &str| crag_hir::Name::new(db, n.to_string());
+            let origin = self.assign(
+                origin_ty,
+                Rvalue::Record {
+                    ty: origin_ty,
+                    fields: vec![
+                        (
+                            name("module"),
+                            Operand::Const(Constant::Str(module.clone())),
+                        ),
+                        (name("line"), int(line)),
+                        (name("column"), int(column)),
+                    ],
+                    dispose: None,
+                },
+            );
+            let error = self.assign(
+                invalid,
+                Rvalue::Record {
+                    ty: invalid,
+                    fields: vec![
+                        (name("condition"), Operand::Const(Constant::Str(label))),
+                        (name("origin"), origin),
+                    ],
+                    dispose: None,
+                },
+            );
+            self.assign_to(out, error, invalid);
+            self.terminate(Terminator::Jump(join));
+            self.switch_to(next);
+        }
+        self.trap(TrapKind::Error, Some(expr));
+        self.switch_to(join);
+        Operand::Local(out)
+    }
+
+    /// The module, line and column, from one, where an expression is
+    /// written.
+    fn origin_of(&self, expr: ExprId) -> (String, i128, i128) {
+        let db = self.db;
+        let module = self.owner.module(db);
+        let source = module.file(db).text(db);
+        let at = lower_body(db, self.program, self.owner)
+            .source_map
+            .exprs
+            .get(expr.index())
+            .map_or(0, |r| r.start as usize)
+            .min(source.len());
+        let before = &source[..at];
+        let line = before.matches('\n').count() as i128 + 1;
+        let start = before.rfind('\n').map_or(0, |i| i + 1);
+        let column = before[start..].chars().count() as i128 + 1;
+        (module.path(db).clone(), line, column)
+    }
+
     /// The part of a module-level `let` with a pattern bound to the item's
     /// name: its value, which the value's code keeps, matched.
     fn part_entry(&mut self) -> Option<Start<'a, 'db>> {
@@ -2531,7 +2652,14 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         StrPart::Text(text) => {
                             ops.push(Operand::Const(Constant::Str(text.clone())))
                         }
-                        StrPart::Expr(e) if self.ty(*e) == ty => ops.push(self.expr(*e)),
+                        // A string, or a conditioned alias of one, is
+                        // written as it is.
+                        StrPart::Expr(e)
+                            if crag_types::unrefined(db, self.program, self.ty(*e)) == ty =>
+                        {
+                            let op = self.expr(*e);
+                            ops.push(self.coerce(op, self.ty(*e), ty));
+                        }
                         // Any other value is written as text, a number as
                         // such and the rest as `show` writes it by its
                         // structure; in a local, so its type stays known.
@@ -2779,6 +2907,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
 
     fn literal(&self, literal: &Literal, ty: Ty<'db>, negative: bool) -> Constant<'db> {
         let sign: i128 = if negative { -1 } else { 1 };
+        // A literal of a conditioned alias is one of its target (§3.10.1).
+        let ty = crag_types::unrefined(self.db, self.program, ty);
         let builtin = ty.as_builtin(self.db).map(|(b, _)| b);
         let float = |x: f64| Constant::Float((sign as f64 * x).to_bits());
         match (literal, builtin) {
@@ -2984,6 +3114,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     .chain(fields.unwrap_or_default().iter().cloned())
                     .collect();
                 self.record(expr, ty, &[], &list)
+            }
+            Some(Callee::Refine(ty)) => {
+                let ty = self.subst(ty);
+                self.refine(expr, ty, positional[0])
             }
             Some(Callee::Dispatch(dispatch)) => self.dispatch(expr, &dispatch, &positional, fields),
             Some(Callee::Value) => self.call_value(expr, tail),

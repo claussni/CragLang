@@ -132,6 +132,9 @@ pub enum Callee<'db> {
     /// `v.update(list)`: the receiver rebuilt as its own type with a
     /// field-update list (§6.7.1).
     Update(Ty<'db>),
+    /// `A(x)` for a conditioned alias `A`: `x` checked against its
+    /// conditions, giving an `A` or `Invalid` (§3.10.1).
+    Refine(Ty<'db>),
     /// A call split by the members of its union arguments, or a function
     /// value that splits its parameters so (§4.6.1).
     Dispatch(Dispatch<'db>),
@@ -254,6 +257,16 @@ pub enum ErrorKind<'db> {
     NoConversion {
         from: Ty<'db>,
         to: Ty<'db>,
+    },
+    /// A literal where a conditioned alias is expected that fails one of
+    /// its conditions, or one the compiler cannot decide (§3.10.1).
+    ConditionNotMet {
+        alias: Ty<'db>,
+        condition: String,
+    },
+    ConditionUndecided {
+        alias: Ty<'db>,
+        condition: String,
     },
     /// A function that would make a type fit a form it forbids (§3.11).
     FitsBanned {
@@ -498,6 +511,15 @@ impl<'db> ErrorKind<'db> {
                 "no `convert` turns {} into {}",
                 from.display(db),
                 to.display(db)
+            ),
+            ErrorKind::ConditionNotMet { alias, condition } => format!(
+                "the value fails the condition `{condition}` of {}",
+                alias.display(db)
+            ),
+            ErrorKind::ConditionUndecided { alias, condition } => format!(
+                "the condition `{condition}` of {} cannot be decided here; convert with `{}(…)`",
+                alias.display(db),
+                alias.display(db)
             ),
             ErrorKind::FitsBanned { ty, form } => format!(
                 "{} is `not {form}`, so no function may make it fit `{form}`",
