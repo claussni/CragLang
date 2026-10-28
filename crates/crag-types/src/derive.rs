@@ -116,7 +116,7 @@ fn derives<'db>(
         TyKind::Union(members) => parts(seen, members.clone()),
         TyKind::Record { fields, .. } => parts(seen, fields.iter().map(|(_, t)| *t).collect()),
         TyKind::Builtin(builtin, args) => match builtin {
-            Builtin::List | Builtin::Grid => parts(seen, args.clone()),
+            Builtin::List => parts(seen, args.clone()),
             // Maps and sets have no order.
             Builtin::Map | Builtin::Set => form != "Ordered" && parts(seen, args.clone()),
             Builtin::Ref | Builtin::Ext | Builtin::Lazy => false,

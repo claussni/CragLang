@@ -75,7 +75,6 @@ pub fn layout<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Lay
             Builtin::List
             | Builtin::Map
             | Builtin::Set
-            | Builtin::Grid
             | Builtin::Ref
             | Builtin::Ext
             | Builtin::Lazy
@@ -471,7 +470,7 @@ pub fn type_descriptor<'db>(
 /// type parameter.
 pub fn deferred<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
     match ty.as_builtin(db) {
-        Some((Builtin::List | Builtin::Map | Builtin::Set | Builtin::Grid, args)) => args
+        Some((Builtin::List | Builtin::Map | Builtin::Set, args)) => args
             .iter()
             .all(|&a| !immediate(db, program, a, &mut Vec::new())),
         _ => false,

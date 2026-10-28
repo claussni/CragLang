@@ -765,10 +765,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                 self.collection(id, items, expected, &[Builtin::List, Builtin::Set])
             }
             Expr::Map(entries) => self.map_literal(id, entries, expected),
-            Expr::Grid(rows) => {
-                let items: Vec<ExprId> = rows.iter().flatten().copied().collect();
-                self.collection(id, &items, expected, &[Builtin::Grid])
-            }
+            Expr::Grid(rows) => self.grid(id, rows, expected),
             Expr::Block { stmts, tail } => {
                 let mut leaves = false;
                 let mut handled = Vec::new();
@@ -1601,7 +1598,10 @@ impl<'a, 'db> Infer<'a, 'db> {
                 _ => false,
             }),
             Expr::Map(_) => builtin(&[Builtin::Map]),
-            Expr::Grid(_) => builtin(&[Builtin::Grid]),
+            Expr::Grid(_) => {
+                let grid = self.grid_item();
+                any(&|k| matches!(k, TyKind::Named(i, _) if Some(*i) == grid))
+            }
             Expr::Lazy(_) => builtin(&[Builtin::Lazy]),
             Expr::Record(_) => any(&|k| matches!(k, TyKind::Record { .. })),
             Expr::Range { start, end } => {
@@ -2884,9 +2884,9 @@ impl<'a, 'db> Infer<'a, 'db> {
         let header = type_header(db, program, item);
         let arity = header.params.len();
         let ty = match header.kind {
-            HeaderKind::Builtin(
-                builtin @ (Builtin::List | Builtin::Map | Builtin::Set | Builtin::Grid),
-            ) if args.is_empty() && fields.is_none() => {
+            HeaderKind::Builtin(builtin @ (Builtin::List | Builtin::Map | Builtin::Set))
+                if args.is_empty() && fields.is_none() =>
+            {
                 let targs = targs.or_else(|| {
                     let (b, a) = expected.and_then(|e| self.member_builtin(e, &[builtin]))?;
                     (b == builtin).then_some(a)
@@ -3387,6 +3387,56 @@ impl<'a, 'db> Infer<'a, 'db> {
         Ty::record(db, built, false)
     }
 
+    /// The prelude's `Grid` (§12.3).
+    fn grid_item(&self) -> Option<ItemId<'db>> {
+        prelude_item(self.db, self.program, "Grid").map(|g| type_identity(self.db, self.program, g))
+    }
+
+    /// A grid literal: rows of one width, the cell type from the expected
+    /// grid type or the union of the cells (§12.3).
+    fn grid(&mut self, id: ExprId, rows: &[Vec<ExprId>], expected: Option<Ty<'db>>) -> Ty<'db> {
+        let db = self.db;
+        let Some(grid) = self.grid_item() else {
+            return self.err_ty();
+        };
+        if let Some(first) = rows.first() {
+            for (k, row) in rows.iter().enumerate().skip(1) {
+                if row.len() != first.len() {
+                    let kind = ErrorKind::RaggedGrid {
+                        row: k,
+                        width: first.len(),
+                        found: row.len(),
+                    };
+                    self.error(Site::Expr(id), kind);
+                }
+            }
+        }
+        let items: Vec<ExprId> = rows.iter().flatten().copied().collect();
+        let wanted = expected.and_then(|e| {
+            e.members(db).into_iter().find_map(|m| match m.kind(db) {
+                TyKind::Named(i, args) if *i == grid => args.first().copied(),
+                _ => None,
+            })
+        });
+        let cell = match wanted {
+            Some(cell) => {
+                for &item in &items {
+                    self.check(item, cell);
+                }
+                cell
+            }
+            None if items.is_empty() => {
+                self.error(Site::Expr(id), ErrorKind::CannotInfer);
+                return self.err_ty();
+            }
+            None => {
+                let types = items.iter().map(|&i| self.synth(i)).collect();
+                self.join_all(types)
+            }
+        };
+        Ty::new(db, TyKind::Named(grid, vec![cell]))
+    }
+
     /// A list, set or grid literal: the element type comes from the
     /// expected collection type, or is the union of the elements.
     fn collection(
@@ -3478,6 +3528,14 @@ impl<'a, 'db> Infer<'a, 'db> {
                 let (k, v) = (kv[0], kv[1]);
                 self.check(*key, k);
                 self.option(v)
+            }
+            // `g[row, column]` (§19.11).
+            (TyKind::Named(item, cell), [row, column]) if Some(*item) == self.grid_item() => {
+                let cell = cell[0];
+                let int = self.builtin(Builtin::Int);
+                self.check(*row, int);
+                self.check(*column, int);
+                cell
             }
             _ => {
                 if !base_ty.is_error(db) {
@@ -4618,7 +4676,9 @@ impl<'a, 'db> Infer<'a, 'db> {
             element
         };
         match ty.kind(db) {
-            TyKind::Builtin(Builtin::List | Builtin::Grid, args) => args[0],
+            TyKind::Builtin(Builtin::List, args) => args[0],
+            // A grid's cells, row by row (§12.3).
+            TyKind::Named(item, args) if Some(*item) == self.grid_item() => listed(self, args[0]),
             TyKind::Builtin(Builtin::Set, args) => listed(self, args[0]),
             TyKind::Builtin(Builtin::Map, args) => {
                 let key = Name::new(db, "key".to_string());

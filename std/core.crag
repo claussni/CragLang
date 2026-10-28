@@ -35,7 +35,6 @@ pub type Bytes
 pub type List[T]
 pub type Map[K, V]
 pub type Set[T]
-pub type Grid[T]
 pub type Lazy[T]
 // The value of a lazy expression, computed by the first read (§6.10).
 pub fn value[T](l: Lazy[T]) -> T
@@ -1562,6 +1561,82 @@ pub fn toSet[T](xs: List[T]) -> Set[T] {
   for x in xs { out = setInsert(out, x) }
   out
 }
+
+// Grids (§12.3, §19.11): `height` rows of `width` cells, row by row in
+// `cells`. Positions are a row and a column, both from 0.
+pub type Grid[T](width: Int, height: Int, cells: List[T])
+  where { shape: width >= 0 and height >= 0 and cells.count() == width * height }
+
+pub fn grid[T](width: Int, height: Int, fill: T) -> Grid[T] {
+  var cells: List[T] = []
+  if width * height > 0 {
+    for k in 1..(width * height) { cells = listAppend(cells, fill) }
+  }
+  Grid(width: width, height: height, cells: cells)
+}
+
+pub fn width[T](g: Grid[T]) -> Int { g.width }
+pub fn height[T](g: Grid[T]) -> Int { g.height }
+
+// The cell at a row and a column; `g[row, column]` traps instead.
+pub fn get[T](g: Grid[T], row: Int, column: Int) -> Option[T] {
+  if row < 0 or row >= g.height or column < 0 or column >= g.width { return Empty }
+  g.cells.get(row * g.width + column)
+}
+
+pub fn set[T](g: Grid[T], row: Int, column: Int, value: T) -> Grid[T] {
+  if row < 0 or row >= g.height or column < 0 or column >= g.width { trapIndex() }
+  Grid(..g, cells: g.cells.set(row * g.width + column, value))
+}
+
+pub fn row[T](g: Grid[T], at: Int) -> List[T] {
+  if at < 0 or at >= g.height { trapIndex() }
+  listSlice(g.cells, at * g.width, (g.height - at - 1) * g.width)
+}
+
+pub fn column[T](g: Grid[T], at: Int) -> List[T] {
+  if at < 0 or at >= g.width { trapIndex() }
+  var out: List[T] = []
+  var k = at
+  if g.height > 0 {
+    for r in 1..g.height {
+      out = listAppend(out, g.cells[k])
+      k = k + g.width
+    }
+  }
+  out
+}
+
+pub fn rows[T](g: Grid[T]) -> List[List[T]] {
+  var out: List[List[T]] = []
+  var r = 0
+  if g.height > 0 {
+    for k in 1..g.height {
+      out = listAppend(out, row(g, r))
+      r = r + 1
+    }
+  }
+  out
+}
+
+pub fn map[T, U](g: Grid[T], f: (T) -> U) -> Grid[U] {
+  Grid(width: g.width, height: g.height, cells: g.cells.map(f))
+}
+
+pub fn transpose[T](g: Grid[T]) -> Grid[T] {
+  var cells: List[T] = []
+  var c = 0
+  if g.width > 0 {
+    for k in 1..g.width {
+      cells = listConcat(cells, column(g, c))
+      c = c + 1
+    }
+  }
+  Grid(width: g.height, height: g.width, cells: cells)
+}
+
+// The cells row by row, which `for` walks.
+pub fn toList[T](g: Grid[T]) -> List[T] { g.cells }
 
 // Ranges
 

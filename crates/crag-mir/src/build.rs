@@ -160,7 +160,6 @@ pub(crate) fn counted<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bo
                 | Builtin::List
                 | Builtin::Map
                 | Builtin::Set
-                | Builtin::Grid
                 | Builtin::Ref
                 | Builtin::Ext
                 | Builtin::Lazy
@@ -2754,7 +2753,48 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 self.eval(expr, Dest::Value(result));
                 Operand::Local(result)
             }
-            Expr::Grid(_) => self.unsupported(expr, "grids"),
+            // A grid of its rows' cells, row by row (§12.3).
+            Expr::Grid(rows) => {
+                let Some(fields) = fields_of(db, self.program, ty) else {
+                    return self.trap(TrapKind::Error, Some(expr));
+                };
+                let cells_ty = fields
+                    .iter()
+                    .find(|(n, _)| n.text(db) == "cells")
+                    .map_or_else(|| Ty::error(db), |(_, t)| *t);
+                let cell = match cells_ty.as_builtin(db) {
+                    Some((Builtin::List, [cell])) => *cell,
+                    _ => return self.trap(TrapKind::Error, Some(expr)),
+                };
+                let mut ops = Vec::new();
+                for &item in rows.iter().flatten() {
+                    let op = self.expr(item);
+                    ops.push(self.coerce(op, self.ty(item), cell));
+                }
+                let cells = self.assign(cells_ty, Rvalue::List(ops));
+                let width = rows.first().map_or(0, Vec::len) as i128;
+                let height = rows.len() as i128;
+                let values = fields
+                    .iter()
+                    .map(|(name, _)| {
+                        let op = match name.text(db).as_str() {
+                            "width" => int(width),
+                            "height" => int(height),
+                            _ => cells.clone(),
+                        };
+                        (*name, op)
+                    })
+                    .collect();
+                let dispose = self.dispose_code(ty);
+                self.assign(
+                    ty,
+                    Rvalue::Record {
+                        ty,
+                        fields: values,
+                        dispose,
+                    },
+                )
+            }
             Expr::TypeArgs { .. } => self.unsupported(expr, "type arguments"),
             Expr::Closure { .. } => self.closure_value(expr, ty, None),
             Expr::Pass => self.unsupported(expr, "`pass`"),
@@ -2979,6 +3019,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let db = self.db;
         let ty = self.ty(expr);
         let base_ty = self.ty(base);
+        if let [row, column] = args {
+            return self.grid_cell(expr, base, *row, *column);
+        }
         let [arg] = args else {
             return self.trap(TrapKind::Error, Some(expr));
         };
@@ -3003,6 +3046,65 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             }
             _ => self.trap(TrapKind::Error, Some(expr)),
         }
+    }
+
+    /// `g[row, column]`: the cell, which traps with `Index` outside the
+    /// grid (§19.11).
+    fn grid_cell(
+        &mut self,
+        expr: ExprId,
+        base: ExprId,
+        row: ExprId,
+        column: ExprId,
+    ) -> Operand<'db> {
+        let db = self.db;
+        let ty = self.ty(expr);
+        let grid = self.place_of(base);
+        let int_ty = self.int();
+        let field = |name: &str| Place {
+            local: grid,
+            path: vec![Step::Field(crag_hir::Name::new(db, name.to_string()))],
+        };
+        let width = self.assign(int_ty, Rvalue::Read(field("width")));
+        let height = self.assign(int_ty, Rvalue::Read(field("height")));
+        let row = self.expr(row);
+        let column = self.expr(column);
+        for (at, limit) in [(row.clone(), height), (column.clone(), width.clone())] {
+            let below = self.compare(CmpOp::Lt, Builtin::Int, at.clone(), int(0));
+            self.check(below, TrapKind::Index, expr);
+            let beyond = self.compare(CmpOp::Ge, Builtin::Int, at, limit);
+            self.check(beyond, TrapKind::Index, expr);
+        }
+        let start = self.assign(
+            int_ty,
+            Rvalue::Binary {
+                op: BinOp::Mul,
+                ty: Builtin::Int,
+                a: row,
+                b: width,
+                check: None,
+            },
+        );
+        let index = self.assign(
+            int_ty,
+            Rvalue::Binary {
+                op: BinOp::Add,
+                ty: Builtin::Int,
+                a: start,
+                b: column,
+                check: None,
+            },
+        );
+        let cells_ty = self.place_ty(grid, &field("cells").path);
+        let cells = self.assign(cells_ty, Rvalue::Read(field("cells")));
+        let cells = self.materialize(cells, cells_ty);
+        self.assign(
+            ty,
+            Rvalue::Index {
+                list: Place::local(cells),
+                index,
+            },
+        )
     }
 
     fn compare(

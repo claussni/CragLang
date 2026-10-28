@@ -315,3 +315,31 @@ fn a_sign_before_a_bare_number_is_part_of_the_literal() {
     assert_eq!(eval(&mut r, "t(-10)"), "-10\n");
     assert!(eval(&mut r, "t(-300)").contains("fails the condition"));
 }
+
+#[test]
+fn grids_have_rows_and_columns() {
+    // §12.3, §19.11.
+    let mut r = repl();
+    eval(&mut r, "let m = [1, 2, 3; 4, 5, 6]");
+    assert_eq!(eval(&mut r, "m.row(0)"), "[1, 2, 3]\n");
+    assert_eq!(eval(&mut r, "m.column(1)"), "[2, 5]\n");
+    assert_eq!(eval(&mut r, "m[1, 2]"), "6\n");
+    assert!(eval(&mut r, "m[2, 0]").starts_with("trap: index out of range"));
+    assert_eq!(eval(&mut r, "m.get(5, 5)"), "Empty\n");
+    assert_eq!(
+        eval(&mut r, "m.transpose().rows()"),
+        "[[1, 4], [2, 5], [3, 6]]\n"
+    );
+    assert_eq!(
+        eval(&mut r, "m.map { x -> x * 10 }.row(1)"),
+        "[40, 50, 60]\n"
+    );
+    assert_eq!(eval(&mut r, "m.set(0, 0, 9).row(0)"), "[9, 2, 3]\n");
+    assert_eq!(eval(&mut r, "grid(2, 3, 0).height()"), "3\n");
+    eval(
+        &mut r,
+        "fn total(g: Grid[Int]) -> Int {\n  var t = 0\n  for x in g { t = t + x }\n  t\n}",
+    );
+    assert_eq!(eval(&mut r, "total(m)"), "21\n");
+    assert!(eval(&mut r, "[1, 2; 3]").contains("a grid's rows are of one width"));
+}

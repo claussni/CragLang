@@ -82,7 +82,6 @@ pub enum Builtin {
     List,
     Map,
     Set,
-    Grid,
     Ref,
     /// The locking ref of an `ext` binding (§9.6).
     Ext,
@@ -121,7 +120,6 @@ impl Builtin {
             "List" => (Builtin::List, 1),
             "Map" => (Builtin::Map, 2),
             "Set" => (Builtin::Set, 1),
-            "Grid" => (Builtin::Grid, 1),
             "Ref" => (Builtin::Ref, 1),
             "Ext" => (Builtin::Ext, 1),
             "Lazy" => (Builtin::Lazy, 1),
@@ -152,7 +150,6 @@ impl Builtin {
             Builtin::List => "List",
             Builtin::Map => "Map",
             Builtin::Set => "Set",
-            Builtin::Grid => "Grid",
             Builtin::Ref => "Ref",
             Builtin::Ext => "Ext",
             Builtin::Lazy => "Lazy",

@@ -268,6 +268,12 @@ pub enum ErrorKind<'db> {
         alias: Ty<'db>,
         condition: String,
     },
+    /// A grid literal whose rows differ in width (§12.3).
+    RaggedGrid {
+        row: usize,
+        width: usize,
+        found: usize,
+    },
     /// A function that would make a type fit a form it forbids (§3.11).
     FitsBanned {
         ty: Ty<'db>,
@@ -520,6 +526,9 @@ impl<'db> ErrorKind<'db> {
                 "the condition `{condition}` of {} cannot be decided here; convert with `{}(…)`",
                 alias.display(db),
                 alias.display(db)
+            ),
+            ErrorKind::RaggedGrid { row, width, found } => format!(
+                "row {row} of the grid has {found} cells, the first {width}; a grid's rows are of one width"
             ),
             ErrorKind::FitsBanned { ty, form } => format!(
                 "{} is `not {form}`, so no function may make it fit `{form}`",
