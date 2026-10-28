@@ -172,6 +172,7 @@ fn dropper(release: RuntimeFn) -> LirFunction {
             ),
         ],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 
@@ -207,6 +208,7 @@ fn handler() -> LirFunction {
             block(vec![], Term::Return(vec![])),
         ],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 
@@ -225,6 +227,7 @@ fn trapping() -> LirFunction {
             },
         )],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 

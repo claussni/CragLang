@@ -92,6 +92,12 @@ pub enum Builtin {
     RuntimeHub,
     /// The runtime's socket, which only `std.io` declares and uses.
     RuntimeSocket,
+    /// The C types only `std.c` declares (§16.1): a 32-bit float, its bits
+    /// in the low half of a word, a pointer tagged with a phantom type, and
+    /// the marker of an out parameter.
+    CF32,
+    CPtr,
+    COut,
     /// The type functions `Oks[X]` and `Errs[X]`, the members of `X` that
     /// are not errors and those that are (§8.1). They stay applied only to
     /// what names type parameters.
@@ -126,6 +132,9 @@ impl Builtin {
             "RuntimeStream" => (Builtin::RuntimeStream, 0),
             "RuntimeHub" => (Builtin::RuntimeHub, 0),
             "RuntimeSocket" => (Builtin::RuntimeSocket, 0),
+            "CF32" => (Builtin::CF32, 0),
+            "CPtr" => (Builtin::CPtr, 1),
+            "COut" => (Builtin::COut, 1),
             "Oks" => (Builtin::Oks, 1),
             "Errs" => (Builtin::Errs, 1),
             _ => return None,
@@ -156,6 +165,9 @@ impl Builtin {
             Builtin::RuntimeStream => "RuntimeStream",
             Builtin::RuntimeHub => "RuntimeHub",
             Builtin::RuntimeSocket => "RuntimeSocket",
+            Builtin::CF32 => "CF32",
+            Builtin::CPtr => "CPtr",
+            Builtin::COut => "COut",
             Builtin::Oks => "Oks",
             Builtin::Errs => "Errs",
         }

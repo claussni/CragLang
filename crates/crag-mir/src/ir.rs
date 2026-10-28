@@ -22,7 +22,7 @@
 //! reference away, and a place only borrows the local it starts at.
 
 use crag_db::Db;
-use crag_hir::{BindingId, ExprId, Name, Owner};
+use crag_hir::{BindingId, ExprId, ItemId, Name, Owner};
 use crag_types::{Builtin, Step, Ty, TyKind};
 
 use crate::{Entry, InstanceKey};
@@ -462,6 +462,18 @@ pub enum Intrinsic<'db> {
     EnvVar,
     EnvVars,
     EnvPlatform,
+    /// A call of a C function with the arguments of its parameters that
+    /// are no out parameters: its C result, a `CStr` result as the address
+    /// of its bytes, a `UInt64` (Specification §16.3).
+    CCall(ItemId<'db>),
+    /// What the last `CCall` of the code left in the out parameter at an
+    /// index among the C function's parameters; `errno`, read right after
+    /// it returned, a `CInt`.
+    COut(u32),
+    CErrno,
+    /// A copy of the NUL-terminated bytes at an address, the NUL included:
+    /// `Bytes`.
+    CStrOf,
     /// The number of elements of a list, map or set.
     CollCount,
     /// The list with an element replaced, which consumes the list and the

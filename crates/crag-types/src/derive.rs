@@ -120,6 +120,8 @@ fn derives<'db>(
             // Maps and sets have no order.
             Builtin::Map | Builtin::Set => form != "Ordered" && parts(seen, args.clone()),
             Builtin::Ref | Builtin::Ext | Builtin::Lazy => false,
+            // A 32-bit float's bits do not order it.
+            Builtin::CF32 => form != "Ordered",
             _ => true,
         },
         TyKind::Named(item, _) => {

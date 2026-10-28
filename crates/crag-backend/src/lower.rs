@@ -42,10 +42,11 @@ use std::ops::Range;
 use crag_abi::{
     BUFFER_HEADER, CELL_FULL, CELL_STATE_OFFSET, CELL_VALUE_OFFSET, COUNT_OFFSET,
     FUNCTION_BOX_HEADER, HEADER_SIZE, HEAP_OFFSET, HandlerKind, INLINE_TEXT_MAX, LEN_OFFSET,
-    LIST_SIZE, MAP_SIZE, MEMBER_BOX_SIZE, NO_POSITION, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, REF_ADD,
-    REF_CELL_SIZE, REF_MUL, REF_SUB, REF_UNSIGNED, SCOPE_DONE, SIDE_END_OFFSET, SIDE_PTR_OFFSET,
-    SIGNAL_NONE, START_EXEMPT, STATIC_COUNT, TEXT_BOX_HEADER, TEXT_LEN_MAX, TX_CONFLICT_OFFSET,
-    TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TrapOrigin, TypeDescriptor, inline_text, size_class,
+    LIST_SIZE, MAP_SIZE, MEMBER_BOX_SIZE, NO_POSITION, NativeSymbol, PAGE_FREE_OFFSET,
+    PAGE_USED_OFFSET, REF_ADD, REF_CELL_SIZE, REF_MUL, REF_SUB, REF_UNSIGNED, SCOPE_DONE,
+    SIDE_END_OFFSET, SIDE_PTR_OFFSET, SIGNAL_NONE, START_EXEMPT, STATIC_COUNT, TEXT_BOX_HEADER,
+    TEXT_LEN_MAX, TX_CONFLICT_OFFSET, TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TrapOrigin,
+    TypeDescriptor, c_kind, inline_text, size_class, threading,
 };
 use crag_codegen::{
     BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, CallTarget, Cond, FuncId, Inst,
@@ -53,7 +54,7 @@ use crag_codegen::{
 };
 use crag_db::Db;
 use crag_db::plumbing::AsId;
-use crag_hir::{Name, Owner, Program, hir_body, lower_body};
+use crag_hir::{ItemId, Name, Owner, Program, Threading, hir_body, lower_body};
 use crag_mir::{
     BinOp, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Entry, InstanceKey, Intrinsic,
     Local, MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,
@@ -137,6 +138,8 @@ pub fn lower_to_lir<'db>(
         source: owner.module(db).file(db).text(db),
         origins: Vec::new(),
         details: Vec::new(),
+        natives: Vec::new(),
+        c_buffer: None,
     };
     for (i, decl) in mir.locals.iter().enumerate() {
         let layout = layout(db, program, decl.ty);
@@ -185,6 +188,16 @@ pub fn lower_to_lir<'db>(
             },
         );
     }
+    if let (Some((dst, words)), Some(entry)) = (l.c_buffer, l.blocks[0].as_mut()) {
+        entry.insts.insert(
+            0,
+            Inst::SidePush {
+                dst,
+                size: words * 8,
+                align: 8,
+            },
+        );
+    }
     if let Some(cell) = cell
         && !unknown_param
         && returns <= 2
@@ -213,6 +226,7 @@ pub fn lower_to_lir<'db>(
             tracked: l.tracked,
             blocks,
             data: l.data,
+            natives: l.natives,
         },
         unsupported: l.unsupported,
         calls: l.calls,
@@ -227,6 +241,32 @@ pub fn lower_to_lir<'db>(
         },
         details: l.details,
     }
+}
+
+/// The kind of a C parameter's or result's type in a `CCall` descriptor;
+/// a `CStr` result is a pointer, and only a result may be `()`.
+fn c_kind_of<'db>(db: &'db dyn Db, ty: Ty<'db>, result: bool) -> Option<u8> {
+    if crag_types::is_cstr(db, ty) {
+        return Some(if result { c_kind::PTR } else { c_kind::CSTR });
+    }
+    if result && matches!(ty.kind(db), TyKind::Record { fields, open: false } if fields.is_empty())
+    {
+        return Some(c_kind::VOID);
+    }
+    Some(match ty.as_builtin(db)?.0 {
+        Builtin::Int8 => c_kind::I8,
+        Builtin::Int16 => c_kind::I16,
+        Builtin::Int32 => c_kind::I32,
+        Builtin::Int => c_kind::I64,
+        Builtin::UInt8 => c_kind::U8,
+        Builtin::UInt16 => c_kind::U16,
+        Builtin::UInt32 => c_kind::U32,
+        Builtin::UInt64 => c_kind::U64,
+        Builtin::Float => c_kind::F64,
+        Builtin::CF32 => c_kind::F32,
+        Builtin::CPtr => c_kind::PTR,
+        _ => return None,
+    })
 }
 
 /// The handlers of a call: for leaving a transaction's attempt, and for a
@@ -274,6 +314,11 @@ struct Lower<'a, 'db> {
     /// The function the code is loaded as, and its steps so far.
     func: FuncId,
     steps: Vec<StepInfo<'db>>,
+    /// The C functions it calls, and the words on the side stack their
+    /// arguments go in, pushed at the entry with room for the most any
+    /// call needs.
+    natives: Vec<NativeSymbol>,
+    c_buffer: Option<(VReg, u32)>,
 }
 
 impl<'a, 'db> Lower<'a, 'db> {
@@ -1240,6 +1285,95 @@ impl<'a, 'db> Lower<'a, 'db> {
         }
     }
 
+    /// The side-stack words of the C calls' arguments, at least `words`.
+    fn c_buffer(&mut self, words: u32) -> VReg {
+        let reg = match self.c_buffer {
+            Some((reg, _)) => reg,
+            None => self.reg(),
+        };
+        let most = self.c_buffer.map_or(0, |(_, w)| w).max(words);
+        self.c_buffer = Some((reg, most));
+        reg
+    }
+
+    /// A call of a C function with the arguments of its parameters that
+    /// are no out parameters (Specification §16.3): its C result's word,
+    /// none for `()`. The out parameters stay in the C buffer and `errno`
+    /// in the scratch words.
+    fn c_call(
+        &mut self,
+        item: ItemId<'db>,
+        args: &[Operand<'db>],
+    ) -> Result<Vec<VReg>, Unsupported> {
+        let (db, program) = (self.db, self.program);
+        let (params, result) = crag_types::c_signature(db, program, item);
+        let info = crag_hir::c_function_info(db, item).ok_or("C functions without an import")?;
+        let unsupported = "C parameters or results of this type";
+        let mut desc = vec![
+            params.len() as u8,
+            c_kind_of(db, result, true).ok_or(unsupported)?,
+        ];
+        let buffer = self.c_buffer(params.len() as u32);
+        let mut args = args.iter();
+        for (i, &ty) in params.iter().enumerate() {
+            let offset = 8 * i as i32;
+            if let Some(inner) = crag_types::c_out(db, ty) {
+                let kind = c_kind_of(db, inner, false).filter(|&k| k != c_kind::CSTR);
+                desc.push(c_kind::OUT | kind.ok_or(unsupported)?);
+                let zero = self.constant(0);
+                self.push(Inst::Store {
+                    src: zero,
+                    addr: buffer,
+                    offset,
+                });
+                continue;
+            }
+            desc.push(c_kind_of(db, ty, false).ok_or(unsupported)?);
+            let arg = args.next().ok_or("C calls with missing arguments")?;
+            let src = word(&self.operand(arg, ty)?)?;
+            self.push(Inst::Store {
+                src,
+                addr: buffer,
+                offset,
+            });
+        }
+        let files = program
+            .packages(db)
+            .native_files(item.module(db).path(db), &info.library)
+            .ok_or("C libraries the manifest does not declare")?;
+        let desc = self.static_data(desc);
+        let native = self.natives.len() as u32;
+        self.natives.push(NativeSymbol {
+            files,
+            symbol: item.name(db).text(db).clone(),
+            threading: match info.threading {
+                Threading::Unsafe => threading::UNSAFE,
+                Threading::Safe => threading::SAFE,
+                Threading::Bound => threading::BOUND,
+            },
+        });
+        let [library, func] = [true, false].map(|library| {
+            let dst = self.reg();
+            self.push(Inst::NativeAddr {
+                dst,
+                native,
+                library,
+            });
+            dst
+        });
+        let out = self.runtime2(RuntimeFn::CCall, vec![library, func, desc, buffer]);
+        let scratch = self.scratch();
+        self.push(Inst::Store {
+            src: out[1],
+            addr: scratch,
+            offset: 0,
+        });
+        Ok(match c_kind_of(db, result, true) {
+            Some(c_kind::VOID) => Vec::new(),
+            _ => vec![out[0]],
+        })
+    }
+
     /// The runtime call of an intrinsic, and its result's words; `ty` is
     /// the result's type.
     fn intrinsic(
@@ -1745,6 +1879,19 @@ impl<'a, 'db> Lower<'a, 'db> {
                     offset: 0,
                 });
                 Ok(vec![out[1]])
+            }
+            (Intrinsic::CCall(item), args) => self.c_call(item, args),
+            (Intrinsic::COut(index), []) => {
+                let buffer = self.c_buffer(index + 1);
+                Ok(vec![self.load(buffer, 8 * index as i32)])
+            }
+            (Intrinsic::CErrno, []) => {
+                let scratch = self.scratch();
+                Ok(vec![self.load(scratch, 0)])
+            }
+            (Intrinsic::CStrOf, [address]) => {
+                let address = word(&self.operand(address, int)?)?;
+                Ok(self.runtime2(RuntimeFn::CStrOf, vec![address]).to_vec())
             }
             (Intrinsic::TextParsed, []) => {
                 let scratch = self.scratch();
@@ -3069,6 +3216,7 @@ impl<'a, 'db> Lower<'a, 'db> {
         };
         if *func.entry(db) == Entry::Body
             && hir_body(db, self.program, Owner::Item(item)).root.is_none()
+            && crag_hir::c_function(db, item).is_none()
         {
             return Err("builtin functions");
         }

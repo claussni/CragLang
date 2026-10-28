@@ -124,6 +124,7 @@ fn run(root: &Path, out: &mut dyn Write) -> Result<u8, String> {
     } else {
         return Err("`main` must return `()` or `ExitCode`".into());
     };
+    open_natives(&project)?;
     let mut image = Image::build(&project, &[key])?;
     match image.run(func_id(key)) {
         Ok(words) => Ok(match code_offset {
@@ -140,6 +141,40 @@ fn run(root: &Path, out: &mut dyn Write) -> Result<u8, String> {
             Ok(EXIT_TRAP)
         }
     }
+}
+
+/// Opens every native library the program imports and finds each of its
+/// C functions, before `main` starts (Specification §16.1).
+fn open_natives(project: &Project) -> Result<(), String> {
+    let (db, program) = (&project.db, project.program);
+    for &module in program.modules(db) {
+        for import in &crag_hir::item_tree(db, module).imports {
+            let crag_hir::Import::C {
+                library,
+                functions,
+                threading,
+                ..
+            } = import
+            else {
+                continue;
+            };
+            let Some(files) = program.packages(db).native_files(module.path(db), library) else {
+                continue;
+            };
+            let threading = match threading {
+                crag_hir::Threading::Unsafe => crag_abi::threading::UNSAFE,
+                crag_hir::Threading::Safe => crag_abi::threading::SAFE,
+                crag_hir::Threading::Bound => crag_abi::threading::BOUND,
+            };
+            let opened =
+                crag_loader::native::library(&files, threading).map_err(|e| e.to_string())?;
+            for function in functions {
+                let name = function.id.name(db).text(db);
+                crag_loader::native::symbol(opened, &files, name).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The project's `fn main()`, which the manifest's `main` module declares.

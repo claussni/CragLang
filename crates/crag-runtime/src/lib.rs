@@ -56,6 +56,7 @@ mod deque;
 mod env;
 mod epoch;
 mod ext;
+mod ffi;
 pub mod fiber;
 pub mod heap;
 mod io;
@@ -219,6 +220,8 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::TrapCaughtText => unwind::rt_trap_caught_text as *const () as usize,
         RuntimeFn::TxDepth => stm::rt_tx_depth as *const () as usize,
         RuntimeFn::TxUnwind => stm::rt_tx_unwind as *const () as usize,
+        RuntimeFn::CCall => ffi::rt_c_call as *const () as usize,
+        RuntimeFn::CStrOf => ffi::rt_c_str_of as *const () as usize,
     }
 }
 

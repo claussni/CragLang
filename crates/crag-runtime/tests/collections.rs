@@ -185,6 +185,7 @@ fn collections_fn() -> LirFunction {
             },
         ],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 

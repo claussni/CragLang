@@ -175,6 +175,7 @@ fn script(steps: &[Step]) -> LirFunction {
             term: term.unwrap_or(Term::Return(vec![status])),
         }],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 

@@ -57,6 +57,9 @@ const NS_SLOT: u32 = 3;
 const NS_CELL: u32 = 4;
 /// Static data of the function, by its index.
 const NS_DATA: u32 = 5;
+/// A C function by its index in `natives`, times two, plus one for its
+/// library.
+const NS_NATIVE: u32 = 6;
 
 /// A machine the facade can generate code for.
 #[derive(Clone)]
@@ -147,6 +150,7 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
             module: String::new(),
             origins: Vec::new(),
             details: Vec::new(),
+            natives: lir.natives.clone(),
         });
     }
 
@@ -210,6 +214,7 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
         module: String::new(),
         origins: Vec::new(),
         details: Vec::new(),
+        natives: lir.natives.clone(),
     })
 }
 
@@ -305,6 +310,7 @@ pub fn compile_entry_stub(
         module: String::new(),
         origins: Vec::new(),
         details: Vec::new(),
+        natives: Vec::new(),
     })
 }
 
@@ -339,6 +345,7 @@ struct Imports {
     slot_values: HashMap<SlotKey, GlobalValue>,
     cell_values: HashMap<SlotKey, GlobalValue>,
     data_values: HashMap<u32, GlobalValue>,
+    native_values: HashMap<u32, GlobalValue>,
 }
 
 /// How a call reaches its callee.
@@ -430,6 +437,25 @@ impl Imports {
             tls: false,
         });
         values.insert(key, value);
+        value
+    }
+
+    /// The symbol of a C function or its library, declared once.
+    fn native(&mut self, b: &mut FunctionBuilder, index: u32) -> GlobalValue {
+        if let Some(&value) = self.native_values.get(&index) {
+            return value;
+        }
+        let name = b.func.declare_imported_user_function(UserExternalName {
+            namespace: NS_NATIVE,
+            index,
+        });
+        let value = b.create_global_value(GlobalValueData::Symbol {
+            name: ExternalName::user(name),
+            offset: Imm64::new(0),
+            colocated: false,
+            tls: false,
+        });
+        self.native_values.insert(index, value);
         value
     }
 
@@ -940,6 +966,16 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa, metered: bool) -> (Functio
                     let v = b.ins().symbol_value(I64, symbol);
                     b.def_var(vars[dst.0 as usize], v);
                 }
+                Inst::NativeAddr {
+                    dst,
+                    native,
+                    library,
+                } => {
+                    let index = native * 2 + u32::from(*library);
+                    let symbol = imports.native(&mut b, index);
+                    let addr = b.ins().symbol_value(I64, symbol);
+                    b.def_var(vars[dst.0 as usize], addr);
+                }
                 Inst::DataAddr { dst, data } => {
                     let symbol = imports.data(&mut b, *data);
                     let v = b.ins().symbol_value(I64, symbol);
@@ -1235,6 +1271,8 @@ fn run_backend(
                 data_relocs.push((relocs.len(), name.index));
                 RelocTarget::Local(0)
             }
+            NS_NATIVE if name.index.is_multiple_of(2) => RelocTarget::Native(name.index / 2),
+            NS_NATIVE => RelocTarget::NativeLibrary(name.index / 2),
             _ => return Err(unsupported()),
         };
         relocs.push(Reloc {

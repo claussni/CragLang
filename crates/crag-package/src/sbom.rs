@@ -26,8 +26,14 @@
 //! ```
 //!
 //! A package from a `path:` source is a folder under development, so it is
-//! recorded without a hash and not verified.
+//! recorded without a hash and not verified. The native libraries the
+//! application and its packages declare follow, each with its package:
+//!
+//! ```text
+//! native shop sqlite "libsqlite3.so.0", "libsqlite3.so"
+//! ```
 
+use crate::manifest::Manifest;
 use crate::resolve::{Origin, Resolution};
 use crate::version::Version;
 
@@ -39,16 +45,27 @@ pub struct Entry {
     pub path: Option<String>,
 }
 
+/// A `native` declaration of a manifest (§16.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeEntry {
+    pub package: String,
+    pub name: String,
+    pub files: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Sbom {
     /// By name.
     pub entries: Vec<Entry>,
+    /// By package, then name.
+    pub natives: Vec<NativeEntry>,
 }
 
 const HEADER: &str = "// The packages this build uses. `crag package sbom regenerate` writes it.\n";
 
 impl Sbom {
-    pub fn of(resolution: &Resolution) -> Sbom {
+    /// The SBOM of an application's manifest and what it resolves to.
+    pub fn of(app: &Manifest, resolution: &Resolution) -> Sbom {
         let mut entries: Vec<Entry> = resolution
             .packages
             .iter()
@@ -66,7 +83,23 @@ impl Sbom {
             })
             .collect();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
-        Sbom { entries }
+        let manifests = std::iter::once(app).chain(resolution.packages.iter().map(|p| &p.manifest));
+        let mut natives: Vec<NativeEntry> = manifests
+            .flat_map(|m| {
+                m.natives.iter().map(|(name, files)| NativeEntry {
+                    package: m.package.clone(),
+                    name: name.clone(),
+                    files: files.clone(),
+                })
+            })
+            .collect();
+        natives.sort_by(|a, b| (&a.package, &a.name).cmp(&(&b.package, &b.name)));
+        Sbom { entries, natives }
+    }
+
+    /// Whether it records nothing.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.natives.is_empty()
     }
 
     pub fn write(&self) -> String {
@@ -81,17 +114,31 @@ impl Sbom {
             }
             out.push('\n');
         }
+        for n in &self.natives {
+            let files: Vec<String> = n.files.iter().map(|f| format!("{f:?}")).collect();
+            out.push_str(&format!(
+                "native {} {} {}\n",
+                n.package,
+                n.name,
+                files.join(", ")
+            ));
+        }
         out
     }
 
     pub fn parse(text: &str) -> Result<Sbom, String> {
         let mut entries = Vec::new();
+        let mut natives = Vec::new();
         for (i, line) in text.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() || line.starts_with("//") {
                 continue;
             }
             let bad = || format!("sbom.crag:{}: cannot read `{line}`", i + 1);
+            if let Some(rest) = line.strip_prefix("native ") {
+                natives.push(native_entry(rest).ok_or_else(bad)?);
+                continue;
+            }
             let words: Vec<&str> = line.split_whitespace().collect();
             let ["package", name, version, rest @ ..] = &words[..] else {
                 return Err(bad());
@@ -114,7 +161,7 @@ impl Sbom {
             }
             entries.push(entry);
         }
-        Ok(Sbom { entries })
+        Ok(Sbom { entries, natives })
     }
 
     /// What changes from `self` to `new`, one line each: `+` for a package
@@ -138,6 +185,42 @@ impl Sbom {
                 lines.push(format!("+ {} {}", e.name, e.version));
             }
         }
+        let same = |a: &NativeEntry, b: &NativeEntry| a.package == b.package && a.name == b.name;
+        for old in &self.natives {
+            match new.natives.iter().find(|n| same(n, old)) {
+                None => lines.push(format!("- native {} {}", old.package, old.name)),
+                Some(n) if n.files != old.files => lines.push(format!(
+                    "~ native {} {}: other files",
+                    old.package, old.name
+                )),
+                Some(_) => {}
+            }
+        }
+        for n in &new.natives {
+            if !self.natives.iter().any(|o| same(o, n)) {
+                lines.push(format!("+ native {} {}", n.package, n.name));
+            }
+        }
         lines
     }
+}
+
+/// `<package> <name> "file", …`, after `native`.
+fn native_entry(rest: &str) -> Option<NativeEntry> {
+    let (package, rest) = rest.trim().split_once(' ')?;
+    let (name, files) = rest.trim().split_once(' ')?;
+    let files = files
+        .split(',')
+        .map(|f| {
+            f.trim()
+                .strip_prefix('"')
+                .and_then(|f| f.strip_suffix('"'))
+                .map(str::to_string)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(NativeEntry {
+        package: package.to_string(),
+        name: name.to_string(),
+        files,
+    })
 }

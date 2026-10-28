@@ -390,6 +390,26 @@ pub enum ErrorKind<'db> {
     },
     /// An overload more specific than a `final` function (§5.6.1), each
     /// as its signature and module; `imported` when an import brings one.
+    /// A parameter or result of a C function whose type C has no value
+    /// of (§16.1); `out` for what an out parameter points to.
+    NotCType {
+        ty: Ty<'db>,
+        out: bool,
+    },
+    /// Imports of one C library with different thread-safety markers
+    /// (§16.4): this one's, and the other's with its module.
+    ThreadingMismatch {
+        library: String,
+        here: &'static str,
+        there: &'static str,
+        module: String,
+    },
+    /// A `cLib` name that the package's manifest declares no `native`
+    /// library for (§14.5.1).
+    UndeclaredLibrary {
+        library: String,
+        package: String,
+    },
     OutranksFinal {
         other: String,
         final_fn: String,
@@ -630,6 +650,25 @@ impl<'db> ErrorKind<'db> {
             ErrorKind::MissingCombined { other, signature } => format!(
                 "this overload and an earlier `{}` take the same parameters with incomparable bounds; add `{signature}`",
                 item(other)
+            ),
+            ErrorKind::NotCType { ty, out: false } => format!(
+                "{} is no C type; a C function takes and gives sized integers, `Float`, `CF32`, `CPtr[T]` and `CStr`",
+                ty.display(db)
+            ),
+            ErrorKind::NotCType { ty, out: true } => format!(
+                "an out parameter cannot point to {}; it takes a sized integer, `Float`, `CF32` or `CPtr[T]`",
+                ty.display(db)
+            ),
+            ErrorKind::ThreadingMismatch {
+                library,
+                here,
+                there,
+                module,
+            } => format!(
+                "`cLib(\"{library}\")` is imported as {here} here but as {there} in `{module}`; every import of a library states the same marker"
+            ),
+            ErrorKind::UndeclaredLibrary { library, package } => format!(
+                "package {package} declares no native library `{library}`; add `native {library} \"<file>\"` to its manifest"
             ),
             ErrorKind::OutranksFinal {
                 other,

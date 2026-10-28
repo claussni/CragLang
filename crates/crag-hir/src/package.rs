@@ -35,6 +35,9 @@ pub struct PackageScope {
     /// development.
     pub imports: Vec<String>,
     pub dev_imports: Vec<String>,
+    /// The native libraries its manifest declares: the name `cLib` uses,
+    /// and the files to try, in order (§14.5.1).
+    pub natives: Vec<(String, Vec<String>)>,
 }
 
 /// The packages of a program, the application first.
@@ -55,6 +58,20 @@ impl Packages {
                     .is_some_and(|rest| rest.starts_with('.'))
             })
             .max_by_key(|p| p.name.len())
+    }
+
+    /// The files a module's `cLib(library)` stands for: those its
+    /// package's manifest declares, or the name itself outside any
+    /// package; none when the package declares no such library.
+    pub fn native_files(&self, module: &str, library: &str) -> Option<Vec<String>> {
+        match self.of(module).or(self.packages.first()) {
+            Some(package) => package
+                .natives
+                .iter()
+                .find(|(name, _)| name == library)
+                .map(|(_, files)| files.clone()),
+            None => Some(vec![library.to_string()]),
+        }
     }
 
     /// Why `importer` may not import the module `target`, if it may not.

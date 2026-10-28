@@ -46,8 +46,8 @@ pub use embed::{embed_content, embed_source, embed_sources};
 pub use hir::*;
 pub use input::{ModuleId, Parse, Program, Resource, SourceFile, parse};
 pub use items::{
-    Import, ImportItem, Item, ItemId, ItemKind, ItemTree, Name, SlotItem, Test, TestId, c_function,
-    form_slots, item_tree, slot_item, type_param_count,
+    CFunction, Import, ImportItem, Item, ItemId, ItemKind, ItemTree, Name, SlotItem, Test, TestId,
+    Threading, c_function, c_function_info, form_slots, item_tree, slot_item, type_param_count,
 };
 pub use literal::Literal;
 pub use lower::{BodySourceMap, LowerError};

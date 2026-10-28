@@ -47,6 +47,7 @@ fn add_fn() -> LirFunction {
             term: Term::Return(vec![r(2)]),
         }],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 
@@ -116,6 +117,7 @@ fn sum_squares_fn(self_id: u32) -> LirFunction {
             },
         ],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 
@@ -180,6 +182,7 @@ fn countdown_fn(self_id: u32) -> LirFunction {
             },
         ],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 
@@ -245,6 +248,7 @@ fn sum_loop_fn() -> LirFunction {
             },
         ],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 
@@ -287,6 +291,7 @@ fn wide_fn(live: u32, add: u32) -> LirFunction {
             term: Term::Return(vec![r(acc)]),
         }],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 

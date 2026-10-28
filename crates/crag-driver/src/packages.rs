@@ -214,7 +214,7 @@ fn change_manifest(root: &Path, text: &str, out: &mut dyn Write) -> u8 {
     if let Err(e) = fs::write(root.join("package.crag"), text) {
         return fail(out, format!("cannot write package.crag: {e}"));
     }
-    write_sbom(root, &old, &resolution, out)
+    write_sbom(root, &manifest, &old, &resolution, out)
 }
 
 fn read_sbom(root: &Path) -> Option<Sbom> {
@@ -222,10 +222,16 @@ fn read_sbom(root: &Path) -> Option<Sbom> {
 }
 
 /// Writes the SBOM of a resolution and prints how it changed.
-fn write_sbom(root: &Path, old: &Sbom, resolution: &Resolution, out: &mut dyn Write) -> u8 {
-    let new = Sbom::of(resolution);
+fn write_sbom(
+    root: &Path,
+    manifest: &Manifest,
+    old: &Sbom,
+    resolution: &Resolution,
+    out: &mut dyn Write,
+) -> u8 {
+    let new = Sbom::of(manifest, resolution);
     let file = root.join("sbom.crag");
-    let result = if new.entries.is_empty() && !file.exists() {
+    let result = if new.is_empty() && !file.exists() {
         Ok(())
     } else {
         fs::write(&file, new.write())
@@ -565,9 +571,9 @@ pub fn crag_sbom(root: &Path, args: &Args, out: &mut dyn Write) -> u8 {
     };
     let old = read_sbom(root).unwrap_or_default();
     if regenerate {
-        return write_sbom(root, &old, &resolution, out);
+        return write_sbom(root, &manifest, &old, &resolution, out);
     }
-    let diff = old.diff(&Sbom::of(&resolution));
+    let diff = old.diff(&Sbom::of(&manifest, &resolution));
     if args.switch("json") {
         let _ = writeln!(out, "{}", serde_json::json!(diff));
     } else if diff.is_empty() {

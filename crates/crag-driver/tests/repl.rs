@@ -376,3 +376,22 @@ fn crag_without_arguments_reads_inputs_from_its_input() {
     // Nothing runs after `:quit`.
     assert!(!stdout.contains("\n42\n"), "{stdout}");
 }
+
+#[test]
+fn outside_a_package_a_c_import_names_the_file() {
+    let mut r = repl();
+    assert_eq!(eval(&mut r, "import std.c"), "");
+    assert_eq!(
+        eval(
+            &mut r,
+            r#"import cLib("libm.so.6").{ cos(x: Float) -> Float, frexp(x: Float, exp: COut[CInt]) -> Float } is ThreadSafe"#
+        ),
+        ""
+    );
+    assert_eq!(eval(&mut r, "cos(0.0)"), "1.0\n");
+    assert_eq!(eval(&mut r, "frexp(8.0)"), "(exp: 4, result: 0.5)\n");
+    assert_eq!(eval(&mut r, r#"Str(!! CStr("text"))"#), "\"text\"\n");
+    assert_eq!(eval(&mut r, r#"CStr("a\0b")"#), "Unconvertible()\n");
+    assert_eq!(eval(&mut r, "Float(!! CF32(0.5))"), "0.5\n");
+    assert_eq!(eval(&mut r, "CF32(1.0e39)"), "Unconvertible()\n");
+}

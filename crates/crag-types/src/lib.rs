@@ -27,6 +27,7 @@
 
 extern crate crag_db as salsa;
 
+mod c;
 mod case;
 mod decision;
 mod def;
@@ -50,8 +51,8 @@ pub use case::{ListLen, Value};
 pub use decision::{Bindings, DecisionTree, Position, Step, decision_tree, decision_tree_with};
 pub use def::{
     FieldDef, HeaderKind, SigParam, Signature, TypeDef, TypeDefKind, TypeHeader, alias_target,
-    place_positional, prelude_item, signature, success_type, type_def, type_header, type_parent,
-    value_type,
+    c_out, c_signature, is_cstr, place_positional, prelude_item, signature, success_type, type_def,
+    type_header, type_parent, value_type,
 };
 pub use effect::{EffectSet, Restriction};
 pub use escape::{BindingsOnly, EscapeLevel, Escapes};
@@ -100,6 +101,7 @@ pub fn module_type_errors<'db>(
         .iter()
         .chain(recursion_errors(db, program, module))
         .chain(&derive::ban_errors(db, program, module))
+        .chain(&c::c_errors(db, program, module))
         .map(|(item, e)| (Owner::Item(*item), e.clone()))
         .collect();
     for owner in owners(db, module) {

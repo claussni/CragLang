@@ -138,9 +138,12 @@ fn the_item_tree_lists_declarations_with_their_signatures() {
             Import::C {
                 library,
                 functions,
+                threading,
                 decl,
+                ..
             } => format!(
-                "@{decl} C {library} {:?}",
+                "@{decl} C {library} {} {:?}",
+                threading.name(),
                 functions
                     .iter()
                     .map(|f| describe(&db, f))
@@ -154,7 +157,7 @@ fn the_item_tree_lists_declarations_with_their_signatures() {
             r#"@0 ["std", "io"] as None items None"#,
             r#"@1 ["std", "text", "split"] as Some("cut") items None"#,
             r#"@2 ["std", "coll"] as None items Some([("List", None), ("Map", Some("Dict"))])"#,
-            r#"@3 C "libm" ["Function sin#0 @3: sin ( x : Float ) -> Float", "Function cos#0 @3: cos ( x : Float ) -> Float"]"#,
+            r#"@3 C libm ThreadUnsafe ["Function sin#0 @3: sin ( x : Float ) -> Float", "Function cos#0 @3: cos ( x : Float ) -> Float"]"#,
         ]
     );
 

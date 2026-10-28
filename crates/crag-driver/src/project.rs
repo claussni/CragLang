@@ -52,6 +52,7 @@ const STD: &[(&str, &str)] = &[
     ("std.io", include_str!("../../../std/io.crag")),
     ("std.test", include_str!("../../../std/test.crag")),
     ("std.env", include_str!("../../../std/env.crag")),
+    ("std.c", include_str!("../../../std/c.crag")),
 ];
 
 /// A module's file, where diagnostics name it.
@@ -123,7 +124,7 @@ impl Project {
         let resolution = resolve(root, &manifest)?;
         let mut warnings = Vec::new();
         if check == Check::Sbom {
-            verify_sbom(root, &resolution)?;
+            verify_sbom(root, &manifest, &resolution)?;
         }
         for p in &resolution.packages {
             if let Some(reason) = &p.yanked {
@@ -156,12 +157,10 @@ impl Project {
         }
         let modules = project.files.iter().map(|f| f.module).collect();
         project.program.set_modules(&mut project.db).to(modules);
-        if !resolution.packages.is_empty() {
-            project
-                .program
-                .set_packages(&mut project.db)
-                .to(packages(&manifest, &resolution));
-        }
+        project
+            .program
+            .set_packages(&mut project.db)
+            .to(packages(&manifest, &resolution));
         project.package = manifest.package.clone();
         project.main = manifest.main.clone();
         project.root = Some(root.to_path_buf());
@@ -180,7 +179,7 @@ impl Project {
         let root = self.root.clone().ok_or("no project is loaded")?;
         let manifest = read_manifest(&root)?;
         let resolution = resolve(&root, &manifest)?;
-        verify_sbom(&root, &resolution)?;
+        verify_sbom(&root, &manifest, &resolution)?;
         let range = STD.len()..STD.len() + self.dependencies;
         let old: Vec<ModuleFile> = self.files[range.clone()].to_vec();
         let new = dependency_files(&mut self.db, &resolution, &old)?;
@@ -188,10 +187,7 @@ impl Project {
         self.files.splice(range, new);
         let modules = self.files.iter().map(|f| f.module).collect();
         self.program.set_modules(&mut self.db).to(modules);
-        let packages = match resolution.packages.is_empty() {
-            true => Packages::default(),
-            false => packages(&manifest, &resolution),
-        };
+        let packages = packages(&manifest, &resolution);
         if *self.program.packages(&self.db) != packages {
             self.program.set_packages(&mut self.db).to(packages);
         }
@@ -494,13 +490,13 @@ pub fn resolve(root: &Path, manifest: &Manifest) -> Result<Resolution, String> {
 }
 
 /// Checks the resolved packages against the committed `sbom.crag`.
-fn verify_sbom(root: &Path, resolution: &Resolution) -> Result<(), String> {
-    let new = Sbom::of(resolution);
+fn verify_sbom(root: &Path, manifest: &Manifest, resolution: &Resolution) -> Result<(), String> {
+    let new = Sbom::of(manifest, resolution);
     let file = root.join("sbom.crag");
     let old = match fs::read_to_string(&file) {
         Ok(text) => Sbom::parse(&text)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if new.entries.is_empty() {
+            if new.is_empty() {
                 return Ok(());
             }
             return Err(
@@ -538,6 +534,7 @@ fn packages(manifest: &Manifest, resolution: &Resolution) -> Packages {
             .filter(|d| d.dev)
             .map(|d| d.name.clone())
             .collect(),
+        natives: m.natives.clone(),
     };
     let mut packages = vec![scope(manifest)];
     packages.extend(resolution.packages.iter().map(|p| PackageScope {

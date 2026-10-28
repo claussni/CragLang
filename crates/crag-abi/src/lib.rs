@@ -943,7 +943,78 @@ pub enum RuntimeFn {
     /// Abandons the transactions begun inside `depth`, as a trap leaves
     /// them for a handler outside (Specification §8.3.1).
     TxUnwind = 110,
+
+    /// `rt_c_call(ctx, library, func, desc, buf) -> (result, errno)`.
+    ///
+    /// Calls the C function at `func` of the [`NativeLibrary`] with the C
+    /// calling convention, on the system stack, as the library's thread
+    /// safety allows (Specification §16.4). `desc` is a [`c_kind`]
+    /// descriptor: the number of parameters, the result's kind, then each
+    /// parameter's. `buf` holds a word per parameter: a value, a `CStr`'s
+    /// box, or, for an out parameter, room for what the function writes
+    /// there, which the call leaves extended to a word. The result comes
+    /// back extended to a word, a `CF32` as its bits; `errno` as read right
+    /// after the call.
+    CCall = 111,
+
+    /// `rt_c_str_of(ctx, address) -> (w0, w1)`.
+    ///
+    /// A copy of the NUL-terminated bytes at the address, the NUL
+    /// included, as `Bytes`; a null address gives only a NUL.
+    CStrOf = 112,
 }
+
+/// The kinds of C values of a [`RuntimeFn::CCall`] descriptor.
+pub mod c_kind {
+    pub const I8: u8 = 0;
+    pub const I16: u8 = 1;
+    pub const I32: u8 = 2;
+    pub const I64: u8 = 3;
+    pub const U8: u8 = 4;
+    pub const U16: u8 = 5;
+    pub const U32: u8 = 6;
+    pub const U64: u8 = 7;
+    pub const F64: u8 = 8;
+    pub const F32: u8 = 9;
+    /// A pointer, which a `CStr` result is too.
+    pub const PTR: u8 = 10;
+    /// A `CStr` argument: the box of its bytes, passed as their address.
+    pub const CSTR: u8 = 11;
+    /// No value: a `()` result.
+    pub const VOID: u8 = 12;
+    /// Set on an out parameter's kind, the kind of what it points to.
+    pub const OUT: u8 = 0x80;
+}
+
+/// How calls of a C library run (Specification §16.4), as a
+/// [`NativeSymbol`] carries it.
+pub mod threading {
+    pub const UNSAFE: u8 = 0;
+    pub const SAFE: u8 = 1;
+    pub const BOUND: u8 = 2;
+}
+
+/// A C function a code object calls: the files of its library, tried in
+/// order, its symbol, and the library's thread safety.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NativeSymbol {
+    pub files: Vec<String>,
+    pub symbol: String,
+    pub threading: u8,
+}
+
+/// A native library as the loader opened it, which lives as long as the
+/// process: its handle, its thread safety, the lock its calls take when it
+/// is not thread-safe, and the thread of its own when it is bound to one.
+pub struct NativeLibrary {
+    pub handle: usize,
+    pub threading: u8,
+    pub lock: std::sync::Mutex<()>,
+    pub thread: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<NativeJob>>>,
+}
+
+/// A call a library's own thread makes.
+pub type NativeJob = Box<dyn FnOnce() + Send>;
 
 /// The kinds of numbers of `BytesRead` and `BytesWrite`.
 pub mod bytes_kind {
@@ -1109,7 +1180,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 111] = [
+    pub const ALL: [RuntimeFn; 113] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -1221,6 +1292,8 @@ impl RuntimeFn {
         RuntimeFn::TrapCaughtText,
         RuntimeFn::TxDepth,
         RuntimeFn::TxUnwind,
+        RuntimeFn::CCall,
+        RuntimeFn::CStrOf,
     ];
 
     /// The symbol the loader looks up.
@@ -1337,6 +1410,8 @@ impl RuntimeFn {
             RuntimeFn::TrapCaughtText => "rt_trap_caught_text",
             RuntimeFn::TxDepth => "rt_tx_depth",
             RuntimeFn::TxUnwind => "rt_tx_unwind",
+            RuntimeFn::CCall => "rt_c_call",
+            RuntimeFn::CStrOf => "rt_c_str_of",
         }
     }
 
@@ -1761,6 +1836,9 @@ pub struct CodeObject {
     /// the error `!!` met: the upper half of a trap's position word, from
     /// one, indexes it.
     pub details: Vec<String>,
+    /// The C functions the code calls, which `RelocTarget::Native` and
+    /// `RelocTarget::NativeLibrary` index.
+    pub natives: Vec<NativeSymbol>,
 }
 
 /// The line and column, from one, of a byte offset in a module's source.
@@ -1852,6 +1930,11 @@ pub enum RelocTarget {
     /// The cell of a module-level value, by the slot key of the code that
     /// computes it.
     Cell(SlotKey),
+    /// The address of a C function, by its index in the code object's
+    /// `natives`.
+    Native(u32),
+    /// The [`NativeLibrary`] of the C function at that index.
+    NativeLibrary(u32),
 }
 
 /// How a value of a type is printed (Implementation Plan §11.6.5): what

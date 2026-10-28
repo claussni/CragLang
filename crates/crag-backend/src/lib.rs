@@ -186,7 +186,10 @@ fn renumber(object: &mut CodeObject, map: impl Fn(u32) -> Option<u32>) -> Option
         match &mut reloc.target {
             RelocTarget::Function(FuncId(id)) => *id = map(*id)?,
             RelocTarget::Slot(key) | RelocTarget::Cell(key) => key.func.0 = map(key.func.0)?,
-            RelocTarget::Runtime(_) | RelocTarget::Local(_) => {}
+            RelocTarget::Runtime(_)
+            | RelocTarget::Local(_)
+            | RelocTarget::Native(_)
+            | RelocTarget::NativeLibrary(_) => {}
         }
     }
     Some(())

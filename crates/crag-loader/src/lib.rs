@@ -58,9 +58,11 @@ use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crag_abi::{
-    CELL_EMPTY, CELL_FULL, CELL_SIZE, CodeObject, FuncId, RelocKind, RelocTarget, RuntimeFn,
-    SlotKey,
+    CELL_EMPTY, CELL_FULL, CELL_SIZE, CodeObject, FuncId, NativeLibrary, RelocKind, RelocTarget,
+    RuntimeFn, SlotKey,
 };
+
+pub mod native;
 
 /// The address of a loaded code object's entry point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -286,6 +288,10 @@ pub enum LoadError {
     Malformed(&'static str),
     /// `unload` was given an address that is not a loaded entry point.
     NotLoaded(CodeAddr),
+    /// None of a native library's files loads (Specification §16.1).
+    NativeLibrary { files: String, why: String },
+    /// A native library has no such function.
+    NativeSymbol { files: String, symbol: String },
 }
 
 impl std::fmt::Display for LoadError {
@@ -312,6 +318,15 @@ impl std::fmt::Display for LoadError {
             }
             LoadError::Malformed(why) => write!(f, "malformed code object: {why}"),
             LoadError::NotLoaded(addr) => write!(f, "no code is loaded at {:#x}", addr.0),
+            LoadError::NativeLibrary { files, why } if why.is_empty() => {
+                write!(f, "the native library {files} cannot be loaded")
+            }
+            LoadError::NativeLibrary { files, why } => {
+                write!(f, "the native library {files} cannot be loaded: {why}")
+            }
+            LoadError::NativeSymbol { files, symbol } => {
+                write!(f, "the native library {files} has no function `{symbol}`")
+            }
         }
     }
 }
@@ -652,6 +667,19 @@ fn place(
                     RelocTarget::Runtime(func) => symbols
                         .runtime(func)
                         .ok_or(LoadError::UnresolvedRuntime(func))?,
+                    RelocTarget::Native(index) | RelocTarget::NativeLibrary(index) => {
+                        let native = obj
+                            .natives
+                            .get(index as usize)
+                            .ok_or(LoadError::Malformed("C function outside the natives"))?;
+                        let library = native::library(&native.files, native.threading)?;
+                        match reloc.target {
+                            RelocTarget::Native(_) => {
+                                native::symbol(library, &native.files, &native.symbol)?
+                            }
+                            _ => library as *const NativeLibrary as usize,
+                        }
+                    }
                     RelocTarget::Local(offset) => {
                         if offset as usize >= obj.code.len() {
                             return Err(LoadError::Malformed("local target outside the code"));

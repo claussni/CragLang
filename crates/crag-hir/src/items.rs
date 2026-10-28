@@ -148,11 +148,42 @@ pub enum Import<'db> {
     /// `import cLib("…").{ … }` (§16.4). Its functions are items of the
     /// module.
     C {
-        /// The library's string literal as written.
+        /// The library's name, the string literal's text.
         library: String,
         functions: Vec<Item<'db>>,
+        /// Which of the functions capture `errno` (§16.3).
+        errno: Vec<bool>,
+        /// The library's thread-safety marker (§16.4).
+        threading: Threading,
         decl: u32,
     },
+}
+
+/// How calls of a C library may run (§16.4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, crag_db::SalsaValue)]
+pub enum Threading {
+    #[default]
+    Unsafe,
+    Safe,
+    Bound,
+}
+
+impl Threading {
+    pub fn name(self) -> &'static str {
+        match self {
+            Threading::Unsafe => "ThreadUnsafe",
+            Threading::Safe => "ThreadSafe",
+            Threading::Bound => "ThreadBound",
+        }
+    }
+}
+
+/// What a C function's import says about it beyond its signature.
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct CFunction {
+    pub library: String,
+    pub threading: Threading,
+    pub errno: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -193,6 +224,44 @@ pub fn c_function<'db>(db: &'db dyn Db, item: ItemId<'db>) -> Option<(u32, usize
                 .map(|index| (*decl, index)),
             Import::Module { .. } => None,
         })
+}
+
+/// The library, thread safety and `errno` capture of a C function.
+pub fn c_function_info<'db>(db: &'db dyn Db, item: ItemId<'db>) -> Option<CFunction> {
+    item_tree(db, *item.module(db))
+        .imports
+        .iter()
+        .find_map(|import| match import {
+            Import::C {
+                library,
+                functions,
+                errno,
+                threading,
+                ..
+            } => functions
+                .iter()
+                .position(|f| f.id == item)
+                .map(|index| CFunction {
+                    library: library.clone(),
+                    threading: *threading,
+                    errno: errno[index],
+                }),
+            Import::Module { .. } => None,
+        })
+}
+
+/// The names of the markers of an `is` clause among a node's children.
+fn marker_names(node: &SyntaxNode) -> Vec<String> {
+    node.children()
+        .filter(|n| n.kind() == S::IsClause)
+        .flat_map(|clause| {
+            clause
+                .descendants()
+                .filter(|n| n.kind() == S::Marker)
+                .collect::<Vec<_>>()
+        })
+        .map(|m| m.text().trim().to_string())
+        .collect()
 }
 
 /// The number of type parameters a function or type signature declares.
@@ -240,17 +309,32 @@ impl<'db> Collector<'db> {
                     .children()
                     .find(|n| matches!(n.kind(), S::Literal | S::StrExpr))
                     .map_or_else(String::new, |n| n.text());
+                let library = library.trim().trim_matches('"').to_string();
+                let mut errno = Vec::new();
                 let functions = node
                     .children()
                     .filter(|n| n.kind() == S::CSig)
                     .filter_map(|sig| {
                         let signature = sig.green().without_trivia();
-                        self.item(ItemKind::Function, &sig, false, decl, signature)
+                        let item = self.item(ItemKind::Function, &sig, false, decl, signature)?;
+                        errno.push(marker_names(&sig).iter().any(|m| m == "Errno"));
+                        Some(item)
                     })
                     .collect();
+                let threading = marker_names(node)
+                    .iter()
+                    .find_map(|m| match m.as_str() {
+                        "ThreadSafe" => Some(Threading::Safe),
+                        "ThreadBound" => Some(Threading::Bound),
+                        "ThreadUnsafe" => Some(Threading::Unsafe),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
                 self.tree.imports.push(Import::C {
                     library,
                     functions,
+                    errno,
+                    threading,
                     decl,
                 });
             }

@@ -105,6 +105,7 @@ fn deep_fn() -> LirFunction {
             },
         ],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 

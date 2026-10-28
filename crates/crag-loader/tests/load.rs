@@ -49,6 +49,7 @@ fn object(code: Vec<u8>, relocs: Vec<Reloc>) -> CodeObject {
         module: String::new(),
         origins: vec![],
         details: vec![],
+        natives: vec![],
     }
 }
 

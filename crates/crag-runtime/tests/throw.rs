@@ -131,6 +131,7 @@ fn outer() -> LirFunction {
             },
         ],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 
@@ -211,6 +212,7 @@ fn deep() -> LirFunction {
             },
         ],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 

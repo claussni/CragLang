@@ -201,6 +201,7 @@ fn add_fn() -> LirFunction {
             term: Term::Return(vec![r(2)]),
         }],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 
@@ -266,6 +267,7 @@ fn sum_loop_fn() -> LirFunction {
             },
         ],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 
@@ -327,6 +329,7 @@ fn countdown_fn(self_id: u32) -> LirFunction {
             },
         ],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 
@@ -372,6 +375,7 @@ fn wide_fn(live: u32, callee: u32) -> LirFunction {
             term: Term::Return(vec![r(acc)]),
         }],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 
@@ -551,6 +555,7 @@ fn tail_call_with_more_arguments_counts_toward_the_footprint() {
             term: Term::Return(vec![r(12)]),
         }],
         data: Vec::new(),
+        natives: Vec::new(),
     };
     // caller(a) = callee(a, a, ..., a) in tail position.
     let caller = LirFunction {
@@ -566,6 +571,7 @@ fn tail_call_with_more_arguments_counts_toward_the_footprint() {
             },
         }],
         data: Vec::new(),
+        natives: Vec::new(),
     };
     let plain = compile(&add_fn(), &s).unwrap();
     let caller = compile(&caller, &s).unwrap();
@@ -623,6 +629,7 @@ fn tracked_fn(add: u32) -> LirFunction {
             term: Term::Return(vec![r(2)]),
         }],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 

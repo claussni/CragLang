@@ -72,6 +72,7 @@ pub fn type_header<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) ->
             let owner = match b {
                 Builtin::RuntimeStream | Builtin::RuntimeHub => "std.stream",
                 Builtin::RuntimeSocket => "std.io",
+                Builtin::CF32 | Builtin::CPtr | Builtin::COut => "std.c",
                 _ => PRELUDE,
             };
             module == owner && !decl.record && decl.alias.is_none()
@@ -313,10 +314,79 @@ pub fn signature<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> S
         .result
         .filter(|&r| *body.type_ref(r) != TypeRef::Infer)
         .map(|r| lower.lower(r));
+    if let Some(c) = crag_hir::c_function_info(db, item) {
+        return c_call_signature(db, params, result, c.errno);
+    }
     Signature {
         type_params: own_type_params(db, item) + lower.implicit.len(),
         params,
         result,
+    }
+}
+
+/// A C function's parameter types as its import writes them, out
+/// parameters included, and its C result type.
+pub fn c_signature<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    item: ItemId<'db>,
+) -> (Vec<Ty<'db>>, Ty<'db>) {
+    let body = hir_body(db, program, Owner::Item(item));
+    let mut lower = TypeLowerer::new(db, program, body, Some(item));
+    let params = body.params.iter().map(|p| lower.lower(p.ty)).collect();
+    let result = body.result.map_or_else(|| Ty::unit(db), |r| lower.lower(r));
+    (params, result)
+}
+
+/// A C function as calls see it (§16.3): without its out parameters, which
+/// come back with the C result as fields of a record, as does `errno`.
+fn c_call_signature<'db>(
+    db: &'db dyn Db,
+    params: Vec<SigParam<'db>>,
+    result: Option<Ty<'db>>,
+    errno: bool,
+) -> Signature<'db> {
+    let result = result.unwrap_or_else(|| Ty::unit(db));
+    let (outs, params): (Vec<_>, Vec<_>) =
+        params.into_iter().partition(|p| c_out(db, p.ty).is_some());
+    let result = if outs.is_empty() && !errno {
+        result
+    } else {
+        let mut fields = vec![(Name::new(db, "result".to_string()), result)];
+        fields.extend(
+            outs.iter()
+                .filter_map(|p| Some((p.name?, c_out(db, p.ty)?))),
+        );
+        if errno {
+            fields.push((
+                Name::new(db, "errno".to_string()),
+                Ty::builtin(db, Builtin::Int32),
+            ));
+        }
+        Ty::record(db, fields, false)
+    };
+    Signature {
+        type_params: 0,
+        params,
+        result: Some(result),
+    }
+}
+
+/// Whether a type is `std.c`'s `CStr`.
+pub fn is_cstr<'db>(db: &'db dyn Db, ty: Ty<'db>) -> bool {
+    match ty.kind(db) {
+        TyKind::Named(item, _) => {
+            item.name(db).text(db) == "CStr" && item.module(db).path(db) == "std.c"
+        }
+        _ => false,
+    }
+}
+
+/// What a `COut[T]` parameter gives back: `T`.
+pub fn c_out<'db>(db: &'db dyn Db, ty: Ty<'db>) -> Option<Ty<'db>> {
+    match ty.as_builtin(db) {
+        Some((Builtin::COut, [inner])) => Some(*inner),
+        _ => None,
     }
 }
 

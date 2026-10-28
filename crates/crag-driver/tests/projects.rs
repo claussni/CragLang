@@ -531,10 +531,12 @@ embed unknown: Unknown from "x.txt"
 
 fn main() {}
 "#;
+    let manifest = format!("{MANIFEST}native m \"libm.so.6\"\n");
     let root = project(
         "on-clauses",
         &[
-            ("package.crag", MANIFEST),
+            ("package.crag", &manifest),
+            ("sbom.crag", "native demo m \"libm.so.6\"\n"),
             ("app.crag", app),
             ("x.txt", "x"),
         ],
@@ -722,4 +724,163 @@ fn main() {
         text(output.stdout),
         "[\"a\", \"b c\"]\n\"hello\"\nEmpty\n\"hello\"\nTrue\n"
     );
+}
+
+const SBOM_NATIVES: &str =
+    "// The packages this build uses. `crag package sbom regenerate` writes it.
+native demo c \"libc.so.6\"
+native demo m \"libnosuchlib.so.0\", \"libm.so.6\"
+";
+
+#[test]
+fn c_functions_are_called_with_the_c_calling_convention() {
+    let manifest = format!(
+        "{MANIFEST}native c \"libc.so.6\"\nnative m \"libnosuchlib.so.0\", \"libm.so.6\"\n"
+    );
+    let app = r#"import std.c
+
+import cLib("m").{ cos(x: CF64) -> CF64, ldexp(x: Float, e: CInt) -> Float, cosf(x: CF32) -> CF32 } is ThreadSafe
+import cLib("c").{
+  labs(n: CLong) -> CLong,
+  abs(n: CInt) -> CInt,
+  strlen(s: CStr) -> CSize,
+  strtol(s: CStr, end: COut[CPtr[CChar]], base: CInt) -> CLong,
+  close(fd: CInt) -> CInt is Errno,
+  getenv(name: CStr) -> CStr,
+}
+
+fn main() -> ExitCode {
+  if cos(0.0) != 1.0 { return ExitCode(code: 2) }
+  if ldexp(1.5, 3) != 12.0 { return ExitCode(code: 3) }
+  if Float(cosf(!! CF32(0.0))) != 1.0 { return ExitCode(code: 4) }
+  if labs(-12345678901) != 12345678901 or abs(-7) != 7 { return ExitCode(code: 5) }
+  // Inline and in a buffer.
+  if strlen(!! CStr("short")) != 5 { return ExitCode(code: 6) }
+  if strlen(!! CStr("a string longer than fifteen bytes")) != 34 { return ExitCode(code: 7) }
+  let parsed = strtol(!! CStr("42 rest"), 10)
+  if parsed.result != 42 or isNull(parsed.end) { return ExitCode(code: 8) }
+  let closed = close(-1)
+  // EBADF
+  if closed.result != -1 or closed.errno != 9 { return ExitCode(code: 9) }
+  if CStr("a\0b") is CStr { return ExitCode(code: 10) }
+  case Str(getenv(!! CStr("CRAG_NO_SUCH_VARIABLE"))) {
+    s: Str -> { if s != "" { return ExitCode(code: 11) } }
+    e: NotUtf8 -> { return ExitCode(code: 12) }
+  }
+  ExitCode(code: 0)
+}
+"#;
+    let root = project(
+        "ffi",
+        &[
+            ("package.crag", &manifest),
+            ("sbom.crag", SBOM_NATIVES),
+            ("app.crag", app),
+        ],
+    );
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 0, "{}", text(out));
+}
+
+#[test]
+fn a_thread_bound_library_runs_on_a_thread_of_its_own() {
+    let manifest = format!("{MANIFEST}native c \"libc.so.6\"\nnative m \"libm.so.6\"\n");
+    let app = r#"import std.c
+
+import cLib("c").{ gettid() -> CInt } is ThreadBound
+import cLib("m").{ cos(x: Float) -> Float } is ThreadUnsafe
+
+fn main() -> ExitCode {
+  let first = gettid()
+  if gettid() != first or cos(0.0) != 1.0 { return ExitCode(code: 2) }
+  ExitCode(code: 0)
+}
+"#;
+    let sbom = "native demo c \"libc.so.6\"\nnative demo m \"libm.so.6\"\n";
+    let root = project(
+        "ffi-bound",
+        &[
+            ("package.crag", &manifest),
+            ("sbom.crag", sbom),
+            ("app.crag", app),
+        ],
+    );
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 0, "{}", text(out));
+}
+
+#[test]
+fn every_native_library_and_symbol_is_loaded_before_main() {
+    let manifest = format!("{MANIFEST}native m \"libm.so.6\"\nnative gone \"libnosuchlib.so.0\"\n");
+    let sbom = "native demo gone \"libnosuchlib.so.0\"\nnative demo m \"libm.so.6\"\n";
+    // Neither is called.
+    let missing_symbol = r#"import cLib("m").{ noSuchFunction() -> Int } is ThreadSafe
+
+fn main() {}
+"#;
+    let root = project(
+        "ffi-symbol",
+        &[
+            ("package.crag", &manifest),
+            ("sbom.crag", sbom),
+            ("app.crag", missing_symbol),
+        ],
+    );
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 1);
+    assert_eq!(
+        text(out),
+        "error: the native library libm.so.6 has no function `noSuchFunction`\n"
+    );
+    let missing_library = r#"import cLib("gone").{ f() -> Int }
+
+fn main() {}
+"#;
+    fs::write(root.join("app.crag"), missing_library).unwrap();
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 1);
+    let out = text(out);
+    assert!(
+        out.starts_with("error: the native library libnosuchlib.so.0 cannot be loaded"),
+        "{out}"
+    );
+}
+
+#[test]
+fn c_imports_are_checked() {
+    let manifest = format!("{MANIFEST}native c \"libc.so.6\"\n");
+    let app = r#"import std.c
+
+import cLib("c").{
+  bad(xs: List[Int], s: COut[CStr]) -> Str,
+  fine(n: CInt, out: COut[CF32]) -> (),
+} is ThreadSafe
+import cLib("c").{ other() -> CInt }
+import cLib("undeclared").{ g() -> CInt }
+
+fn main() {}
+"#;
+    let sbom = "native demo c \"libc.so.6\"\n";
+    let root = project(
+        "ffi-checks",
+        &[
+            ("package.crag", &manifest),
+            ("sbom.crag", sbom),
+            ("app.crag", app),
+        ],
+    );
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 1);
+    let out = text(out);
+    for message in [
+        "error: List[Int] is no C type; a C function takes and gives sized integers, `Float`, `CF32`, `CPtr[T]` and `CStr`\n --> app.crag:4:11",
+        "error: an out parameter cannot point to CStr; it takes a sized integer, `Float`, `CF32` or `CPtr[T]`\n --> app.crag:4:25",
+        "error: Str is no C type",
+        "error: `cLib(\"c\")` is imported as ThreadSafe here but as ThreadUnsafe in `demo.app`",
+        "error: `cLib(\"c\")` is imported as ThreadUnsafe here but as ThreadSafe in `demo.app`",
+        "error: package demo declares no native library `undeclared`; add `native undeclared \"<file>\"` to its manifest",
+    ] {
+        assert!(out.contains(message), "{message}\nnot in\n{out}");
+    }
+    assert!(!out.contains("fine"), "{out}");
 }

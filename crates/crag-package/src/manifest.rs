@@ -65,6 +65,9 @@ pub struct Manifest {
     pub exports: Vec<String>,
     pub imports: Vec<Dependency>,
     pub main: Option<String>,
+    /// The native libraries `cLib` names stand for: each name with the
+    /// files to try, in order (§14.5.1).
+    pub natives: Vec<(String, Vec<String>)>,
 }
 
 /// A mistake in a manifest, at a 1-based line.
@@ -176,8 +179,15 @@ impl Manifest {
                     }
                     Err(e) => fail(e),
                 },
+                "native" => match native(text, rest) {
+                    Ok((name, _)) if manifest.natives.iter().any(|(n, _)| *n == name) => {
+                        fail(format!("the native library `{name}` is declared twice"));
+                    }
+                    Ok(native) => manifest.natives.push(native),
+                    Err(e) => fail(e),
+                },
                 _ => fail(format!(
-                    "a manifest declares only package, runtime, name, summary, description, export, import and main; not `{word}`"
+                    "a manifest declares only package, runtime, name, summary, description, export, import, main and native; not `{word}`"
                 )),
             }
         }
@@ -224,6 +234,23 @@ fn string(text: &str, tokens: &[Token]) -> Result<String, String> {
             crag_hir::literal::Piece::Hole(_) => String::new(),
         })
         .collect())
+}
+
+/// `native L "file", …`, from the tokens after `native`.
+fn native(text: &str, tokens: &[Token]) -> Result<(String, Vec<String>), String> {
+    let usage = || "write `native <name> \"<file>\", …`".to_string();
+    let [name, files @ ..] = tokens else {
+        return Err(usage());
+    };
+    if name.kind != TokenKind::Ident || files.is_empty() {
+        return Err(usage());
+    }
+    let files = files
+        .split(|t| t.kind == TokenKind::Comma)
+        .map(|file| string(text, file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("{}: {e}", usage()))?;
+    Ok((name.text(text).to_string(), files))
 }
 
 /// The paths of `a.b`, or of a selection `a.{b, c}`.
@@ -421,6 +448,31 @@ import dev 1.0 from "path:dev"
         let lines: Vec<usize> = errors.iter().map(|e| e.line).collect();
         assert_eq!(lines, [2, 3, 6, 7, 5], "{errors:?}");
         assert!(Manifest::parse("runtime 1.0\n").is_err());
+    }
+
+    #[test]
+    fn native_libraries_name_the_files_to_try() {
+        let m = Manifest::parse(
+            "package demo 0.1\nnative sqlite \"libsqlite3.so.0\", \"libsqlite3.so\"\nnative m \"libm.so.6\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            m.natives,
+            [
+                (
+                    "sqlite".to_string(),
+                    vec!["libsqlite3.so.0".to_string(), "libsqlite3.so".to_string()]
+                ),
+                ("m".to_string(), vec!["libm.so.6".to_string()]),
+            ]
+        );
+        let errors = Manifest::parse(
+            "package demo 0.1\nnative m\nnative \"libm.so.6\"\nnative m \"a\" \"b\"\nnative c \"libc.so.6\"\nnative c \"libc.so\"\n",
+        )
+        .unwrap_err();
+        let lines: Vec<usize> = errors.iter().map(|e| e.line).collect();
+        assert_eq!(lines, [2, 3, 4, 6], "{errors:?}");
+        assert!(errors[3].message.contains("declared twice"), "{errors:?}");
     }
 
     #[test]

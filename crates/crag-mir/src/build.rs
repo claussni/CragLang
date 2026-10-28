@@ -82,7 +82,12 @@ pub fn build<'db>(
     let types = body_types(db, program, owner);
     let mut b = MirBuilder::new(db, program, instance, &lowered.body, types);
     let ok = lowered.errors.is_empty() && types.errors.is_empty();
+    let c = match owner {
+        Owner::Item(item) => crag_hir::c_function(db, item).map(|_| item),
+        Owner::Test(_) => None,
+    };
     let start = match entry {
+        Entry::Body if c.is_some() => c.and_then(|item| b.c_entry(item)),
         Entry::Body => b.body_entry(lowered.body.root?),
         Entry::Closure(frame) => b.closure_entry(frame),
         Entry::Function(expr) => b.function_entry(expr),
@@ -442,6 +447,66 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             }));
         }
         Some(Box::new(move |b| b.eval(root, Dest::Return)))
+    }
+
+    /// The code of a C function (§16.3): the call, then the record of its
+    /// result, its out parameters and `errno`, if it gives one.
+    fn c_entry(&mut self, item: ItemId<'db>) -> Option<Start<'a, 'db>> {
+        let db = self.db;
+        let sig = signature(db, self.program, item);
+        let (c_params, c_result) = crag_types::c_signature(db, self.program, item);
+        let args: Vec<Local> = sig.params.iter().map(|p| self.temp(p.ty)).collect();
+        self.params = args.len();
+        self.result = sig.result?;
+        Some(Box::new(move |b| {
+            let cstr = crag_types::is_cstr(db, c_result);
+            let raw_ty = match cstr {
+                true => Ty::builtin(db, Builtin::UInt64),
+                false => c_result,
+            };
+            let ops = args.into_iter().map(Operand::Local).collect();
+            let mut value = b.assign(raw_ty, Rvalue::Intrinsic(Intrinsic::CCall(item), ops));
+            if cstr {
+                let bytes_ty = Ty::builtin(db, Builtin::Bytes);
+                let bytes = b.assign(bytes_ty, Rvalue::Intrinsic(Intrinsic::CStrOf, vec![value]));
+                let record = Rvalue::Record {
+                    ty: c_result,
+                    fields: vec![(Name::new(db, "bytes".to_string()), bytes)],
+                    dispose: None,
+                };
+                value = b.assign(c_result, record);
+            }
+            let result = b.result;
+            if result != c_result {
+                let mut fields = vec![(Name::new(db, "result".to_string()), value)];
+                let body = b.body;
+                for (index, (param, &ty)) in body.params.iter().zip(&c_params).enumerate() {
+                    let (Some(out), Some(name)) =
+                        (crag_types::c_out(db, ty), body.binding(param.binding).name)
+                    else {
+                        continue;
+                    };
+                    let op = b.assign(
+                        out,
+                        Rvalue::Intrinsic(Intrinsic::COut(index as u32), vec![]),
+                    );
+                    fields.push((name, op));
+                }
+                if crag_hir::c_function_info(db, item).is_some_and(|c| c.errno) {
+                    let int32 = Ty::builtin(db, Builtin::Int32);
+                    let op = b.assign(int32, Rvalue::Intrinsic(Intrinsic::CErrno, vec![]));
+                    fields.push((Name::new(db, "errno".to_string()), op));
+                }
+                fields.sort_by(|(x, _), (y, _)| x.text(db).cmp(y.text(db)));
+                let record = Rvalue::Record {
+                    ty: result,
+                    fields,
+                    dispose: None,
+                };
+                value = b.assign(result, record);
+            }
+            b.terminate(Terminator::Return(value));
+        }))
     }
 
     /// The value conditions of a type, against the value it is called
@@ -1863,6 +1928,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 ("std.env", "envVarBytes") => Intrinsic::IoReadBytes,
                 ("std.env", "envVars") => Intrinsic::EnvVars,
                 ("std.env", "envPlatform") => Intrinsic::EnvPlatform,
+                ("std.c", "cf32Bits" | "cf32Of" | "ptrWord") => Intrinsic::Word,
                 ("std.io", "ioPrint") => Intrinsic::IoPrint,
                 ("std.io", "ioFault") => Intrinsic::IoFault,
                 ("std.io", "ioReadFile") => Intrinsic::IoReadFile,
@@ -1963,10 +2029,6 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     /// cannot be called yet, which is recorded at the call.
     fn callable(&mut self, expr: ExprId, instance: &Instance<'db>) -> Option<InstanceKey<'db>> {
         let db = self.db;
-        if crag_hir::c_function(db, instance.function).is_some() {
-            self.unsupported(expr, "calls of C functions");
-            return None;
-        }
         if signature(db, self.program, instance.function).type_params != instance.args.len() {
             self.trap(TrapKind::Error, Some(expr));
             return None;

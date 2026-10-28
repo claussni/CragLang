@@ -27,14 +27,14 @@
 use std::io::{self, Read, Write};
 
 use crag_abi::{
-    CallHandler, CodeObject, CountedField, ElementLayout, FuncId, HandlerKind, Reloc, RelocKind,
-    RelocTarget, RuntimeFn, Shapes, SlotKey, StackCheck, StackMap, TrapKind, TrapOrigin,
+    CallHandler, CodeObject, CountedField, ElementLayout, FuncId, HandlerKind, NativeSymbol, Reloc,
+    RelocKind, RelocTarget, RuntimeFn, Shapes, SlotKey, StackCheck, StackMap, TrapKind, TrapOrigin,
     TypeDescriptor,
 };
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -565,6 +565,14 @@ impl Writer {
                     w.u8(4);
                     w.slot_key(&key);
                 }
+                RelocTarget::Native(index) => {
+                    w.u8(5);
+                    w.u32(index);
+                }
+                RelocTarget::NativeLibrary(index) => {
+                    w.u8(6);
+                    w.u32(index);
+                }
             }
             w.u64(r.addend as u64);
         });
@@ -597,6 +605,11 @@ impl Writer {
             w.u32(o.column);
         });
         self.seq(&o.details, |w, d| w.text(d));
+        self.seq(&o.natives, |w, n| {
+            w.seq(&n.files, |w, f| w.text(f));
+            w.text(&n.symbol);
+            w.u8(n.threading);
+        });
     }
 
     fn text(&mut self, text: &str) {
@@ -749,6 +762,8 @@ impl Reader<'_> {
                     2 => RelocTarget::Local(r.u32()?),
                     3 => RelocTarget::Slot(r.slot_key()?),
                     4 => RelocTarget::Cell(r.slot_key()?),
+                    5 => RelocTarget::Native(r.u32()?),
+                    6 => RelocTarget::NativeLibrary(r.u32()?),
                     tag => return Err(invalid(format!("a relocation target with the tag {tag}"))),
                 };
                 Ok(Reloc {
@@ -794,6 +809,13 @@ impl Reader<'_> {
                 })
             })?,
             details: self.seq(Reader::text)?,
+            natives: self.seq(|r| {
+                Ok(NativeSymbol {
+                    files: r.seq(Reader::text)?,
+                    symbol: r.text()?,
+                    threading: r.u8()?,
+                })
+            })?,
         })
     }
 
@@ -1100,6 +1122,11 @@ mod tests {
                 column: 3,
             }],
             details: vec!["NotFound".into()],
+            natives: vec![NativeSymbol {
+                files: vec!["libm.so.6".into()],
+                symbol: "cos".into(),
+                threading: 1,
+            }],
             stack_maps: vec![StackMap {
                 return_offset: 1,
                 slots: vec![0, 8],
@@ -1199,7 +1226,7 @@ mod tests {
         assert!(read_message(&mut frame.as_slice()).is_ok());
         assert_eq!(broken(at, 200), io::ErrorKind::InvalidData);
         // A relocation target after the cell's tag.
-        assert_eq!(broken(at - 1, 5), io::ErrorKind::InvalidData);
+        assert_eq!(broken(at - 1, 7), io::ErrorKind::InvalidData);
         // A shape that names a shape the table lacks, as an element or as
         // a record's.
         for shapes in [

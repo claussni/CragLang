@@ -48,6 +48,7 @@ fn calling(func: RuntimeFn, params: u32, results: u32) -> LirFunction {
             term: Term::Return(dsts),
         }],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 
@@ -67,6 +68,7 @@ fn sleeper() -> LirFunction {
             term: Term::Return(vec![r(1)]),
         }],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 
@@ -128,6 +130,7 @@ fn count() -> LirFunction {
             },
         ],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 

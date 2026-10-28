@@ -40,6 +40,7 @@ fn function(id: u32, params: u32, relocs: Vec<Reloc>) -> ShippedFunction {
             module: String::new(),
             origins: Vec::new(),
             details: Vec::new(),
+            natives: Vec::new(),
         },
     }
 }

@@ -20,7 +20,7 @@
 //! in SSA form: any block may assign any register, and the facade builds SSA.
 //! Every register holds one machine word.
 
-use crag_abi::{FuncId, HandlerKind, RuntimeFn, SlotKey, TrapKind};
+use crag_abi::{FuncId, HandlerKind, NativeSymbol, RuntimeFn, SlotKey, TrapKind};
 
 /// A virtual register. Registers `0..params` hold the parameters on entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -230,6 +230,13 @@ pub enum Inst {
         dst: VReg,
         data: u32,
     },
+    /// `dst` becomes the address of the C function `natives[native]`, or,
+    /// with `library`, of its `crag_abi::NativeLibrary`.
+    NativeAddr {
+        dst: VReg,
+        native: u32,
+        library: bool,
+    },
     /// Reads the word at `addr + offset`.
     Load {
         dst: VReg,
@@ -342,6 +349,8 @@ pub struct LirFunction {
     /// Bytes the code reads, such as the buffers of long string literals:
     /// placed after the code, in the code object.
     pub data: Vec<Vec<u8>>,
+    /// The C functions the code calls.
+    pub natives: Vec<NativeSymbol>,
 }
 
 impl LirFunction {
@@ -380,6 +389,12 @@ impl LirFunction {
                     Inst::Const { dst, .. }
                     | Inst::Context { dst }
                     | Inst::CellAddr { dst, .. } => reg(dst)?,
+                    Inst::NativeAddr { dst, native, .. } => {
+                        reg(dst)?;
+                        if *native as usize >= self.natives.len() {
+                            return Err(format!("C function {native} out of range"));
+                        }
+                    }
                     Inst::DataAddr { dst, data } => {
                         reg(dst)?;
                         if *data as usize >= self.data.len() {

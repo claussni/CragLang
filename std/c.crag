@@ -1,0 +1,65 @@
+// This file is part of Crag.
+//
+// Copyright (C) 2026 Ralf Claussnitzer
+//
+// Crag is free software: you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the Free Software
+// Foundation, either version 3 of the License, or (at your option) any later
+// version.
+//
+// Crag is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+// A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// Crag. If not, see <https://www.gnu.org/licenses/>.
+
+// The C-level types of the foreign function interface (Specification
+// §16.1). The integer types are aliases of the sized integers; `CF32`,
+// `CPtr` and `COut` are the compiler's, and a `CStr` holds its bytes and
+// the NUL after them.
+
+pub type CChar = Int8
+pub type CUChar = UInt8
+pub type CShort = Int16
+pub type CUShort = UInt16
+pub type CInt = Int32
+pub type CUInt = UInt32
+pub type CLong = Int
+pub type CULong = UInt64
+pub type CSize = UInt64
+pub type CF64 = Float
+
+pub type CF32
+pub type CPtr[T]
+pub type COut[T]
+
+pub opaque type CStr(bytes: Bytes)
+
+// The greatest finite 32-bit float.
+let cf32Max = 3.4028234663852886e38
+
+// A float that is not finite has no `Float`; it gives 0.0.
+pub fn convert(x: CF32) -> Float {
+  bytes([0, 0, 0, 0]).writeUInt32(0, cf32Bits(x), Little).readFloat32(0, Little).orElse(0.0)
+}
+
+pub fn convert(f: Float) -> CF32 | Unconvertible {
+  if f > cf32Max or f < -cf32Max { return Unconvertible }
+  let raw = bytes([0, 0, 0, 0]).writeFloat32(0, f, Little)
+  cf32Of(raw.readUInt32(0, Little).orElse(0))
+}
+
+pub fn isNull[T](p: CPtr[T]) -> Bool { ptrWord(p) == 0 }
+
+// A copy of the string with a NUL after it, unless it holds one.
+pub fn convert(s: Str) -> CStr | Unconvertible {
+  if s.contains("\0") { return Unconvertible }
+  CStr(bytes: s.bytes() + bytes([0]))
+}
+
+pub fn convert(c: CStr) -> Str | NotUtf8 { c.bytes.slice(0..c.bytes.count() - 2).text() }
+
+fn cf32Bits(x: CF32) -> UInt32
+fn cf32Of(bits: UInt32) -> CF32
+fn ptrWord[T](p: CPtr[T]) -> UInt64

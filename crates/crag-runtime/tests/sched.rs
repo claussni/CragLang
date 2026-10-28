@@ -101,6 +101,7 @@ fn sum_fn(yields: bool) -> LirFunction {
             },
         ],
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 

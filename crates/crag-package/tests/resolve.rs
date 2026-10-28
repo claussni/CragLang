@@ -91,7 +91,7 @@ fn each_major_settles_on_the_highest_version_required() {
     );
     assert!(r.get("acme.maps").unwrap().dir.ends_with("acme/maps/1.0"));
     // The SBOM records each with its hash, and reads back.
-    let sbom = Sbom::of(&r);
+    let sbom = Sbom::of(&manifest, &r);
     assert_eq!(Sbom::parse(&sbom.write()).unwrap(), sbom);
     assert!(sbom.write().contains(&format!(
         "package geo 1.3 hash \"{}\"",
@@ -99,8 +99,29 @@ fn each_major_settles_on_the_highest_version_required() {
     )));
     // Asking for units 2.1 moves only units.
     let manifest = app("import geo 1.1\nimport acme.maps 1.0\nimport units 2.1\n");
-    let newer = Sbom::of(&resolve(&manifest, &root, std::slice::from_ref(&team)).unwrap());
+    let newer = Sbom::of(
+        &manifest,
+        &resolve(&manifest, &root, std::slice::from_ref(&team)).unwrap(),
+    );
     assert_eq!(sbom.diff(&newer), ["~ units 2.0 -> 2.1"]);
+    // Native libraries are recorded with their package.
+    let manifest =
+        app("import geo 1.1\nimport acme.maps 1.0\nnative m \"libm.so.6\", \"libm.so\"\n");
+    let r = resolve(&manifest, &root, std::slice::from_ref(&team)).unwrap();
+    let native = Sbom::of(&manifest, &r);
+    assert!(
+        native
+            .write()
+            .ends_with("native app m \"libm.so.6\", \"libm.so\"\n"),
+        "{}",
+        native.write()
+    );
+    assert_eq!(Sbom::parse(&native.write()).unwrap(), native);
+    assert_eq!(sbom.diff(&native), ["+ native app m"]);
+    let manifest = app("import geo 1.1\nimport acme.maps 1.0\nnative m \"libm.so.6\"\n");
+    let other = Sbom::of(&manifest, &r);
+    assert_eq!(native.diff(&other), ["~ native app m: other files"]);
+    assert_eq!(other.diff(&sbom), ["- native app m"]);
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -179,7 +200,7 @@ fn path_sources_settings_and_yanked_versions() {
     assert_eq!(billing_r.layout, crag_package::content::Layout::Project);
     assert_eq!(r.get("geo").unwrap().yanked.as_deref(), Some("wrong areas"));
     assert!(
-        Sbom::of(&r)
+        Sbom::of(&manifest, &r)
             .write()
             .contains("package billing 1.2 path \"../billing\"\n")
     );

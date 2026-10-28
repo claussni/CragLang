@@ -103,6 +103,7 @@ fn lir(params: u32, returns: u32, vregs: u32, blocks: Vec<Block>) -> LirFunction
         tracked: vec![],
         blocks,
         data: Vec::new(),
+        natives: Vec::new(),
     }
 }
 
