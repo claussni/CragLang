@@ -266,44 +266,33 @@ fn dominates<'db>(db: &'db dyn Db, program: Program, a: &Ranked<'db>, b: &Ranked
     strictly
 }
 
-/// Whether `a` is at least as specific as `b` on every parameter both
-/// take an argument for.
-fn at_least_as_specific<'db>(
-    db: &'db dyn Db,
-    program: Program,
-    a: &Ranked<'db>,
-    b: &Ranked<'db>,
-) -> bool {
-    a.params
-        .iter()
-        .zip(&b.params)
-        .all(|(pa, pb)| match (pa, pb) {
-            (Some(pa), Some(pb)) => matches!(
-                compare_param(db, program, (a.function, *pa), (b.function, *pb)),
-                Specificity::More | Specificity::Equal
-            ),
-            _ => true,
-        })
-}
-
 /// The candidates no other candidate is more specific than, by index; the
 /// modules of the candidates if they come from several, which are never
-/// ranked. A candidate of the prelude that another module's candidate is
-/// at least as specific as drops out first, so a type's own `equals` or
-/// `show` is chosen over the prelude's generic one, and a module's own
-/// `sum` over the prelude's (Specification §19.3, §19.11).
+/// ranked. One kind of prelude candidate is the exception: a function a
+/// prelude form requires, such as the generic `equals` or `show` that
+/// every type fits by its structure, drops out first when another
+/// module's candidate is more specific, so a type's own is chosen
+/// (Specification §19.11).
 pub fn most_specific<'db>(
     db: &'db dyn Db,
     program: Program,
     candidates: &[Ranked<'db>],
 ) -> Result<Vec<usize>, Vec<ModuleId>> {
     let prelude = |c: &Ranked<'db>| c.module.path(db) == crag_hir::PRELUDE;
+    let derived = |c: &Ranked<'db>| {
+        let name = c.function.name(db);
+        prelude(c)
+            && item_tree(db, c.module)
+                .slots
+                .iter()
+                .any(|slot| slot.id.name(db) == name)
+    };
     let left: Vec<usize> = (0..candidates.len())
         .filter(|&i| {
-            !prelude(&candidates[i])
-                || !candidates.iter().any(|other| {
-                    !prelude(other) && at_least_as_specific(db, program, other, &candidates[i])
-                })
+            !derived(&candidates[i])
+                || !candidates
+                    .iter()
+                    .any(|other| !prelude(other) && dominates(db, program, other, &candidates[i]))
         })
         .collect();
     let mut modules: Vec<ModuleId> = Vec::new();

@@ -193,9 +193,16 @@ fn the_prelude_is_imported_everywhere_else() {
             ("app", "fn main() {}"),
             // Naming the prelude again is no collision.
             ("again", "import std.core\nimport std.core.print as say"),
+            // A declaration with a prelude function's signature clashes,
+            // unless the prelude's is renamed (§19.3).
+            ("clash", "fn print(s: Str) {}"),
+            (
+                "renamed",
+                "import std.core.print as say\nfn print(s: Str) {}",
+            ),
         ],
     );
-    let [core, app, again] = modules[..] else {
+    let [core, app, again, clash, renamed] = modules[..] else {
         unreachable!()
     };
     assert_eq!(
@@ -219,6 +226,19 @@ fn the_prelude_is_imported_everywhere_else() {
         ]
     );
     assert_eq!(errors(&db, program, again), Vec::<String>::new());
+    assert_eq!(
+        errors(&db, program, clash),
+        ["print collides: clash.print#0 (declared), std.core.print#0 (prelude)"]
+    );
+    assert_eq!(
+        names(&db, program, renamed),
+        [
+            "Int = type std.core.Int#0",
+            "print = fn renamed.print#0",
+            "say = fn std.core.print#0",
+        ]
+    );
+    assert_eq!(errors(&db, program, renamed), Vec::<String>::new());
     assert!(import_graph(&db, program).cycles.is_empty());
 }
 

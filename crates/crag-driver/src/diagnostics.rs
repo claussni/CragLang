@@ -219,11 +219,21 @@ fn name_error(db: &dyn Db, error: &NameError) -> String {
                 .iter()
                 .map(|(item, _)| format!("`{}`", item.module(db).path(db)))
                 .collect();
-            format!(
+            let mut message = format!(
                 "`{}` comes from more than one place: {}",
                 name.text(db),
                 from.join(", ")
-            )
+            );
+            // The prelude's names are reserved, but a file may rename one
+            // (Specification §19.3).
+            if items.iter().any(|(_, origin)| *origin == Origin::Prelude) {
+                message += &format!(
+                    "; use another name, or rename the prelude's with \
+                     `import std.core.{} as <name>`",
+                    name.text(db)
+                );
+            }
+            message
         }
     }
 }

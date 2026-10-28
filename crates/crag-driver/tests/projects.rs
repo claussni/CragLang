@@ -43,7 +43,7 @@ pub fn area(p: Point) -> Int {
   p.x * p.y
 }
 
-pub fn sum(xs: List[Int]) -> Int {
+pub fn addUp(xs: List[Int]) -> Int {
   var total = 0
   for x in xs {
     total = total + x
@@ -58,7 +58,7 @@ test "area multiplies" {
 
 const APP: &str = r#"import demo.geo.shape
 
-let offset = sum([1, 2, 3])
+let offset = addUp([1, 2, 3])
 
 fn main() -> ExitCode {
   let p = Point(x: 2, y: 3)
@@ -66,7 +66,7 @@ fn main() -> ExitCode {
 }
 
 test "sums" {
-  if sum([1, 2]) != 3 { ??? }
+  if addUp([1, 2]) != 3 { ??? }
 }
 
 test "reads past the end" {

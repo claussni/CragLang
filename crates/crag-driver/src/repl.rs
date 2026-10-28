@@ -62,9 +62,14 @@ Enter a definition to add it to the session, or an expression to run it.
   :continue [n]         let stopped task n go on
   :step, :next, :out [n]  go on to the next statement: anywhere, in this
                         function or its caller, or in its caller
-  :add <package> [version], :remove <package>, :upgrade <package> [version: V]
-  :outdated, :deps, :sbom diff | regenerate, :package, :publish <registry>
+  :package add <package> [version], :package remove <package>,
+  :package upgrade <package> [version: V], :package outdated, :package deps,
+  :package sbom diff | regenerate, :package pack, :package publish <registry>
                         manage the project's packages, as the shell does
+  :registry new <name> <folder> | add <name> <folder> | list | remove <name>
+                        manage the registries of the settings
+  :cd [directory]       go to another directory and the project in it, with
+                        a fresh session; alone, show where the session runs
   :help                 show this
   :quit                 leave; so does Ctrl-D
 An input continues on the next line until it is complete; an empty line
@@ -352,6 +357,7 @@ impl Repl {
             "help" => Ok(EvalOutput::Text(HELP.into())),
             "rebind" => self.rebind(rest.trim()),
             "start" => self.start_app(),
+            "cd" => self.change_dir(rest.trim()),
             "reload" => self.reload(),
             "status" => self.status(),
             "break" => self.breakpoint(rest.trim()),
@@ -367,9 +373,21 @@ impl Repl {
             "step" | "s" => self.go_on(rest.trim(), Resume::Into),
             "next" | "n" => self.go_on(rest.trim(), Resume::Over),
             "out" => self.go_on(rest.trim(), Resume::Out),
-            "add" | "remove" | "upgrade" | "outdated" | "deps" | "sbom" | "publish" | "package" => {
-                self.package_command(name, rest)
+            "package" => {
+                let (verb, rest) = rest
+                    .trim_start()
+                    .split_once(char::is_whitespace)
+                    .unwrap_or((rest.trim(), ""));
+                if verb == "new" || !crate::packages::is_package_command(verb) {
+                    return Err(
+                        "error: :package takes add, remove, upgrade, outdated, deps, sbom, \
+                         pack or publish\n"
+                            .into(),
+                    );
+                }
+                self.package_command(verb, rest)
             }
+            "registry" => self.package_command("registry", rest),
             "stop" => {
                 self.scratch
                     .stop_app()
@@ -387,11 +405,12 @@ impl Repl {
     /// arguments. After one that changed the packages, the session uses the
     /// new ones at once; the app gets them at its next reload.
     fn package_command(&mut self, name: &str, rest: &str) -> Result<EvalOutput, String> {
-        let root = self
-            .project
-            .root
-            .clone()
-            .ok_or("error: package commands work in a project\n")?;
+        let root = match (name, &self.project.root) {
+            // Relative folders of the registries are the session's.
+            ("registry", _) => std::env::current_dir().map_err(|e| format!("error: {e}\n"))?,
+            (_, Some(root)) => root.clone(),
+            (_, None) => return Err("error: package commands work in a project\n".into()),
+        };
         let (spec, run) = crate::packages::command(name).expect("a package command");
         let args = crate::commands::Args::repl(rest, spec).map_err(|e| format!("error: {e}\n"))?;
         let mut out = Vec::new();
@@ -533,6 +552,56 @@ impl Repl {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    /// `:cd [directory]`. Alone it tells the directory the session runs
+    /// in. With a directory, relative to that one, the session moves
+    /// there: it opens the project in it, or none if it has no
+    /// `package.crag`, and starts afresh, with a new scratch image and
+    /// without its definitions; a running app stops. The images and
+    /// relative paths in programs then start from that directory.
+    pub fn change_dir(&mut self, dir: &str) -> Result<EvalOutput, String> {
+        let here = std::env::current_dir().map_err(|e| format!("error: {e}\n"))?;
+        if dir.is_empty() {
+            return Ok(EvalOutput::Text(format!("{}\n", here.display())));
+        }
+        let there = here
+            .join(dir)
+            .canonicalize()
+            .map_err(|e| format!("error: cannot go to {dir}: {e}\n"))?;
+        if !there.is_dir() {
+            return Err(format!("error: {} is not a directory\n", there.display()));
+        }
+        let project = match there.join("package.crag").exists() {
+            true => Project::load(&there).map_err(|e| format!("error: {e}\n"))?,
+            false => Project::bare(),
+        };
+        std::env::set_current_dir(&there).map_err(|e| format!("error: {e}\n"))?;
+        let command = self.scratch.session.command().clone();
+        let scratch = match Scratch::start(command) {
+            Ok(scratch) => scratch,
+            Err(e) => {
+                let _ = std::env::set_current_dir(&here);
+                return Err(format!("error: cannot start the scratch image: {e}\n"));
+            }
+        };
+        let mut text = format!("in {}", there.display());
+        text += &match project.root {
+            Some(_) => format!(", project {}\n", project.package),
+            None => ", outside a project\n".to_string(),
+        };
+        for warning in &project.warnings {
+            text += &format!("warning: {warning}\n");
+        }
+        let errors = check(&project).len();
+        if errors > 0 {
+            text += &format!(
+                "the project has {errors} error{}\n",
+                if errors == 1 { "" } else { "s" }
+            );
+        }
+        *self = Repl::new(project, scratch);
+        Ok(EvalOutput::Text(text))
     }
 
     fn start_app(&mut self) -> Result<EvalOutput, String> {

@@ -26,7 +26,9 @@ server instead, so it needs no network. The tests use the assertions of
 
 ## In the editor and the REPL
 
-`crag` without arguments opens the editor on the project. Ctrl+E
+`crag` without arguments opens the editor on the project. Started
+somewhere else, such as the repository's root, it sees only `std`; `:cd
+examples/hello` in the REPL goes to the example and opens it. Ctrl+E
 evaluates the line under the cursor in the scratch image, F1 tells what a
 name is, and F12 goes to its definition. In the REPL (Alt+3), import the
 module to use its functions:

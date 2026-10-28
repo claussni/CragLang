@@ -517,3 +517,38 @@ fn a_breakpoint_takes_the_ui_to_the_stopped_line() {
     assert!(shows(&s, "│ Edit "), "{}", s.join("\n"));
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn cd_opens_the_project_in_another_directory() {
+    let root = project("cd-from");
+    let other = std::env::temp_dir().join(format!("crag-ui-cd-to-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&other);
+    fs::create_dir_all(&other).unwrap();
+    fs::write(
+        other.join("package.crag"),
+        "package other 0.1\nruntime 0.0\nmain other.start\n",
+    )
+    .unwrap();
+    fs::write(
+        other.join("start.crag"),
+        "pub fn twice(n: Int) -> Int { n * 2 }\n",
+    )
+    .unwrap();
+    let mut ui = ui(&root);
+    assert_eq!(ui.buffer().name, "app.crag");
+    // An edit of the project left behind is saved.
+    ui.buffer_mut().set_text("// edited\n");
+    ui.run_repl(&format!(":cd {}", other.display()));
+    assert_eq!(
+        fs::read_to_string(root.join("app.crag")).unwrap(),
+        "// edited\n"
+    );
+    assert_eq!(ui.buffer().name, "start.crag");
+    assert_eq!(ui.project_files(), ["start.crag"]);
+    ui.run_repl("import other.start");
+    ui.run_repl("twice(21)");
+    let shown = screen(&mut ui, 100, 30);
+    assert!(shows(&shown, "42"), "{}", shown.join("\n"));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&other);
+}

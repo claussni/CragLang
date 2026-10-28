@@ -139,3 +139,28 @@ fn the_repl_shows_what_programs_print_in_order() {
     let app = shown.find("Hello, world!\n").expect(&shown);
     assert!(ada < three && three < app, "{shown}");
 }
+
+#[test]
+fn the_repl_goes_to_an_example_with_cd() {
+    watchdog();
+    // Outside a project only `std` is there; `:cd` opens the example, and
+    // the scratch image reads files from there.
+    let input = "import hello.main\n:cd hello\nimport hello.main\ngreeting(\"Ada\")\n\
+                 import std.io\nreadText(\"package.crag\")\n:cd\n:cd ../nowhere\n:cd ..\n";
+    let out = crag("", &[], input);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let shown = stdout(&out);
+    let hello = example("hello").canonicalize().unwrap();
+    let examples = example("").canonicalize().unwrap();
+    for expected in [
+        "error: ".to_string(),
+        format!("in {}, project hello\n", hello.display()),
+        "\"Hello, Ada!\"\n".to_string(),
+        "\"package hello 0.1\\nruntime 0.0\\n\\nmain hello.main\\n\"\n".to_string(),
+        format!("{}\n", hello.display()),
+        "error: cannot go to ../nowhere: ".to_string(),
+        format!("in {}, outside a project\n", examples.display()),
+    ] {
+        assert!(shown.contains(&expected), "{expected:?} in {shown}");
+    }
+}

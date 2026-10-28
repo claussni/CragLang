@@ -113,24 +113,28 @@ fn a_project_adds_uses_and_upgrades_a_package() {
     );
     publish(&team, "geo", "2.0", geo, &[("shape.crag", SHAPE)]);
 
-    let out = crag(&home, &root, &["new", "app"]);
+    let out = crag(&home, &root, &["package", "new", "app"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     let app = root.join("app");
     assert!(app.join("main.crag").is_file() && app.join("test/main_test.crag").is_file());
     // Bare, a command that changes the project only explains itself.
-    let out = crag(&home, &app, &["add"]);
+    let out = crag(&home, &app, &["package", "add"]);
     assert_eq!(out.status.code(), Some(2));
-    assert!(text(&out).contains("usage: crag add <package> [version]"));
+    assert!(text(&out).contains("usage: crag package add <package> [version]"));
+    // The commands of an area come after its name.
+    let out = crag(&home, &app, &["add", "geo"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(text(&out).contains("crag package add"), "{}", text(&out));
 
     // Without a version, the newest; the SBOM follows.
-    let out = crag(&home, &app, &["add", "geo"]);
+    let out = crag(&home, &app, &["package", "add", "geo"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(
         text(&out).contains("sbom.crag: + geo 2.0") && text(&out).contains("added geo 2.0"),
         "{}",
         text(&out)
     );
-    let out = crag(&home, &app, &["upgrade", "geo", "--version=1.0"]);
+    let out = crag(&home, &app, &["package", "upgrade", "geo", "--version=1.0"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(
         text(&out).contains("sbom.crag: ~ geo 2.0 -> 1.0"),
@@ -171,7 +175,7 @@ fn a_project_adds_uses_and_upgrades_a_package() {
     .unwrap();
 
     // Code still imports geo.
-    let out = crag(&home, &app, &["remove", "geo"]);
+    let out = crag(&home, &app, &["package", "remove", "geo"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
         text(&out).contains("geo is still imported by main.crag"),
@@ -179,19 +183,19 @@ fn a_project_adds_uses_and_upgrades_a_package() {
         text(&out)
     );
 
-    let out = crag(&home, &app, &["outdated"]);
+    let out = crag(&home, &app, &["package", "outdated"]);
     assert!(
         text(&out).contains("geo 1.0: 1.1 available, new major 2.0"),
         "{}",
         text(&out)
     );
-    let out = crag(&home, &app, &["upgrade", "geo"]);
+    let out = crag(&home, &app, &["package", "upgrade", "geo"]);
     assert!(
         text(&out).contains("upgraded geo 1.0 -> 1.1"),
         "{}",
         text(&out)
     );
-    let out = crag(&home, &app, &["deps"]);
+    let out = crag(&home, &app, &["package", "deps"]);
     assert_eq!(text(&out), "app\n  geo 1.1\n");
 
     // A manifest edited by hand no longer matches the SBOM, until it is
@@ -209,9 +213,9 @@ fn a_project_adds_uses_and_upgrades_a_package() {
         "{}",
         text(&out)
     );
-    let out = crag(&home, &app, &["sbom", "diff"]);
+    let out = crag(&home, &app, &["package", "sbom", "diff"]);
     assert_eq!(text(&out), "~ geo 1.1 -> 1.0\n");
-    let out = crag(&home, &app, &["sbom", "regenerate"]);
+    let out = crag(&home, &app, &["package", "sbom", "regenerate"]);
     assert_eq!(text(&out), "sbom.crag: ~ geo 1.1 -> 1.0\n");
     let out = crag(&home, &app, &["run"]);
     assert_eq!(out.status.code(), Some(6), "{}", text(&out));
@@ -251,7 +255,7 @@ fn development_imports_are_for_tests_and_yanked_versions_are_refused() {
         &[("shape.crag", SHAPE)],
     );
     fs::write(team.dir.join("geo/1.0/yanked"), "wrong areas").unwrap();
-    crag(&home, &root, &["new", "app"]);
+    crag(&home, &root, &["package", "new", "app"]);
     let app = root.join("app");
     let manifest = fs::read_to_string(app.join("package.crag")).unwrap();
     fs::write(
@@ -259,7 +263,7 @@ fn development_imports_are_for_tests_and_yanked_versions_are_refused() {
         format!("{manifest}import dev testkit 1.0\n"),
     )
     .unwrap();
-    let out = crag(&home, &app, &["sbom", "regenerate"]);
+    let out = crag(&home, &app, &["package", "sbom", "regenerate"]);
     assert_eq!(text(&out), "sbom.crag: + testkit 1.0\n");
     fs::write(
         app.join("test/main_test.crag"),
@@ -281,7 +285,7 @@ fn development_imports_are_for_tests_and_yanked_versions_are_refused() {
         text(&out)
     );
     // A yanked version is not taken anew.
-    let out = crag(&home, &app, &["add", "geo", "1.0"]);
+    let out = crag(&home, &app, &["package", "add", "geo", "1.0"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
         text(&out).contains("geo 1.0 was yanked (wrong areas); choose another version"),
@@ -302,8 +306,8 @@ fn new_projects_build_run_and_test() {
     let root = temp("new");
     let (home, _) = home(&root);
     for (name, args) in [
-        ("app", &["new", "app"][..]),
-        ("lib", &["new", "lib", "--lib"][..]),
+        ("app", &["package", "new", "app"][..]),
+        ("lib", &["package", "new", "lib", "--lib"][..]),
     ] {
         let out = crag(&home, &root, args);
         assert_eq!(out.status.code(), Some(0), "{}", text(&out));
@@ -314,7 +318,7 @@ fn new_projects_build_run_and_test() {
     }
     let out = crag(&home, &root.join("app"), &["run"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
-    let out = crag(&home, &root, &["new", "app"]);
+    let out = crag(&home, &root, &["package", "new", "app"]);
     assert_eq!(out.status.code(), Some(1));
     let _ = fs::remove_dir_all(&root);
 }
@@ -324,7 +328,7 @@ fn a_library_is_checked_published_and_used() {
     watchdog();
     let root = temp("publish");
     let (home, team) = home(&root);
-    crag(&home, &root, &["new", "geo", "--lib"]);
+    crag(&home, &root, &["package", "new", "geo", "--lib"]);
     let geo = root.join("geo");
     // An embed source travels with the package, into res/.
     fs::create_dir_all(geo.join("data")).unwrap();
@@ -334,15 +338,15 @@ fn a_library_is_checked_published_and_used() {
         "pub fn greeting() -> Str { \"Hello\" }\n\nembed unit: Str from \"data/unit.txt\"\n\npub fn unitName() -> Str { unit }\n\npub fn area(w: Int, h: Int) -> Int { w * h }\n",
     )
     .unwrap();
-    let out = crag(&home, &geo, &["publish"]);
+    let out = crag(&home, &geo, &["package", "publish"]);
     assert_eq!(out.status.code(), Some(2));
-    let out = crag(&home, &geo, &["publish", "elsewhere"]);
+    let out = crag(&home, &geo, &["package", "publish", "elsewhere"]);
     assert!(
         text(&out).contains("no registry is named `elsewhere`; the settings name team"),
         "{}",
         text(&out)
     );
-    let out = crag(&home, &geo, &["publish", "team"]);
+    let out = crag(&home, &geo, &["package", "publish", "team"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(
         text(&out).contains("published geo 0.1 to team"),
@@ -370,9 +374,9 @@ fn a_library_is_checked_published_and_used() {
     );
 
     // An application uses it, embed and all.
-    crag(&home, &root, &["new", "app"]);
+    crag(&home, &root, &["package", "new", "app"]);
     let app = root.join("app");
-    let out = crag(&home, &app, &["add", "geo"]);
+    let out = crag(&home, &app, &["package", "add", "geo"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     fs::write(
         app.join("main.crag"),
@@ -394,7 +398,7 @@ fn a_library_is_checked_published_and_used() {
         "pub fn greeting() -> Str { \"Hello\" }\n\nembed unit: Str from \"data/unit.txt\"\n\npub fn unitName() -> Str { unit }\n",
     )
     .unwrap();
-    let out = crag(&home, &geo, &["publish", "team"]);
+    let out = crag(&home, &geo, &["package", "publish", "team"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
         text(&out).contains("from 0.1, the API changed so that it needs a new major version:\n  removed or changed in geo.greeting: pub fn area(w: Int, h: Int) -> Int"),
@@ -412,7 +416,7 @@ fn a_library_is_checked_published_and_used() {
         "pub fn greeting() -> Str { ??? }\n",
     )
     .unwrap();
-    let out = crag(&home, &geo, &["publish", "team"]);
+    let out = crag(&home, &geo, &["package", "publish", "team"]);
     assert!(
         text(&out).contains("greeting.crag:1: a type hole `???` is not published"),
         "{}",
@@ -428,19 +432,19 @@ fn a_library_is_checked_published_and_used() {
         "test \"fails\" {\n  let xs = [1]\n  let y = xs[3]\n}\n",
     )
     .unwrap();
-    let out = crag(&home, &geo, &["publish", "team"]);
+    let out = crag(&home, &geo, &["package", "publish", "team"]);
     assert!(
         text(&out).contains("the tests do not pass, so nothing is published"),
         "{}",
         text(&out)
     );
     fs::remove_file(geo.join("test/greeting_test.crag")).unwrap();
-    let out = crag(&home, &geo, &["package"]);
+    let out = crag(&home, &geo, &["package", "pack"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert!(geo.join("target/package/geo-1.0/api.crag").is_file());
-    let out = crag(&home, &geo, &["publish", "team"]);
+    let out = crag(&home, &geo, &["package", "publish", "team"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
-    let out = crag(&home, &app, &["outdated"]);
+    let out = crag(&home, &app, &["package", "outdated"]);
     assert!(
         text(&out).contains("geo 0.1: new major 1.0"),
         "{}",
@@ -488,7 +492,7 @@ fn compiled_code_is_kept_for_the_next_session_and_command() {
     watchdog();
     let root = temp("cache");
     let (home, _) = home(&root);
-    crag(&home, &root, &["new", "app"]);
+    crag(&home, &root, &["package", "new", "app"]);
     let app = root.join("app");
     let main = "pub fn double(n: Int) -> Int { n * 2 }\n\nfn triple(n: Int) -> Int { n * 3 }\n\nfn main() -> ExitCode {\n  ExitCode(code: double(2) + triple(1))\n}\n\ntest \"doubles\" {\n  double(1)\n}\n";
     fs::write(app.join("main.crag"), main).unwrap();
@@ -530,7 +534,7 @@ fn the_repl_adds_a_package_and_uses_it_at_once() {
         "export geo.shape\n",
         &[("shape.crag", SHAPE)],
     );
-    crag(&home, &root, &["new", "app"]);
+    crag(&home, &root, &["package", "new", "app"]);
     let app = root.join("app");
     let mut child = Command::new(env!("CARGO_BIN_EXE_crag"))
         .current_dir(&app)
@@ -545,12 +549,15 @@ fn the_repl_adds_a_package_and_uses_it_at_once() {
         .take()
         .unwrap()
         .write_all(
-            b":add\n:add geo\nimport geo.shape\narea(6, 7)\n:deps\n:upgrade geo version: 3.0\n",
+            b":package add\n:package add geo\nimport geo.shape\narea(6, 7)\n:package deps\n:package upgrade geo version: 3.0\n",
         )
         .unwrap();
     let out = child.wait_with_output().unwrap();
     let all = text(&out);
-    assert!(all.contains("usage: crag add <package> [version]"), "{all}");
+    assert!(
+        all.contains("usage: crag package add <package> [version]"),
+        "{all}"
+    );
     assert!(all.contains("sbom.crag: + geo 1.0\nadded geo 1.0"), "{all}");
     assert!(all.contains("42"), "{all}");
     assert!(all.contains("app\n  geo 1.0\n"), "{all}");
@@ -597,15 +604,15 @@ fn registries_are_made_added_listed_and_removed() {
     );
 
     // A library published to the new registry is found by another project.
-    let out = crag(&home, &root, &["new", "geo", "--lib"]);
+    let out = crag(&home, &root, &["package", "new", "geo", "--lib"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
-    let out = crag(&home, &root.join("geo"), &["publish", "team"]);
+    let out = crag(&home, &root.join("geo"), &["package", "publish", "team"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     let out = crag(&home, &root, &["registry", "remove", "mine"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
-    let out = crag(&home, &root, &["new", "app"]);
+    let out = crag(&home, &root, &["package", "new", "app"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
-    let out = crag(&home, &root.join("app"), &["add", "geo"]);
+    let out = crag(&home, &root.join("app"), &["package", "add", "geo"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
 
     let out = crag(&home, &root, &["registry", "remove", "mine"]);

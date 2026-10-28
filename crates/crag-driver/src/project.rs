@@ -504,7 +504,7 @@ fn verify_sbom(root: &Path, resolution: &Resolution) -> Result<(), String> {
                 return Ok(());
             }
             return Err(
-                "the project has dependencies but no sbom.crag; `crag sbom regenerate` writes it"
+                "the project has dependencies but no sbom.crag; `crag package sbom regenerate` writes it"
                     .into(),
             );
         }
@@ -515,7 +515,7 @@ fn verify_sbom(root: &Path, resolution: &Resolution) -> Result<(), String> {
         return Ok(());
     }
     Err(format!(
-        "sbom.crag does not match the packages the manifests resolve to:\n  {}\n`crag sbom diff` shows it again; `crag sbom regenerate` accepts it",
+        "sbom.crag does not match the packages the manifests resolve to:\n  {}\n`crag package sbom diff` shows it again; `crag package sbom regenerate` accepts it",
         diff.join("\n  ")
     ))
 }

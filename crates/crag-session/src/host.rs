@@ -489,6 +489,11 @@ impl Session {
         &self.scratch
     }
 
+    /// How the session starts its images.
+    pub fn command(&self) -> &ImageCommand {
+        &self.command
+    }
+
     /// The app image, while there is one.
     pub fn app(&self) -> Option<&ImageHandle> {
         self.app.as_ref()

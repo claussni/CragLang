@@ -378,6 +378,17 @@ pub fn scope_entries<'db>(db: &'db dyn Db, program: Program, module: ModuleId) -
             origin: Origin::Declared,
         });
     }
+    // An element the module imports from the prelude by name is known
+    // only by the name that import gives it (§19.3).
+    let renamed: Vec<Name<'db>> = imports
+        .targets
+        .iter()
+        .filter(|t| t.origin != Origin::Prelude && t.module.path(db) == PRELUDE)
+        .flat_map(|t| match &t.selection {
+            Selection::Elements(elements) => elements.iter().map(|&(e, _)| e).collect(),
+            Selection::All => Vec::new(),
+        })
+        .collect();
     for target in &imports.targets {
         let tree = item_tree(db, target.module);
         let mut enter = |name, item: &Item<'db>| {
@@ -390,6 +401,9 @@ pub fn scope_entries<'db>(db: &'db dyn Db, program: Program, module: ModuleId) -
         match &target.selection {
             Selection::All => {
                 for item in tree.items.iter().filter(|i| i.public) {
+                    if target.origin == Origin::Prelude && renamed.contains(item.id.name(db)) {
+                        continue;
+                    }
                     enter(*item.id.name(db), item);
                 }
             }
@@ -607,14 +621,9 @@ fn meet<'a, 'db>(
             collisions.push(same);
         }
     }
-    // Overloads with one signature clash (§14.3), but the prelude's give
-    // way to the module's own and to those it imports (§19.3).
+    // Overloads with one signature clash (§14.3).
     let mut shapes: Vec<(FnShape, Vec<&Entry>)> = Vec::new();
-    let shadowing = functions.iter().any(|f| f.origin != Origin::Prelude);
     for function in functions {
-        if shadowing && function.origin == Origin::Prelude {
-            continue;
-        }
         let shape = fn_shape(&function.item.signature);
         match shapes.iter_mut().find(|(s, _)| *s == shape) {
             Some((_, same)) => same.push(function),

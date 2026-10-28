@@ -14,9 +14,10 @@
 // You should have received a copy of the GNU General Public License along with
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
-//! The commands that manage a project's packages (Specification §20.6):
-//! `new`, `add`, `remove`, `upgrade`, `outdated`, `deps` and `sbom`, and
-//! `registry`, which edits the user's list of registries. Each
+//! The commands that manage a project's packages (Specification §20.6),
+//! `crag package new`, `add`, `remove`, `upgrade`, `outdated`, `deps`,
+//! `sbom`, `pack` and `publish`, and `crag registry`, which edits the
+//! user's list of registries. Each
 //! returns its exit status, 0 for success, 1 for a failure and 2 for a
 //! usage error, and a command that would change something prints its
 //! usage when run bare. Those that edit the manifest change only the
@@ -112,7 +113,7 @@ fn newest(registry: &Registry, name: &str, keep: impl Fn(&Version) -> bool) -> O
 /// `new <name> [--lib]`: a project in a new directory `name` below `dir`.
 pub fn crag_new(dir: &Path, args: &Args, out: &mut dyn Write) -> u8 {
     let [name] = &args.positional[..] else {
-        return usage(out, "crag new <name> [--lib]");
+        return usage(out, "crag package new <name> [--lib]");
     };
     if !valid_name(name) || name.contains('.') || reserved(name) {
         return fail(out, format!("`{name}` is not a name for a new package"));
@@ -251,7 +252,7 @@ pub fn crag_add(root: &Path, args: &Args, out: &mut dyn Write) -> u8 {
     let (name, version) = match &args.positional[..] {
         [name] => (name, None),
         [name, version] => (name, Some(version)),
-        _ => return usage(out, "crag add <package> [version]"),
+        _ => return usage(out, "crag package add <package> [version]"),
     };
     let (text, manifest) = match manifest(root, out) {
         Ok(m) => m,
@@ -293,7 +294,7 @@ pub fn crag_add(root: &Path, args: &Args, out: &mut dyn Write) -> u8 {
 /// `remove <package>`: refused while code still imports from it.
 pub fn crag_remove(root: &Path, args: &Args, out: &mut dyn Write) -> u8 {
     let [name] = &args.positional[..] else {
-        return usage(out, "crag remove <package>");
+        return usage(out, "crag package remove <package>");
     };
     let (text, manifest) = match manifest(root, out) {
         Ok(m) => m,
@@ -343,7 +344,7 @@ pub fn crag_upgrade(root: &Path, args: &Args, out: &mut dyn Write) -> u8 {
     let [target] = &args.positional[..] else {
         return usage(
             out,
-            "crag upgrade <package> [--version=V] | crag upgrade all",
+            "crag package upgrade <package> [--version=V] | crag package upgrade all",
         );
     };
     let (mut text, manifest) = match manifest(root, out) {
@@ -552,7 +553,7 @@ pub fn crag_sbom(root: &Path, args: &Args, out: &mut dyn Write) -> u8 {
     let regenerate = match &args.positional[..] {
         [w] if w == "diff" => false,
         [w] if w == "regenerate" => true,
-        _ => return usage(out, "crag sbom diff | crag sbom regenerate"),
+        _ => return usage(out, "crag package sbom diff | crag package sbom regenerate"),
     };
     let (_, manifest) = match manifest(root, out) {
         Ok(m) => m,
@@ -580,8 +581,15 @@ pub fn crag_sbom(root: &Path, args: &Args, out: &mut dyn Write) -> u8 {
 
 pub const PUBLISH: Spec = Spec::NONE;
 
+/// Whether `crag package <name>` is a command: one of [`command`] but
+/// `registry`, which is an area of its own.
+pub fn is_package_command(name: &str) -> bool {
+    name != "registry" && command(name).is_some()
+}
+
 /// The commands of this module by name, with what they accept, for both
-/// surfaces; `new` is the shell's alone, since it makes another project.
+/// surfaces; `package new` is the shell's alone, since it makes another
+/// project.
 pub fn command(name: &str) -> Option<(Spec, PackageCommand)> {
     Some(match name {
         "new" => (NEW, crag_new),
@@ -592,7 +600,7 @@ pub fn command(name: &str) -> Option<(Spec, PackageCommand)> {
         "deps" => (LIST, crag_deps),
         "sbom" => (LIST, crag_sbom),
         "publish" => (PUBLISH, crag_publish),
-        "package" => (PUBLISH, crag_package),
+        "pack" => (PUBLISH, crag_pack),
         "registry" => (REGISTRY, crag_registry),
         _ => return None,
     })
@@ -690,7 +698,7 @@ pub fn changes_packages(name: &str, args: &Args) -> bool {
 /// package folder and places it into the registry.
 pub fn crag_publish(root: &Path, args: &Args, out: &mut dyn Write) -> u8 {
     let [name] = &args.positional[..] else {
-        return usage(out, "crag publish <registry>");
+        return usage(out, "crag package publish <registry>");
     };
     let registries = match registries() {
         Ok(r) => r,
@@ -729,10 +737,10 @@ pub fn crag_publish(root: &Path, args: &Args, out: &mut dyn Write) -> u8 {
     }
 }
 
-/// `package` for a library: the folder `publish` would place, in
+/// `package pack` for a library: the folder `publish` would place, in
 /// `target/package/`, after every publishing check; compared with the
 /// default registry's previous version when there is one.
-pub fn crag_package(root: &Path, _args: &Args, out: &mut dyn Write) -> u8 {
+pub fn crag_pack(root: &Path, _args: &Args, out: &mut dyn Write) -> u8 {
     let registries = match registries() {
         Ok(r) => r,
         Err(e) => return fail(out, e),

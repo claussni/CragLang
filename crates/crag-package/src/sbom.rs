@@ -20,7 +20,7 @@
 //! refuses on a mismatch until it is regenerated on purpose.
 //!
 //! ```text
-//! // The packages this build uses. `crag sbom regenerate` writes it.
+//! // The packages this build uses. `crag package sbom regenerate` writes it.
 //! package geo 1.2 hash "9f3c…"
 //! package billing 1.2 path "../billing"
 //! ```
@@ -45,7 +45,7 @@ pub struct Sbom {
     pub entries: Vec<Entry>,
 }
 
-const HEADER: &str = "// The packages this build uses. `crag sbom regenerate` writes it.\n";
+const HEADER: &str = "// The packages this build uses. `crag package sbom regenerate` writes it.\n";
 
 impl Sbom {
     pub fn of(resolution: &Resolution) -> Sbom {

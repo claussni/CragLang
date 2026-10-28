@@ -452,15 +452,35 @@ impl Ui {
             highlight: None,
             page: 20,
         };
-        ui.expanded.insert(String::new());
-        // The main module first, as the project names it.
-        let main = ui.main_file();
-        match main.or_else(|| ui.project_files().into_iter().next()) {
-            Some(file) => ui.open(&file, None),
-            None => ui.buffers.push(Buffer::new("scratch", "", None)),
-        }
-        ui.check();
+        ui.show_project();
         ui
+    }
+
+    /// Shows the REPL's project afresh, with its main module open.
+    fn show_project(&mut self) {
+        self.buffers.clear();
+        self.current = 0;
+        self.expanded = HashSet::from([String::new()]);
+        self.file_selected = 0;
+        self.buffer_selected = 0;
+        self.right_selected = 0;
+        self.jumps.clear();
+        self.jump_at = 0;
+        self.problems.clear();
+        self.push_at = None;
+        self.pushed.clear();
+        self.inline.clear();
+        self.pauses.clear();
+        self.repl_error = None;
+        self.imported.clear();
+        self.highlight = None;
+        // The main module first, as the project names it.
+        let main = self.main_file();
+        match main.or_else(|| self.project_files().into_iter().next()) {
+            Some(file) => self.open(&file, None),
+            None => self.buffers.push(Buffer::new("scratch", "", None)),
+        }
+        self.check();
     }
 
     fn main_file(&self) -> Option<String> {
@@ -1153,11 +1173,11 @@ impl Ui {
 
     pub fn save_all(&mut self) {
         let current = self.current;
+        // A buffer has a file once saved, or if it is one of the project's.
+        let own = self.project_files();
         for i in 0..self.buffers.len() {
-            if self.buffers[i].dirty()
-                && !self.buffers[i].readonly
-                && self.buffers[i].path.is_some()
-            {
+            let b = &self.buffers[i];
+            if b.dirty() && !b.readonly && (b.path.is_some() || own.contains(&b.name)) {
                 self.current = i;
                 self.save();
             }
@@ -1686,6 +1706,16 @@ impl Ui {
         }
     }
 
+    /// Lines of the REPL's output, all of one kind.
+    fn say(&mut self, text: &str, kind: OutKind) {
+        for line in text.lines() {
+            self.output.push(OutLine {
+                text: line.to_string(),
+                kind,
+            });
+        }
+    }
+
     /// Runs REPL input as if typed, showing it.
     pub fn run_repl(&mut self, text: &str) {
         self.echo(text);
@@ -1710,6 +1740,20 @@ impl Ui {
     }
 
     fn run_repl_quietly(&mut self, text: &str) {
+        // `:cd` saves the buffers of the project it leaves.
+        if let Some(rest) = text.trim().strip_prefix(":cd")
+            && rest.starts_with(char::is_whitespace)
+        {
+            self.save_all();
+            match self.repl.change_dir(rest.trim()) {
+                Ok(output) => {
+                    self.show_project();
+                    self.say(&output.render(), OutKind::Info);
+                }
+                Err(errors) => self.say(&errors, OutKind::Error),
+            }
+            return;
+        }
         self.push();
         let result = self.repl.eval_input(text);
         self.show_printed(true);

@@ -86,21 +86,24 @@ there; `crag registry add <name> <folder>` adds one that exists, such as a
 team's shared folder. `crag registry list` and `crag registry remove
 <name>` show and edit the list; removing leaves the folder as it is.
 
-`crag new <name> [--lib]` creates a project; `crag add <package>
-[version]`, `remove`, `upgrade <package> [--version=V] | all`, `outdated`
-and `deps` manage its imports. Each major of a package settles on the
-highest version any manifest requires; the committed `sbom.crag` pins the
-content hash of every package, and a build refuses a mismatch until `crag
-sbom regenerate` accepts it on purpose. `crag sbom diff` shows the change.
+`run`, `test` and `fmt` are short; the other commands come after the name
+of their area, `package` or `registry`. `crag package new <name> [--lib]`
+creates a project; `crag package add <package> [version]`, `remove`,
+`upgrade <package> [--version=V] | all`, `outdated` and `deps` manage its
+imports. Each major of a package settles on the highest version any
+manifest requires; the committed `sbom.crag` pins the content hash of
+every package, and a build refuses a mismatch until `crag package sbom
+regenerate` accepts it on purpose. `crag package sbom diff` shows the
+change.
 
-`crag publish <registry>` checks a library and places it into a registry:
-its tests pass, it has no type holes, and its `api.crag`, the public
-declarations with their inferred errors, effects and escaping parameters,
-needs no larger version step than the one taken since the previous
-version of its major. `crag package` builds the same folder in
-`target/package/` without publishing it. In the REPL, `:add`, `:remove`,
-`:upgrade`, `:outdated`, `:deps`, `:sbom`, `:package` and `:publish` do the
-same, and the session can use an added package at once.
+`crag package publish <registry>` checks a library and places it into a
+registry: its tests pass, it has no type holes, and its `api.crag`, the
+public declarations with their inferred errors, effects and escaping
+parameters, needs no larger version step than the one taken since the
+previous version of its major. `crag package pack` builds the same folder
+in `target/package/` without publishing it. In the REPL, `:package add`
+and the others do the same, as `:registry` does for the registries, and
+the session can use an added package at once.
 
 Compiled code is kept in the settings directory's `cache/`, so a second
 run, `crag test` or a new session compiles only what changed;
@@ -123,7 +126,9 @@ quits. The line at the bottom shows the keys that matter where the focus
 is, and the command palette names the key of each command. Without a
 terminal, `crag` is the plain REPL.
 
-`:help` lists the REPL's commands. In a project,
+`:help` lists the REPL's commands. `:cd <directory>` takes the session
+to another directory and opens the project there, so `:cd examples/hello`
+loads that example; alone, `:cd` tells where the session is. In a project,
 `:start` runs the app in an image of its own; after editing its files,
 `:reload` swaps the changed code into the running app, which keeps its
 state and connections, and `:stop` ends it. `:break file:line` stops the

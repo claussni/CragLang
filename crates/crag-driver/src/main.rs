@@ -16,7 +16,9 @@
 
 //! The `crag` command. Without arguments it opens the REPL (Specification
 //! §20); `run`, `test` and `fmt` (§20.6) work on the project in the
-//! current directory, as the REPL does when there is one. `crag __image` is not
+//! current directory, as the REPL does when there is one, and the
+//! commands of an area come after its name: `crag package add`, `crag
+//! registry list`. `crag __image` is not
 //! for people: the session manager starts images with it (Implementation
 //! Plan §11.6.1).
 
@@ -26,19 +28,19 @@ use std::process::ExitCode;
 use crag_driver::{crag_fmt, crag_repl, crag_run, crag_test};
 
 const USAGE: &str = "usage: crag
-       crag new <name> [--lib]
-       crag add <package> [version]
-       crag remove <package>
-       crag upgrade <package> [--version=V] | crag upgrade all
-       crag outdated [--json]
-       crag deps [--json]
-       crag sbom diff [--json] | crag sbom regenerate
-       crag package
-       crag publish <registry>
-       crag registry new <name> <folder> | add <name> <folder> | list | remove <name>
        crag run [argument...]
        crag test [filter]
        crag fmt [--check] [all | - | file...]
+       crag package new <name> [--lib]
+       crag package add <package> [version]
+       crag package remove <package>
+       crag package upgrade <package> [--version=V] | crag package upgrade all
+       crag package outdated [--json]
+       crag package deps [--json]
+       crag package sbom diff [--json] | crag package sbom regenerate
+       crag package pack
+       crag package publish <registry>
+       crag registry new <name> <folder> | add <name> <folder> | list | remove <name>
        crag lsp
        crag dap
 ";
@@ -48,14 +50,15 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let root = std::path::Path::new(".");
     // What compiles keeps its code in the persisted store.
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
     let compiles = matches!(
-        args.first().map(String::as_str),
-        None | Some("run" | "test" | "dap" | "package" | "publish")
+        words[..],
+        [] | ["run" | "test" | "dap", ..] | ["package", "pack" | "publish", ..]
     );
     if compiles {
         crag_driver::persist::install();
     }
-    let status = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+    let status = match words[..] {
         // On a terminal the UI; else the plain REPL, as scripts use it.
         [] if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
             ExitCode::from(crag_driver::crag_ui(root))
@@ -69,11 +72,12 @@ fn main() -> ExitCode {
         ["test"] => test(root, None),
         ["test", filter] => test(root, Some(filter)),
         ["fmt", ref rest @ ..] => ExitCode::from(crag_fmt(root, rest, &mut std::io::stderr())),
-        [
-            command @ ("new" | "add" | "remove" | "upgrade" | "outdated" | "deps" | "sbom"
-            | "package" | "publish" | "registry"),
-            ref rest @ ..,
-        ] => package_command(root, command, rest),
+        ["package", command, ref rest @ ..]
+            if crag_driver::packages::is_package_command(command) =>
+        {
+            package_command(root, command, rest)
+        }
+        ["registry", ref rest @ ..] => package_command(root, "registry", rest),
         ["lsp"] => ExitCode::from(crag_driver::lsp::serve(std::io::stdin(), std::io::stdout())),
         ["dap"] => dap(),
         [crag_session::host::IMAGE_ARG, kind, socket] => image(kind, socket),
