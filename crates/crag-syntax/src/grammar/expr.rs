@@ -146,8 +146,9 @@ fn expr_bp(p: &mut Parser, min_power: u8, cx: Context) {
             T::DotDot => {
                 p.start_at(start, S::RangeExpr);
                 p.bump();
-                // `a..` is an open range (§7.4).
-                if at_expr_start(p, 0) {
+                // `a..` is an open range (§7.4); a `{` after it opens
+                // what follows, as the block of `for i in 1.. { … }`.
+                if at_expr_start(p, 0) && !p.at(T::LBrace) {
                     expr_bp(p, right, cx);
                 }
             }

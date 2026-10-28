@@ -52,14 +52,16 @@ use crate::def::{
 };
 use crate::effect::{EffectSet, Walker};
 use crate::escape::{EscapeLevel, EscapeWalker, Escapes};
-use crate::generic::{CallSite, Slot, bind, instantiate, mentions, slots, type_param_names};
+use crate::generic::{
+    CallSite, Slot, bind, function_at, instantiate, mentions, slots, type_param_names,
+};
 use crate::group::{
     GroupMember, error_type, function_effects, group_of, param_escapes, result_type,
 };
 use crate::overload::{Ranked, most_specific};
 use crate::relate::{declared_fields, fields_of, is_subtype, join, normalize};
 use crate::result::{
-    Callee, Dispatch, DispatchArm, ErrorKind, InferenceResult, Optional, Site, TypeError,
+    Callee, Dispatch, DispatchArm, ErrorKind, InferenceResult, Iteration, Optional, Site, TypeError,
 };
 use crate::ty::{Builtin, Ty, TyKind};
 
@@ -95,6 +97,7 @@ pub fn infer_in_group<'db>(
         callees: Vec::new(),
         holes: Vec::new(),
         optional: Vec::new(),
+        iterations: Vec::new(),
         typed: HashMap::new(),
         frames: Vec::new(),
         negative: false,
@@ -185,6 +188,7 @@ pub fn infer_in_group<'db>(
         result,
         holes: cx.holes,
         optional: cx.optional,
+        iterations: cx.iterations,
         effects,
         escapes,
         errors: cx.lower.errors,
@@ -219,6 +223,7 @@ struct Infer<'a, 'db> {
     callees: Vec<(ExprId, Callee<'db>)>,
     holes: Vec<(ExprId, Ty<'db>)>,
     optional: Vec<(ExprId, Optional<'db>)>,
+    iterations: Vec<(ExprId, Iteration<'db>)>,
     /// Expressions already typed, which their next check takes as they
     /// are: the field values a construction infers its type arguments
     /// from.
@@ -4290,14 +4295,57 @@ impl<'a, 'db> Infer<'a, 'db> {
         let db = self.db;
         let ty = self.synth(iterable);
         if let Some(element) = self.range_element(ty) {
+            let known = match element.kind(db) {
+                TyKind::Builtin(b, _) => {
+                    b.int_range().is_some() || matches!(b, Builtin::CodePoint | Builtin::Fixed(_))
+                }
+                // A type parameter's range is walked by the instance.
+                TyKind::Param(..) => true,
+                _ => element.is_error(db),
+            };
+            if !known {
+                // The range steps with the type's own `next` (§7.4).
+                let ordering = prelude_type(db, self.program, "Ordering");
+                let at = self.call_site();
+                let next = function_at(db, self.program, "next", &[element], element, at);
+                let compare = function_at(
+                    db,
+                    self.program,
+                    "compare",
+                    &[element, element],
+                    ordering,
+                    at,
+                );
+                match (next, compare) {
+                    (Some(next), Some(compare)) => self
+                        .iterations
+                        .push((iterable, Iteration::Stepped { next, compare })),
+                    _ => self.error(Site::Expr(iterable), ErrorKind::NotIterable { ty }),
+                }
+            }
             return element;
         }
+        let listed = |this: &mut Self, element: Ty<'db>| {
+            let list = this.builtin_of(Builtin::List, vec![element]);
+            let name = if matches!(ty.as_builtin(db), Some((Builtin::Map, _))) {
+                "entries"
+            } else {
+                "toList"
+            };
+            match function_at(db, this.program, name, &[ty], list, this.call_site()) {
+                Some(f) => this.iterations.push((iterable, Iteration::Listed(f))),
+                None => this.error(Site::Expr(iterable), ErrorKind::NotIterable { ty }),
+            }
+            element
+        };
         match ty.kind(db) {
-            TyKind::Builtin(Builtin::List | Builtin::Set | Builtin::Grid, args) => args[0],
+            TyKind::Builtin(Builtin::List | Builtin::Grid, args) => args[0],
+            TyKind::Builtin(Builtin::Set, args) => listed(self, args[0]),
             TyKind::Builtin(Builtin::Map, args) => {
                 let key = Name::new(db, "key".to_string());
                 let value = Name::new(db, "value".to_string());
-                Ty::record(db, vec![(key, args[0]), (value, args[1])], false)
+                let entry = Ty::record(db, vec![(key, args[0]), (value, args[1])], false);
+                listed(self, entry)
             }
             // Every source of a stream fits `Iterable` (§10.5).
             TyKind::Named(item, args) if is_source(db, *item) => args[0],

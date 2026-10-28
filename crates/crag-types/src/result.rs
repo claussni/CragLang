@@ -22,8 +22,20 @@ use crag_hir::{BindingId, BodySourceMap, ExprId, ItemId, Name, PatId, TypeRefId}
 
 use crate::effect::{EffectSet, Restriction};
 use crate::escape::{BindingsOnly, Escapes};
-use crate::generic::{FitError, Instance};
+use crate::generic::{Filling, FitError, Instance};
 use crate::ty::Ty;
+
+/// How a `for` walks what it iterates, where the compiler does not know
+/// it: a function that lists a map's entries or a set's members, or the
+/// `next` and `compare` of a range of another type (§7.3, §7.4).
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub enum Iteration<'db> {
+    Listed(Filling<'db>),
+    Stepped {
+        next: Filling<'db>,
+        compare: Filling<'db>,
+    },
+}
 
 /// A `?.` access on a value that can be `Empty` (§6.8).
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -52,6 +64,8 @@ pub struct InferenceResult<'db> {
     pub result: Option<Ty<'db>>,
     /// Every `???` with the type it must have (§6.11).
     pub holes: Vec<(ExprId, Ty<'db>)>,
+    /// What a `for` calls to walk what it iterates, by the iterable.
+    pub iterations: Vec<(ExprId, Iteration<'db>)>,
     /// Every `?.` access on a value that can be `Empty` (§6.8).
     pub optional: Vec<(ExprId, Optional<'db>)>,
     /// What the body does beyond computing (§3.14).
@@ -72,6 +86,13 @@ impl<'db> InferenceResult<'db> {
 
     pub fn binding(&self, id: BindingId) -> Option<Ty<'db>> {
         self.bindings.get(id.index()).copied().flatten()
+    }
+
+    pub fn iteration(&self, id: ExprId) -> Option<&Iteration<'db>> {
+        self.iterations
+            .iter()
+            .find(|(e, _)| *e == id)
+            .map(|(_, i)| i)
     }
 
     pub fn optional(&self, id: ExprId) -> Option<&Optional<'db>> {

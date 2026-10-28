@@ -42,7 +42,7 @@ use crag_hir::{
 };
 use crag_types::{
     Builtin, Callee, DecisionTree, Dispatch, EscapeLevel, Filling, Handler, HandlerCode,
-    InferenceResult, Instance, ListLen, Position, SigParam, Signature, Step, Ty, TyKind,
+    InferenceResult, Instance, Iteration, ListLen, Position, SigParam, Signature, Step, Ty, TyKind,
     TypeDefKind, Value, body_types, decision_tree_with, declared_fields, dispose_handler,
     fields_of, lifecycle_handler, literal_value, prelude_item, result_type, signature, subst,
     type_def, type_header, value_type,
@@ -3763,10 +3763,188 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         self.switch_to(exit);
     }
 
+    /// The function a filling names, as a concrete instance.
+    fn filled(&self, filling: &Filling<'db>) -> Option<Instance<'db>> {
+        match filling {
+            Filling::Function(instance) => self.concrete(instance),
+            Filling::Slot(k) => self.fillings.get(*k as usize).cloned(),
+        }
+    }
+
+    /// Calls a filling with the arguments and gives its result.
+    fn call_filled(
+        &mut self,
+        filling: &Filling<'db>,
+        args: Vec<(Operand<'db>, Ty<'db>)>,
+        site: ExprId,
+    ) -> Option<(Local, Ty<'db>)> {
+        let instance = self.filled(filling)?;
+        let sig = self.instance_signature(&instance);
+        let result = sig.result?;
+        let key = self.callable(site, &instance)?;
+        let ops = args
+            .into_iter()
+            .zip(&sig.params)
+            .map(|((op, ty), p)| self.coerce(op, ty, p.ty))
+            .collect();
+        Some((self.call_code(key, ops, result, site), result))
+    }
+
+    /// `for` over what a function lists first: a map's entries or a set's
+    /// members (§7.3.1).
+    fn listed_loop(&mut self, pat: PatId, iterable: ExprId, list: &Filling<'db>, body: ExprId) {
+        let op = self.expr(iterable);
+        let ty = self.ty(iterable);
+        let Some((listed, list_ty)) = self.call_filled(list, vec![(op, ty)], iterable) else {
+            self.trap(TrapKind::Error, Some(iterable));
+            return;
+        };
+        let Some((Builtin::List, [element])) = list_ty.as_builtin(self.db) else {
+            self.trap(TrapKind::Error, Some(iterable));
+            return;
+        };
+        let element = *element;
+        let int_ty = self.int();
+        let len = self.assign(int_ty, Rvalue::Len(Place::local(listed)));
+        let i = self.temp(int_ty);
+        self.push(Statement::Assign(i, Rvalue::Use(int(0))));
+        let (head, inside, exit) = (self.new_block(), self.new_block(), self.new_block());
+        self.terminate(Terminator::Jump(head));
+        self.switch_to(head);
+        let more = self.compare(CmpOp::Lt, Builtin::Int, Operand::Local(i), len);
+        self.terminate(Terminator::Branch {
+            cond: more,
+            then: inside,
+            otherwise: exit,
+        });
+        self.switch_to(inside);
+        let value = self.assign(
+            element,
+            Rvalue::Index {
+                list: Place::local(listed),
+                index: Operand::Local(i),
+            },
+        );
+        let pat_ty = self.pats[pat.index()].unwrap_or(element);
+        let value = self.coerce(value, element, pat_ty);
+        self.matched(pat, value, pat_ty, None);
+        self.eval(body, Dest::Discard);
+        let n = self.assign(
+            int_ty,
+            Rvalue::Binary {
+                op: BinOp::Add,
+                ty: Builtin::Int,
+                a: Operand::Local(i),
+                b: int(1),
+                check: None,
+            },
+        );
+        self.assign_to(i, n, int_ty);
+        self.push(Statement::Poll);
+        self.terminate(Terminator::Jump(head));
+        self.switch_to(exit);
+    }
+
+    /// `for` over a range of a type with its own `next` and `compare`
+    /// (§7.4): from the first value, while it is not past the last; it
+    /// never calls `next` on the last.
+    fn stepped_loop(
+        &mut self,
+        pat: PatId,
+        iterable: ExprId,
+        next: &Filling<'db>,
+        compare: &Filling<'db>,
+        body: ExprId,
+    ) {
+        let db = self.db;
+        let container = self.place_of(iterable);
+        let ty = self.ty(iterable);
+        let Some(element) = (match ty.kind(db) {
+            TyKind::Named(_, args) => args.first().copied(),
+            _ => None,
+        }) else {
+            self.trap(TrapKind::Error, Some(iterable));
+            return;
+        };
+        let field = |name: &str| Step::Field(crag_hir::Name::new(db, name.to_string()));
+        let has_last = fields_of(db, self.program, ty)
+            .is_some_and(|fs| fs.iter().any(|(n, _)| n.text(db) == "last"));
+        let i = self.temp(element);
+        let first = Place {
+            local: container,
+            path: vec![field("first")],
+        };
+        self.push(Statement::Assign(i, Rvalue::Read(first)));
+        let last = has_last.then(|| {
+            let place = Place {
+                local: container,
+                path: vec![field("last")],
+            };
+            self.assign(element, Rvalue::Read(place))
+        });
+        let tag = |name: &str| {
+            prelude_item(db, self.program, name)
+                .map(|item| Ty::new(db, TyKind::Named(item, Vec::new())))
+        };
+        let (Some(greater), Some(equal)) = (tag("Greater"), tag("Equal")) else {
+            self.trap(TrapKind::Error, Some(iterable));
+            return;
+        };
+        let (inside, exit) = (self.new_block(), self.new_block());
+        // Whether the value compares as `wanted` with the last.
+        let is = |this: &mut Self, wanted: Ty<'db>, yes: BlockId, no: BlockId| -> bool {
+            let Some(last) = last.clone() else {
+                this.terminate(Terminator::Jump(no));
+                return true;
+            };
+            let args = vec![(Operand::Local(i), element), (last, element)];
+            let Some((order, _)) = this.call_filled(compare, args, iterable) else {
+                return false;
+            };
+            this.terminate(Terminator::Switch {
+                place: Place::local(order),
+                cases: vec![(wanted, yes)],
+                otherwise: no,
+            });
+            true
+        };
+        if !is(self, greater, exit, inside) {
+            self.trap(TrapKind::Error, Some(iterable));
+            return;
+        }
+        self.switch_to(inside);
+        self.matched(pat, Operand::Local(i), element, None);
+        self.eval(body, Dest::Discard);
+        let more = self.new_block();
+        if !is(self, equal, exit, more) {
+            self.trap(TrapKind::Error, Some(iterable));
+            return;
+        }
+        self.switch_to(more);
+        let Some((n, n_ty)) = self.call_filled(next, vec![(Operand::Local(i), element)], iterable)
+        else {
+            self.trap(TrapKind::Error, Some(iterable));
+            return;
+        };
+        self.assign_to(i, Operand::Local(n), n_ty);
+        self.push(Statement::Poll);
+        self.terminate(Terminator::Jump(inside));
+        self.switch_to(exit);
+    }
+
     fn for_loop(&mut self, pat: PatId, iterable: ExprId, body: ExprId) {
         let db = self.db;
         let ty = self.ty(iterable);
         let range = |name: &str| prelude_item(db, self.program, name);
+        match self.types.iteration(iterable).cloned() {
+            Some(Iteration::Listed(filling)) => {
+                return self.listed_loop(pat, iterable, &filling, body);
+            }
+            Some(Iteration::Stepped { next, compare }) => {
+                return self.stepped_loop(pat, iterable, &next, &compare, body);
+            }
+            None => {}
+        }
         let (kind, element) = match ty.kind(db) {
             TyKind::Named(item, args) if crag_types::is_source(db, *item) => {
                 return self.source_loop(pat, iterable, args[0], body);

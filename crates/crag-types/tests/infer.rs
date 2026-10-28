@@ -63,6 +63,8 @@ pub fn update[T, R](r: Ext[T], f: (T) -> R) -> () | Errs[R]
 pub fn swap[T](r: Ext[T], new: T) -> T
 pub fn empty[T](r: Ext[Option[T]]) -> Option[T]
 pub distinct type Signal
+pub fn entries[K, V](m: Map[K, V]) -> List[(key: K, value: V)]
+pub fn toList[T](s: Set[T]) -> List[T]
 pub fn add(a: Int, b: Int) -> Int
 pub fn add(a: Int8, b: Int8) -> Int8
 pub fn add(a: Float, b: Float) -> Float

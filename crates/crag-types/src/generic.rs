@@ -597,6 +597,21 @@ fn fit_slots<'db>(
     Ok(fillings)
 }
 
+/// The function a construct of the language calls with these parameter
+/// and result types where `at` is: as a slot is filled, so a generic
+/// caller's own slots count.
+pub fn function_at<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    name: &str,
+    params: &[Ty<'db>],
+    result: Ty<'db>,
+    at: CallSite<'db>,
+) -> Option<Filling<'db>> {
+    let name = Name::new(db, name.to_string());
+    fill(db, program, name, params, result, at, 0).ok()
+}
+
 /// The function that fills a slot with these parameter and result types:
 /// the most specific of the visible functions that accept the parameters
 /// and give the result, and the slots of the caller (§5.6.1). Without
