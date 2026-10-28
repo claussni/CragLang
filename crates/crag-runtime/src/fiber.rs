@@ -95,6 +95,12 @@ pub struct TaskContext {
     /// position.
     pub(crate) raise: AtomicU64,
     pub(crate) raise_position: AtomicU64,
+    /// The trap a handler took last: its kind, its position word, and
+    /// the return address of the call it was raised by, in its frame
+    /// (Specification §8.3.1). `rt_trap_catch` writes them directly.
+    pub(crate) caught_kind: AtomicU64,
+    pub(crate) caught_position: AtomicU64,
+    pub(crate) caught_ret: AtomicUsize,
     /// What the suspended fiber waits for, as far as a cancellation can
     /// call it off or must pass it on.
     pub(crate) waiting: Mutex<Option<Waiting>>,
@@ -199,6 +205,9 @@ pub struct Fiber {
     results: Box<[u64; 2]>,
     /// Why it trapped, once it has.
     pub(crate) trap: Option<Trap>,
+    /// The frames the trap a handler took last had unwound, so that one
+    /// raised again reports where it began (Specification §8.3.1).
+    pub(crate) caught_stack: Vec<crag_abi::FuncId>,
     /// What metered code it runs may still use, if it is metered.
     pub(crate) metering: Option<Metering>,
     /// What it waits for while it is suspended.
@@ -257,6 +266,9 @@ impl Fiber {
             no_cancel: AtomicUsize::new(0),
             raise: AtomicU64::new(0),
             raise_position: AtomicU64::new(0),
+            caught_kind: AtomicU64::new(0),
+            caught_position: AtomicU64::new(0),
+            caught_ret: AtomicUsize::new(0),
             waiting: Mutex::new(None),
             pinned: AtomicU64::new(0),
             lazy: Mutex::new(Vec::new()),
@@ -303,6 +315,7 @@ impl Fiber {
             _args: args,
             results,
             trap: None,
+            caught_stack: Vec::new(),
             metering: None,
             wait: WaitReason::Yield,
             task: None,

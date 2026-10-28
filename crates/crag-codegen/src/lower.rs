@@ -20,8 +20,8 @@
 use std::collections::HashMap;
 
 use crag_abi::{
-    CELL_STATE_OFFSET, FRAME_BUDGET, FUEL_OFFSET, NO_POSITION, RuntimeFn, SIDE_END_OFFSET,
-    SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET,
+    CELL_STATE_OFFSET, FRAME_BUDGET, FUEL_OFFSET, HandlerKind, NO_POSITION, RuntimeFn,
+    SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET,
 };
 use cranelift_codegen::binemit::Reloc as ClifReloc;
 use cranelift_codegen::control::ControlPlane;
@@ -29,9 +29,10 @@ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Imm64;
 use cranelift_codegen::ir::types::{F64, I64};
 use cranelift_codegen::ir::{
-    AbiParam, AtomicRmwOp, BlockArg, ExceptionTableData, ExceptionTableItem, ExtFuncData,
-    ExternalName, FuncRef, Function, GlobalValue, GlobalValueData, InstBuilder, MemFlagsData,
-    Signature, StackSlotData, StackSlotKind, TrapCode, UserExternalName, UserFuncName, Value,
+    AbiParam, AtomicRmwOp, BlockArg, ExceptionTableData, ExceptionTableItem, ExceptionTag,
+    ExtFuncData, ExternalName, FuncRef, Function, GlobalValue, GlobalValueData, InstBuilder,
+    MemFlagsData, Signature, StackSlotData, StackSlotKind, TrapCode, UserExternalName,
+    UserFuncName, Value,
 };
 use cranelift_codegen::isa::{self, CallConv, OwnedTargetIsa, TargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
@@ -143,6 +144,9 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
             stack_check: StackCheck::Margin,
             stack_maps: body.stack_maps,
             handlers: body.handlers,
+            module: String::new(),
+            origins: Vec::new(),
+            details: Vec::new(),
         });
     }
 
@@ -203,6 +207,9 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
         stack_check: StackCheck::Sized { needed: footprint },
         stack_maps,
         handlers,
+        module: String::new(),
+        origins: Vec::new(),
+        details: Vec::new(),
     })
 }
 
@@ -295,6 +302,9 @@ pub fn compile_entry_stub(
         stack_check: StackCheck::None,
         stack_maps: stub.stack_maps,
         handlers: stub.handlers,
+        module: String::new(),
+        origins: Vec::new(),
+        details: Vec::new(),
     })
 }
 
@@ -824,7 +834,7 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa, metered: bool) -> (Functio
                     func,
                     args,
                     dsts,
-                    handler,
+                    handlers,
                 } => {
                     let (params, returns) = (args.len() as u32, dsts.len() as u32);
                     let callee = imports.target(&mut b, *func, params, returns);
@@ -832,32 +842,24 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa, metered: bool) -> (Functio
                         Reached::Direct(callee) => Ok(callee),
                         Reached::Loaded(entry) => Err(entry),
                     };
-                    emit_try_call(
-                        &mut b,
-                        ctx,
-                        &vars,
-                        target,
-                        args,
-                        dsts,
-                        blocks[handler.0 as usize],
-                    );
+                    let handlers: Vec<_> = handlers
+                        .iter()
+                        .map(|&(kind, h)| (kind, blocks[h.0 as usize]))
+                        .collect();
+                    emit_try_call(&mut b, ctx, &vars, target, args, dsts, &handlers);
                 }
                 Inst::TryCallIndirect {
                     callee,
                     args,
                     dsts,
-                    handler,
+                    handlers,
                 } => {
                     let target = Err(b.use_var(vars[callee.0 as usize]));
-                    emit_try_call(
-                        &mut b,
-                        ctx,
-                        &vars,
-                        target,
-                        args,
-                        dsts,
-                        blocks[handler.0 as usize],
-                    );
+                    let handlers: Vec<_> = handlers
+                        .iter()
+                        .map(|&(kind, h)| (kind, blocks[h.0 as usize]))
+                        .collect();
+                    emit_try_call(&mut b, ctx, &vars, target, args, dsts, &handlers);
                 }
                 Inst::FuncAddr {
                     dst,
@@ -1006,6 +1008,32 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa, metered: bool) -> (Functio
                 // `rt_trap` does not return.
                 b.ins().trap(TrapCode::unwrap_user(1));
             }
+            Term::Rethrow => {
+                let conv = isa.default_call_conv();
+                let rethrow = imports.runtime(&mut b, conv, RuntimeFn::TrapRethrow, 0, 0);
+                b.ins().call(rethrow, &[ctx]);
+                b.ins().trap(TrapCode::unwrap_user(1));
+            }
+            Term::Raise { kind, position } => {
+                let conv = isa.default_call_conv();
+                let trap = imports.runtime(&mut b, conv, RuntimeFn::Trap, 2, 0);
+                let kind = b.ins().iconst(I64, *kind as i64);
+                let position = b.ins().iconst(I64, *position as i64);
+                b.ins().call(trap, &[ctx, kind, position]);
+                b.ins().trap(TrapCode::unwrap_user(1));
+            }
+            Term::Caught {
+                kind,
+                position,
+                handler,
+            } => {
+                let conv = isa.default_call_conv();
+                let catch = imports.runtime(&mut b, conv, RuntimeFn::TrapCatch, 2, 0);
+                let kind = b.ins().iconst(I64, *kind as i64);
+                let position = b.ins().iconst(I64, *position as i64);
+                b.ins().call(catch, &[ctx, kind, position]);
+                b.ins().jump(blocks[handler.0 as usize], &[]);
+            }
         }
     }
 
@@ -1014,10 +1042,20 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa, metered: bool) -> (Functio
     (func, imports.keys)
 }
 
-/// A call that continues at `handler` when the code it called leaves a
-/// transaction's attempt (`Inst::TryCall`): Cranelift's `try_call`, whose
-/// results arrive in a new block that the rest of the LIR block goes on in.
-/// The callee is a function reference, or an address.
+/// The exception tag of a handler kind, which the code object's handlers
+/// carry back.
+fn handler_tag(kind: HandlerKind) -> ExceptionTag {
+    ExceptionTag::from_u32(match kind {
+        HandlerKind::Transaction => 1,
+        HandlerKind::Trap => 2,
+    })
+}
+
+/// A call that continues at a handler when the code it called leaves a
+/// transaction's attempt or traps (`Inst::TryCall`): Cranelift's
+/// `try_call`, whose results arrive in a new block that the rest of the
+/// LIR block goes on in. The callee is a function reference, or an
+/// address.
 fn emit_try_call(
     b: &mut FunctionBuilder,
     ctx: Value,
@@ -1025,7 +1063,7 @@ fn emit_try_call(
     callee: Result<FuncRef, Value>,
     args: &[crate::lir::VReg],
     dsts: &[crate::lir::VReg],
-    handler: cranelift_codegen::ir::Block,
+    handlers: &[(HandlerKind, cranelift_codegen::ir::Block)],
 ) {
     let (params, returns) = (args.len() as u32, dsts.len() as u32);
     let mut values = vec![ctx];
@@ -1036,12 +1074,18 @@ fn emit_try_call(
     }
     let rets: Vec<BlockArg> = (0..returns).map(BlockArg::TryCallRet).collect();
     let normal = b.func.dfg.block_call(next, &rets);
-    let exceptional = b.func.dfg.block_call(handler, &[]);
+    let items: Vec<ExceptionTableItem> = handlers
+        .iter()
+        .map(|&(kind, handler)| {
+            let exceptional = b.func.dfg.block_call(handler, &[]);
+            ExceptionTableItem::Tag(handler_tag(kind), exceptional)
+        })
+        .collect();
     let sig = match callee {
         Ok(func) => b.func.dfg.ext_funcs[func].signature,
         Err(_) => b.import_signature(crag_signature(params, returns)),
     };
-    let table = ExceptionTableData::new(sig, normal, [ExceptionTableItem::Default(exceptional)]);
+    let table = ExceptionTableData::new(sig, normal, items);
     let table = b.func.dfg.exception_tables.push(table);
     match callee {
         Ok(func) => b.ins().try_call(func, &values, table),
@@ -1165,14 +1209,19 @@ fn run_backend(
     let mut handlers = Vec::new();
     for site in buffer.call_sites() {
         for handler in site.exception_handlers {
-            if let FinalizedMachExceptionHandler::Default(handler_offset) = handler {
+            if let FinalizedMachExceptionHandler::Tag(tag, handler_offset) = handler {
                 let frame_offset = site.frame_offset.ok_or_else(|| {
                     CodegenError::Backend("a call with a handler has no frame offset".into())
                 })?;
+                let kind = match tag.as_u32() {
+                    1 => HandlerKind::Transaction,
+                    _ => HandlerKind::Trap,
+                };
                 handlers.push(CallHandler {
                     return_offset: site.ret_addr,
                     handler_offset: *handler_offset,
                     frame_offset,
+                    kind,
                 });
             }
         }

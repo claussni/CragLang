@@ -22,7 +22,7 @@ mod common;
 
 use std::sync::Arc;
 
-use crag_abi::{FuncId, RuntimeFn, TypeDescriptor};
+use crag_abi::{FuncId, HandlerKind, RuntimeFn, TypeDescriptor};
 use crag_codegen::{BinOp, Block, BlockId, Cond, Inst, LirFunction, Term};
 use crag_runtime::{FiberConfig, FiberState, Types, Worker};
 
@@ -75,7 +75,7 @@ fn outer() -> LirFunction {
                         func: FuncId(1).into(),
                         args: vec![r(n), r(d)],
                         dsts: vec![r(5)],
-                        handler: BlockId(2),
+                        handlers: vec![(HandlerKind::Transaction, BlockId(2))],
                     },
                     Inst::Load {
                         dst: r(6),

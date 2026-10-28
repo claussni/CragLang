@@ -83,6 +83,22 @@ pub distinct type Embed[T](..LifecycleHandler)
 // (§18.4.1).
 pub type EmbedError(..Error, message: Str, line: Int = 0, column: Int = 0)
 
+// Traps: what the runtime raises, which handlers read but never make
+// (§8.3). `origin` is where the trap was raised.
+pub type Origin(module: Str, line: Int, column: Int)
+pub distinct type Trap(message: Str, origin: Origin)
+pub type Overflow(..Trap)
+pub type DivisionByZero(..Trap)
+pub type OutOfBounds(..Trap)
+pub type ConditionFailed(..Trap, condition: Str)
+pub type Expectation(..Trap, errorType: Str)
+pub type Unfinished(..Trap)
+pub type Cycle(..Trap)
+pub type Unordered(..Trap)
+pub type Exhausted(..Trap)
+pub type StackOverflow(..Trap)
+pub type Fault(..Trap)
+
 // The type functions of error unions and the type mapping functions over
 // them (§8.4).
 pub type Oks[X]

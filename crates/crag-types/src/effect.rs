@@ -475,7 +475,22 @@ impl<'a, 'db> Walker<'a, 'db> {
             Expr::Block { stmts, tail } => {
                 for stmt in stmts {
                     match stmt {
-                        Stmt::Fn { .. } | Stmt::On { .. } => {}
+                        // A trap handler's body runs in the frame
+                        // (§8.3.1); a signal handler's when it is called.
+                        Stmt::On { handler, .. } => {
+                            let signal = matches!(
+                                self.exprs
+                                    .get(handler.index())
+                                    .copied()
+                                    .flatten()
+                                    .map(|t| t.kind(self.db)),
+                                Some(TyKind::Fn { .. })
+                            );
+                            if !signal && let Expr::Closure { body, .. } = body.expr(*handler) {
+                                self.walk(*body, found);
+                            }
+                        }
+                        Stmt::Fn { .. } => {}
                         Stmt::Emit { value, .. } => {
                             self.walk(*value, found);
                             found.push(Occurrence {

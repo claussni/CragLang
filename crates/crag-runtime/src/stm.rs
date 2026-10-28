@@ -504,6 +504,45 @@ impl TxLog {
 }
 
 system_stack_fn! {
+    /// `rt_tx_depth(ctx) -> depth`: see `crag_abi::RuntimeFn::TxDepth`.
+    fn rt_tx_depth(ctx: *const TaskContext) -> u64 => depth_entry
+}
+
+/// The Rust half of `rt_tx_depth`.
+///
+/// # Safety
+///
+/// Called only by `rt_tx_depth`.
+unsafe extern "C" fn depth_entry(ctx: *const TaskContext) -> u64 {
+    // SAFETY: as the caller promises, a worker runs the fiber.
+    let fiber = unsafe { &*(*ctx).fiber.load(Ordering::Relaxed) };
+    fiber.tx.as_deref().map_or(0, |log| u64::from(log.depth))
+}
+
+system_stack_fn! {
+    /// `rt_tx_unwind(ctx, depth)`: see `crag_abi::RuntimeFn::TxUnwind`.
+    fn rt_tx_unwind(ctx: *const TaskContext, depth: u64) => unwind_entry
+}
+
+/// The Rust half of `rt_tx_unwind`: aborts the blocks begun inside
+/// `depth`, innermost first, as `rt_tx_abort` aborts one.
+///
+/// # Safety
+///
+/// Called only by `rt_tx_unwind`.
+unsafe extern "C" fn unwind_entry(ctx: *const TaskContext, depth: u64) {
+    loop {
+        // SAFETY: as the caller promises, a worker runs the fiber.
+        let fiber = unsafe { &*(*ctx).fiber.load(Ordering::Relaxed) };
+        if fiber.tx.as_deref().map_or(0, |log| u64::from(log.depth)) <= depth {
+            return;
+        }
+        // SAFETY: as the caller promises.
+        unsafe { abort_entry(ctx) };
+    }
+}
+
+system_stack_fn! {
     /// `rt_tx_abort(ctx)`: see `crag_abi::RuntimeFn::TxAbort`.
     fn rt_tx_abort(ctx: *const TaskContext) => abort_entry
 }

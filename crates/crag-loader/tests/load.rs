@@ -46,6 +46,9 @@ fn object(code: Vec<u8>, relocs: Vec<Reloc>) -> CodeObject {
         stack_check: StackCheck::None,
         stack_maps: vec![],
         handlers: vec![],
+        module: String::new(),
+        origins: vec![],
+        details: vec![],
     }
 }
 

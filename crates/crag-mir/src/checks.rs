@@ -138,11 +138,15 @@ fn items(statements: Vec<Statement<'_>>) -> Vec<Item<'_>> {
 /// Puts the items back into the block, ending it at each check with a
 /// branch to a trap of its own and continuing in a new block.
 fn split<'db>(body: &mut MirBody<'db>, b: usize, items: Vec<Item<'db>>) {
+    // The checks go to the trap handler around the block's code.
+    let catch = body.blocks[b].catch;
     let terminator = std::mem::replace(
         &mut body.blocks[b].terminator,
         Terminator::Trap {
             kind: TrapKind::Error,
             site: None,
+            detail: None,
+            catch: None,
         },
     );
     let mut current = b;
@@ -163,14 +167,20 @@ fn split<'db>(body: &mut MirBody<'db>, b: usize, items: Vec<Item<'db>>) {
                     Terminator::Trap {
                         kind,
                         site: Some(site),
+                        detail: None,
+                        catch,
                     },
+                    catch,
                 );
                 let next = push(
                     body,
                     Terminator::Trap {
                         kind: TrapKind::Error,
                         site: None,
+                        detail: None,
+                        catch: None,
                     },
+                    catch,
                 );
                 body.blocks[current] = Block {
                     statements: std::mem::take(&mut statements),
@@ -179,6 +189,7 @@ fn split<'db>(body: &mut MirBody<'db>, b: usize, items: Vec<Item<'db>>) {
                         then: trap,
                         otherwise: next,
                     },
+                    catch,
                 };
                 current = next.index();
             }
@@ -187,13 +198,19 @@ fn split<'db>(body: &mut MirBody<'db>, b: usize, items: Vec<Item<'db>>) {
     body.blocks[current] = Block {
         statements,
         terminator,
+        catch,
     };
 }
 
-fn push<'db>(body: &mut MirBody<'db>, terminator: Terminator<'db>) -> BlockId {
+fn push<'db>(
+    body: &mut MirBody<'db>,
+    terminator: Terminator<'db>,
+    catch: Option<BlockId>,
+) -> BlockId {
     body.blocks.push(Block {
         statements: Vec::new(),
         terminator,
+        catch,
     });
     BlockId(body.blocks.len() as u32 - 1)
 }

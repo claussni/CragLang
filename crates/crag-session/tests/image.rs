@@ -37,6 +37,9 @@ fn function(id: u32, params: u32, relocs: Vec<Reloc>) -> ShippedFunction {
             stack_check: StackCheck::Margin,
             stack_maps: Vec::new(),
             handlers: Vec::new(),
+            module: String::new(),
+            origins: Vec::new(),
+            details: Vec::new(),
         },
     }
 }

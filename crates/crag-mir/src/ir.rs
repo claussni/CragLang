@@ -77,6 +77,9 @@ pub struct LocalDecl<'db> {
 pub struct Block<'db> {
     pub statements: Vec<Statement<'db>>,
     pub terminator: Terminator<'db>,
+    /// The handler of the trap handler around the block's code, which the
+    /// checks of its arithmetic go to (§8.3.1).
+    pub catch: Option<BlockId>,
 }
 
 /// A local, or a part of the value in it.
@@ -264,6 +267,15 @@ pub enum Intrinsic<'db> {
     },
     /// Opens an `atomic` block: the number of blocks open, an `Int`.
     TxBegin,
+    /// How many `atomic` blocks the task is in, and abandoning those begun
+    /// inside a depth, for a trap handler (§8.3.1).
+    TxDepth,
+    TxUnwind,
+    /// Of the trap a handler took: its kind, the line or the column of its
+    /// origin, by `rt_trap_caught`'s numbering; and its module, message or
+    /// detail as a `Str`.
+    TrapCaught(u8),
+    TrapCaughtText(u8),
     /// Closes a block whose value is a success: 0, or else the attempt
     /// must rerun.
     TxCommit,
@@ -538,6 +550,9 @@ pub enum TrapKind {
     Unsupported,
     /// `!!` met an error (§8.4).
     Expectation,
+    /// The trap a handler took, raised again for the handlers around it
+    /// (§8.3.1).
+    Rethrow,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -566,6 +581,9 @@ pub enum Terminator<'db> {
         target: BlockId,
         site: ExprId,
         unwind: Option<BlockId>,
+        /// Where a trap in the code it called continues: the handler of
+        /// a trap handler around the call (§8.3.1).
+        catch: Option<BlockId>,
     },
     /// A call that replaces this function's frame (§5.6.3).
     TailCall {
@@ -582,6 +600,7 @@ pub enum Terminator<'db> {
         target: BlockId,
         site: ExprId,
         unwind: Option<BlockId>,
+        catch: Option<BlockId>,
     },
     TailCallValue {
         callee: Operand<'db>,
@@ -592,6 +611,12 @@ pub enum Terminator<'db> {
     Trap {
         kind: TrapKind,
         site: Option<ExprId>,
+        /// What the trap names beyond its kind, such as the type of the
+        /// error `!!` met (§8.3).
+        detail: Option<String>,
+        /// The handler of a trap handler of this function that takes it
+        /// (§8.3.1).
+        catch: Option<BlockId>,
     },
 }
 
@@ -605,14 +630,22 @@ impl<'db> Terminator<'db> {
             Terminator::Switch {
                 cases, otherwise, ..
             } => cases.iter().map(|(_, b)| *b).chain([*otherwise]).collect(),
-            Terminator::Call { target, unwind, .. }
-            | Terminator::CallValue { target, unwind, .. } => {
-                [*target].into_iter().chain(*unwind).collect()
+            Terminator::Call {
+                target,
+                unwind,
+                catch,
+                ..
             }
+            | Terminator::CallValue {
+                target,
+                unwind,
+                catch,
+                ..
+            } => [*target].into_iter().chain(*unwind).chain(*catch).collect(),
+            Terminator::Trap { catch, .. } => catch.iter().copied().collect(),
             Terminator::TailCall { .. }
             | Terminator::TailCallValue { .. }
-            | Terminator::Return(_)
-            | Terminator::Trap { .. } => Vec::new(),
+            | Terminator::Return(_) => Vec::new(),
         }
     }
 
@@ -629,14 +662,26 @@ impl<'db> Terminator<'db> {
                 .map(|(_, b)| b)
                 .chain([otherwise])
                 .collect(),
-            Terminator::Call { target, unwind, .. }
-            | Terminator::CallValue { target, unwind, .. } => {
-                [target].into_iter().chain(unwind.as_mut()).collect()
+            Terminator::Call {
+                target,
+                unwind,
+                catch,
+                ..
             }
+            | Terminator::CallValue {
+                target,
+                unwind,
+                catch,
+                ..
+            } => [target]
+                .into_iter()
+                .chain(unwind.as_mut())
+                .chain(catch.as_mut())
+                .collect(),
+            Terminator::Trap { catch, .. } => catch.as_mut().into_iter().collect(),
             Terminator::TailCall { .. }
             | Terminator::TailCallValue { .. }
-            | Terminator::Return(_)
-            | Terminator::Trap { .. } => Vec::new(),
+            | Terminator::Return(_) => Vec::new(),
         }
     }
 }
@@ -999,6 +1044,7 @@ fn terminator_text<'db>(db: &'db dyn Db, terminator: &Terminator<'db>) -> String
                 TrapKind::Error => "error",
                 TrapKind::Unsupported => "unsupported",
                 TrapKind::Expectation => "expectation",
+                TrapKind::Rethrow => "rethrow",
             };
             format!("trap {kind}")
         }

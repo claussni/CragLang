@@ -246,22 +246,7 @@ impl Sources for Project {
 
 /// What a trap of the kind tells the user.
 pub fn trap_message(kind: TrapKind) -> &'static str {
-    match kind {
-        TrapKind::Overflow => "arithmetic overflow",
-        TrapKind::DivideByZero => "division by zero",
-        TrapKind::Index => "index out of range",
-        TrapKind::Hole => "reached `???`",
-        TrapKind::NoMatch => "no arm of `case` matched",
-        TrapKind::Error => "reached code with errors",
-        TrapKind::Unsupported => "reached code the compiler does not support yet",
-        TrapKind::OutOfSteps => "ran out of steps",
-        TrapKind::OutOfMemory => "ran out of memory",
-        TrapKind::Cancelled => "was cancelled",
-        TrapKind::Cycle => "a lazy value needed itself",
-        TrapKind::Fault => "the environment failed, as writing to a closed output does",
-        TrapKind::Unordered => "compared values that have no order",
-        TrapKind::Expectation => "`!!` met an error",
-    }
+    kind.message()
 }
 
 /// A trap as the user sees it: what went wrong, where, and the functions

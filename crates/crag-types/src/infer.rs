@@ -98,6 +98,7 @@ pub fn infer_in_group<'db>(
         holes: Vec::new(),
         optional: Vec::new(),
         iterations: Vec::new(),
+        trap_handlers: Vec::new(),
         typed: HashMap::new(),
         frames: Vec::new(),
         negative: false,
@@ -189,6 +190,7 @@ pub fn infer_in_group<'db>(
         holes: cx.holes,
         optional: cx.optional,
         iterations: cx.iterations,
+        trap_handlers: cx.trap_handlers,
         effects,
         escapes,
         errors: cx.lower.errors,
@@ -224,6 +226,7 @@ struct Infer<'a, 'db> {
     holes: Vec<(ExprId, Ty<'db>)>,
     optional: Vec<(ExprId, Optional<'db>)>,
     iterations: Vec<(ExprId, Iteration<'db>)>,
+    trap_handlers: Vec<(ExprId, Ty<'db>)>,
     /// Expressions already typed, which their next check takes as they
     /// are: the field values a construction infers its type arguments
     /// from.
@@ -727,14 +730,30 @@ impl<'a, 'db> Infer<'a, 'db> {
             }
             Expr::Block { stmts, tail } => {
                 let mut leaves = false;
+                let mut handled = Vec::new();
                 for stmt in stmts {
+                    // A trap handler gives the block its value (§8.3.1).
+                    if let Stmt::On { ty, handler } = stmt
+                        && let Some(trap) = self.trap_type(*ty)
+                    {
+                        handled.push((*handler, self.trap_handler(*handler, trap)));
+                        continue;
+                    }
                     leaves |= self.stmt(stmt).is_never(db);
                 }
                 let ty = match tail {
                     Some(tail) => self.infer(*tail, expected),
                     None => Ty::unit(db),
                 };
-                if leaves { Ty::never(db) } else { ty }
+                let ty = if leaves { Ty::never(db) } else { ty };
+                let mut whole = ty;
+                for (handler, given) in handled {
+                    match expected.or(Some(ty).filter(|t| !t.is_never(db))) {
+                        Some(wanted) => self.expect(Site::Expr(handler), given, wanted),
+                        None => whole = self.join(whole, given),
+                    }
+                }
+                whole
             }
             Expr::Closure { params, body: root } => {
                 let ty = self.closure(params, *root, expected);
@@ -3563,6 +3582,53 @@ impl<'a, 'db> Infer<'a, 'db> {
         )
     }
 
+    /// The type a handler takes, if it is a trap's (§8.3.1).
+    fn trap_type(&mut self, ty: TypeRefId) -> Option<Ty<'db>> {
+        let db = self.db;
+        prelude_item(db, self.program, "Trap")?;
+        let ty = self.lower_type(ty);
+        let trap = prelude_type(db, self.program, "Trap");
+        (!ty.is_error(db) && self.fits(ty, trap)).then_some(ty)
+    }
+
+    /// `on T { t -> … }` for a trap type `T`: the parameter takes the trap,
+    /// and the body runs in the function's frame once the block has left
+    /// what it was doing, so `return` leaves the function and nothing
+    /// narrowed before holds. Gives the body's value.
+    fn trap_handler(&mut self, handler: ExprId, trap: Ty<'db>) -> Ty<'db> {
+        let Expr::Closure { params, body } = self.body.expr(handler) else {
+            return self.synth(handler);
+        };
+        match params.as_slice() {
+            [param] => {
+                if let Some(written) = self.written(param.ty)
+                    && !self.fits(trap, written)
+                {
+                    let kind = ErrorKind::Mismatch {
+                        expected: trap,
+                        found: written,
+                    };
+                    self.error(Site::Pat(param.pat), kind);
+                }
+                self.pattern(param.pat, trap);
+            }
+            _ => {
+                let kind = ErrorKind::ArgCount {
+                    expected: 1,
+                    found: params.len(),
+                };
+                self.error(Site::Expr(handler), kind);
+            }
+        }
+        let inside = self.without_vars();
+        let outside = std::mem::replace(&mut self.narrowed, inside);
+        let given = self.synth(*body);
+        self.narrowed = outside;
+        self.exprs[handler.index()] = Some(trap);
+        self.trap_handlers.push((handler, trap));
+        given
+    }
+
     /// The binding of a `_` of a partial application, if `pat` is one.
     fn hole_of(&self, pat: PatId) -> Option<BindingId> {
         match self.body.pat(pat) {
@@ -4073,6 +4139,21 @@ impl<'a, 'db> Infer<'a, 'db> {
             }
             // A signal spreads the prelude's `Signal` (§11.1).
             Stmt::Emit { value, .. } => {
+                // A trap handler passes its trap on (§8.3.1).
+                let trap = prelude_item(db, self.program, "Trap")
+                    .map(|_| prelude_type(db, self.program, "Trap"));
+                if let Some(trap) = trap
+                    && let Expr::Name { local: Some(_), .. } = self.body.expr(*value)
+                {
+                    let found = self.synth(*value);
+                    // Passed on, it leaves the handler.
+                    if self.fits(found, trap) {
+                        return Ty::never(db);
+                    }
+                    let signal = prelude_type(db, self.program, "Signal");
+                    self.expect(Site::Expr(*value), found, signal);
+                    return unit;
+                }
                 if prelude_item(db, self.program, "Signal").is_some() {
                     let signal = prelude_type(db, self.program, "Signal");
                     self.check(*value, signal);

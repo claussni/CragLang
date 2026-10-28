@@ -93,3 +93,64 @@ fn type_mapping_functions_keep_successes_or_errors() {
     assert_eq!(eval(&mut r, "expected(4)"), "4\n");
     assert!(eval(&mut r, "expected(E)").starts_with("trap: `!!` met an error"));
 }
+
+#[test]
+fn trap_handlers_give_their_block_its_value() {
+    // §8.3.1: a handler takes a trap in its block or in what it calls;
+    // the most specific of a block's handlers wins, and one that takes
+    // none passes it on.
+    let mut r = repl();
+    eval(
+        &mut r,
+        "fn deep(n: Int) -> Int { if n == 0 { 1 / n } else { deep(n - 1) } }",
+    );
+    eval(
+        &mut r,
+        "fn safe(xs: List[Int], i: Int) -> Int {\n  on OutOfBounds { t -> -1 }\n  xs[i]\n}",
+    );
+    assert_eq!(eval(&mut r, "safe([1, 2], 1)"), "2\n");
+    assert_eq!(eval(&mut r, "safe([1, 2], 5)"), "-1\n");
+    eval(
+        &mut r,
+        "fn told(n: Int) -> Str {\n  on Trap { t -> \"{t.message} at {t.origin.line}:{t.origin.column}\" }\n  \"fine {deep(n)}\"\n}",
+    );
+    assert_eq!(eval(&mut r, "told(3)"), "\"division by zero at 1:38\"\n");
+    eval(
+        &mut r,
+        "fn specific() -> Str {\n  on Trap { t -> \"any\" }\n  on DivisionByZero { t -> \"zero\" }\n  \"{deep(0)}\"\n}",
+    );
+    assert_eq!(eval(&mut r, "specific()"), "\"zero\"\n");
+    // Passed on, the trap reports where it began.
+    eval(
+        &mut r,
+        "fn other() -> Int {\n  on Overflow { t -> 0 }\n  deep(2)\n}",
+    );
+    let out = eval(&mut r, "other()");
+    assert!(
+        out.starts_with("trap: division by zero\n --> deep:1:38"),
+        "{out}"
+    );
+    assert!(
+        out.contains("  in deep\n") && out.contains("  in other"),
+        "{out}"
+    );
+    eval(
+        &mut r,
+        "fn passing() -> Int {\n  on Trap { t -> emit t }\n  deep(1)\n}",
+    );
+    assert!(eval(&mut r, "passing()").starts_with("trap: division by zero"));
+    // `!!` names the error it met.
+    eval(&mut r, "type E(..Error)");
+    eval(
+        &mut r,
+        "fn x(v: Int | E) -> Str {\n  on Expectation { t -> \"met {t.errorType}\" }\n  \"{!!v}\"\n}",
+    );
+    assert_eq!(eval(&mut r, "x(E)"), "\"met E\"\n");
+    // An `atomic` block a trap leaves rolls back; refs keep the rest.
+    eval(
+        &mut r,
+        "fn tx(n: Int) -> Int {\n  ref r: Int = 10\n  r.swap(20)\n  on Trap { t -> r.use() }\n  atomic {\n    r.swap(30)\n    let x = 1 / n\n  }\n  r.use()\n}",
+    );
+    assert_eq!(eval(&mut r, "tx(0)"), "20\n");
+    assert_eq!(eval(&mut r, "tx(1)"), "30\n");
+}

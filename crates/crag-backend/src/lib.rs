@@ -342,15 +342,20 @@ pub fn code<'db>(
         opt: OptLevel::None,
         metered: tier == Tier::Metered,
     };
-    Some(compile_cached(&lowered.lir, &settings).map(|object| Code {
-        object,
-        func: func_id(instance),
-        slot: slot_key(db, program, instance),
-        params: lowered.lir.params,
-        returns: lowered.lir.returns,
-        calls: lowered.calls,
-        types: lowered.types,
-        unsupported: lowered.unsupported,
-        steps: lowered.steps,
+    Some(compile_cached(&lowered.lir, &settings).map(|mut object| {
+        object.module = lowered.module.clone();
+        object.origins = lowered.origins.clone();
+        object.details = lowered.details.clone();
+        Code {
+            object,
+            func: func_id(instance),
+            slot: slot_key(db, program, instance),
+            params: lowered.lir.params,
+            returns: lowered.lir.returns,
+            calls: lowered.calls,
+            types: lowered.types,
+            unsupported: lowered.unsupported,
+            steps: lowered.steps,
+        }
     }))
 }

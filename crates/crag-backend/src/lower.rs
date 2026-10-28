@@ -41,11 +41,11 @@ use std::ops::Range;
 
 use crag_abi::{
     BUFFER_HEADER, CELL_FULL, CELL_STATE_OFFSET, CELL_VALUE_OFFSET, COUNT_OFFSET,
-    FUNCTION_BOX_HEADER, HEADER_SIZE, HEAP_OFFSET, INLINE_TEXT_MAX, LEN_OFFSET, LIST_SIZE,
-    MAP_SIZE, MEMBER_BOX_SIZE, NO_POSITION, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, REF_ADD,
+    FUNCTION_BOX_HEADER, HEADER_SIZE, HEAP_OFFSET, HandlerKind, INLINE_TEXT_MAX, LEN_OFFSET,
+    LIST_SIZE, MAP_SIZE, MEMBER_BOX_SIZE, NO_POSITION, PAGE_FREE_OFFSET, PAGE_USED_OFFSET, REF_ADD,
     REF_CELL_SIZE, REF_MUL, REF_SUB, REF_UNSIGNED, SCOPE_DONE, SIDE_END_OFFSET, SIDE_PTR_OFFSET,
     SIGNAL_NONE, START_EXEMPT, STATIC_COUNT, TEXT_BOX_HEADER, TEXT_LEN_MAX, TX_CONFLICT_OFFSET,
-    TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TypeDescriptor, inline_text, size_class,
+    TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TrapOrigin, TypeDescriptor, inline_text, size_class,
 };
 use crag_codegen::{
     BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, CallTarget, Cond, FuncId, Inst,
@@ -77,6 +77,11 @@ pub struct Lowered<'db> {
     pub types: Vec<(u32, TypeDescriptor)>,
     /// Its steps, by index (Implementation Plan §11.8.6).
     pub steps: Vec<StepInfo<'db>>,
+    /// The module of its code, where the positions of its traps lie, and
+    /// what they name (Specification §8.3).
+    pub module: String,
+    pub origins: Vec<TrapOrigin>,
+    pub details: Vec<String>,
 }
 
 /// A statement's step, for the debugger: where the statement starts and
@@ -129,6 +134,9 @@ pub fn lower_to_lir<'db>(
         scratch: None,
         func,
         steps: Vec::new(),
+        source: owner.module(db).file(db).text(db),
+        origins: Vec::new(),
+        details: Vec::new(),
     };
     for (i, decl) in mir.locals.iter().enumerate() {
         let layout = layout(db, program, decl.ty);
@@ -210,7 +218,26 @@ pub fn lower_to_lir<'db>(
         calls: l.calls,
         types: l.types,
         steps: l.steps,
+        module: owner.module(db).path(db).clone(),
+        origins: {
+            let mut origins = l.origins;
+            origins.sort_by_key(|o| o.position);
+            origins.dedup();
+            origins
+        },
+        details: l.details,
     }
+}
+
+/// The handlers of a call: for leaving a transaction's attempt, and for a
+/// trap (Specification §8.3.1).
+fn handlers(unwind: &Option<BlockId>, catch: &Option<BlockId>) -> Vec<(HandlerKind, LirBlockId)> {
+    let block = |b: &BlockId| LirBlockId(b.0);
+    unwind
+        .iter()
+        .map(|b| (HandlerKind::Transaction, block(b)))
+        .chain(catch.iter().map(|b| (HandlerKind::Trap, block(b))))
+        .collect()
 }
 
 struct Lower<'a, 'db> {
@@ -237,6 +264,10 @@ struct Lower<'a, 'db> {
     false_index: i64,
     /// The cell of the value the code computes, if it is a value's.
     cell: Option<SlotKey>,
+    /// The source of the module, for the origins of traps.
+    source: &'db str,
+    origins: Vec<TrapOrigin>,
+    details: Vec<String>,
     /// Three words on the side stack that the runtime's reads put what they
     /// read in, pushed at the entry once the code reads anything.
     scratch: Option<VReg>,
@@ -253,6 +284,20 @@ impl<'a, 'db> Lower<'a, 'db> {
 
     fn push(&mut self, inst: Inst) {
         self.current.1.push(inst);
+    }
+
+    /// The line and column, from one, of a byte offset in the module, the
+    /// column counted in characters.
+    fn origin(&self, at: u32) -> TrapOrigin {
+        let before = &self.source[..(at as usize).min(self.source.len())];
+        let line = before.matches('\n').count() as u32 + 1;
+        let start = before.rfind('\n').map_or(0, |i| i + 1);
+        let column = before[start..].chars().count() as u32 + 1;
+        TrapOrigin {
+            position: at,
+            line,
+            column,
+        }
     }
 
     fn new_block(&mut self) -> LirBlockId {
@@ -2027,6 +2072,24 @@ impl<'a, 'db> Lower<'a, 'db> {
                 Ok(Vec::new())
             }
             (Intrinsic::TxBegin, []) => Ok(vec![self.runtime(RuntimeFn::TxBegin, Vec::new())]),
+            (Intrinsic::TxDepth, []) => Ok(vec![self.runtime(RuntimeFn::TxDepth, Vec::new())]),
+            (Intrinsic::TxUnwind, [depth]) => {
+                let depth = word(&self.operand(depth, int)?)?;
+                self.push(Inst::CallRuntime {
+                    func: RuntimeFn::TxUnwind,
+                    args: vec![depth],
+                    dsts: Vec::new(),
+                });
+                Ok(Vec::new())
+            }
+            (Intrinsic::TrapCaught(which), []) => {
+                let which = self.constant(i64::from(which));
+                Ok(vec![self.runtime(RuntimeFn::TrapCaught, vec![which])])
+            }
+            (Intrinsic::TrapCaughtText(which), []) => {
+                let which = self.constant(i64::from(which));
+                Ok(self.runtime2(RuntimeFn::TrapCaughtText, vec![which]))
+            }
             (Intrinsic::TxCommit, []) => Ok(vec![self.runtime(RuntimeFn::TxCommit, Vec::new())]),
             (Intrinsic::TxAbort | Intrinsic::TxRetry | Intrinsic::TxThrow, []) => {
                 let func = match intrinsic {
@@ -2756,19 +2819,21 @@ impl<'a, 'db> Lower<'a, 'db> {
                 dst,
                 target,
                 unwind,
+                catch,
                 ..
             } => {
                 let args = self.arguments(*func, args)?;
                 let dsts = self.locals[dst.index()].clone();
                 self.layouts[dst.index()].ok_or("values of this type")?;
                 let func = self.slot(*func);
-                self.push(match unwind {
-                    None => Inst::Call { func, args, dsts },
-                    Some(handler) => Inst::TryCall {
+                let handlers = handlers(unwind, catch);
+                self.push(match handlers.is_empty() {
+                    true => Inst::Call { func, args, dsts },
+                    false => Inst::TryCall {
                         func,
                         args,
                         dsts,
-                        handler: block(*handler),
+                        handlers,
                     },
                 });
                 self.end(Term::Jump(block(*target)), None);
@@ -2787,22 +2852,24 @@ impl<'a, 'db> Lower<'a, 'db> {
                 dst,
                 target,
                 unwind,
+                catch,
                 ..
             } => {
                 let (code, args) = self.value_arguments(callee, args)?;
                 let dsts = self.locals[dst.index()].clone();
                 self.layouts[dst.index()].ok_or("values of this type")?;
-                self.push(match unwind {
-                    None => Inst::CallIndirect {
+                let handlers = handlers(unwind, catch);
+                self.push(match handlers.is_empty() {
+                    true => Inst::CallIndirect {
                         callee: code,
                         args,
                         dsts,
                     },
-                    Some(handler) => Inst::TryCallIndirect {
+                    false => Inst::TryCallIndirect {
                         callee: code,
                         args,
                         dsts,
-                        handler: block(*handler),
+                        handlers,
                     },
                 });
                 self.end(Term::Jump(block(*target)), None);
@@ -2822,8 +2889,24 @@ impl<'a, 'db> Lower<'a, 'db> {
                 }
                 self.end(Term::Return(values), None);
             }
-            Terminator::Trap { kind, site } => {
+            Terminator::Trap {
+                kind,
+                site,
+                detail,
+                catch,
+            } => {
+                // A trap raised again goes to the handler around, in this
+                // function or past it.
+                if let TrapKind::Rethrow = kind {
+                    let term = match catch {
+                        Some(handler) => Term::Jump(block(*handler)),
+                        None => Term::Rethrow,
+                    };
+                    self.end(term, None);
+                    return Ok(());
+                }
                 let kind = match kind {
+                    TrapKind::Rethrow => unreachable!("raised again above"),
                     TrapKind::Overflow => AbiTrap::Overflow,
                     TrapKind::DivideByZero => AbiTrap::DivideByZero,
                     TrapKind::Index => AbiTrap::Index,
@@ -2833,9 +2916,36 @@ impl<'a, 'db> Lower<'a, 'db> {
                     TrapKind::Unsupported => AbiTrap::Unsupported,
                     TrapKind::Expectation => AbiTrap::Expectation,
                 };
-                // The byte offset of the expression in the module's source.
+                // The byte offset of the expression in the module's source,
+                // with the detail it names in the upper half.
                 let position = site.and_then(|e| self.positions.get(e.index()).map(|r| r.start));
-                self.end(Term::Trap { kind, position }, None);
+                if let Some(at) = position {
+                    let origin = self.origin(at);
+                    self.origins.push(origin);
+                }
+                let word = |this: &mut Self| -> u64 {
+                    let Some(at) = position else {
+                        return NO_POSITION;
+                    };
+                    let index = detail.as_ref().map_or(0, |d| {
+                        this.details.push(d.clone());
+                        this.details.len() as u64
+                    });
+                    u64::from(at) | index << 32
+                };
+                let term = match (catch, detail) {
+                    (Some(handler), _) => Term::Caught {
+                        kind,
+                        position: word(self),
+                        handler: block(*handler),
+                    },
+                    (None, Some(_)) => Term::Raise {
+                        kind,
+                        position: word(self),
+                    },
+                    (None, None) => Term::Trap { kind, position },
+                };
+                self.end(term, None);
             }
         }
         Ok(())

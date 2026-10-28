@@ -66,6 +66,9 @@ pub struct InferenceResult<'db> {
     pub holes: Vec<(ExprId, Ty<'db>)>,
     /// What a `for` calls to walk what it iterates, by the iterable.
     pub iterations: Vec<(ExprId, Iteration<'db>)>,
+    /// The trap handlers, by their `{ t -> … }`, with the trap type each
+    /// takes; their bodies run in the function's frame (§8.3.1).
+    pub trap_handlers: Vec<(ExprId, Ty<'db>)>,
     /// Every `?.` access on a value that can be `Empty` (§6.8).
     pub optional: Vec<(ExprId, Optional<'db>)>,
     /// What the body does beyond computing (§3.14).
@@ -86,6 +89,15 @@ impl<'db> InferenceResult<'db> {
 
     pub fn binding(&self, id: BindingId) -> Option<Ty<'db>> {
         self.bindings.get(id.index()).copied().flatten()
+    }
+
+    /// The trap type a handler takes, if `id` is a trap handler's
+    /// `{ t -> … }`.
+    pub fn trap_handler(&self, id: ExprId) -> Option<Ty<'db>> {
+        self.trap_handlers
+            .iter()
+            .find(|(e, _)| *e == id)
+            .map(|(_, t)| *t)
     }
 
     pub fn iteration(&self, id: ExprId) -> Option<&Iteration<'db>> {

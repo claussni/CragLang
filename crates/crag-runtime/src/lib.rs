@@ -213,6 +213,12 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::BytesRead => strings::rt_bytes_read as *const () as usize,
         RuntimeFn::BytesWrite => strings::rt_bytes_write as *const () as usize,
         RuntimeFn::BytesOfList => strings::rt_bytes_of_list as *const () as usize,
+        RuntimeFn::TrapCatch => unwind::rt_trap_catch as *const () as usize,
+        RuntimeFn::TrapRethrow => unwind::rt_trap_rethrow as *const () as usize,
+        RuntimeFn::TrapCaught => unwind::rt_trap_caught as *const () as usize,
+        RuntimeFn::TrapCaughtText => unwind::rt_trap_caught_text as *const () as usize,
+        RuntimeFn::TxDepth => stm::rt_tx_depth as *const () as usize,
+        RuntimeFn::TxUnwind => stm::rt_tx_unwind as *const () as usize,
     }
 }
 

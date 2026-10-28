@@ -431,6 +431,7 @@ pub fn insert_drops(body: &mut MirBody<'_>, live: &Liveness) {
             body.blocks.push(crate::ir::Block {
                 statements: releases.collect(),
                 terminator: Terminator::Jump(s),
+                catch: None,
             });
             let edge = BlockId(body.blocks.len() as u32 - 1);
             *body.blocks[b].terminator.successors_mut()[k] = edge;

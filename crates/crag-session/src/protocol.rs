@@ -27,8 +27,9 @@
 use std::io::{self, Read, Write};
 
 use crag_abi::{
-    CallHandler, CodeObject, CountedField, ElementLayout, FuncId, Reloc, RelocKind, RelocTarget,
-    RuntimeFn, Shapes, SlotKey, StackCheck, StackMap, TrapKind, TypeDescriptor,
+    CallHandler, CodeObject, CountedField, ElementLayout, FuncId, HandlerKind, Reloc, RelocKind,
+    RelocTarget, RuntimeFn, Shapes, SlotKey, StackCheck, StackMap, TrapKind, TrapOrigin,
+    TypeDescriptor,
 };
 
 /// The version of the protocol, raised whenever a message changes, or
@@ -580,7 +581,18 @@ impl Writer {
             w.u32(h.return_offset);
             w.u32(h.handler_offset);
             w.u32(h.frame_offset);
+            w.u8(match h.kind {
+                HandlerKind::Transaction => 0,
+                HandlerKind::Trap => 1,
+            });
         });
+        self.text(&o.module);
+        self.seq(&o.origins, |w, o| {
+            w.u32(o.position);
+            w.u32(o.line);
+            w.u32(o.column);
+        });
+        self.seq(&o.details, |w, d| w.text(d));
     }
 
     fn text(&mut self, text: &str) {
@@ -762,8 +774,22 @@ impl Reader<'_> {
                     return_offset: r.u32()?,
                     handler_offset: r.u32()?,
                     frame_offset: r.u32()?,
+                    kind: match r.u8()? {
+                        0 => HandlerKind::Transaction,
+                        1 => HandlerKind::Trap,
+                        tag => return Err(invalid(format!("a handler kind with the tag {tag}"))),
+                    },
                 })
             })?,
+            module: self.text()?,
+            origins: self.seq(|r| {
+                Ok(TrapOrigin {
+                    position: r.u32()?,
+                    line: r.u32()?,
+                    column: r.u32()?,
+                })
+            })?,
+            details: self.seq(Reader::text)?,
         })
     }
 
@@ -1059,7 +1085,15 @@ mod tests {
                 return_offset: 3,
                 handler_offset: 9,
                 frame_offset: 16,
+                kind: HandlerKind::Trap,
             }],
+            module: "app".into(),
+            origins: vec![TrapOrigin {
+                position: 7,
+                line: 2,
+                column: 3,
+            }],
+            details: vec!["NotFound".into()],
             stack_maps: vec![StackMap {
                 return_offset: 1,
                 slots: vec![0, 8],

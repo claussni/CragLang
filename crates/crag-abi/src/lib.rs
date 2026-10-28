@@ -907,6 +907,42 @@ pub enum RuntimeFn {
     ///
     /// The bytes of a list of `UInt8` values. It borrows the list.
     BytesOfList = 104,
+
+    /// `rt_trap_catch(ctx, kind, position)`.
+    ///
+    /// A trap that a handler of its own frame takes (Specification
+    /// §8.3.1): records it, as `rt_trap` records one it unwinds to a
+    /// handler, and returns, so the frame goes on at the handler.
+    TrapCatch = 105,
+
+    /// `rt_trap_rethrow(ctx) -> !`.
+    ///
+    /// Raises the trap a handler took again, for the handlers around it.
+    TrapRethrow = 106,
+
+    /// `rt_trap_caught(ctx, which) -> u64`.
+    ///
+    /// Of the trap a handler took: its kind (0), the line (1) and the
+    /// column (2) of its origin, from one.
+    TrapCaught = 107,
+
+    /// `rt_trap_caught_text(ctx, which) -> (w0, w1)`.
+    ///
+    /// Of the trap a handler took, as a string: the module of its origin
+    /// (0), its message (1), and what it names (2), such as the type of
+    /// the error `!!` met.
+    TrapCaughtText = 108,
+
+    /// `rt_tx_depth(ctx) -> depth`.
+    ///
+    /// How many `atomic` blocks the task is in.
+    TxDepth = 109,
+
+    /// `rt_tx_unwind(ctx, depth)`.
+    ///
+    /// Abandons the transactions begun inside `depth`, as a trap leaves
+    /// them for a handler outside (Specification §8.3.1).
+    TxUnwind = 110,
 }
 
 /// The kinds of numbers of `BytesRead` and `BytesWrite`.
@@ -1073,7 +1109,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 105] = [
+    pub const ALL: [RuntimeFn; 111] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -1179,6 +1215,12 @@ impl RuntimeFn {
         RuntimeFn::BytesRead,
         RuntimeFn::BytesWrite,
         RuntimeFn::BytesOfList,
+        RuntimeFn::TrapCatch,
+        RuntimeFn::TrapRethrow,
+        RuntimeFn::TrapCaught,
+        RuntimeFn::TrapCaughtText,
+        RuntimeFn::TxDepth,
+        RuntimeFn::TxUnwind,
     ];
 
     /// The symbol the loader looks up.
@@ -1289,6 +1331,12 @@ impl RuntimeFn {
             RuntimeFn::BytesRead => "rt_bytes_read",
             RuntimeFn::BytesWrite => "rt_bytes_write",
             RuntimeFn::BytesOfList => "rt_bytes_of_list",
+            RuntimeFn::TrapCatch => "rt_trap_catch",
+            RuntimeFn::TrapRethrow => "rt_trap_rethrow",
+            RuntimeFn::TrapCaught => "rt_trap_caught",
+            RuntimeFn::TrapCaughtText => "rt_trap_caught_text",
+            RuntimeFn::TxDepth => "rt_tx_depth",
+            RuntimeFn::TxUnwind => "rt_tx_unwind",
         }
     }
 
@@ -1332,6 +1380,38 @@ pub enum TrapKind {
     Unordered = 12,
     /// `!!` met an error (Specification §8.4).
     Expectation = 13,
+}
+
+impl TrapKind {
+    /// What a trap of the kind tells the user.
+    pub fn message(self) -> &'static str {
+        match self {
+            TrapKind::Overflow => "arithmetic overflow",
+            TrapKind::DivideByZero => "division by zero",
+            TrapKind::Index => "index out of range",
+            TrapKind::Hole => "reached `???`",
+            TrapKind::NoMatch => "no arm of `case` matched",
+            TrapKind::Error => "reached code with errors",
+            TrapKind::Unsupported => "reached code the compiler does not support yet",
+            TrapKind::OutOfSteps => "ran out of steps",
+            TrapKind::OutOfMemory => "ran out of memory",
+            TrapKind::Cancelled => "was cancelled",
+            TrapKind::Cycle => "a lazy value needed itself",
+            TrapKind::Fault => "the environment failed, as writing to a closed output does",
+            TrapKind::Unordered => "compared values that have no order",
+            TrapKind::Expectation => "`!!` met an error",
+        }
+    }
+
+    /// Whether a trap handler may take a trap of the kind: cancellation
+    /// is no trap (Specification §10.4), and code with errors or the
+    /// compiler's gaps are not the program's.
+    pub fn catchable(self) -> bool {
+        !matches!(
+            self,
+            TrapKind::Cancelled | TrapKind::Error | TrapKind::Unsupported
+        )
+    }
 }
 
 impl TrapKind {
@@ -1665,9 +1745,35 @@ pub struct CodeObject {
     pub stack_check: StackCheck,
     /// Where the tracked values are at each call, ordered by offset.
     pub stack_maps: Vec<StackMap>,
-    /// The calls with a handler, which `TxThrow` continues at, ordered by
-    /// offset.
+    /// The calls with a handler, which `TxThrow` or a trap continues at,
+    /// ordered by offset.
     pub handlers: Vec<CallHandler>,
+    /// The module of the code, which origins name.
+    pub module: String,
+    /// Where each position a trap of this code may name lies, ordered by
+    /// position.
+    pub origins: Vec<TrapOrigin>,
+    /// What traps of this code name beyond their kind, such as the type of
+    /// the error `!!` met: the upper half of a trap's position word, from
+    /// one, indexes it.
+    pub details: Vec<String>,
+}
+
+/// The line and column, from one, of a byte offset in a module's source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TrapOrigin {
+    pub position: u32,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// What a call's handler takes over from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HandlerKind {
+    /// Leaving a transaction's attempt (Implementation Plan §11.7.14).
+    Transaction,
+    /// A trap (Specification §8.3.1).
+    Trap,
 }
 
 /// A call whose frame takes over when the code it called leaves a
@@ -1682,6 +1788,7 @@ pub struct CallHandler {
     pub handler_offset: u32,
     /// From the frame pointer down to the stack pointer at the call.
     pub frame_offset: u32,
+    pub kind: HandlerKind,
 }
 
 /// The tracked values of one frame while it is suspended at a call.

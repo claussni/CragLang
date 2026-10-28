@@ -20,7 +20,7 @@
 //! in SSA form: any block may assign any register, and the facade builds SSA.
 //! Every register holds one machine word.
 
-use crag_abi::{FuncId, RuntimeFn, SlotKey, TrapKind};
+use crag_abi::{FuncId, HandlerKind, RuntimeFn, SlotKey, TrapKind};
 
 /// A virtual register. Registers `0..params` hold the parameters on entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -166,21 +166,22 @@ pub enum Inst {
         args: Vec<VReg>,
         dsts: Vec<VReg>,
     },
-    /// A call, as `Call`, that continues at `handler` instead when the code
-    /// it called leaves a transaction's attempt with `rt_tx_throw`. The
-    /// handler sees the registers as they were before the call.
+    /// A call, as `Call`, that continues at a handler instead when the
+    /// code it called leaves a transaction's attempt with `rt_tx_throw`, or
+    /// traps, by the kind of each. A handler sees the registers as they
+    /// were before the call.
     TryCall {
         func: CallTarget,
         args: Vec<VReg>,
         dsts: Vec<VReg>,
-        handler: BlockId,
+        handlers: Vec<(HandlerKind, BlockId)>,
     },
-    /// A call, as `CallIndirect`, with a handler, as `TryCall` has.
+    /// A call, as `CallIndirect`, with handlers, as `TryCall` has.
     TryCallIndirect {
         callee: VReg,
         args: Vec<VReg>,
         dsts: Vec<VReg>,
-        handler: BlockId,
+        handlers: Vec<(HandlerKind, BlockId)>,
     },
     /// A call of a runtime function with the C calling convention. The task
     /// context goes first, before `args`; `dsts` receive the results, at
@@ -277,6 +278,22 @@ pub enum Term {
     Trap {
         kind: TrapKind,
         position: Option<u32>,
+    },
+    /// Calls `rt_trap_rethrow`, which raises the trap a handler took again.
+    Rethrow,
+    /// Calls `rt_trap`, as `Trap` does, with a position word whose upper
+    /// half names a detail of the code object.
+    Raise {
+        kind: TrapKind,
+        position: u64,
+    },
+    /// A trap that a handler of this function takes (Specification
+    /// §8.3.1): records it with `rt_trap_catch` and goes on at `handler`.
+    /// The position word's upper half may name a detail.
+    Caught {
+        kind: TrapKind,
+        position: u64,
+        handler: BlockId,
     },
 }
 
@@ -396,27 +413,27 @@ impl LirFunction {
                     Inst::TryCall {
                         args,
                         dsts,
-                        handler,
+                        handlers,
                         ..
                     } => {
                         if dsts.len() > 2 {
                             return Err("a call with more than 2 results".into());
                         }
                         args.iter().chain(dsts).try_for_each(reg)?;
-                        block(handler)?;
+                        handlers.iter().try_for_each(|(_, h)| block(h))?;
                     }
                     Inst::TryCallIndirect {
                         callee,
                         args,
                         dsts,
-                        handler,
+                        handlers,
                     } => {
                         if dsts.len() > 2 {
                             return Err("a call with more than 2 results".into());
                         }
                         reg(callee)?;
                         args.iter().chain(dsts).try_for_each(reg)?;
-                        block(handler)?;
+                        handlers.iter().try_for_each(|(_, h)| block(h))?;
                     }
                     Inst::Load { dst, addr, .. } => {
                         reg(dst)?;
@@ -467,6 +484,8 @@ impl LirFunction {
                     args.iter().try_for_each(reg)?;
                 }
                 Term::Trap { .. } => {}
+                Term::Caught { handler, .. } => block(handler)?,
+                Term::Raise { .. } | Term::Rethrow => {}
             }
         }
         Ok(())

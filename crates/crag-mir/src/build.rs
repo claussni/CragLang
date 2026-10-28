@@ -96,6 +96,8 @@ pub fn build<'db>(
             b.terminate(Terminator::Trap {
                 kind: TrapKind::Error,
                 site: None,
+                detail: None,
+                catch: None,
             });
         }
     }
@@ -276,6 +278,22 @@ struct Otherwise {
     body: ExprId,
 }
 
+/// The trap kinds a handler may take, with the prelude's types for them
+/// (§8.3).
+const TRAP_TYPES: [(crag_abi::TrapKind, &str); 11] = [
+    (crag_abi::TrapKind::Overflow, "Overflow"),
+    (crag_abi::TrapKind::DivideByZero, "DivisionByZero"),
+    (crag_abi::TrapKind::Index, "OutOfBounds"),
+    (crag_abi::TrapKind::Hole, "Unfinished"),
+    (crag_abi::TrapKind::NoMatch, "Fault"),
+    (crag_abi::TrapKind::OutOfSteps, "Exhausted"),
+    (crag_abi::TrapKind::OutOfMemory, "Exhausted"),
+    (crag_abi::TrapKind::Cycle, "Cycle"),
+    (crag_abi::TrapKind::Fault, "Fault"),
+    (crag_abi::TrapKind::Unordered, "Unordered"),
+    (crag_abi::TrapKind::Expectation, "Expectation"),
+];
+
 /// The state of lowering one decision tree.
 struct Match {
     subject: Local,
@@ -303,6 +321,10 @@ pub struct MirBuilder<'a, 'db> {
     blocks: Vec<(Vec<Statement<'db>>, Option<Terminator<'db>>)>,
     current: BlockId,
     bindings: HashMap<BindingId, Local>,
+    /// The handlers of the trap handlers around what is being built, the
+    /// innermost last (§8.3.1), and the one around each block's code.
+    catches: Vec<BlockId>,
+    block_catch: Vec<Option<BlockId>>,
     /// Expressions already evaluated, by the local holding their value
     /// and its type: the receiver of a `?.` access narrowed to what is
     /// not `Empty` (§6.8), and the access itself then.
@@ -372,6 +394,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             blocks: Vec::new(),
             current: BlockId(0),
             bindings: HashMap::new(),
+            catches: Vec::new(),
+            block_catch: Vec::new(),
             given: HashMap::new(),
             unsupported: Vec::new(),
             params: 0,
@@ -674,6 +698,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             target,
             site: expr,
             unwind: None,
+            catch: None,
         });
         self.switch_to(target);
         self.finish_dest(Operand::Local(dst), ty, Dest::Return);
@@ -951,6 +976,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             target: after,
             site: expr,
             unwind: None,
+            catch: None,
         });
         self.switch_to(after);
         let unit = Ty::unit(db);
@@ -965,6 +991,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         self.terminate(Terminator::Trap {
             kind: TrapKind::Error,
             site: Some(expr),
+            detail: None,
+            catch: None,
         });
         self.switch_to(join);
         Operand::Local(value)
@@ -1041,6 +1069,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     target,
                     site: expr,
                     unwind: None,
+                    catch: None,
                 });
                 self.switch_to(target);
                 Operand::Local(dst)
@@ -1200,6 +1229,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         self.terminate(Terminator::Trap {
             kind: TrapKind::Error,
             site: None,
+            detail: None,
+            catch: None,
         });
     }
 
@@ -1262,6 +1293,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 target,
                 site: expr,
                 unwind: None,
+                catch: None,
             });
             b.switch_to(target);
             dst
@@ -1439,6 +1471,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             target: ran,
             site: expr,
             unwind: None,
+            catch: None,
         });
         self.switch_to(ran);
         let errors = crag_types::error_members(db, program, result_ty);
@@ -1794,6 +1827,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             order.push(b);
             let term = self.blocks[b].1.as_ref().expect("reachable blocks end");
             stack.extend(term.successors().iter().rev().map(|s| s.index()));
+            // The checks of arithmetic, which come later, may go there.
+            stack.extend(self.block_catch[b].map(|c| forward[c.index()].index()));
         }
         order.sort_unstable();
         let mut renumber = vec![BlockId(u32::MAX); self.blocks.len()];
@@ -1808,9 +1843,11 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             for s in terminator.successors_mut() {
                 *s = renumber[s.index()];
             }
+            let catch = self.block_catch[old].map(|c| renumber[forward[c.index()].index()]);
             blocks.push(Block {
                 statements,
                 terminator,
+                catch,
             });
         }
         let mut used = vec![false; self.locals.len()];
@@ -1858,6 +1895,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
 
     fn new_block(&mut self) -> BlockId {
         self.blocks.push((Vec::new(), None));
+        self.block_catch.push(None);
         BlockId(self.blocks.len() as u32 - 1)
     }
 
@@ -1876,6 +1914,21 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         {
             *unwind = Some(frame.handler);
         }
+        // So does a trap in a trap handler's block, and in the code a call
+        // there calls, to its handler (§8.3.1).
+        let landing = self.catches.last().copied();
+        match &mut terminator {
+            Terminator::Call { catch, .. } | Terminator::CallValue { catch, .. } => {
+                *catch = landing
+            }
+            Terminator::Trap { kind, catch, .. }
+                if !matches!(kind, TrapKind::Error | TrapKind::Unsupported) =>
+            {
+                *catch = landing
+            }
+            _ => {}
+        }
+        self.block_catch[self.current.index()] = landing;
         let slot = &mut self.blocks[self.current.index()].1;
         assert!(slot.is_none(), "a block ends once");
         *slot = Some(terminator);
@@ -1982,7 +2035,12 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     }
 
     fn trap(&mut self, kind: TrapKind, site: Option<ExprId>) -> Operand<'db> {
-        self.terminate(Terminator::Trap { kind, site });
+        self.terminate(Terminator::Trap {
+            kind,
+            site,
+            detail: None,
+            catch: None,
+        });
         self.unit()
     }
 
@@ -2053,7 +2111,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         match body.expr(expr) {
             Expr::Block { stmts, tail } => {
                 // A block with signal handlers forgets them when it ends.
-                let registers = stmts.iter().any(|s| matches!(s, Stmt::On { .. }));
+                let registers = stmts.iter().any(
+                    |s| matches!(s, Stmt::On { handler, .. } if self.types.trap_handler(*handler).is_none()),
+                );
                 if registers {
                     let int = self.int();
                     let mark =
@@ -2063,19 +2123,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         closures: Vec::new(),
                     });
                 }
-                for stmt in stmts {
-                    self.stmt(stmt);
-                }
-                match tail {
-                    Some(tail) => {
-                        self.step(Some(*tail));
-                        self.eval(*tail, dest)
-                    }
-                    None => {
-                        let unit = Ty::unit(self.db);
-                        self.finish_dest(self.unit(), unit, dest);
-                    }
-                }
+                self.block_rest(stmts, *tail, dest, &[]);
                 if registers {
                     if !matches!(dest, Dest::Return) {
                         let depth = self.handlers.len() - 1;
@@ -2114,11 +2162,11 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Expr::Call { .. } | Expr::MethodCall { .. } | Expr::TypedCall { .. }
                 if matches!(dest, Dest::Return) =>
             {
-                let op = self.call(expr, self.atomic.is_empty() && self.handlers.is_empty());
+                let op = self.call(expr, self.leaves_frame_freely());
                 self.finish_dest(op, self.ty(expr), dest);
             }
             Expr::Field { .. } if matches!(dest, Dest::Return) && self.is_call(expr) => {
-                let op = self.call(expr, self.atomic.is_empty() && self.handlers.is_empty());
+                let op = self.call(expr, self.leaves_frame_freely());
                 self.finish_dest(op, self.ty(expr), dest);
             }
             _ => {
@@ -2126,6 +2174,203 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 self.finish_dest(op, self.ty(expr), dest);
             }
         }
+    }
+
+    /// Whether a tail call may leave the frame: not from an `atomic`
+    /// block, a block with signal handlers or one with a trap handler.
+    fn leaves_frame_freely(&self) -> bool {
+        self.atomic.is_empty() && self.handlers.is_empty() && self.catches.is_empty()
+    }
+
+    /// The statements of a block from one on, then its tail, into `dest`.
+    /// A trap handler takes the rest after it (§8.3.1); `siblings` are the
+    /// trap handlers of the block before.
+    fn block_rest(
+        &mut self,
+        stmts: &[Stmt],
+        tail: Option<ExprId>,
+        dest: Dest,
+        siblings: &[ExprId],
+    ) {
+        for (i, stmt) in stmts.iter().enumerate() {
+            if let Stmt::On { handler, .. } = stmt
+                && self.types.trap_handler(*handler).is_some()
+            {
+                let mut handlers = siblings.to_vec();
+                handlers.push(*handler);
+                self.trap_region(&stmts[i + 1..], tail, dest, &handlers);
+                return;
+            }
+            self.stmt(stmt);
+        }
+        match tail {
+            Some(tail) => {
+                self.step(Some(tail));
+                self.eval(tail, dest)
+            }
+            None => {
+                let unit = Ty::unit(self.db);
+                self.finish_dest(self.unit(), unit, dest);
+            }
+        }
+    }
+
+    /// The rest of a block that trap handlers cover, then their handler:
+    /// the state the trap left behind reset, the trap made a value of its
+    /// type, and the most specific of the handlers that takes it run into
+    /// `dest`; a trap none takes goes on to the handlers around
+    /// (§8.3.1).
+    fn trap_region(
+        &mut self,
+        stmts: &[Stmt],
+        tail: Option<ExprId>,
+        dest: Dest,
+        handlers: &[ExprId],
+    ) {
+        let (db, program) = (self.db, self.program);
+        let (int_ty, unit) = (self.int(), Ty::unit(db));
+        let int = int_ty;
+        let intrinsic = |b: &mut Self, ty: Ty<'db>, i: Intrinsic<'db>, args: Vec<Operand<'db>>| {
+            b.assign(ty, Rvalue::Intrinsic(i, args))
+        };
+        let side_ptr = intrinsic(self, int, Intrinsic::SidePtr, Vec::new());
+        let side_end = intrinsic(self, int, Intrinsic::SideEnd, Vec::new());
+        let signal_mark = intrinsic(self, int, Intrinsic::SignalMark, Vec::new());
+        let depth = intrinsic(self, int, Intrinsic::TxDepth, Vec::new());
+        let (landing, join) = (self.new_block(), self.new_block());
+        self.catches.push(landing);
+        self.block_rest(stmts, tail, dest, handlers);
+        self.join(dest, join);
+        self.catches.pop();
+
+        self.switch_to(landing);
+        intrinsic(self, unit, Intrinsic::SideReset, vec![side_ptr, side_end]);
+        intrinsic(self, unit, Intrinsic::SignalReset, vec![signal_mark]);
+        intrinsic(self, unit, Intrinsic::TxUnwind, vec![depth]);
+        let kind = intrinsic(self, int, Intrinsic::TrapCaught(0), Vec::new());
+        let takes: Vec<(ExprId, Ty<'db>)> = handlers
+            .iter()
+            .filter_map(|&h| Some((h, self.subst(self.types.trap_handler(h)?))))
+            .collect();
+        for (abi, name) in TRAP_TYPES {
+            let Some(item) = prelude_item(db, program, name) else {
+                continue;
+            };
+            let trap_ty = Ty::new(db, TyKind::Named(item, Vec::new()));
+            // The most specific handler whose type the trap fits.
+            let fitting: Vec<&(ExprId, Ty<'db>)> = takes
+                .iter()
+                .filter(|(_, t)| crag_types::is_subtype(db, program, trap_ty, *t))
+                .collect();
+            let Some(&&(handler, takes_ty)) = fitting.iter().find(|(_, t)| {
+                fitting
+                    .iter()
+                    .all(|(_, other)| crag_types::is_subtype(db, program, *t, *other))
+            }) else {
+                continue;
+            };
+            let (this, next) = (self.new_block(), self.new_block());
+            let code = Operand::Const(Constant::Int(abi as i128));
+            let is = self.compare(CmpOp::Eq, Builtin::Int, kind.clone(), code);
+            self.terminate(Terminator::Branch {
+                cond: is,
+                then: this,
+                otherwise: next,
+            });
+            self.switch_to(this);
+            let value = self.trap_value(trap_ty);
+            let value = self.coerce(value, trap_ty, takes_ty);
+            if let Expr::Closure { params, body } = self.body.expr(handler) {
+                if let Some(param) = params.first() {
+                    self.matched(param.pat, value, takes_ty, None);
+                }
+                let body = *body;
+                self.eval(body, dest);
+            }
+            self.join(dest, join);
+            self.switch_to(next);
+        }
+        self.terminate(Terminator::Trap {
+            kind: TrapKind::Rethrow,
+            site: None,
+            detail: None,
+            catch: None,
+        });
+        self.switch_to(join);
+    }
+
+    /// Whether a type is a trap's.
+    fn is_trap(&self, ty: Ty<'db>) -> bool {
+        let (db, program) = (self.db, self.program);
+        prelude_item(db, program, "Trap").is_some_and(|item| {
+            let trap = Ty::new(db, TyKind::Named(item, Vec::new()));
+            !ty.is_error(db) && crag_types::is_subtype(db, program, ty, trap)
+        })
+    }
+
+    /// The value of a trap a handler took, of the prelude's type for its
+    /// kind (§8.3): its message, origin, and the detail some name.
+    fn trap_value(&mut self, ty: Ty<'db>) -> Operand<'db> {
+        let (db, program) = (self.db, self.program);
+        let (int, text) = (self.int(), Ty::builtin(db, Builtin::Str));
+        let Some(fields) = fields_of(db, program, ty) else {
+            return self.trap(TrapKind::Error, None);
+        };
+        let mut values = Vec::new();
+        for (name, field_ty) in fields {
+            let op = match name.text(db).as_str() {
+                "message" => self.assign(
+                    text,
+                    Rvalue::Intrinsic(Intrinsic::TrapCaughtText(1), Vec::new()),
+                ),
+                "origin" => {
+                    let Some(origin) = fields_of(db, program, field_ty) else {
+                        return self.trap(TrapKind::Error, None);
+                    };
+                    let mut parts = Vec::new();
+                    for (part, _) in origin {
+                        let op = match part.text(db).as_str() {
+                            "module" => self.assign(
+                                text,
+                                Rvalue::Intrinsic(Intrinsic::TrapCaughtText(0), Vec::new()),
+                            ),
+                            "line" => self.assign(
+                                int,
+                                Rvalue::Intrinsic(Intrinsic::TrapCaught(1), Vec::new()),
+                            ),
+                            _ => self.assign(
+                                int,
+                                Rvalue::Intrinsic(Intrinsic::TrapCaught(2), Vec::new()),
+                            ),
+                        };
+                        parts.push((part, op));
+                    }
+                    let dispose = self.dispose_code(field_ty);
+                    self.assign(
+                        field_ty,
+                        Rvalue::Record {
+                            ty: field_ty,
+                            fields: parts,
+                            dispose,
+                        },
+                    )
+                }
+                _ => self.assign(
+                    text,
+                    Rvalue::Intrinsic(Intrinsic::TrapCaughtText(2), Vec::new()),
+                ),
+            };
+            values.push((name, op));
+        }
+        let dispose = self.dispose_code(ty);
+        self.assign(
+            ty,
+            Rvalue::Record {
+                ty,
+                fields: values,
+                dispose,
+            },
+        )
     }
 
     fn finish_dest(&mut self, op: Operand<'db>, ty: Ty<'db>, dest: Dest) {
@@ -2385,6 +2630,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     target,
                     site,
                     unwind: None,
+                    catch: None,
                 });
                 self.switch_to(target);
                 Some(dst)
@@ -2423,6 +2669,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             target,
             site: expr,
             unwind: None,
+            catch: None,
         });
         self.switch_to(target);
         self.coerce(Operand::Local(dst), ty, self.ty(expr))
@@ -2704,6 +2951,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             target,
             site: expr,
             unwind: None,
+            catch: None,
         });
         self.switch_to(target);
         Operand::Local(dst)
@@ -2858,6 +3106,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     target,
                     site: expr,
                     unwind: None,
+                    catch: None,
                 });
                 self.switch_to(target);
                 Operand::Local(out)
@@ -2933,6 +3182,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             target,
             site: expr,
             unwind: None,
+            catch: None,
         });
         self.switch_to(target);
         Operand::Local(dst)
@@ -3086,16 +3336,31 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let successes = crag_types::success_members(db, program, ty);
         let out = self.temp(result);
         let (ok, failed, join) = (self.new_block(), self.new_block(), self.new_block());
-        let cases = errors
-            .members(db)
-            .into_iter()
-            .map(|m| (m, failed))
+        // `!!` names the error it met, so each error gets a trap of its own.
+        let members = errors.members(db);
+        let raises: Vec<BlockId> = match mapping {
+            "expect" => members.iter().map(|_| self.new_block()).collect(),
+            _ => Vec::new(),
+        };
+        let cases = members
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| (m, raises.get(i).copied().unwrap_or(failed)))
             .collect();
         self.terminate(Terminator::Switch {
             place: Place::local(subject),
             cases,
             otherwise: ok,
         });
+        for (&m, &raise) in members.iter().zip(&raises) {
+            self.switch_to(raise);
+            self.terminate(Terminator::Trap {
+                kind: TrapKind::Expectation,
+                site: Some(expr),
+                detail: Some(m.display(db)),
+                catch: None,
+            });
+        }
         // A member of the subject narrowed to `to`, and given as `result`.
         let give = |b: &mut Self, to: Ty<'db>| {
             let narrowed = b.temp(to);
@@ -3308,6 +3573,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             target,
             site,
             unwind: None,
+            catch: None,
         });
         self.switch_to(target);
         dst
@@ -3595,6 +3861,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             target,
             site,
             unwind: None,
+            catch: None,
         });
         self.switch_to(target);
         self.coerce(Operand::Local(dst), result, field_ty)
@@ -3779,6 +4046,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Stmt::Return(None) => {
                 let unit = Ty::unit(self.db);
                 self.finish_dest(self.unit(), unit, Dest::Return);
+            }
+            // A trap handler passes its trap on (§8.3.1).
+            Stmt::Emit { value, .. } if self.is_trap(self.ty(*value)) => {
+                self.terminate(Terminator::Trap {
+                    kind: TrapKind::Rethrow,
+                    site: None,
+                    detail: None,
+                    catch: None,
+                });
             }
             Stmt::Emit { kind, value } => {
                 let qualifier = match kind {
