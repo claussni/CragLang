@@ -30,6 +30,7 @@ extern crate crag_db as salsa;
 mod case;
 mod decision;
 mod def;
+mod derive;
 mod effect;
 mod escape;
 mod generic;
@@ -95,6 +96,7 @@ pub fn module_type_errors<'db>(
     let mut errors: Vec<(Owner<'db>, TypeError<'db>)> = overload_errors(db, program, module)
         .iter()
         .chain(recursion_errors(db, program, module))
+        .chain(&derive::ban_errors(db, program, module))
         .map(|(item, e)| (Owner::Item(*item), e.clone()))
         .collect();
     for owner in owners(db, module) {

@@ -104,8 +104,8 @@ pub struct SlotDecl<'db> {
 }
 
 /// A type declaration (§3.2–3.9), with its lifecycle handlers and, for a
-/// lifecycle kind, the form of their functions (§11.4), and its value
-/// conditions (§3.10.1). Its markers are not lowered yet.
+/// lifecycle kind, the form of their functions (§11.4), its markers
+/// (§3.11) and its value conditions (§3.10.1).
 #[derive(Clone, Debug, Default, PartialEq, Eq, crag_db::SalsaValue)]
 pub struct TypeDecl<'db> {
     /// Whether it has a field list; a tag has none (§3.2).
@@ -121,6 +121,9 @@ pub struct TypeDecl<'db> {
     pub handlers: Vec<HandlerClause>,
     /// A lifecycle kind's `where HandlerForm[…]`.
     pub form: Option<HandlerForm>,
+    /// Its markers by name, each with whether it is negated: `is not F`
+    /// forbids the form `F` (§3.11).
+    pub markers: Vec<(Name<'db>, bool)>,
     /// Its value conditions, checked in order (§3.10.1).
     pub conditions: Vec<Condition<'db>>,
     /// What the conditions see: `this`, the whole value, and each field

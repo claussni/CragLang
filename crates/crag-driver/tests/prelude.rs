@@ -237,15 +237,10 @@ fn a_type_of_its_own_wins_over_the_structure() {
 
 #[test]
 fn maps_have_no_order() {
+    // §19.11: maps and sets fit no `Ordered`, nor does what holds one.
     let mut r = repl();
-    let out = r
-        .eval_input(r#"["a": 1].compare(["a": 1])"#)
-        .unwrap()
-        .render();
-    assert!(
-        out.contains("trap: compared values that have no order"),
-        "{out}"
-    );
+    let out = r.eval_input(r#"["a": 1].compare(["a": 1])"#).unwrap_err();
+    assert!(out.contains("no function `compare` takes"), "{out}");
 }
 
 #[test]

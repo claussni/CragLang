@@ -795,6 +795,12 @@ pub opaque type StrIndex(at: Int)
 pub fn start(s: Str) -> StrIndex { StrIndex(at: 0) }
 pub fn end(s: Str) -> StrIndex { StrIndex(at: textByteCount(s)) }
 
+// Positions compare by where they are (§19.10); being opaque, they derive
+// nothing outside the prelude.
+pub fn equals(a: StrIndex, b: StrIndex) -> Bool { a.at == b.at }
+pub fn compare(a: StrIndex, b: StrIndex) -> Ordering { compare(a.at, b.at) }
+pub fn hash(i: StrIndex) -> Int { hash(i.at) }
+
 // The offset of a position, which must be a boundary in `s`.
 fn offset(s: Str, i: StrIndex) -> Int {
   if textIsBoundary(s, i.at) == 0 { trapIndex() }

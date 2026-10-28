@@ -155,6 +155,9 @@ pub enum FitError<'db> {
     },
     /// No form of a union fits.
     NoneOf { forms: Vec<FormBound<'db>> },
+    /// A type does not fit a derived form by its structure, or forbids
+    /// the form (§19.11, §3.11).
+    NotDerived { form: String, ty: Ty<'db> },
 }
 
 impl<'db> FitError<'db> {
@@ -191,6 +194,10 @@ impl<'db> FitError<'db> {
                 let forms: Vec<String> = forms.iter().map(|f| f.display(db)).collect();
                 format!("none of {} holds", forms.join(" | "))
             }
+            FitError::NotDerived { form, ty } => format!(
+                "{} does not fit `{form}`: it forbids it, or holds a function or a part that does not fit; declare its own",
+                ty.display(db)
+            ),
         }
     }
 }
@@ -481,6 +488,12 @@ fn instantiate_at<'db>(
     at: CallSite<'db>,
     depth: u32,
 ) -> Result<Instance<'db>, FitError<'db>> {
+    if let Err((form, ty)) = crate::derive::derivable(db, program, function, args, at.module) {
+        return Err(FitError::NotDerived {
+            form: form.to_string(),
+            ty,
+        });
+    }
     let b = bounds(db, program, function);
     for &(i, bound) in &b.types {
         let bound = subst(db, program, bound, function, args);

@@ -255,6 +255,11 @@ pub enum ErrorKind<'db> {
         from: Ty<'db>,
         to: Ty<'db>,
     },
+    /// A function that would make a type fit a form it forbids (§3.11).
+    FitsBanned {
+        ty: Ty<'db>,
+        form: String,
+    },
     /// A local function with type parameters (§5.6.4).
     GenericLocalFn,
     /// A form's function with type parameters of its own (§4.1).
@@ -493,6 +498,10 @@ impl<'db> ErrorKind<'db> {
                 "no `convert` turns {} into {}",
                 from.display(db),
                 to.display(db)
+            ),
+            ErrorKind::FitsBanned { ty, form } => format!(
+                "{} is `not {form}`, so no function may make it fit `{form}`",
+                ty.display(db)
             ),
             ErrorKind::GenericLocalFn => {
                 "a local function has no type parameters; a generic helper belongs at module level"

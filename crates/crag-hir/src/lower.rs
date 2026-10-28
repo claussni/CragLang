@@ -481,6 +481,19 @@ impl<'a, 'db> Lowerer<'a, 'db> {
         }
         for clause in node.children() {
             match clause.kind() {
+                S::IsClause => {
+                    for marker in clause.children().filter(|n| n.kind() == S::Marker) {
+                        let negated = marker.tokens().any(|t| t.kind() == LeafKind::Token(T::Not));
+                        let name = marker
+                            .children()
+                            .next()
+                            .filter(|t| t.kind() == S::NamedType)
+                            .and_then(|t| first_token(&t));
+                        if let Some(name) = name {
+                            decl.markers.push((self.name(name.text()), negated));
+                        }
+                    }
+                }
                 S::OnClause => {
                     let mut parts = clause.children();
                     let kind = self.type_or_missing(parts.next(), &clause);

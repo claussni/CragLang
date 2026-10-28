@@ -275,3 +275,26 @@ fn conversions_go_through_convert() {
     assert_eq!(eval(&mut r, "Celsius(21.5)"), "Celsius(degrees: 21.5)\n");
     assert!(eval(&mut r, "Celsius(\"warm\")").contains("error"));
 }
+
+#[test]
+fn derived_forms_follow_the_structure() {
+    // §19.11: a record fits by its fields, a union by its members; a
+    // function fits none, and a type that is `not F` never fits `F`
+    // (§3.11).
+    let mut r = repl();
+    eval(&mut r, "fn h[K: Hash](k: K) -> Int { 1 }");
+    eval(&mut r, "type A(n: Int)");
+    eval(&mut r, "type B(s: Str)");
+    eval(&mut r, "let u: A | B = A(n: 1)");
+    assert_eq!(eval(&mut r, "h(u)"), "1\n");
+    assert_eq!(eval(&mut r, "A(n: 1) == A(n: 1)"), "True\n");
+    eval(&mut r, "type F(f: () -> Int)");
+    assert!(eval(&mut r, "h(F(f: { -> 1 }))").contains("does not hold"));
+    assert!(eval(&mut r, "F(f: { -> 1 }) == F(f: { -> 1 })").contains("error"));
+    eval(&mut r, "type Secret(n: Int) is not Hash");
+    assert!(eval(&mut r, "h(Secret(n: 1))").contains("does not hold"));
+    assert_eq!(
+        eval(&mut r, "fn hash(s: Secret) -> Int { 1 }"),
+        "error: Secret is `not Hash`, so no function may make it fit `Hash`\n --> input:1:4\n  |\n1 | fn hash(s: Secret) -> Int { 1 }\n  |    ^^^^\n"
+    );
+}
