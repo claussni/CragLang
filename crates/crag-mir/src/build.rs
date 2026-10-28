@@ -49,8 +49,8 @@ use crag_types::{
 };
 
 use crate::ir::{
-    BinOp, Block, BlockId, ClosurePlacement, CmpOp, Constant, Intrinsic, Local, LocalDecl, MirBody,
-    Operand, Place, Rvalue, Statement, Terminator, TrapKind,
+    BinOp, Block, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Intrinsic, Local, LocalDecl,
+    MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,
 };
 use crate::{Entry, InstanceKey};
 
@@ -250,6 +250,8 @@ enum Primitive {
     Compare(CmpOp, Builtin),
     /// Strings or bytes joined, or a string's bytes: a `Concat`.
     Concat,
+    /// A number as another number type (§19.13).
+    Cast(CastOp, Builtin),
 }
 
 /// A field of a record being built: the expression written for it, or
@@ -3475,6 +3477,23 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 [a] if number(*a) => Some(Primitive::Negate(*a)),
                 _ => None,
             },
+            // The conversions of numbers build on these (§19.13).
+            "numberSame" | "numberWrap" | "intToFloat" | "floatToInt" | "floatFloor"
+            | "floatCeil" | "floatTrunc" => {
+                let ([from], Some(to)) = (params.as_slice(), result) else {
+                    return None;
+                };
+                let op = match name {
+                    "numberSame" => CastOp::Same,
+                    "numberWrap" => CastOp::Wrap(to),
+                    "intToFloat" => CastOp::IntToFloat,
+                    "floatToInt" => CastOp::FloatToInt,
+                    "floatFloor" => CastOp::Floor,
+                    "floatCeil" => CastOp::Ceil,
+                    _ => CastOp::Trunc,
+                };
+                Some(Primitive::Cast(op, *from))
+            }
             "equals" => compare(CmpOp::Eq),
             "lessThan" => compare(CmpOp::Lt),
             "lessOrEqual" => compare(CmpOp::Le),
@@ -3549,6 +3568,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             }
             (Primitive::Compare(op, b), Some(a), Some(c)) => {
                 self.assign(ty, Rvalue::Compare { op, ty: b, a, b: c })
+            }
+            (Primitive::Cast(op, from), Some(value), None) => {
+                self.assign(ty, Rvalue::Cast { op, from, value })
             }
             _ => self.trap(TrapKind::Error, Some(expr)),
         }

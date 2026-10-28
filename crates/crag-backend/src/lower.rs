@@ -49,14 +49,14 @@ use crag_abi::{
 };
 use crag_codegen::{
     BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, CallTarget, Cond, FuncId, Inst,
-    LirFunction, OverflowOp, RuntimeFn, SlotKey, Term, VReg,
+    LirFunction, OverflowOp, RuntimeFn, SlotKey, Term, UnOp, VReg,
 };
 use crag_db::Db;
 use crag_db::plumbing::AsId;
 use crag_hir::{Name, Owner, Program, hir_body, lower_body};
 use crag_mir::{
-    BinOp, BlockId, ClosurePlacement, CmpOp, Constant, Entry, InstanceKey, Intrinsic, Local,
-    MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,
+    BinOp, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Entry, InstanceKey, Intrinsic,
+    Local, MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,
 };
 use crag_types::{Builtin, Step, Ty, TyKind, prelude_item, signature};
 
@@ -785,6 +785,25 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let y = self.operand(c, operand_ty)?;
                 let (x, y) = (word(&x)?, word(&y)?);
                 Ok(vec![self.arith(*op, *b, x, y)?])
+            }
+            Rvalue::Cast { op, from, value } => {
+                let operand_ty = Ty::builtin(self.db, *from);
+                let x = word(&self.operand(value, operand_ty)?)?;
+                let un = |this: &mut Self, op: UnOp| {
+                    let dst = this.reg();
+                    this.push(Inst::Un { op, dst, src: x });
+                    dst
+                };
+                Ok(vec![match op {
+                    CastOp::Same => x,
+                    CastOp::Wrap(to) => self.narrow(*to, x),
+                    CastOp::IntToFloat if *from == Builtin::UInt64 => un(self, UnOp::UIntToFloat),
+                    CastOp::IntToFloat => un(self, UnOp::SIntToFloat),
+                    CastOp::FloatToInt => un(self, UnOp::FloatToSInt),
+                    CastOp::Floor => un(self, UnOp::FloatFloor),
+                    CastOp::Ceil => un(self, UnOp::FloatCeil),
+                    CastOp::Trunc => un(self, UnOp::FloatTrunc),
+                }])
             }
             Rvalue::Overflows { op, ty: b, a, b: c } => {
                 let operand_ty = Ty::builtin(self.db, *b);

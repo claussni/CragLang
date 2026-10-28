@@ -2837,19 +2837,18 @@ impl<'a, 'db> Infer<'a, 'db> {
                     self.synth_args(args, fields);
                     return self.err_ty();
                 };
+                if let ([arg], None) = (args, fields) {
+                    return self.conversion(id, callee, ty, *arg, expected);
+                }
                 if declared_fields(db, program, ty).is_none() {
                     self.error(Site::Expr(id), ErrorKind::NotAValue { name });
                     self.synth_args(args, fields);
                     return self.err_ty();
                 }
                 if !args.is_empty() {
-                    let kind = if args.len() == 1 && fields.is_none() {
-                        ErrorKind::Unsupported("conversions")
-                    } else {
-                        ErrorKind::ArgCount {
-                            expected: 0,
-                            found: args.len(),
-                        }
+                    let kind = ErrorKind::ArgCount {
+                        expected: 0,
+                        found: args.len(),
                     };
                     self.error(Site::Expr(id), kind);
                     self.synth_args(args, None);
@@ -2857,13 +2856,20 @@ impl<'a, 'db> Infer<'a, 'db> {
                 self.build_record(id, ty, fields.unwrap_or_default());
                 ty
             }
-            _ => {
-                let kind = if args.len() == 1 && fields.is_none() {
-                    ErrorKind::Unsupported("conversions")
-                } else {
-                    ErrorKind::NotAValue { name }
+            HeaderKind::Builtin(builtin) if matches!((args, fields), ([_], None)) => {
+                let target = match targs {
+                    Some(targs) => self.builtin_of(builtin, targs),
+                    None if arity == 0 => self.builtin_of(builtin, Vec::new()),
+                    None => {
+                        self.error(Site::Expr(id), ErrorKind::CannotInfer);
+                        self.synth_args(args, fields);
+                        return self.err_ty();
+                    }
                 };
-                self.error(Site::Expr(id), kind);
+                return self.conversion(id, callee, target, args[0], expected);
+            }
+            _ => {
+                self.error(Site::Expr(id), ErrorKind::NotAValue { name });
                 self.synth_args(args, fields);
                 return self.err_ty();
             }
@@ -2879,6 +2885,42 @@ impl<'a, 'db> Infer<'a, 'db> {
         self.exprs[callee.index()] = Some(ty);
         self.callees.push((id, Callee::Construct(ty)));
         ty
+    }
+
+    /// `T(x)`: a call of the `convert` that takes `x` and whose success
+    /// type is `T`, as `T.convert(x)` would make (§5.6).
+    fn conversion(
+        &mut self,
+        id: ExprId,
+        callee: ExprId,
+        target: Ty<'db>,
+        arg: ExprId,
+        expected: Option<Ty<'db>>,
+    ) -> Ty<'db> {
+        let db = self.db;
+        let name = Name::new(db, "convert".to_string());
+        let functions = match module_scope(db, self.program, self.module).resolve(name) {
+            Some(Resolution::Value { functions, .. }) => functions.clone(),
+            _ => Vec::new(),
+        };
+        self.exprs[callee.index()] = Some(target);
+        if functions.is_empty() {
+            let from = self.synth(arg);
+            self.error(Site::Expr(id), ErrorKind::NoConversion { from, to: target });
+            return self.err_ty();
+        }
+        self.resolve(
+            id,
+            None,
+            name,
+            &functions,
+            None,
+            None,
+            &[arg],
+            None,
+            expected,
+            Some(target),
+        )
     }
 
     /// The type arguments of a construction of the generic type

@@ -250,6 +250,11 @@ pub enum ErrorKind<'db> {
     UnknownField {
         name: Name<'db>,
     },
+    /// `T(x)` where no `convert` makes a `T` of nothing (§5.6).
+    NoConversion {
+        from: Ty<'db>,
+        to: Ty<'db>,
+    },
     /// A local function with type parameters (§5.6.4).
     GenericLocalFn,
     /// A form's function with type parameters of its own (§4.1).
@@ -484,6 +489,11 @@ impl<'db> ErrorKind<'db> {
             }
             ErrorKind::MissingField { name: n } => format!("the field `{}` is missing", name(n)),
             ErrorKind::UnknownField { name: n } => format!("there is no field `{}`", name(n)),
+            ErrorKind::NoConversion { from, to } => format!(
+                "no `convert` turns {} into {}",
+                from.display(db),
+                to.display(db)
+            ),
             ErrorKind::GenericLocalFn => {
                 "a local function has no type parameters; a generic helper belongs at module level"
                     .into()

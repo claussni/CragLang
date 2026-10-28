@@ -42,8 +42,8 @@ use crag_types::{Filling, Handler, HandlerCode, Instance, Ty};
 pub use build::place;
 pub use checks::insert_overflow_checks;
 pub use ir::{
-    BinOp, Block, BlockId, ClosurePlacement, CmpOp, Constant, Intrinsic, Local, LocalDecl, MirBody,
-    Operand, Place, Rvalue, Statement, Terminator, TrapKind,
+    BinOp, Block, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Intrinsic, Local, LocalDecl,
+    MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,
 };
 pub use liveness::{Liveness, compute_liveness, insert_drops, insert_rc_ops};
 

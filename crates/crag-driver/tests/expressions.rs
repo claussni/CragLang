@@ -248,3 +248,30 @@ fn lifted_calls_fill_in_defaults() {
     assert_eq!(eval(&mut r, "g(A(n: 3))"), "3\n");
     assert_eq!(eval(&mut r, "g(B(n: 3))"), "30\n");
 }
+
+#[test]
+fn conversions_go_through_convert() {
+    // §5.6, §19.13: `T(x)` calls the `convert` that makes a `T`; one that
+    // may not fit gives `Unconvertible`.
+    let mut r = repl();
+    assert_eq!(eval(&mut r, "Float(3)"), "3.0\n");
+    assert_eq!(eval(&mut r, "Int8(100)"), "100\n");
+    assert_eq!(eval(&mut r, "Int8(300)"), "Unconvertible()\n");
+    assert_eq!(eval(&mut r, "UInt8(-1)"), "Unconvertible()\n");
+    assert_eq!(eval(&mut r, "Int8.trunc(300)"), "44\n");
+    assert_eq!(eval(&mut r, "Int(-2.9)"), "-2\n");
+    assert_eq!(eval(&mut r, "Int(1.0e30)"), "Unconvertible()\n");
+    assert_eq!(eval(&mut r, "Int.round(-2.5)"), "-3\n");
+    assert_eq!(eval(&mut r, "Int.floor(-2.5)"), "-3\n");
+    assert_eq!(eval(&mut r, "Int.ceil(2.1)"), "3\n");
+    assert_eq!(eval(&mut r, "CodePoint(97)"), "'a'\n");
+    assert_eq!(eval(&mut r, "Int('a')"), "97\n");
+    // A module adds its own.
+    eval(&mut r, "type Celsius(degrees: Float)");
+    eval(
+        &mut r,
+        "fn convert(f: Float) -> Celsius { Celsius(degrees: f) }",
+    );
+    assert_eq!(eval(&mut r, "Celsius(21.5)"), "Celsius(degrees: 21.5)\n");
+    assert!(eval(&mut r, "Celsius(\"warm\")").contains("error"));
+}

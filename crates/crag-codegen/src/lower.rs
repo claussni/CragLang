@@ -39,7 +39,7 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::{Context, FinalizedMachExceptionHandler, FinalizedRelocTarget};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
-use crate::lir::{BinOp, CallTarget, Cond, Inst, LirFunction, OverflowOp, Term};
+use crate::lir::{BinOp, CallTarget, Cond, Inst, LirFunction, OverflowOp, Term, UnOp};
 use crate::{
     CallHandler, CodeObject, CodegenError, CodegenSettings, FuncId, OptLevel, Reloc, RelocKind,
     RelocTarget, SlotKey, StackCheck, StackMap,
@@ -704,6 +704,55 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa, metered: bool) -> (Functio
                 }
                 Inst::Move { dst, src } => {
                     let v = b.use_var(vars[src.0 as usize]);
+                    b.def_var(vars[dst.0 as usize], v);
+                }
+                Inst::Un { op, dst, src } => {
+                    let x = b.use_var(vars[src.0 as usize]);
+                    let float =
+                        |b: &mut FunctionBuilder, x| b.ins().bitcast(F64, MemFlagsData::new(), x);
+                    let bits =
+                        |b: &mut FunctionBuilder, f| b.ins().bitcast(I64, MemFlagsData::new(), f);
+                    let v = match op {
+                        UnOp::SIntToFloat => {
+                            let f = b.ins().fcvt_from_sint(F64, x);
+                            bits(&mut b, f)
+                        }
+                        UnOp::UIntToFloat => {
+                            let f = b.ins().fcvt_from_uint(F64, x);
+                            bits(&mut b, f)
+                        }
+                        UnOp::FloatToSInt => {
+                            let f = float(&mut b, x);
+                            b.ins().fcvt_to_sint_sat(I64, f)
+                        }
+                        // Through a whole `i64`, without the library calls
+                        // the instructions need on plain x86-64; a value of
+                        // 2^63 or more is whole already.
+                        UnOp::FloatFloor | UnOp::FloatCeil | UnOp::FloatTrunc => {
+                            let f = float(&mut b, x);
+                            let whole = b.ins().fcvt_to_sint_sat(I64, f);
+                            let t = b.ins().fcvt_from_sint(F64, whole);
+                            let one = b.ins().f64const(1.0);
+                            let r = match op {
+                                UnOp::FloatFloor => {
+                                    let above = b.ins().fcmp(FloatCC::GreaterThan, t, f);
+                                    let less = b.ins().fsub(t, one);
+                                    b.ins().select(above, less, t)
+                                }
+                                UnOp::FloatCeil => {
+                                    let below = b.ins().fcmp(FloatCC::LessThan, t, f);
+                                    let more = b.ins().fadd(t, one);
+                                    b.ins().select(below, more, t)
+                                }
+                                _ => t,
+                            };
+                            let magnitude = b.ins().fabs(f);
+                            let limit = b.ins().f64const(9223372036854775808.0);
+                            let small = b.ins().fcmp(FloatCC::LessThan, magnitude, limit);
+                            let r = b.ins().select(small, r, f);
+                            bits(&mut b, r)
+                        }
+                    };
                     b.def_var(vars[dst.0 as usize], v);
                 }
                 Inst::Bin { op, dst, a, b: rhs } => {

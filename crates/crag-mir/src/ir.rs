@@ -139,6 +139,21 @@ pub enum CmpOp {
     Ge,
 }
 
+/// What a `Cast` does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
+pub enum CastOp {
+    /// The integer as another integer type it fits.
+    Same,
+    /// The integer wrapped to the width of an integer type.
+    Wrap(Builtin),
+    IntToFloat,
+    /// Toward zero; the value fits `Int`.
+    FloatToInt,
+    Floor,
+    Ceil,
+    Trunc,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
 pub enum Rvalue<'db> {
     Use(Operand<'db>),
@@ -157,6 +172,15 @@ pub enum Rvalue<'db> {
         a: Operand<'db>,
         b: Operand<'db>,
         check: Option<ExprId>,
+    },
+    /// A number as another number type: its bits as they are, wrapped to
+    /// a narrower integer, between integers and `Float`, or a `Float`
+    /// rounded to a whole number (§19.13). The prelude checks the range
+    /// first where the result may not fit.
+    Cast {
+        op: CastOp,
+        from: Builtin,
+        value: Operand<'db>,
     },
     /// Whether the integer operation overflows its type.
     Overflows {
@@ -700,9 +724,10 @@ impl<'db> Rvalue<'db> {
     pub fn locals_mut(&mut self) -> Vec<&mut Local> {
         let mut out = Vec::new();
         match self {
-            Rvalue::Use(o) | Rvalue::Convert(o) | Rvalue::FnValue { env: o, .. } => {
-                out.extend(o.locals_mut())
-            }
+            Rvalue::Use(o)
+            | Rvalue::Convert(o)
+            | Rvalue::FnValue { env: o, .. }
+            | Rvalue::Cast { value: o, .. } => out.extend(o.locals_mut()),
             Rvalue::Read(p) | Rvalue::Len(p) | Rvalue::Slice { list: p, .. } => {
                 out.push(&mut p.local)
             }
@@ -872,6 +897,11 @@ fn rvalue_text<'db>(db: &'db dyn Db, rvalue: &Rvalue<'db>) -> String {
         Rvalue::Use(o) => op(o),
         Rvalue::Read(p) => place(p),
         Rvalue::Convert(o) => format!("convert {}", op(o)),
+        Rvalue::Cast {
+            op: cast,
+            from,
+            value,
+        } => format!("{}.{cast:?}({})", ty_name(*from), op(value)),
         Rvalue::Binary {
             op: bin,
             ty,

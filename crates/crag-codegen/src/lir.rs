@@ -106,8 +106,29 @@ pub enum OverflowOp {
     UMul,
 }
 
+/// Operations of one word: conversions between integers and `f64` bits,
+/// and the rounding of `f64` bits to whole numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnOp {
+    /// A signed or an unsigned integer as an `f64`.
+    SIntToFloat,
+    UIntToFloat,
+    /// An `f64` toward zero as a signed integer, saturating; the caller
+    /// checks the range first.
+    FloatToSInt,
+    FloatFloor,
+    FloatCeil,
+    FloatTrunc,
+}
+
 #[derive(Clone, Debug)]
 pub enum Inst {
+    /// `dst` becomes the operation applied to `src`.
+    Un {
+        op: UnOp,
+        dst: VReg,
+        src: VReg,
+    },
     Const {
         dst: VReg,
         value: i64,
@@ -365,7 +386,7 @@ impl LirFunction {
                             return Err(format!("static data {data} out of range"));
                         }
                     }
-                    Inst::Move { dst, src } => {
+                    Inst::Move { dst, src } | Inst::Un { dst, src, .. } => {
                         reg(dst)?;
                         reg(src)?;
                     }

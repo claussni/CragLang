@@ -99,6 +99,456 @@ pub type Exhausted(..Trap)
 pub type StackOverflow(..Trap)
 pub type Fault(..Trap)
 
+// Conversions (§5.6, §19.13): `T(x)` calls the `convert` that takes `x` and
+// gives a `T`. One that may not fit gives `Unconvertible` instead.
+pub form Convert[A, B] {
+  convert(a: A) -> B
+}
+
+pub type Unconvertible(..Error)
+
+// A value a conditioned alias's check rejects (§3.10.1).
+pub type Invalid(..Error, condition: Str, origin: Origin)
+
+// Between integers: the value as it is, after a check of the range where
+// it may not fit.
+fn numberSame(n: Int8) -> Int16
+fn numberSame(n: Int8) -> Int32
+fn numberSame(n: Int8) -> Int
+fn numberSame(n: Int8) -> UInt8
+fn numberSame(n: Int8) -> UInt16
+fn numberSame(n: Int8) -> UInt32
+fn numberSame(n: Int8) -> UInt64
+fn numberSame(n: Int16) -> Int8
+fn numberSame(n: Int16) -> Int32
+fn numberSame(n: Int16) -> Int
+fn numberSame(n: Int16) -> UInt8
+fn numberSame(n: Int16) -> UInt16
+fn numberSame(n: Int16) -> UInt32
+fn numberSame(n: Int16) -> UInt64
+fn numberSame(n: Int32) -> Int8
+fn numberSame(n: Int32) -> Int16
+fn numberSame(n: Int32) -> Int
+fn numberSame(n: Int32) -> UInt8
+fn numberSame(n: Int32) -> UInt16
+fn numberSame(n: Int32) -> UInt32
+fn numberSame(n: Int32) -> UInt64
+fn numberSame(n: Int) -> Int8
+fn numberSame(n: Int) -> Int16
+fn numberSame(n: Int) -> Int32
+fn numberSame(n: Int) -> UInt8
+fn numberSame(n: Int) -> UInt16
+fn numberSame(n: Int) -> UInt32
+fn numberSame(n: Int) -> UInt64
+fn numberSame(n: UInt8) -> Int8
+fn numberSame(n: UInt8) -> Int16
+fn numberSame(n: UInt8) -> Int32
+fn numberSame(n: UInt8) -> Int
+fn numberSame(n: UInt8) -> UInt16
+fn numberSame(n: UInt8) -> UInt32
+fn numberSame(n: UInt8) -> UInt64
+fn numberSame(n: UInt16) -> Int8
+fn numberSame(n: UInt16) -> Int16
+fn numberSame(n: UInt16) -> Int32
+fn numberSame(n: UInt16) -> Int
+fn numberSame(n: UInt16) -> UInt8
+fn numberSame(n: UInt16) -> UInt32
+fn numberSame(n: UInt16) -> UInt64
+fn numberSame(n: UInt32) -> Int8
+fn numberSame(n: UInt32) -> Int16
+fn numberSame(n: UInt32) -> Int32
+fn numberSame(n: UInt32) -> Int
+fn numberSame(n: UInt32) -> UInt8
+fn numberSame(n: UInt32) -> UInt16
+fn numberSame(n: UInt32) -> UInt64
+fn numberSame(n: UInt64) -> Int8
+fn numberSame(n: UInt64) -> Int16
+fn numberSame(n: UInt64) -> Int32
+fn numberSame(n: UInt64) -> Int
+fn numberSame(n: UInt64) -> UInt8
+fn numberSame(n: UInt64) -> UInt16
+fn numberSame(n: UInt64) -> UInt32
+pub fn convert(n: Int8) -> Int16 { numberSame(n) }
+pub fn convert(n: Int8) -> Int32 { numberSame(n) }
+pub fn convert(n: Int8) -> Int { numberSame(n) }
+
+pub fn convert(n: Int8) -> UInt8 | Unconvertible {
+  if n < 0 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int8) -> UInt16 | Unconvertible {
+  if n < 0 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int8) -> UInt32 | Unconvertible {
+  if n < 0 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int8) -> UInt64 | Unconvertible {
+  if n < 0 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int16) -> Int8 | Unconvertible {
+  if n < -128 or n > 127 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int16) -> Int32 { numberSame(n) }
+pub fn convert(n: Int16) -> Int { numberSame(n) }
+
+pub fn convert(n: Int16) -> UInt8 | Unconvertible {
+  if n < 0 or n > 255 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int16) -> UInt16 | Unconvertible {
+  if n < 0 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int16) -> UInt32 | Unconvertible {
+  if n < 0 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int16) -> UInt64 | Unconvertible {
+  if n < 0 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int32) -> Int8 | Unconvertible {
+  if n < -128 or n > 127 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int32) -> Int16 | Unconvertible {
+  if n < -32768 or n > 32767 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int32) -> Int { numberSame(n) }
+
+pub fn convert(n: Int32) -> UInt8 | Unconvertible {
+  if n < 0 or n > 255 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int32) -> UInt16 | Unconvertible {
+  if n < 0 or n > 65535 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int32) -> UInt32 | Unconvertible {
+  if n < 0 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int32) -> UInt64 | Unconvertible {
+  if n < 0 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int) -> Int8 | Unconvertible {
+  if n < -128 or n > 127 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int) -> Int16 | Unconvertible {
+  if n < -32768 or n > 32767 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int) -> Int32 | Unconvertible {
+  if n < -2147483648 or n > 2147483647 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int) -> UInt8 | Unconvertible {
+  if n < 0 or n > 255 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int) -> UInt16 | Unconvertible {
+  if n < 0 or n > 65535 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int) -> UInt32 | Unconvertible {
+  if n < 0 or n > 4294967295 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: Int) -> UInt64 | Unconvertible {
+  if n < 0 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt8) -> Int8 | Unconvertible {
+  if n > 127 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt8) -> Int16 { numberSame(n) }
+pub fn convert(n: UInt8) -> Int32 { numberSame(n) }
+pub fn convert(n: UInt8) -> Int { numberSame(n) }
+pub fn convert(n: UInt8) -> UInt16 { numberSame(n) }
+pub fn convert(n: UInt8) -> UInt32 { numberSame(n) }
+pub fn convert(n: UInt8) -> UInt64 { numberSame(n) }
+
+pub fn convert(n: UInt16) -> Int8 | Unconvertible {
+  if n > 127 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt16) -> Int16 | Unconvertible {
+  if n > 32767 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt16) -> Int32 { numberSame(n) }
+pub fn convert(n: UInt16) -> Int { numberSame(n) }
+
+pub fn convert(n: UInt16) -> UInt8 | Unconvertible {
+  if n > 255 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt16) -> UInt32 { numberSame(n) }
+pub fn convert(n: UInt16) -> UInt64 { numberSame(n) }
+
+pub fn convert(n: UInt32) -> Int8 | Unconvertible {
+  if n > 127 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt32) -> Int16 | Unconvertible {
+  if n > 32767 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt32) -> Int32 | Unconvertible {
+  if n > 2147483647 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt32) -> Int { numberSame(n) }
+
+pub fn convert(n: UInt32) -> UInt8 | Unconvertible {
+  if n > 255 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt32) -> UInt16 | Unconvertible {
+  if n > 65535 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt32) -> UInt64 { numberSame(n) }
+
+pub fn convert(n: UInt64) -> Int8 | Unconvertible {
+  if n > 127 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt64) -> Int16 | Unconvertible {
+  if n > 32767 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt64) -> Int32 | Unconvertible {
+  if n > 2147483647 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt64) -> Int | Unconvertible {
+  if n > 9223372036854775807 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt64) -> UInt8 | Unconvertible {
+  if n > 255 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt64) -> UInt16 | Unconvertible {
+  if n > 65535 { return Unconvertible }
+  numberSame(n)
+}
+
+pub fn convert(n: UInt64) -> UInt32 | Unconvertible {
+  if n > 4294967295 { return Unconvertible }
+  numberSame(n)
+}
+
+// `T.trunc(n)`: an integer wrapped to a sized integer type, keeping the low
+// bits.
+fn numberWrap(n: Int8) -> Int16
+fn numberWrap(n: Int8) -> Int32
+fn numberWrap(n: Int8) -> UInt8
+fn numberWrap(n: Int8) -> UInt16
+fn numberWrap(n: Int8) -> UInt32
+fn numberWrap(n: Int8) -> UInt64
+fn numberWrap(n: Int16) -> Int8
+fn numberWrap(n: Int16) -> Int32
+fn numberWrap(n: Int16) -> UInt8
+fn numberWrap(n: Int16) -> UInt16
+fn numberWrap(n: Int16) -> UInt32
+fn numberWrap(n: Int16) -> UInt64
+fn numberWrap(n: Int32) -> Int8
+fn numberWrap(n: Int32) -> Int16
+fn numberWrap(n: Int32) -> UInt8
+fn numberWrap(n: Int32) -> UInt16
+fn numberWrap(n: Int32) -> UInt32
+fn numberWrap(n: Int32) -> UInt64
+fn numberWrap(n: Int) -> Int8
+fn numberWrap(n: Int) -> Int16
+fn numberWrap(n: Int) -> Int32
+fn numberWrap(n: Int) -> UInt8
+fn numberWrap(n: Int) -> UInt16
+fn numberWrap(n: Int) -> UInt32
+fn numberWrap(n: Int) -> UInt64
+fn numberWrap(n: UInt8) -> Int8
+fn numberWrap(n: UInt8) -> Int16
+fn numberWrap(n: UInt8) -> Int32
+fn numberWrap(n: UInt8) -> UInt16
+fn numberWrap(n: UInt8) -> UInt32
+fn numberWrap(n: UInt8) -> UInt64
+fn numberWrap(n: UInt16) -> Int8
+fn numberWrap(n: UInt16) -> Int16
+fn numberWrap(n: UInt16) -> Int32
+fn numberWrap(n: UInt16) -> UInt8
+fn numberWrap(n: UInt16) -> UInt32
+fn numberWrap(n: UInt16) -> UInt64
+fn numberWrap(n: UInt32) -> Int8
+fn numberWrap(n: UInt32) -> Int16
+fn numberWrap(n: UInt32) -> Int32
+fn numberWrap(n: UInt32) -> UInt8
+fn numberWrap(n: UInt32) -> UInt16
+fn numberWrap(n: UInt32) -> UInt64
+fn numberWrap(n: UInt64) -> Int8
+fn numberWrap(n: UInt64) -> Int16
+fn numberWrap(n: UInt64) -> Int32
+fn numberWrap(n: UInt64) -> UInt8
+fn numberWrap(n: UInt64) -> UInt16
+fn numberWrap(n: UInt64) -> UInt32
+pub fn trunc(n: Int8) -> Int16 { numberWrap(n) }
+pub fn trunc(n: Int8) -> Int32 { numberWrap(n) }
+pub fn trunc(n: Int8) -> UInt8 { numberWrap(n) }
+pub fn trunc(n: Int8) -> UInt16 { numberWrap(n) }
+pub fn trunc(n: Int8) -> UInt32 { numberWrap(n) }
+pub fn trunc(n: Int8) -> UInt64 { numberWrap(n) }
+pub fn trunc(n: Int16) -> Int8 { numberWrap(n) }
+pub fn trunc(n: Int16) -> Int32 { numberWrap(n) }
+pub fn trunc(n: Int16) -> UInt8 { numberWrap(n) }
+pub fn trunc(n: Int16) -> UInt16 { numberWrap(n) }
+pub fn trunc(n: Int16) -> UInt32 { numberWrap(n) }
+pub fn trunc(n: Int16) -> UInt64 { numberWrap(n) }
+pub fn trunc(n: Int32) -> Int8 { numberWrap(n) }
+pub fn trunc(n: Int32) -> Int16 { numberWrap(n) }
+pub fn trunc(n: Int32) -> UInt8 { numberWrap(n) }
+pub fn trunc(n: Int32) -> UInt16 { numberWrap(n) }
+pub fn trunc(n: Int32) -> UInt32 { numberWrap(n) }
+pub fn trunc(n: Int32) -> UInt64 { numberWrap(n) }
+pub fn trunc(n: Int) -> Int8 { numberWrap(n) }
+pub fn trunc(n: Int) -> Int16 { numberWrap(n) }
+pub fn trunc(n: Int) -> Int32 { numberWrap(n) }
+pub fn trunc(n: Int) -> UInt8 { numberWrap(n) }
+pub fn trunc(n: Int) -> UInt16 { numberWrap(n) }
+pub fn trunc(n: Int) -> UInt32 { numberWrap(n) }
+pub fn trunc(n: Int) -> UInt64 { numberWrap(n) }
+pub fn trunc(n: UInt8) -> Int8 { numberWrap(n) }
+pub fn trunc(n: UInt8) -> Int16 { numberWrap(n) }
+pub fn trunc(n: UInt8) -> Int32 { numberWrap(n) }
+pub fn trunc(n: UInt8) -> UInt16 { numberWrap(n) }
+pub fn trunc(n: UInt8) -> UInt32 { numberWrap(n) }
+pub fn trunc(n: UInt8) -> UInt64 { numberWrap(n) }
+pub fn trunc(n: UInt16) -> Int8 { numberWrap(n) }
+pub fn trunc(n: UInt16) -> Int16 { numberWrap(n) }
+pub fn trunc(n: UInt16) -> Int32 { numberWrap(n) }
+pub fn trunc(n: UInt16) -> UInt8 { numberWrap(n) }
+pub fn trunc(n: UInt16) -> UInt32 { numberWrap(n) }
+pub fn trunc(n: UInt16) -> UInt64 { numberWrap(n) }
+pub fn trunc(n: UInt32) -> Int8 { numberWrap(n) }
+pub fn trunc(n: UInt32) -> Int16 { numberWrap(n) }
+pub fn trunc(n: UInt32) -> Int32 { numberWrap(n) }
+pub fn trunc(n: UInt32) -> UInt8 { numberWrap(n) }
+pub fn trunc(n: UInt32) -> UInt16 { numberWrap(n) }
+pub fn trunc(n: UInt32) -> UInt64 { numberWrap(n) }
+pub fn trunc(n: UInt64) -> Int8 { numberWrap(n) }
+pub fn trunc(n: UInt64) -> Int16 { numberWrap(n) }
+pub fn trunc(n: UInt64) -> Int32 { numberWrap(n) }
+pub fn trunc(n: UInt64) -> UInt8 { numberWrap(n) }
+pub fn trunc(n: UInt64) -> UInt16 { numberWrap(n) }
+pub fn trunc(n: UInt64) -> UInt32 { numberWrap(n) }
+
+// Integers and `Float`. `Int(x)` truncates toward zero; `Int.trunc`,
+// `Int.round` (half away from zero), `Int.floor` and `Int.ceil` choose.
+fn intToFloat(n: Int) -> Float
+fn intToFloat(n: UInt64) -> Float
+fn floatToInt(x: Float) -> Int
+fn floatFloor(x: Float) -> Float
+fn floatCeil(x: Float) -> Float
+fn floatTrunc(x: Float) -> Float
+pub fn convert(n: Int) -> Float { intToFloat(n) }
+pub fn convert(n: UInt64) -> Float { intToFloat(n) }
+
+pub fn convert(n: Int8) -> Float {
+  let whole: Int = numberSame(n)
+  intToFloat(whole)
+}
+
+pub fn convert(n: Int16) -> Float {
+  let whole: Int = numberSame(n)
+  intToFloat(whole)
+}
+
+pub fn convert(n: Int32) -> Float {
+  let whole: Int = numberSame(n)
+  intToFloat(whole)
+}
+
+pub fn convert(n: UInt8) -> Float {
+  let whole: Int = numberSame(n)
+  intToFloat(whole)
+}
+
+pub fn convert(n: UInt16) -> Float {
+  let whole: Int = numberSame(n)
+  intToFloat(whole)
+}
+
+pub fn convert(n: UInt32) -> Float {
+  let whole: Int = numberSame(n)
+  intToFloat(whole)
+}
+
+// A whole `Float` as an `Int`, if it fits.
+fn wholeToInt(x: Float) -> Int | Unconvertible {
+  if x < -9223372036854775808.0 or x >= 9223372036854775808.0 { return Unconvertible }
+  floatToInt(x)
+}
+
+pub fn convert(x: Float) -> Int | Unconvertible { wholeToInt(floatTrunc(x)) }
+pub fn trunc(x: Float) -> Int | Unconvertible { wholeToInt(floatTrunc(x)) }
+pub fn floor(x: Float) -> Int | Unconvertible { wholeToInt(floatFloor(x)) }
+pub fn ceil(x: Float) -> Int | Unconvertible { wholeToInt(floatCeil(x)) }
+
+pub fn round(x: Float) -> Int | Unconvertible {
+  let whole = floatTrunc(x)
+  let part = x - whole
+  if part >= 0.5 { return wholeToInt(whole + 1.0) }
+  if part <= -0.5 { return wholeToInt(whole - 1.0) }
+  wholeToInt(whole)
+}
+
+// Code points.
+pub fn convert(value: Int) -> CodePoint | InvalidCodePoint { codePoint(value) }
+pub fn convert(c: CodePoint) -> Int { value(c) }
+
 // The type functions of error unions and the type mapping functions over
 // them (§8.4).
 pub type Oks[X]

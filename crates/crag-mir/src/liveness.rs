@@ -154,6 +154,7 @@ fn statement_uses(body: &MirBody<'_>, holds: &[LocalSet], statement: &Statement<
                     uses.operand(a, false);
                     uses.operand(b, false);
                 }
+                Rvalue::Cast { value, .. } => uses.operand(value, false),
                 Rvalue::FloatOverflow(locals) => uses.borrowed.extend(locals),
                 Rvalue::Record { fields, .. } => {
                     for (_, o) in fields {
