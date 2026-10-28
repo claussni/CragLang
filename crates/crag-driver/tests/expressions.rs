@@ -153,3 +153,13 @@ fn module_values_keep_what_their_closures_capture() {
     );
     assert_eq!(eval(&mut r, "add(1)"), "11\n");
 }
+
+#[test]
+fn collection_types_construct_empty_collections() {
+    // §6.5: brackets after a type give its type arguments.
+    let mut r = repl();
+    assert_eq!(eval(&mut r, "List[Int]()"), "[]\n");
+    assert_eq!(eval(&mut r, "Map[Str, Int]()"), "[:]\n");
+    eval(&mut r, "let xs = Set[Int]()");
+    assert_eq!(eval(&mut r, "xs.isEmpty()"), "True\n");
+}

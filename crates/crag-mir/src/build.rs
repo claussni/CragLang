@@ -3155,6 +3155,14 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         {
             return Operand::Const(Constant::Tag(ty));
         }
+        // `List[T]()` and the others build an empty collection (§6.5).
+        match ty.as_builtin(db) {
+            Some((Builtin::List | Builtin::Set, _)) => {
+                return self.assign(ty, Rvalue::List(Vec::new()));
+            }
+            Some((Builtin::Map, _)) => return self.assign(ty, Rvalue::Map(Vec::new())),
+            _ => {}
+        }
         if fields_of(db, self.program, ty).is_none() {
             return self.unsupported(expr, "constructions of collections");
         }
