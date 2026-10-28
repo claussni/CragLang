@@ -278,12 +278,12 @@ fn where_clause(p: &mut Parser) {
     p.start(S::WhereClause);
     p.bump();
     if p.eat(T::LBrace) {
-        items(p, expr);
+        items(p, expr::where_entry);
         p.expect(T::RBrace, "`}`");
     } else {
-        expr(p);
+        expr::where_entry(p);
         while p.eat(T::Comma) {
-            expr(p);
+            expr::where_entry(p);
         }
     }
     p.finish_node();

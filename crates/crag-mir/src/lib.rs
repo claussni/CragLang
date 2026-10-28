@@ -127,6 +127,10 @@ pub enum Entry {
     /// binds to the item's name: the whole value, which its code keeps,
     /// matched against the pattern.
     Part,
+    /// The value conditions of a type: called with a value of the type,
+    /// it gives the number, from one, of the first that fails, or zero
+    /// (§3.10.1).
+    Check,
 }
 
 impl Entry {
@@ -134,7 +138,7 @@ impl Entry {
     pub fn takes_env(self) -> bool {
         !matches!(
             self,
-            Entry::Body | Entry::Default(_) | Entry::Dispose | Entry::Part
+            Entry::Body | Entry::Default(_) | Entry::Dispose | Entry::Part | Entry::Check
         )
     }
 }

@@ -2934,6 +2934,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                     TrapKind::Error => AbiTrap::Error,
                     TrapKind::Unsupported => AbiTrap::Unsupported,
                     TrapKind::Expectation => AbiTrap::Expectation,
+                    TrapKind::ConditionFailed => AbiTrap::ConditionFailed,
                 };
                 // The byte offset of the expression in the module's source,
                 // with the detail it names in the upper half.
@@ -3065,6 +3066,19 @@ impl<'a, 'db> Lower<'a, 'db> {
             && hir_body(db, self.program, Owner::Item(item)).root.is_none()
         {
             return Err("builtin functions");
+        }
+        // The conditions of a type take a value of the instance's type.
+        if *func.entry(db) == Entry::Check {
+            let identity = crag_hir::type_identity(db, self.program, item);
+            let ty = Ty::new(db, TyKind::Named(identity, func.args(db).clone()));
+            let mut words = Vec::new();
+            for arg in args {
+                words.extend(self.operand(arg, ty)?);
+            }
+            if !self.calls.contains(&func) {
+                self.calls.push(func);
+            }
+            return Ok(words);
         }
         let params = match args.is_empty() {
             true => &[][..],

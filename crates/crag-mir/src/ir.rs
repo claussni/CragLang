@@ -577,6 +577,8 @@ pub enum TrapKind {
     /// The trap a handler took, raised again for the handlers around it
     /// (§8.3.1).
     Rethrow,
+    /// A value failed a condition of its type (§3.10.1).
+    ConditionFailed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -1075,6 +1077,7 @@ fn terminator_text<'db>(db: &'db dyn Db, terminator: &Terminator<'db>) -> String
                 TrapKind::Unsupported => "unsupported",
                 TrapKind::Expectation => "expectation",
                 TrapKind::Rethrow => "rethrow",
+                TrapKind::ConditionFailed => "condition failed",
             };
             format!("trap {kind}")
         }
@@ -1096,6 +1099,7 @@ fn func_name<'db>(db: &'db dyn Db, func: InstanceKey<'db>) -> String {
         Entry::Default(e) => format!("{owner}#default{}", e.index()),
         Entry::Dispose => format!("{owner}#dispose"),
         Entry::Part => format!("{owner}#part"),
+        Entry::Check => format!("{owner}#check"),
     }
 }
 

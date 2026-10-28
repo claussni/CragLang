@@ -178,6 +178,9 @@ pub struct Trap {
     /// The function that trapped, then the functions of the frames below it
     /// in turn, as far as the code map holds them.
     pub stack: Vec<FuncId>,
+    /// What the trap names beyond its kind, such as the condition that
+    /// failed or the error `!!` met.
+    pub detail: Option<String>,
 }
 
 /// `rt_trap(ctx, kind, position)`: see `crag_abi::RuntimeFn::Trap`.
@@ -247,10 +250,16 @@ unsafe extern "C" fn trap_entry(
             land(fp_at - offset as usize, fp_at, handler)
         };
         unwind(worker, ret, fp, trap_kind.catchable(), land_at, &mut stack);
+        let detail = stack
+            .first()
+            .and_then(|&f| Worker::code(worker).origin(f, position))
+            .map(|(_, _, _, detail)| detail)
+            .filter(|d| !d.is_empty());
         let trap = Trap {
             kind: trap_kind,
             position: (position != NO_POSITION).then_some(position as u32),
             stack,
+            detail,
         };
         // The fiber takes the trap, so nothing on this stack owns anything
         // when `leave` abandons it.

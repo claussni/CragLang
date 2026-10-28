@@ -472,6 +472,7 @@ impl Image {
                     kind: trap.kind,
                     position: trap.position,
                     stack: trap.stack.clone(),
+                    detail: trap.detail.clone(),
                 }
             }
             state => Message::Failed(format!("the fiber stopped as {state:?}")),

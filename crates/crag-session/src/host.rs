@@ -710,10 +710,12 @@ impl Session {
                 kind,
                 position,
                 stack,
+                detail,
             } => Ok(RunResult::Trapped(Trap {
                 kind,
                 position,
                 stack,
+                detail,
             })),
             Message::Failed(why) => Err(SessionError::Refused(why)),
             other => Err(SessionError::Refused(format!(
@@ -743,10 +745,12 @@ impl Session {
                 kind,
                 position,
                 stack,
+                detail,
             } => AppStatus::Ended(RunResult::Trapped(Trap {
                 kind,
                 position,
                 stack,
+                detail,
             })),
             Message::Failed(why) => return Err(SessionError::Refused(why)),
             other => {
@@ -836,10 +840,12 @@ impl Session {
                 kind,
                 position,
                 stack,
+                detail,
             } => Ok(RunResult::Trapped(Trap {
                 kind,
                 position,
                 stack,
+                detail,
             })),
             Message::Interrupted => Ok(RunResult::Interrupted),
             Message::Failed(why) => Err(SessionError::Refused(why)),

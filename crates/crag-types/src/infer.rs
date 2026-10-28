@@ -533,12 +533,38 @@ impl<'a, 'db> Infer<'a, 'db> {
         let fields: Vec<_> = decl
             .fields
             .iter()
-            .map(|f| (self.lower_type(f.ty), f.default))
+            .map(|f| (f.name, self.lower_type(f.ty), f.default))
             .collect();
+        let alias = decl.alias.map(|a| self.lower_type(a));
         self.lower.errors.clear();
-        for (ty, default) in fields {
+        for &(_, ty, default) in &fields {
             if let Some(default) = default {
                 self.check(default, ty);
+            }
+        }
+        // The conditions see the value as `this` and the fields by name
+        // (§3.10).
+        if let Some(this) = decl.this {
+            let db = self.db;
+            let own = match alias {
+                Some(target) => target,
+                None => {
+                    let identity = type_identity(db, self.program, item);
+                    let names = type_header(db, self.program, item).params.clone();
+                    let params = (0..names.len())
+                        .map(|i| Ty::new(db, TyKind::Param(Some(identity), i as u32, names[i])))
+                        .collect();
+                    Ty::new(db, TyKind::Named(identity, params))
+                }
+            };
+            self.bindings[this.index()] = Some(own);
+            for &(name, binding) in &decl.field_bindings {
+                let ty = fields.iter().find(|(n, ..)| *n == name).map(|(_, t, _)| *t);
+                self.bindings[binding.index()] = ty;
+            }
+            let bool_ty = self.bool_ty;
+            for condition in &decl.conditions {
+                self.check(condition.value, bool_ty);
             }
         }
         for clause in &decl.handlers {

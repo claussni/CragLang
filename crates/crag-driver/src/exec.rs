@@ -146,6 +146,7 @@ pub fn compile<'a>(
             }
             Entry::Default(_) => format!("a default in {}", owner_name(project, owner)),
             Entry::Dispose => format!("the dispose code of {}", owner_name(project, owner)),
+            Entry::Check => format!("the conditions of {}", owner_name(project, owner)),
         };
         // `CRAG_MIR=1` shows the MIR of what is compiled and what code
         // generation does not support, for debugging the compiler.
@@ -252,7 +253,11 @@ pub fn trap_message(kind: TrapKind) -> &'static str {
 /// A trap as the user sees it: what went wrong, where, and the functions
 /// it happened in.
 pub fn report(sources: &dyn Sources, functions: &HashMap<FuncId, Function>, trap: &Trap) -> String {
-    let what = trap_message(trap.kind);
+    let what = match &trap.detail {
+        Some(detail) => format!("{}: {detail}", trap_message(trap.kind)),
+        None => trap_message(trap.kind).to_string(),
+    };
+    let what = what.as_str();
     let first = trap.stack.first().map(|f| &functions[f]);
     let mut out = match (first, trap.position) {
         (Some(f), Some(position)) => {

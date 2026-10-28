@@ -123,6 +123,7 @@ fn check(config: FiberConfig) {
         kind: TrapKind::Overflow,
         position: Some(42),
         stack: vec![FuncId(0); 5001],
+        detail: None,
     };
     assert_eq!(fiber.trap(), Some(&trap));
     assert_eq!(fiber.results(), None);

@@ -380,6 +380,22 @@ fn label_ahead(p: &Parser) -> bool {
     p.nth(n) == T::Colon
 }
 
+/// An entry of a `where` clause: a requirement or a condition, which may
+/// be named, `name: expr` (§3.10).
+pub(crate) fn where_entry(p: &mut Parser) {
+    if p.at(T::Ident) && p.nth(1) == T::Colon {
+        p.start(S::LabeledArg);
+        p.start(S::Label);
+        p.bump();
+        p.finish_node();
+        p.bump();
+        expr(p);
+        p.finish_node();
+    } else {
+        expr(p);
+    }
+}
+
 /// An argument of bracket application, which may be a type or an
 /// expression (§6.5). Function types, parenthesized ones among them,
 /// unions and `is` clauses are parsed as types; anything else as an

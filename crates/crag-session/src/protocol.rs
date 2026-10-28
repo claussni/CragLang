@@ -75,6 +75,7 @@ pub enum Message {
         kind: TrapKind,
         position: Option<u32>,
         stack: Vec<FuncId>,
+        detail: Option<String>,
     },
     /// From the image: it could not do what the host asked, and why; it
     /// is as it was before.
@@ -255,6 +256,7 @@ impl Message {
                 kind,
                 position,
                 stack,
+                detail,
             } => {
                 w.u8(TRAPPED);
                 w.u32(*kind as u32);
@@ -266,6 +268,7 @@ impl Message {
                     }
                 }
                 w.seq(stack, |w, f| w.u32(f.0));
+                w.text(detail.as_deref().unwrap_or(""));
             }
             Message::Failed(why) => {
                 w.u8(FAILED);
@@ -382,6 +385,7 @@ impl Message {
                     tag => return Err(invalid(format!("an option with the tag {tag}"))),
                 },
                 stack: r.seq(|r| Ok(FuncId(r.u32()?)))?,
+                detail: Some(r.text()?).filter(|d| !d.is_empty()),
             },
             FAILED => Message::Failed(r.text()?),
             INTERRUPTED => Message::Interrupted,
@@ -974,11 +978,13 @@ mod tests {
                 kind: TrapKind::Overflow,
                 position: Some(17),
                 stack: vec![FuncId(9), FuncId(10)],
+                detail: None,
             },
             Message::Trapped {
-                kind: TrapKind::Unsupported,
+                kind: TrapKind::ConditionFailed,
                 position: None,
                 stack: Vec::new(),
+                detail: Some("atMost100".into()),
             },
             Message::Failed("function 3 is not loaded".into()),
             Message::Interrupted,

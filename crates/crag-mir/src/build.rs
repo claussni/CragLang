@@ -89,6 +89,7 @@ pub fn build<'db>(
         Entry::Default(expr) => b.default_entry(expr),
         Entry::Dispose => b.dispose_entry(),
         Entry::Part => b.part_entry(),
+        Entry::Check => b.check_entry(),
     };
     match start {
         Some(start) if ok => start(&mut b),
@@ -282,7 +283,7 @@ struct Otherwise {
 
 /// The trap kinds a handler may take, with the prelude's types for them
 /// (§8.3).
-const TRAP_TYPES: [(crag_abi::TrapKind, &str); 11] = [
+const TRAP_TYPES: [(crag_abi::TrapKind, &str); 12] = [
     (crag_abi::TrapKind::Overflow, "Overflow"),
     (crag_abi::TrapKind::DivideByZero, "DivisionByZero"),
     (crag_abi::TrapKind::Index, "OutOfBounds"),
@@ -294,6 +295,7 @@ const TRAP_TYPES: [(crag_abi::TrapKind, &str); 11] = [
     (crag_abi::TrapKind::Fault, "Fault"),
     (crag_abi::TrapKind::Unordered, "Unordered"),
     (crag_abi::TrapKind::Expectation, "Expectation"),
+    (crag_abi::TrapKind::ConditionFailed, "ConditionFailed"),
 ];
 
 /// The state of lowering one decision tree.
@@ -441,6 +443,98 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             }));
         }
         Some(Box::new(move |b| b.eval(root, Dest::Return)))
+    }
+
+    /// The value conditions of a type, against the value it is called
+    /// with: the number of the first that fails, from one, or zero
+    /// (§3.10.1).
+    fn check_entry(&mut self) -> Option<Start<'a, 'db>> {
+        let decl = self.body.type_decl.as_ref()?;
+        let this = decl.this?;
+        let ty = self.binding_ty(this)?;
+        let value = self.local(ty, None);
+        self.params = 1;
+        let int_ty = self.int();
+        self.result = int_ty;
+        let fields = decl.field_bindings.clone();
+        let conditions: Vec<ExprId> = decl.conditions.iter().map(|c| c.value).collect();
+        Some(Box::new(move |b| {
+            let local = b.binding(this);
+            b.push(Statement::Assign(local, Rvalue::Use(Operand::Local(value))));
+            for (name, binding) in fields {
+                let local = b.binding(binding);
+                let place = Place {
+                    local: value,
+                    path: vec![Step::Field(name)],
+                };
+                b.push(Statement::Assign(local, Rvalue::Read(place)));
+            }
+            for (k, condition) in conditions.into_iter().enumerate() {
+                let (holds, fails) = (b.new_block(), b.new_block());
+                b.branch_on(condition, holds, fails);
+                b.switch_to(fails);
+                b.terminate(Terminator::Return(int(k as i128 + 1)));
+                b.switch_to(holds);
+            }
+            b.terminate(Terminator::Return(int(0)));
+        }))
+    }
+
+    /// Checks a value just built against the conditions of its type and of
+    /// its parents, which trap with `ConditionFailed` naming the one that
+    /// fails (§3.10.1).
+    fn check_conditions(&mut self, value: Operand<'db>, ty: Ty<'db>, site: ExprId) -> Operand<'db> {
+        let (db, program) = (self.db, self.program);
+        let mut checked = Some(ty);
+        let mut value_local: Option<Local> = None;
+        while let Some(t) = checked {
+            checked = crag_types::parent(db, program, t);
+            let TyKind::Named(item, args) = t.kind(db) else {
+                continue;
+            };
+            let body = hir_body(db, program, Owner::Item(*item));
+            let Some(decl) = body.type_decl.as_ref().filter(|d| !d.conditions.is_empty()) else {
+                continue;
+            };
+            let labels: Vec<String> = decl.conditions.iter().map(|c| c.label(db)).collect();
+            let local = *value_local.get_or_insert_with(|| self.materialize(value.clone(), ty));
+            let as_t = self.coerce(Operand::Local(local), ty, t);
+            let code = InstanceKey::new(
+                db,
+                Owner::Item(*item),
+                args.clone(),
+                Vec::new(),
+                Entry::Check,
+            );
+            let int_ty = self.int();
+            let failed = self.call_code(code, vec![as_t], int_ty, site);
+            for (k, label) in labels.into_iter().enumerate() {
+                let (this, next) = (self.new_block(), self.new_block());
+                let is = self.compare(
+                    CmpOp::Eq,
+                    Builtin::Int,
+                    Operand::Local(failed),
+                    int(k as i128 + 1),
+                );
+                self.terminate(Terminator::Branch {
+                    cond: is,
+                    then: this,
+                    otherwise: next,
+                });
+                self.switch_to(this);
+                self.terminate(Terminator::Trap {
+                    kind: TrapKind::ConditionFailed,
+                    site: Some(site),
+                    detail: Some(label),
+                    catch: None,
+                });
+                self.switch_to(next);
+            }
+        }
+        match value_local {
+            Some(local) => Operand::Local(local),
+            None => value,
+        }
     }
 
     /// The part of a module-level `let` with a pattern bound to the item's
@@ -3839,14 +3933,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             out.push((name, op));
         }
         let dispose = self.dispose_code(ty);
-        self.assign(
+        let built = self.assign(
             ty,
             Rvalue::Record {
                 ty,
                 fields: out,
                 dispose,
             },
-        )
+        );
+        self.check_conditions(built, ty, site)
     }
 
     /// Whether the value `e` given for a field of type `field_ty`
@@ -3937,14 +4032,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             out.push((name, op));
         }
         let dispose = self.dispose_code(ty);
-        self.assign(
+        let built = self.assign(
             ty,
             Rvalue::Record {
                 ty,
                 fields: out,
                 dispose,
             },
-        )
+        );
+        self.check_conditions(built, ty, site)
     }
 
     // Statements.

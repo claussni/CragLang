@@ -1380,6 +1380,8 @@ pub enum TrapKind {
     Unordered = 12,
     /// `!!` met an error (Specification §8.4).
     Expectation = 13,
+    /// A value failed a condition of its type (Specification §3.10.1).
+    ConditionFailed = 14,
 }
 
 impl TrapKind {
@@ -1400,6 +1402,7 @@ impl TrapKind {
             TrapKind::Fault => "the environment failed, as writing to a closed output does",
             TrapKind::Unordered => "compared values that have no order",
             TrapKind::Expectation => "`!!` met an error",
+            TrapKind::ConditionFailed => "a value failed a condition of its type",
         }
     }
 
@@ -1415,7 +1418,7 @@ impl TrapKind {
 }
 
 impl TrapKind {
-    pub const ALL: [TrapKind; 14] = [
+    pub const ALL: [TrapKind; 15] = [
         TrapKind::Overflow,
         TrapKind::DivideByZero,
         TrapKind::Index,
@@ -1430,6 +1433,7 @@ impl TrapKind {
         TrapKind::Fault,
         TrapKind::Unordered,
         TrapKind::Expectation,
+        TrapKind::ConditionFailed,
     ];
 
     /// The kind with this discriminant, if any.

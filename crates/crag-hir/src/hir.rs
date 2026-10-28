@@ -104,8 +104,8 @@ pub struct SlotDecl<'db> {
 }
 
 /// A type declaration (§3.2–3.9), with its lifecycle handlers and, for a
-/// lifecycle kind, the form of their functions (§11.4). Its conditions and
-/// markers are not lowered yet.
+/// lifecycle kind, the form of their functions (§11.4), and its value
+/// conditions (§3.10.1). Its markers are not lowered yet.
 #[derive(Clone, Debug, Default, PartialEq, Eq, crag_db::SalsaValue)]
 pub struct TypeDecl<'db> {
     /// Whether it has a field list; a tag has none (§3.2).
@@ -121,6 +121,31 @@ pub struct TypeDecl<'db> {
     pub handlers: Vec<HandlerClause>,
     /// A lifecycle kind's `where HandlerForm[…]`.
     pub form: Option<HandlerForm>,
+    /// Its value conditions, checked in order (§3.10.1).
+    pub conditions: Vec<Condition<'db>>,
+    /// What the conditions see: `this`, the whole value, and each field
+    /// the type declares, by name.
+    pub this: Option<BindingId>,
+    pub field_bindings: Vec<(Name<'db>, BindingId)>,
+}
+
+/// A value condition: its name, if it has one, and its source text, which
+/// a failure reports, and the `Bool` that must hold (§3.10).
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct Condition<'db> {
+    pub name: Option<Name<'db>>,
+    pub text: String,
+    pub value: ExprId,
+}
+
+impl Condition<'_> {
+    /// What a failure names: the condition's name, or its text.
+    pub fn label(&self, db: &dyn crag_db::Db) -> String {
+        match self.name {
+            Some(name) => name.text(db).clone(),
+            None => self.text.clone(),
+        }
+    }
 }
 
 /// `on H f`: the lifecycle kind and the handler (§11.4).

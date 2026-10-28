@@ -440,6 +440,7 @@ impl<'a, 'db> Lowerer<'a, 'db> {
 
     pub fn type_decl(&mut self, node: &SyntaxNode) -> TypeDecl<'db> {
         self.type_params(node);
+        let mut conditions = Vec::new();
         let modifier = |kind| node.tokens().any(|t| t.kind() == LeafKind::Token(kind));
         let mut decl = TypeDecl {
             distinct: modifier(T::Distinct),
@@ -487,26 +488,89 @@ impl<'a, 'db> Lowerer<'a, 'db> {
                     decl.handlers.push(HandlerClause { kind, handler });
                 }
                 // The kind's form is the compiler's to know, by name
-                // (§11.4); other entries are conditions.
+                // (§11.4); a form applied to types is a requirement (§4.4),
+                // and other entries are conditions (§3.10).
                 S::WhereClause => {
                     for entry in clause.children() {
                         let form = entry.kind() == S::BracketExpr
                             && entry.children().next().is_some_and(|n| {
                                 n.kind() == S::NameRef && n.text() == "HandlerForm"
                             });
-                        let Some(args) = child(&entry, S::ArgList).filter(|_| form) else {
-                            continue;
-                        };
-                        let ty = args.children().find(|n| n.kind() != S::IsClause);
-                        let ty = self.type_or_missing(ty, &entry);
-                        let pure = self.pure_marker(&args);
-                        decl.form = Some(HandlerForm { ty, pure });
+                        if let Some(args) = child(&entry, S::ArgList).filter(|_| form) {
+                            let ty = args.children().find(|n| n.kind() != S::IsClause);
+                            let ty = self.type_or_missing(ty, &entry);
+                            let pure = self.pure_marker(&args);
+                            decl.form = Some(HandlerForm { ty, pure });
+                        } else if self.names_form(&entry) {
+                            let ty = self.type_node(&entry);
+                            self.body.requirements.push(Requirement { param: None, ty });
+                        } else {
+                            conditions.push(entry);
+                        }
                     }
                 }
                 _ => {}
             }
         }
+        if !conditions.is_empty() {
+            self.conditions(&mut decl, &conditions);
+        }
         decl
+    }
+
+    /// The value conditions of a type, which see `this` and the fields the
+    /// type declares (§3.10).
+    fn conditions(&mut self, decl: &mut TypeDecl<'db>, entries: &[SyntaxNode]) {
+        self.scoped(|this| {
+            let range = entries[0].range();
+            let name = this.name("this");
+            let binding = this.alloc_binding(Some(name), BindingKind::Let, range.clone());
+            this.declare(name, binding);
+            decl.this = Some(binding);
+            for field in decl.fields.clone() {
+                let binding = this.alloc_binding(Some(field.name), BindingKind::Let, range.clone());
+                this.declare(field.name, binding);
+                decl.field_bindings.push((field.name, binding));
+            }
+            for entry in entries {
+                let (name, value) = match entry.kind() {
+                    S::LabeledArg => {
+                        let label = child(entry, S::Label).and_then(|l| ident(&l));
+                        let value = entry.children().find(|n| n.kind() != S::Label);
+                        (label.map(|t| this.name(t.text())), value)
+                    }
+                    _ => (None, Some(entry.clone())),
+                };
+                let text = value
+                    .as_ref()
+                    .map(|v| {
+                        v.text()
+                            .to_string()
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+                let value = this.boundary_or_missing(value.as_ref(), entry);
+                decl.conditions.push(Condition { name, text, value });
+            }
+        });
+    }
+
+    /// Whether a `where` entry applies a form, `F[T]`, rather than states a
+    /// condition.
+    fn names_form(&self, entry: &SyntaxNode) -> bool {
+        if entry.kind() != S::BracketExpr {
+            return false;
+        }
+        let Some(callee) = entry.children().next().filter(|n| n.kind() == S::NameRef) else {
+            return false;
+        };
+        let Some(token) = ident(&callee) else {
+            return false;
+        };
+        let name = self.name(token.text());
+        matches!(self.scope.resolve(name), Some(Resolution::Form(_)))
     }
 
     /// Whether an `is` clause among a node's children marks it `Pure`;

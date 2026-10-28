@@ -154,3 +154,31 @@ fn trap_handlers_give_their_block_its_value() {
     assert_eq!(eval(&mut r, "tx(0)"), "20\n");
     assert_eq!(eval(&mut r, "tx(1)"), "30\n");
 }
+
+#[test]
+fn constructions_check_the_conditions_of_their_types() {
+    // §3.10.1: a value that fails a condition of its type, or of a
+    // parent's, traps with `ConditionFailed`, which names it.
+    let mut r = repl();
+    eval(
+        &mut r,
+        "type Percent(value: Int) where { nonNegative: value >= 0, atMost100: value <= 100 }",
+    );
+    eval(
+        &mut r,
+        "fn percent(k: Int) -> Str {\n  on ConditionFailed { t -> \"rejected: {t.condition}\" }\n  \"ok {Percent(value: k).value}\"\n}",
+    );
+    assert_eq!(eval(&mut r, "percent(50)"), "\"ok 50\"\n");
+    assert_eq!(eval(&mut r, "percent(150)"), "\"rejected: atMost100\"\n");
+    assert_eq!(eval(&mut r, "percent(-1)"), "\"rejected: nonNegative\"\n");
+    eval(&mut r, "type Base(x: Int) where x != 0");
+    eval(&mut r, "type Sub(..Base, y: Int) where y > this.x");
+    eval(&mut r, "fn sub(a: Int, b: Int) -> Sub { Sub(x: a, y: b) }");
+    assert_eq!(eval(&mut r, "sub(1, 2)"), "Sub(x: 1, y: 2)\n");
+    let out = eval(&mut r, "sub(0, 5)");
+    assert!(
+        out.starts_with("trap: a value failed a condition of its type: x != 0"),
+        "{out}"
+    );
+    assert!(eval(&mut r, "sub(3, 1)").contains("y > this.x"));
+}
