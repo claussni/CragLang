@@ -110,3 +110,46 @@ fn updates_change_fields_by_paths_and_transforms() {
         "Circle(pos: Pos(x: 1, y: 0), size: 1, r: 5)\n"
     );
 }
+
+#[test]
+fn partial_application_fills_the_parameters_left() {
+    // §6.6: each `_` is a parameter of the closure, of the type the call
+    // takes there; the supplied arguments are evaluated once, here.
+    let mut r = repl();
+    eval(&mut r, "fn plus(a: Int, b: Int) -> Int { a + b }");
+    eval(&mut r, "let n = 5");
+    eval(&mut r, "let addTen = plus(n * 2, _)");
+    assert_eq!(eval(&mut r, "addTen(1)"), "11\n");
+    // An overloaded target is chosen as a call would be, with the
+    // literals' default types.
+    eval(&mut r, "let twice = multiply(_, 2)");
+    assert_eq!(eval(&mut r, "[1, 2].map(twice)"), "[2, 4]\n");
+    eval(&mut r, "let both = plus(_, _)");
+    assert_eq!(eval(&mut r, "both(3, 4)"), "7\n");
+    // A generic target takes its type arguments from what is supplied.
+    eval(
+        &mut r,
+        "fn clamp[T: Ordered](x: T, min: T, max: T) -> T {\n  if x < min { min } else { if x > max { max } else { x } }\n}",
+    );
+    eval(&mut r, "let percent = clamp(_, min: 0, max: 100)");
+    assert_eq!(eval(&mut r, "percent(150)"), "100\n");
+    // Named arguments, and defaults left to their own.
+    eval(
+        &mut r,
+        "fn resize(w: Int, h: Int = 1, width: Int) -> Int { w + h + width }",
+    );
+    eval(&mut r, "let thumb = resize(_, width: 256)");
+    assert_eq!(eval(&mut r, "thumb(1)"), "258\n");
+    // Types that stay open are an error.
+    assert!(eval(&mut r, "let open = clamp(_, _, _)").contains("cannot be inferred"),);
+}
+
+#[test]
+fn module_values_keep_what_their_closures_capture() {
+    let mut r = repl();
+    eval(
+        &mut r,
+        "let add = {\n  let m = 10\n  { x: Int -> m + x }\n}",
+    );
+    assert_eq!(eval(&mut r, "add(1)"), "11\n");
+}

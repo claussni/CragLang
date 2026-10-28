@@ -727,7 +727,9 @@ pub(crate) fn mentions_any<'db>(db: &'db dyn Db, ty: Ty<'db>) -> bool {
 
 /// Infers type arguments of `owner` by matching a type written with its
 /// type parameters against a type found: each parameter takes what it
-/// meets, or the union of what it meets.
+/// meets, or the union of what it meets. `Never`, which an argument that
+/// does not finish has and a `_` of a partial application while its call
+/// resolves (§6.6), tells nothing.
 pub(crate) fn bind<'db>(
     db: &'db dyn Db,
     program: Program,
@@ -736,7 +738,7 @@ pub(crate) fn bind<'db>(
     found: Ty<'db>,
     args: &mut [Option<Ty<'db>>],
 ) {
-    if found.is_error(db) || !mentions(db, pattern, owner, &|_| true) {
+    if found.is_error(db) || found.is_never(db) || !mentions(db, pattern, owner, &|_| true) {
         return;
     }
     let go =
