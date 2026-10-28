@@ -652,7 +652,7 @@ impl<'db> ErrorKind<'db> {
                 item(other)
             ),
             ErrorKind::NotCType { ty, out: false } => format!(
-                "{} is no C type; a C function takes and gives sized integers, `Float`, `CF32`, `CPtr[T]` and `CStr`",
+                "{} is no C type here; a C function takes sized integers, `Float`, `CF32`, `CPtr[T]`, `CStr` and `Option[CStr]`, and `Float` with any of `NaN`, `PosInfinity` and `NegInfinity`; a result may also be `Str`, `Option[Str]` or `()`",
                 ty.display(db)
             ),
             ErrorKind::NotCType { ty, out: true } => format!(

@@ -27,13 +27,14 @@ use crate::fiber::TaskContext;
 use crate::system::worker_of;
 use crate::text::{TextWords, in_buffer, make_text};
 
-/// The C result's word and `errno`, as `rt_c_call` returns them.
+/// The C result's word and the class of a float result, as `rt_c_call`
+/// returns them.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CResult(pub u64, pub u64);
 
 system_stack_fn! {
-    /// `rt_c_call(ctx, library, func, desc, buf) -> (result, errno)`: see
+    /// `rt_c_call(ctx, library, func, desc, buf) -> (result, class)`: see
     /// `crag_abi::RuntimeFn::CCall`.
     fn rt_c_call(
         ctx: *const TaskContext,
@@ -45,9 +46,9 @@ system_stack_fn! {
 }
 
 system_stack_fn! {
-    /// `rt_c_str_of(ctx, address) -> (w0, w1)`: see
+    /// `rt_c_str_of(ctx, address, nul) -> (w0, w1)`: see
     /// `crag_abi::RuntimeFn::CStrOf`.
-    fn rt_c_str_of(ctx: *const TaskContext, address: u64) -> TextWords => str_of_entry
+    fn rt_c_str_of(ctx: *const TaskContext, address: u64, nul: u64) -> TextWords => str_of_entry
 }
 
 /// The registers and the stack words of a call: six integer registers,
@@ -66,7 +67,8 @@ type Raw = [u64; 3];
 ///
 /// Called only by `rt_c_call`, with a loaded library, the address of a C
 /// function of it whose parameters and result the descriptor describes,
-/// and a buffer of a word per parameter whose `CStr`s are live boxes.
+/// and a buffer of a word per parameter and one more, whose `CStr`s are
+/// live boxes.
 unsafe extern "C" fn call_entry(
     _ctx: *const TaskContext,
     library: *const NativeLibrary,
@@ -106,13 +108,16 @@ unsafe extern "C" fn call_entry(
                 *slot = extend(kind & !c_kind::OUT, *slot);
             }
         }
-        let word = match result {
-            c_kind::VOID => 0,
-            c_kind::F64 => raw[2],
-            c_kind::F32 => raw[2] & 0xffff_ffff,
-            kind => extend(kind, raw[0]),
-        };
-        CResult(word, errno as i64 as u64)
+        *buf.add(count) = errno as i64 as u64;
+        match result {
+            c_kind::VOID => CResult(0, 0),
+            c_kind::F64 => CResult(raw[2], class(f64::from_bits(raw[2]))),
+            c_kind::F32 => {
+                let bits = raw[2] & 0xffff_ffff;
+                CResult(bits, class(f32::from_bits(bits as u32).into()))
+            }
+            kind => CResult(extend(kind, raw[0]), 0),
+        }
     }
 }
 
@@ -137,6 +142,8 @@ unsafe fn arguments(kinds: &[u8], buf: *mut u64) -> Args {
             match kind {
                 _ if kind & c_kind::OUT != 0 => slot as u64,
                 c_kind::CSTR => cstr_address(*slot),
+                c_kind::OPT_CSTR if *slot == 0 => 0,
+                c_kind::OPT_CSTR => cstr_address(*slot),
                 _ => *slot,
             }
         };
@@ -169,6 +176,17 @@ unsafe fn cstr_address(cstr: u64) -> u64 {
     } else {
         // The bytes follow the length byte.
         field + 1
+    }
+}
+
+/// The class of a float: 0 finite, 1 NaN, 2 positive and 3 negative
+/// infinity (Specification §3.1.4).
+fn class(x: f64) -> u64 {
+    match x {
+        _ if x.is_nan() => 1,
+        f64::INFINITY => 2,
+        f64::NEG_INFINITY => 3,
+        _ => 0,
     }
 }
 
@@ -286,15 +304,16 @@ unsafe extern "C" fn c_invoke(
 ///
 /// # Safety
 ///
-/// Called only by `rt_c_str_of`, with null or the address of
-/// NUL-terminated bytes.
-unsafe extern "C" fn str_of_entry(ctx: *const TaskContext, address: u64) -> TextWords {
+/// Called only by `rt_c_str_of`, with the address of NUL-terminated
+/// bytes.
+unsafe extern "C" fn str_of_entry(ctx: *const TaskContext, address: u64, nul: u64) -> TextWords {
     // SAFETY: as the caller promises.
     unsafe {
         let (heap, _) = worker_of(ctx);
-        let bytes: &[u8] = match address {
-            0 => b"\0",
-            _ => std::ffi::CStr::from_ptr(address as *const libc::c_char).to_bytes_with_nul(),
+        let c = std::ffi::CStr::from_ptr(address as *const libc::c_char);
+        let bytes = match nul {
+            0 => c.to_bytes(),
+            _ => c.to_bytes_with_nul(),
         };
         let [w0, w1] = make_text(heap, &[bytes]);
         TextWords(w0, w1)

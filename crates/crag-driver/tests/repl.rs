@@ -394,4 +394,17 @@ fn outside_a_package_a_c_import_names_the_file() {
     assert_eq!(eval(&mut r, r#"CStr("a\0b")"#), "Unconvertible()\n");
     assert_eq!(eval(&mut r, "Float(!! CF32(0.5))"), "0.5\n");
     assert_eq!(eval(&mut r, "CF32(1.0e39)"), "Unconvertible()\n");
+    // The values IEEE 754 adds come as tags.
+    assert_eq!(
+        eval(
+            &mut r,
+            r#"import cLib("libm.so.6").{ log(x: Float) -> Float | NonFinite, ldexp(x: Float | NonFinite, e: CInt) -> Float | NonFinite } is ThreadSafe"#
+        ),
+        ""
+    );
+    assert_eq!(eval(&mut r, "log(0.0)"), "NegInfinity\n");
+    assert_eq!(eval(&mut r, "log(-1.0)"), "NaN\n");
+    assert_eq!(eval(&mut r, "ldexp(PosInfinity, 2)"), "PosInfinity\n");
+    assert_eq!(eval(&mut r, "ldexp(1.5, 2)"), "6.0\n");
+    assert_eq!(eval(&mut r, "log(1.0).number()"), "0.0\n");
 }

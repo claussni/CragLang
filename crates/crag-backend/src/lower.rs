@@ -59,7 +59,7 @@ use crag_mir::{
     BinOp, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Entry, InstanceKey, Intrinsic,
     Local, MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,
 };
-use crag_types::{Builtin, Step, Ty, TyKind, prelude_item, signature};
+use crag_types::{Builtin, CForm, Step, Ty, TyKind, prelude_item, signature};
 
 use crate::layout::{
     Layout, boxed_indices, deferred, dispose_word, equal_by_words, layout, record_layout,
@@ -119,6 +119,7 @@ pub fn lower_to_lir<'db>(
         program,
         mir,
         positions: &lower_body(db, program, owner).source_map.exprs,
+        name_at: lower_body(db, program, owner).source_map.name.start,
         vregs: 0,
         locals: Vec::new(),
         layouts: Vec::new(),
@@ -243,16 +244,9 @@ pub fn lower_to_lir<'db>(
     }
 }
 
-/// The kind of a C parameter's or result's type in a `CCall` descriptor;
-/// a `CStr` result is a pointer, and only a result may be `()`.
-fn c_kind_of<'db>(db: &'db dyn Db, ty: Ty<'db>, result: bool) -> Option<u8> {
-    if crag_types::is_cstr(db, ty) {
-        return Some(if result { c_kind::PTR } else { c_kind::CSTR });
-    }
-    if result && matches!(ty.kind(db), TyKind::Record { fields, open: false } if fields.is_empty())
-    {
-        return Some(c_kind::VOID);
-    }
+/// The kind of a plain C value's type in a `CCall` descriptor
+/// (`CForm::Value`).
+fn c_kind_of<'db>(db: &'db dyn Db, ty: Ty<'db>) -> Option<u8> {
     Some(match ty.as_builtin(db)?.0 {
         Builtin::Int8 => c_kind::I8,
         Builtin::Int16 => c_kind::I16,
@@ -286,6 +280,9 @@ struct Lower<'a, 'db> {
     mir: &'a MirBody<'db>,
     /// Where each expression of the body is in its module's source.
     positions: &'db [Range<u32>],
+    /// Where the name of the declaration starts: the position of a trap
+    /// with a detail but no expression, as of a C function's result.
+    name_at: u32,
     vregs: u32,
     /// The registers of each local.
     locals: Vec<Vec<VReg>>,
@@ -1309,17 +1306,21 @@ impl<'a, 'db> Lower<'a, 'db> {
         let (params, result) = crag_types::c_signature(db, program, item);
         let info = crag_hir::c_function_info(db, item).ok_or("C functions without an import")?;
         let unsupported = "C parameters or results of this type";
-        let mut desc = vec![
-            params.len() as u8,
-            c_kind_of(db, result, true).ok_or(unsupported)?,
-        ];
-        let buffer = self.c_buffer(params.len() as u32);
+        let result_kind = match CForm::of(db, result) {
+            CForm::Void => c_kind::VOID,
+            CForm::CStr | CForm::OptionCStr | CForm::Str | CForm::OptionStr => c_kind::PTR,
+            CForm::Float(_) => c_kind::F64,
+            CForm::Value => c_kind_of(db, result).ok_or(unsupported)?,
+            CForm::Invalid => return Err(unsupported),
+        };
+        let mut desc = vec![params.len() as u8, result_kind];
+        // A word per parameter, and `errno`.
+        let buffer = self.c_buffer(params.len() as u32 + 1);
         let mut args = args.iter();
         for (i, &ty) in params.iter().enumerate() {
             let offset = 8 * i as i32;
             if let Some(inner) = crag_types::c_out(db, ty) {
-                let kind = c_kind_of(db, inner, false).filter(|&k| k != c_kind::CSTR);
-                desc.push(c_kind::OUT | kind.ok_or(unsupported)?);
+                desc.push(c_kind::OUT | c_kind_of(db, inner).ok_or(unsupported)?);
                 let zero = self.constant(0);
                 self.push(Inst::Store {
                     src: zero,
@@ -1328,9 +1329,17 @@ impl<'a, 'db> Lower<'a, 'db> {
                 });
                 continue;
             }
-            desc.push(c_kind_of(db, ty, false).ok_or(unsupported)?);
             let arg = args.next().ok_or("C calls with missing arguments")?;
-            let src = word(&self.operand(arg, ty)?)?;
+            let words = self.operand(arg, ty)?;
+            let (kind, src) = match CForm::of(db, ty) {
+                CForm::CStr => (c_kind::CSTR, word(&words)?),
+                // The payload: the box, or zero for `Empty`.
+                CForm::OptionCStr => (c_kind::OPT_CSTR, *words.get(1).ok_or(unsupported)?),
+                CForm::Float(_) => (c_kind::F64, self.float_word(ty, &words)?),
+                CForm::Value => (c_kind_of(db, ty).ok_or(unsupported)?, word(&words)?),
+                _ => return Err(unsupported),
+            };
+            desc.push(kind);
             self.push(Inst::Store {
                 src,
                 addr: buffer,
@@ -1362,16 +1371,51 @@ impl<'a, 'db> Lower<'a, 'db> {
             dst
         });
         let out = self.runtime2(RuntimeFn::CCall, vec![library, func, desc, buffer]);
+        // The class of a float result waits for `CClass`.
         let scratch = self.scratch();
         self.push(Inst::Store {
             src: out[1],
             addr: scratch,
             offset: 0,
         });
-        Ok(match c_kind_of(db, result, true) {
-            Some(c_kind::VOID) => Vec::new(),
+        Ok(match result_kind {
+            c_kind::VOID => Vec::new(),
             _ => vec![out[0]],
         })
+    }
+
+    /// The IEEE 754 bits of a `Float` united with tags of non-finite
+    /// values (Specification §3.1.4): the payload, or the bits of the tag
+    /// the value is.
+    fn float_word(&mut self, ty: Ty<'db>, words: &[VReg]) -> Result<VReg, Unsupported> {
+        let db = self.db;
+        let [index, payload] = words else {
+            return Err("floats united with other values");
+        };
+        let mut bits = *payload;
+        for member in ty.members(db) {
+            let TyKind::Named(item, _) = member.kind(db) else {
+                continue;
+            };
+            let value = match item.name(db).text(db).as_str() {
+                "NaN" => f64::NAN,
+                "PosInfinity" => f64::INFINITY,
+                "NegInfinity" => f64::NEG_INFINITY,
+                _ => continue,
+            };
+            let tag = self.constant(type_index(member));
+            let is = self.cmp(Cond::Eq, *index, tag);
+            let value = self.constant(value.to_bits() as i64);
+            let dst = self.reg();
+            self.push(Inst::Select {
+                dst,
+                cond: is,
+                a: value,
+                b: bits,
+            });
+            bits = dst;
+        }
+        Ok(bits)
     }
 
     /// The runtime call of an intrinsic, and its result's words; `ty` is
@@ -1885,13 +1929,16 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let buffer = self.c_buffer(index + 1);
                 Ok(vec![self.load(buffer, 8 * index as i32)])
             }
-            (Intrinsic::CErrno, []) => {
+            (Intrinsic::CClass, []) => {
                 let scratch = self.scratch();
                 Ok(vec![self.load(scratch, 0)])
             }
-            (Intrinsic::CStrOf, [address]) => {
+            (Intrinsic::CStrOf { nul }, [address]) => {
                 let address = word(&self.operand(address, int)?)?;
-                Ok(self.runtime2(RuntimeFn::CStrOf, vec![address]).to_vec())
+                let nul = self.constant(i64::from(nul));
+                Ok(self
+                    .runtime2(RuntimeFn::CStrOf, vec![address, nul])
+                    .to_vec())
             }
             (Intrinsic::TextParsed, []) => {
                 let scratch = self.scratch();
@@ -3087,10 +3134,14 @@ impl<'a, 'db> Lower<'a, 'db> {
                     TrapKind::Unsupported => AbiTrap::Unsupported,
                     TrapKind::Expectation => AbiTrap::Expectation,
                     TrapKind::ConditionFailed => AbiTrap::ConditionFailed,
+                    TrapKind::Fault => AbiTrap::Fault,
                 };
                 // The byte offset of the expression in the module's source,
                 // with the detail it names in the upper half.
-                let position = site.and_then(|e| self.positions.get(e.index()).map(|r| r.start));
+                let position = match site {
+                    Some(e) => self.positions.get(e.index()).map(|r| r.start),
+                    None => detail.as_ref().map(|_| self.name_at),
+                };
                 if let Some(at) = position {
                     let origin = self.origin(at);
                     self.origins.push(origin);

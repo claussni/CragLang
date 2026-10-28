@@ -467,13 +467,17 @@ pub enum Intrinsic<'db> {
     /// of its bytes, a `UInt64` (Specification §16.3).
     CCall(ItemId<'db>),
     /// What the last `CCall` of the code left in the out parameter at an
-    /// index among the C function's parameters; `errno`, read right after
-    /// it returned, a `CInt`.
+    /// index among the C function's parameters; at the index after the
+    /// last, `errno`, read right after it returned, a `CInt`.
     COut(u32),
-    CErrno,
-    /// A copy of the NUL-terminated bytes at an address, the NUL included:
-    /// `Bytes`.
-    CStrOf,
+    /// The class of the last `CCall`'s float result, an `Int`: 0 finite,
+    /// 1 NaN, 2 positive and 3 negative infinity.
+    CClass,
+    /// A copy of the NUL-terminated bytes at an address, with the NUL or
+    /// without it: `Bytes`.
+    CStrOf {
+        nul: bool,
+    },
     /// The number of elements of a list, map or set.
     CollCount,
     /// The list with an element replaced, which consumes the list and the
@@ -591,6 +595,9 @@ pub enum TrapKind {
     Rethrow,
     /// A value failed a condition of its type (§3.10.1).
     ConditionFailed,
+    /// Foreign code broke what its import declares: a null or a value
+    /// that is not finite where none may come (§16.1).
+    Fault,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -1090,6 +1097,7 @@ fn terminator_text<'db>(db: &'db dyn Db, terminator: &Terminator<'db>) -> String
                 TrapKind::Expectation => "expectation",
                 TrapKind::Rethrow => "rethrow",
                 TrapKind::ConditionFailed => "condition failed",
+                TrapKind::Fault => "fault",
             };
             format!("trap {kind}")
         }

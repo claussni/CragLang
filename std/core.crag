@@ -98,6 +98,24 @@ pub type Exhausted(..Trap)
 pub type StackOverflow(..Trap)
 pub type Fault(..Trap)
 
+// The values IEEE 754 adds to `Float`, which is finite (§3.1.4). A
+// function that can give one says so in its result type.
+pub type NaN
+pub type PosInfinity
+pub type NegInfinity
+pub type NonFinite = NaN | PosInfinity | NegInfinity
+
+// The `Float`, trapping on a NaN or an infinity.
+pub fn number(x: Float | NonFinite) -> Float {
+  case x {
+    f: Float -> f
+    _ -> {
+      trapExpectation()
+      0.0
+    }
+  }
+}
+
 // Conversions (§5.6, §19.13): `T(x)` calls the `convert` that takes `x` and
 // gives a `T`. One that may not fit gives `Unconvertible` instead.
 pub form Convert[A, B] {
@@ -621,6 +639,7 @@ fn valueCompare[T](a: T, b: T) -> Int
 fn valueHash[T](x: T) -> Int
 fn valueShow[T](x: T) -> Str
 fn trapUnordered() -> ()
+fn trapExpectation() -> ()
 
 // Int
 

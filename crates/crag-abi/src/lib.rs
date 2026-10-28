@@ -944,23 +944,24 @@ pub enum RuntimeFn {
     /// them for a handler outside (Specification §8.3.1).
     TxUnwind = 110,
 
-    /// `rt_c_call(ctx, library, func, desc, buf) -> (result, errno)`.
+    /// `rt_c_call(ctx, library, func, desc, buf) -> (result, class)`.
     ///
     /// Calls the C function at `func` of the [`NativeLibrary`] with the C
     /// calling convention, on the system stack, as the library's thread
     /// safety allows (Specification §16.4). `desc` is a [`c_kind`]
     /// descriptor: the number of parameters, the result's kind, then each
     /// parameter's. `buf` holds a word per parameter: a value, a `CStr`'s
-    /// box, or, for an out parameter, room for what the function writes
-    /// there, which the call leaves extended to a word. The result comes
-    /// back extended to a word, a `CF32` as its bits; `errno` as read right
-    /// after the call.
+    /// box or null, or, for an out parameter, room for what the function
+    /// writes there, which the call leaves extended to a word; the word
+    /// after them gets `errno` as read right after the call. The result
+    /// comes back extended to a word, a `CF32` as its bits, with the class
+    /// of a float: 0 finite, 1 NaN, 2 positive, 3 negative infinity.
     CCall = 111,
 
-    /// `rt_c_str_of(ctx, address) -> (w0, w1)`.
+    /// `rt_c_str_of(ctx, address, nul) -> (w0, w1)`.
     ///
-    /// A copy of the NUL-terminated bytes at the address, the NUL
-    /// included, as `Bytes`; a null address gives only a NUL.
+    /// A copy of the NUL-terminated bytes at the address, which is not
+    /// null, as `Bytes`: with the NUL when `nul` is not zero.
     CStrOf = 112,
 }
 
@@ -982,6 +983,8 @@ pub mod c_kind {
     pub const CSTR: u8 = 11;
     /// No value: a `()` result.
     pub const VOID: u8 = 12;
+    /// An `Option[CStr]` argument: a `CStr`'s box, or null for `Empty`.
+    pub const OPT_CSTR: u8 = 13;
     /// Set on an out parameter's kind, the kind of what it points to.
     pub const OUT: u8 = 0x80;
 }
@@ -1474,7 +1477,7 @@ impl TrapKind {
             TrapKind::OutOfMemory => "ran out of memory",
             TrapKind::Cancelled => "was cancelled",
             TrapKind::Cycle => "a lazy value needed itself",
-            TrapKind::Fault => "the environment failed, as writing to a closed output does",
+            TrapKind::Fault => "the environment failed",
             TrapKind::Unordered => "compared values that have no order",
             TrapKind::Expectation => "`!!` met an error",
             TrapKind::ConditionFailed => "a value failed a condition of its type",

@@ -28,6 +28,7 @@
 extern crate crag_db as salsa;
 
 mod c;
+pub use c::{CForm, NON_FINITE};
 mod case;
 mod decision;
 mod def;

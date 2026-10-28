@@ -39,9 +39,18 @@ pub opaque type CStr(bytes: Bytes)
 // The greatest finite 32-bit float.
 let cf32Max = 3.4028234663852886e38
 
-// A float that is not finite has no `Float`; it gives 0.0.
-pub fn convert(x: CF32) -> Float {
-  bytes([0, 0, 0, 0]).writeUInt32(0, cf32Bits(x), Little).readFloat32(0, Little).orElse(0.0)
+// The `Float`, or the tag of a NaN or an infinity (§3.1.4), read from
+// the bits: the sign is the top bit, and a NaN's magnitude is above the
+// infinity's.
+pub fn convert(x: CF32) -> Float | NonFinite {
+  let bits = cf32Bits(x)
+  let magnitude = if bits >= 2147483648 { bits - 2147483648 } else { bits }
+  if magnitude > 2139095040 { return NaN }
+  if magnitude == 2139095040 {
+    if bits == magnitude { return PosInfinity }
+    return NegInfinity
+  }
+  bytes([0, 0, 0, 0]).writeUInt32(0, bits, Little).readFloat32(0, Little).orElse(0.0)
 }
 
 pub fn convert(f: Float) -> CF32 | Unconvertible {

@@ -746,13 +746,18 @@ import cLib("c").{
   strlen(s: CStr) -> CSize,
   strtol(s: CStr, end: COut[CPtr[CChar]], base: CInt) -> CLong,
   close(fd: CInt) -> CInt is Errno,
-  getenv(name: CStr) -> CStr,
+  getenv(name: CStr) -> Option[CStr],
+  secure_getenv(name: CStr) -> Option[Str],
+  strerror(n: CInt) -> Str,
+  setlocale(category: CInt, locale: Option[CStr]) -> Option[Str],
+  strtod(s: CStr, end: COut[CPtr[CChar]]) -> Float | NonFinite,
+  atof(s: CStr) -> Float,
 }
 
 fn main() -> ExitCode {
   if cos(0.0) != 1.0 { return ExitCode(code: 2) }
   if ldexp(1.5, 3) != 12.0 { return ExitCode(code: 3) }
-  if Float(cosf(!! CF32(0.0))) != 1.0 { return ExitCode(code: 4) }
+  if Float(cosf(!! CF32(0.0))).number() != 1.0 { return ExitCode(code: 4) }
   if labs(-12345678901) != 12345678901 or abs(-7) != 7 { return ExitCode(code: 5) }
   // Inline and in a buffer.
   if strlen(!! CStr("short")) != 5 { return ExitCode(code: 6) }
@@ -763,10 +768,16 @@ fn main() -> ExitCode {
   // EBADF
   if closed.result != -1 or closed.errno != 9 { return ExitCode(code: 9) }
   if CStr("a\0b") is CStr { return ExitCode(code: 10) }
-  case Str(getenv(!! CStr("CRAG_NO_SUCH_VARIABLE"))) {
-    s: Str -> { if s != "" { return ExitCode(code: 11) } }
-    e: NotUtf8 -> { return ExitCode(code: 12) }
-  }
+  // A null pointer is `Empty`, and `Empty` passes one.
+  if getenv(!! CStr("CRAG_NO_SUCH_VARIABLE")) is CStr { return ExitCode(code: 11) }
+  if not (secure_getenv(!! CStr("CRAG_NO_SUCH_VARIABLE")) is Empty) { return ExitCode(code: 12) }
+  if strerror(2) != "No such file or directory" { return ExitCode(code: 13) }
+  if setlocale(6, Empty) != "C" { return ExitCode(code: 14) }
+  // Floats that are not finite are tags.
+  if not (strtod(!! CStr("-inf")).result is NegInfinity) { return ExitCode(code: 15) }
+  if not (strtod(!! CStr("nan")).result is NaN) { return ExitCode(code: 16) }
+  if strtod(!! CStr("2.5")).result.number() != 2.5 { return ExitCode(code: 17) }
+  if atof(!! CStr("0.5")) != 0.5 { return ExitCode(code: 18) }
   ExitCode(code: 0)
 }
 "#;
@@ -852,7 +863,7 @@ fn c_imports_are_checked() {
     let app = r#"import std.c
 
 import cLib("c").{
-  bad(xs: List[Int], s: COut[CStr]) -> Str,
+  bad(xs: List[Int], s: COut[CStr]) -> List[Int],
   fine(n: CInt, out: COut[CF32]) -> (),
 } is ThreadSafe
 import cLib("c").{ other() -> CInt }
@@ -873,9 +884,9 @@ fn main() {}
     assert_eq!(crag_run(&root, &mut out), 1);
     let out = text(out);
     for message in [
-        "error: List[Int] is no C type; a C function takes and gives sized integers, `Float`, `CF32`, `CPtr[T]` and `CStr`\n --> app.crag:4:11",
+        "error: List[Int] is no C type here; a C function takes sized integers, `Float`, `CF32`, `CPtr[T]`, `CStr` and `Option[CStr]`, and `Float` with any of `NaN`, `PosInfinity` and `NegInfinity`; a result may also be `Str`, `Option[Str]` or `()`\n --> app.crag:4:11",
         "error: an out parameter cannot point to CStr; it takes a sized integer, `Float`, `CF32` or `CPtr[T]`\n --> app.crag:4:25",
-        "error: Str is no C type",
+        "error: List[Int] is no C type here; a C function takes sized integers, `Float`, `CF32`, `CPtr[T]`, `CStr` and `Option[CStr]`, and `Float` with any of `NaN`, `PosInfinity` and `NegInfinity`; a result may also be `Str`, `Option[Str]` or `()`\n --> app.crag:4:40",
         "error: `cLib(\"c\")` is imported as ThreadSafe here but as ThreadUnsafe in `demo.app`",
         "error: `cLib(\"c\")` is imported as ThreadUnsafe here but as ThreadSafe in `demo.app`",
         "error: package demo declares no native library `undeclared`; add `native undeclared \"<file>\"` to its manifest",
@@ -883,4 +894,48 @@ fn main() {}
         assert!(out.contains(message), "{message}\nnot in\n{out}");
     }
     assert!(!out.contains("fine"), "{out}");
+}
+
+#[test]
+fn a_c_result_the_import_does_not_allow_is_a_fault() {
+    let manifest = format!("{MANIFEST}native c \"libc.so.6\"\n");
+    let sbom = "native demo c \"libc.so.6\"\n";
+    let app = r#"import std.c
+
+import cLib("c").{ atof(s: CStr) -> Float, getenv(name: CStr) -> Str }
+
+fn main() {
+  let x = atof(!! CStr("inf"))
+}
+"#;
+    let root = project(
+        "ffi-fault",
+        &[
+            ("package.crag", &manifest),
+            ("sbom.crag", sbom),
+            ("app.crag", app),
+        ],
+    );
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), EXIT_TRAP);
+    let out = text(out);
+    assert!(
+        out.starts_with("trap: the environment failed: a C function gave a float that its import does not allow\n --> app.crag:3:20"),
+        "{out}"
+    );
+    fs::write(
+        root.join("app.crag"),
+        app.replace(
+            "let x = atof(!! CStr(\"inf\"))",
+            "let s = getenv(!! CStr(\"CRAG_NO_SUCH_VARIABLE\"))",
+        ),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), EXIT_TRAP);
+    let out = text(out);
+    assert!(
+        out.starts_with("trap: the environment failed: a C function gave a null pointer where its import allows none\n"),
+        "{out}"
+    );
 }

@@ -315,7 +315,7 @@ pub fn signature<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> S
         .filter(|&r| *body.type_ref(r) != TypeRef::Infer)
         .map(|r| lower.lower(r));
     if let Some(c) = crag_hir::c_function_info(db, item) {
-        return c_call_signature(db, params, result, c.errno);
+        return c_call_signature(db, program, params, result, c.errno);
     }
     Signature {
         type_params: own_type_params(db, item) + lower.implicit.len(),
@@ -342,11 +342,21 @@ pub fn c_signature<'db>(
 /// come back with the C result as fields of a record, as does `errno`.
 fn c_call_signature<'db>(
     db: &'db dyn Db,
+    program: Program,
     params: Vec<SigParam<'db>>,
     result: Option<Ty<'db>>,
     errno: bool,
 ) -> Signature<'db> {
-    let result = result.unwrap_or_else(|| Ty::unit(db));
+    let mut result = result.unwrap_or_else(|| Ty::unit(db));
+    // A `char*` copied to text may not be UTF-8.
+    if matches!(
+        crate::c::CForm::of(db, result),
+        crate::c::CForm::Str | crate::c::CForm::OptionStr
+    ) && let Some(not_utf8) = prelude_item(db, program, "NotUtf8")
+    {
+        let not_utf8 = Ty::new(db, TyKind::Named(not_utf8, Vec::new()));
+        result = relate::join(db, program, result, not_utf8);
+    }
     let (outs, params): (Vec<_>, Vec<_>) =
         params.into_iter().partition(|p| c_out(db, p.ty).is_some());
     let result = if outs.is_empty() && !errno {

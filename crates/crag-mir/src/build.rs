@@ -41,7 +41,7 @@ use crag_hir::{
     lower_body,
 };
 use crag_types::{
-    Builtin, Callee, DecisionTree, Dispatch, EscapeLevel, Filling, Handler, HandlerCode,
+    Builtin, CForm, Callee, DecisionTree, Dispatch, EscapeLevel, Filling, Handler, HandlerCode,
     InferenceResult, Instance, Iteration, ListLen, Position, SigParam, Signature, Step, Ty, TyKind,
     TypeDefKind, Value, body_types, decision_tree_with, declared_fields, dispose_handler,
     fields_of, lifecycle_handler, literal_value, prelude_item, result_type, signature, subst,
@@ -449,8 +449,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         Some(Box::new(move |b| b.eval(root, Dest::Return)))
     }
 
-    /// The code of a C function (§16.3): the call, then the record of its
-    /// result, its out parameters and `errno`, if it gives one.
+    /// The code of a C function (§16.3): the call, its result as the
+    /// import declares it, then the record of the result, its out
+    /// parameters and `errno`, if it gives one.
     fn c_entry(&mut self, item: ItemId<'db>) -> Option<Start<'a, 'db>> {
         let db = self.db;
         let sig = signature(db, self.program, item);
@@ -458,26 +459,35 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let args: Vec<Local> = sig.params.iter().map(|p| self.temp(p.ty)).collect();
         self.params = args.len();
         self.result = sig.result?;
+        let errno = crag_hir::c_function_info(db, item).is_some_and(|c| c.errno);
+        let record = errno || c_params.iter().any(|&t| crag_types::c_out(db, t).is_some());
+        // The type the C result has in a call: the record's `result`.
+        let value_ty = match (record, self.result.kind(db)) {
+            (true, TyKind::Record { fields, .. }) => fields
+                .iter()
+                .find(|(name, _)| name.text(db) == "result")
+                .map(|&(_, t)| t)?,
+            _ => self.result,
+        };
         Some(Box::new(move |b| {
-            let cstr = crag_types::is_cstr(db, c_result);
-            let raw_ty = match cstr {
-                true => Ty::builtin(db, Builtin::UInt64),
-                false => c_result,
+            // A plain float is checked too: only a finite one may come.
+            let form = match (CForm::of(db, c_result), c_result.as_builtin(db)) {
+                (CForm::Value, Some((Builtin::Float | Builtin::CF32, _))) => {
+                    CForm::Float([false; 3])
+                }
+                (form, _) => form,
+            };
+            let raw_ty = match form {
+                CForm::Value | CForm::Void | CForm::Invalid => c_result,
+                _ => Ty::builtin(db, Builtin::UInt64),
             };
             let ops = args.into_iter().map(Operand::Local).collect();
-            let mut value = b.assign(raw_ty, Rvalue::Intrinsic(Intrinsic::CCall(item), ops));
-            if cstr {
-                let bytes_ty = Ty::builtin(db, Builtin::Bytes);
-                let bytes = b.assign(bytes_ty, Rvalue::Intrinsic(Intrinsic::CStrOf, vec![value]));
-                let record = Rvalue::Record {
-                    ty: c_result,
-                    fields: vec![(Name::new(db, "bytes".to_string()), bytes)],
-                    dispose: None,
-                };
-                value = b.assign(c_result, record);
-            }
-            let result = b.result;
-            if result != c_result {
+            let raw = b.assign(raw_ty, Rvalue::Intrinsic(Intrinsic::CCall(item), ops));
+            let mut value = match form {
+                CForm::Value | CForm::Void | CForm::Invalid => raw,
+                _ => b.c_value(form, raw, value_ty),
+            };
+            if record {
                 let mut fields = vec![(Name::new(db, "result".to_string()), value)];
                 let body = b.body;
                 for (index, (param, &ty)) in body.params.iter().zip(&c_params).enumerate() {
@@ -492,21 +502,178 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     );
                     fields.push((name, op));
                 }
-                if crag_hir::c_function_info(db, item).is_some_and(|c| c.errno) {
+                if errno {
                     let int32 = Ty::builtin(db, Builtin::Int32);
-                    let op = b.assign(int32, Rvalue::Intrinsic(Intrinsic::CErrno, vec![]));
+                    let at = c_params.len() as u32;
+                    let op = b.assign(int32, Rvalue::Intrinsic(Intrinsic::COut(at), vec![]));
                     fields.push((Name::new(db, "errno".to_string()), op));
                 }
                 fields.sort_by(|(x, _), (y, _)| x.text(db).cmp(y.text(db)));
+                let ty = b.result;
                 let record = Rvalue::Record {
-                    ty: result,
+                    ty,
                     fields,
                     dispose: None,
                 };
-                value = b.assign(result, record);
+                value = b.assign(ty, record);
             }
             b.terminate(Terminator::Return(value));
         }))
+    }
+
+    /// A C result as its import declares it, from the word the call gave
+    /// (Specification §16.1, §3.1.4): a pointer becomes a `CStr` or text,
+    /// or `Empty` when it is null and the type allows it; a float becomes
+    /// a `Float` or the tag of what it is. What the type does not allow
+    /// is a `Fault`.
+    fn c_value(&mut self, form: CForm, raw: Operand<'db>, ty: Ty<'db>) -> Operand<'db> {
+        let db = self.db;
+        let dst = self.temp(ty);
+        let join = self.new_block();
+        let tag = |name: &str| {
+            ty.members(db).into_iter().find(|m| match m.kind(db) {
+                TyKind::Named(item, _) => item.name(db).text(db) == name,
+                _ => false,
+            })
+        };
+        match form {
+            CForm::Float(_) => {
+                let class = self.assign(self.int(), Rvalue::Intrinsic(Intrinsic::CClass, vec![]));
+                for (k, name) in ["", "NaN", "PosInfinity", "NegInfinity"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let code = Operand::Const(Constant::Int(k as i128));
+                    let is = self.compare(CmpOp::Eq, Builtin::Int, class.clone(), code);
+                    let (this, next) = (self.new_block(), self.new_block());
+                    self.terminate(Terminator::Branch {
+                        cond: is,
+                        then: this,
+                        otherwise: next,
+                    });
+                    self.switch_to(this);
+                    let float = ty
+                        .members(db)
+                        .into_iter()
+                        .find(|m| {
+                            matches!(m.as_builtin(db), Some((Builtin::Float | Builtin::CF32, _)))
+                        })
+                        .unwrap_or(ty);
+                    match (k, tag(name)) {
+                        (0, _) => {
+                            let x = self.assign(
+                                float,
+                                Rvalue::Intrinsic(Intrinsic::Word, vec![raw.clone()]),
+                            );
+                            self.assign_to(dst, x, float);
+                        }
+                        (_, Some(t)) => self.assign_to(dst, Operand::Const(Constant::Tag(t)), t),
+                        (_, None) => {
+                            self.c_fault(form);
+                            self.switch_to(next);
+                            continue;
+                        }
+                    }
+                    self.terminate(Terminator::Jump(join));
+                    self.switch_to(next);
+                }
+                self.c_fault(form);
+            }
+            _ => {
+                let zero = Operand::Const(Constant::Int(0));
+                let null = self.compare(CmpOp::Eq, Builtin::UInt64, raw.clone(), zero);
+                let (empty, present) = (self.new_block(), self.new_block());
+                self.terminate(Terminator::Branch {
+                    cond: null,
+                    then: empty,
+                    otherwise: present,
+                });
+                self.switch_to(empty);
+                match tag("Empty") {
+                    Some(t) => {
+                        self.assign_to(dst, Operand::Const(Constant::Tag(t)), t);
+                        self.terminate(Terminator::Jump(join));
+                    }
+                    None => {
+                        self.c_fault(form);
+                    }
+                }
+                self.switch_to(present);
+                let bytes_ty = Ty::builtin(db, Builtin::Bytes);
+                let text = matches!(form, CForm::Str | CForm::OptionStr);
+                let of = Intrinsic::CStrOf { nul: !text };
+                let bytes = self.assign(bytes_ty, Rvalue::Intrinsic(of, vec![raw]));
+                if text {
+                    self.c_text(bytes, dst, join);
+                } else {
+                    let cstr = ty
+                        .members(db)
+                        .into_iter()
+                        .find(|&m| crag_types::is_cstr(db, m))
+                        .unwrap_or(ty);
+                    let record = Rvalue::Record {
+                        ty: cstr,
+                        fields: vec![(Name::new(db, "bytes".to_string()), bytes)],
+                        dispose: None,
+                    };
+                    let value = self.assign(cstr, record);
+                    self.assign_to(dst, value, cstr);
+                    self.terminate(Terminator::Jump(join));
+                }
+            }
+        }
+        self.switch_to(join);
+        Operand::Local(dst)
+    }
+
+    /// The `Fault` of a C result its import does not allow, naming what
+    /// came.
+    fn c_fault(&mut self, form: CForm) {
+        let what = match form {
+            CForm::Float(_) => "a C function gave a float that its import does not allow",
+            _ => "a C function gave a null pointer where its import allows none",
+        };
+        self.terminate(Terminator::Trap {
+            kind: TrapKind::Fault,
+            site: None,
+            detail: Some(what.to_string()),
+            catch: None,
+        });
+    }
+
+    /// The bytes as a `Str` in `dst`, or `NotUtf8`, then on to `join`.
+    fn c_text(&mut self, bytes: Operand<'db>, dst: Local, join: BlockId) {
+        let db = self.db;
+        let int = self.int();
+        let valid = self.assign(
+            int,
+            Rvalue::Intrinsic(Intrinsic::TextUtf8, vec![bytes.clone()]),
+        );
+        let zero = Operand::Const(Constant::Int(0));
+        let invalid = self.compare(CmpOp::Eq, Builtin::Int, valid, zero);
+        let (bad, good) = (self.new_block(), self.new_block());
+        self.terminate(Terminator::Branch {
+            cond: invalid,
+            then: bad,
+            otherwise: good,
+        });
+        self.switch_to(bad);
+        if let Some(item) = prelude_item(db, self.program, "NotUtf8") {
+            let not_utf8 = Ty::new(db, TyKind::Named(item, Vec::new()));
+            let record = Rvalue::Record {
+                ty: not_utf8,
+                fields: Vec::new(),
+                dispose: None,
+            };
+            let value = self.assign(not_utf8, record);
+            self.assign_to(dst, value, not_utf8);
+        }
+        self.terminate(Terminator::Jump(join));
+        self.switch_to(good);
+        let str_ty = Ty::builtin(db, Builtin::Str);
+        let text = self.assign(str_ty, Rvalue::Intrinsic(Intrinsic::TextCast, vec![bytes]));
+        self.assign_to(dst, text, str_ty);
+        self.terminate(Terminator::Jump(join));
     }
 
     /// The value conditions of a type, against the value it is called
@@ -2003,6 +2170,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         },
                         "trapIndex" => Intrinsic::TrapWith(crag_abi::TrapKind::Index as u8),
                         "trapUnordered" => Intrinsic::TrapWith(crag_abi::TrapKind::Unordered as u8),
+                        "trapExpectation" => {
+                            Intrinsic::TrapWith(crag_abi::TrapKind::Expectation as u8)
+                        }
                         "bytesCount" => Intrinsic::TextMeasure(BYTE_COUNT),
                         "bytesAt" => Intrinsic::TextAt(BYTE_AT),
                         "bytesSlice" => Intrinsic::TextSlice,
