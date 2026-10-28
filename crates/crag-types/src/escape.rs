@@ -470,6 +470,12 @@ impl<'a, 'db> EscapeWalker<'a, 'db> {
             Stmt::Let { pat, value, .. } | Stmt::LetElse { pat, value, .. } => {
                 let mut bound = HashSet::new();
                 pat_bindings(body, *pat, &mut bound);
+                if let Stmt::LetElse {
+                    rest: Some(rest), ..
+                } = stmt
+                {
+                    pat_bindings(body, *rest, &mut bound);
+                }
                 let level = bound
                     .iter()
                     .map(|b| self.levels[b.index()])
@@ -768,9 +774,15 @@ fn declared_in(body: &Body, expr: ExprId) -> HashSet<BindingId> {
             Expr::Block { stmts, .. } => {
                 for stmt in stmts {
                     match stmt {
-                        Stmt::Let { pat, .. }
-                        | Stmt::LetElse { pat, .. }
-                        | Stmt::For { pat, .. } => pat_bindings(body, *pat, &mut out),
+                        Stmt::Let { pat, .. } | Stmt::For { pat, .. } => {
+                            pat_bindings(body, *pat, &mut out)
+                        }
+                        Stmt::LetElse { pat, rest, .. } => {
+                            pat_bindings(body, *pat, &mut out);
+                            if let Some(rest) = rest {
+                                pat_bindings(body, *rest, &mut out);
+                            }
+                        }
                         Stmt::Bind { binding, .. } => {
                             out.insert(*binding);
                         }

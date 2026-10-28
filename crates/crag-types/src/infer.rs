@@ -3853,6 +3853,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                 pat,
                 ty,
                 value,
+                rest,
                 otherwise,
             } => {
                 let value_ty = self.synth(*value);
@@ -3872,31 +3873,28 @@ impl<'a, 'db> Infer<'a, 'db> {
                 let typed = self.pattern_checks(*pat, target);
                 let binding = self.narrowable(*value).filter(|_| typed);
                 let start = self.narrowed.clone();
-                if let Some(binding) = binding {
-                    // The `else` part sees the values the pattern misses.
-                    let mut matrix = PatternMatrix::default();
-                    let rest = match self.lowered(*pat) {
-                        Some(patterns) => {
-                            for pattern in patterns {
-                                matrix.push(pattern);
-                            }
-                            let tested = self.rest(value_ty, target);
-                            let missed = self.unmatched(&matrix, target);
-                            self.join(tested, missed)
+                // The `else` part sees the values the pattern misses.
+                let unmatched = match self.lowered(*pat).filter(|_| typed) {
+                    Some(patterns) => {
+                        let mut matrix = PatternMatrix::default();
+                        for pattern in patterns {
+                            matrix.push(pattern);
                         }
-                        None => value_ty,
-                    };
-                    self.narrowed[binding.index()] = Some(rest);
-                }
-                if let Expr::Closure { .. } = self.body.expr(*otherwise) {
-                    let kind = ErrorKind::Unsupported("`else` closures");
-                    self.error(Site::Expr(*otherwise), kind);
-                    self.synth(*otherwise);
-                } else {
-                    let leaves = self.synth(*otherwise);
-                    if !leaves.is_never(db) && !leaves.is_error(db) {
-                        self.error(Site::Expr(*otherwise), ErrorKind::MustLeave);
+                        let tested = self.rest(value_ty, target);
+                        let missed = self.unmatched(&matrix, target);
+                        self.join(tested, missed)
                     }
+                    None => value_ty,
+                };
+                if let Some(binding) = binding {
+                    self.narrowed[binding.index()] = Some(unmatched);
+                }
+                if let Some(rest) = rest {
+                    self.pattern(*rest, unmatched);
+                }
+                let leaves = self.synth(*otherwise);
+                if !leaves.is_never(db) && !leaves.is_error(db) {
+                    self.error(Site::Expr(*otherwise), ErrorKind::MustLeave);
                 }
                 self.narrowed = start;
                 if let Some(binding) = binding

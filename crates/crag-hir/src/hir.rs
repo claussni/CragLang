@@ -474,6 +474,9 @@ pub enum Stmt {
         pat: PatId,
         ty: Option<TypeRefId>,
         value: ExprId,
+        /// The pattern of `else { rest -> … }`, which receives the value
+        /// the pattern does not match (§7.1.1).
+        rest: Option<PatId>,
         otherwise: ExprId,
     },
     /// `var`, `ref` and `ext`, told apart by the binding's kind.

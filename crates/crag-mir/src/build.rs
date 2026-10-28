@@ -268,6 +268,13 @@ enum FieldDefault<'db> {
     Code(InstanceKey<'db>),
 }
 
+/// The `else` part of a `let`, and the pattern of `{ rest -> … }`.
+#[derive(Clone, Copy)]
+struct Otherwise {
+    rest: Option<PatId>,
+    body: ExprId,
+}
+
 /// The state of lowering one decision tree.
 struct Match {
     subject: Local,
@@ -3528,16 +3535,21 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 pat,
                 ty,
                 value,
+                rest,
                 otherwise,
             } => {
                 let test = ty.map(|t| self.type_ref(t));
                 let op = self.expr(*value);
+                let otherwise = Otherwise {
+                    rest: *rest,
+                    body: *otherwise,
+                };
                 match test {
                     Some(None) => {
                         self.trap(TrapKind::Error, Some(*value));
                     }
-                    Some(Some(test)) => self.tested(*pat, op, self.ty(*value), test, *otherwise),
-                    None => self.matched(*pat, op, self.ty(*value), Some(*otherwise)),
+                    Some(Some(test)) => self.tested(*pat, op, self.ty(*value), test, otherwise),
+                    None => self.matched(*pat, op, self.ty(*value), Some(otherwise)),
                 }
             }
             Stmt::Bind { binding, value, .. } => {
@@ -3635,7 +3647,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
 
     /// Matches a value against the pattern of a `let`, a `let … else` or
     /// a `for`, binding its names.
-    fn matched(&mut self, pat: PatId, op: Operand<'db>, ty: Ty<'db>, otherwise: Option<ExprId>) {
+    fn matched(&mut self, pat: PatId, op: Operand<'db>, ty: Ty<'db>, otherwise: Option<Otherwise>) {
         match self.body.pat(pat) {
             Pat::Bind { binding, sub: None } if otherwise.is_none() => {
                 let local = self.binding(*binding);
@@ -3666,12 +3678,24 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         };
         self.lower_decision_tree(&tree, &mut m);
         self.switch_to(fail);
+        let site = otherwise.map(|o| o.body);
         if let Some(otherwise) = otherwise {
-            // The `else` leaves, so its end is never reached (§7.1.1).
-            self.eval(otherwise, Dest::Discard);
+            self.otherwise(otherwise, subject, ty);
         }
-        self.trap(TrapKind::NoMatch, otherwise);
+        self.trap(TrapKind::NoMatch, site);
         self.switch_to(cont);
+    }
+
+    /// The `else` part of a `let`, its pattern given the unmatched value
+    /// in `subject`. It leaves, so its end is never reached (§7.1.1).
+    fn otherwise(&mut self, otherwise: Otherwise, subject: Local, ty: Ty<'db>) {
+        if let Some(rest) = otherwise.rest {
+            let rest_ty = self.pats[rest.index()].unwrap_or_else(|| Ty::error(self.db));
+            let value = self.temp(rest_ty);
+            self.assign_to(value, Operand::Local(subject), ty);
+            self.matched(rest, Operand::Local(value), rest_ty, None);
+        }
+        self.eval(otherwise.body, Dest::Discard);
     }
 
     /// `let pat: T = value else …`: the value is tested to be a `T`
@@ -3682,7 +3706,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         op: Operand<'db>,
         ty: Ty<'db>,
         test: Ty<'db>,
-        otherwise: ExprId,
+        otherwise: Otherwise,
     ) {
         let subject = self.materialize(op, ty);
         let (fits, fail) = (self.new_block(), self.new_block());
@@ -3697,8 +3721,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             otherwise: fail,
         });
         self.switch_to(fail);
-        self.eval(otherwise, Dest::Discard);
-        self.trap(TrapKind::NoMatch, Some(otherwise));
+        self.otherwise(otherwise, subject, ty);
+        self.trap(TrapKind::NoMatch, Some(otherwise.body));
         self.switch_to(fits);
         let narrowed = self.temp(test);
         self.assign_to(narrowed, Operand::Local(subject), ty);

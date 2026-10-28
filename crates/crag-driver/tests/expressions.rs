@@ -163,3 +163,31 @@ fn collection_types_construct_empty_collections() {
     eval(&mut r, "let xs = Set[Int]()");
     assert_eq!(eval(&mut r, "xs.isEmpty()"), "True\n");
 }
+
+#[test]
+fn let_else_passes_the_unmatched_value_on() {
+    // §7.1.1: `else { rest -> … }` receives what the pattern does not
+    // match, narrowed, and its `return` leaves the function.
+    let mut r = repl();
+    eval(&mut r, "type NotFound");
+    eval(&mut r, "type DbError(code: Int)");
+    eval(&mut r, "type User(name: Str)");
+    eval(
+        &mut r,
+        "fn lookup(id: Int) -> User | NotFound | DbError {\n  if id == 1 { User(name: \"ada\") } else { if id == 2 { NotFound } else { DbError(code: 7) } }\n}",
+    );
+    eval(
+        &mut r,
+        "fn code(id: Int) -> Int {\n  let u: User = lookup(id) else { e ->\n    return case e {\n      NotFound -> 0\n      d: DbError -> d.code\n    }\n  }\n  1\n}",
+    );
+    assert_eq!(eval(&mut r, "code(1)"), "1\n");
+    assert_eq!(eval(&mut r, "code(2)"), "0\n");
+    assert_eq!(eval(&mut r, "code(3)"), "7\n");
+    assert!(
+        eval(
+            &mut r,
+            "fn bad(id: Int) -> Int {\n  let u: User = lookup(id) else { rest -> 5 }\n  1\n}"
+        )
+        .contains("must leave")
+    );
+}

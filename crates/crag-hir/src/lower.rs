@@ -597,19 +597,41 @@ impl<'a, 'db> Lowerer<'a, 'db> {
         })
     }
 
+    /// The `else` part of a `let`: a block, or `{ rest -> … }`, whose
+    /// parameter receives the unmatched value. Neither is a closure: its
+    /// `return` leaves the function (§7.1.1).
+    fn otherwise(&mut self, node: &SyntaxNode) -> (Option<PatId>, ExprId) {
+        let Some(list) = child(node, S::ClosureParams).filter(|_| node.kind() == S::Closure) else {
+            return (None, self.boundary(node));
+        };
+        self.scoped(|this| {
+            let param = list.children().next();
+            let rest = param.map(|param| {
+                let pattern = param.children().next();
+                this.pattern_or_missing(pattern.as_ref(), &param, BindingKind::Let)
+            });
+            let statements = node
+                .children()
+                .filter(|n| n.kind() != S::ClosureParams)
+                .collect();
+            (rest, this.block(node, statements))
+        })
+    }
+
     fn statement(&mut self, node: &SyntaxNode) -> Option<Stmt> {
         Some(match node.kind() {
             S::LetDecl => {
                 let parts = let_parts(node);
                 let value = self.boundary_or_missing(parts.value.as_ref(), node);
-                let otherwise = parts.otherwise.map(|n| self.boundary(&n));
+                let otherwise = parts.otherwise.map(|n| self.otherwise(&n));
                 let ty = parts.ty.map(|t| self.type_node(&t));
                 let pat = self.pattern_or_missing(parts.pattern.as_ref(), node, BindingKind::Let);
                 match otherwise {
-                    Some(otherwise) => Stmt::LetElse {
+                    Some((rest, otherwise)) => Stmt::LetElse {
                         pat,
                         ty,
                         value,
+                        rest,
                         otherwise,
                     },
                     None => Stmt::Let { pat, ty, value },

@@ -289,12 +289,14 @@ impl Printer<'_, '_> {
                 pat,
                 ty,
                 value,
+                rest,
                 otherwise,
             } => format!(
-                "(let {}{} {} else {})",
+                "(let {}{} {} else {}{})",
                 self.pat(*pat),
                 self.annotation(*ty),
                 self.expr(*value),
+                rest.map_or(String::new(), |r| format!("{} -> ", self.pat(r))),
                 self.expr(*otherwise)
             ),
             Stmt::Bind { binding, ty, value } => format!(
