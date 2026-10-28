@@ -1361,6 +1361,30 @@ fn f(s: Shape) {
 }
 
 #[test]
+fn constructions_infer_their_type_arguments() {
+    // The field values fix them, a spread's own fields too unless the
+    // list gives them anew.
+    let text = "type Box[T](value: T)
+type Pair[A, B](a: A, b: B)
+type Hold[T](f: () -> T)
+fn f() {
+  let a = Box(value: 3)
+  let p = Pair(a: 1, b: 2.5)
+  let q = Pair(..p, b: \"now\")
+  let h = Hold(f: { -> 1 })
+}";
+    let checked = check(text);
+    assert_eq!(
+        checked.bindings.last().unwrap(),
+        "a: Box[Int], p: Pair[Int, Float], q: Pair[Int, Str], h: Hold[_], -> ()"
+    );
+    assert_eq!(
+        checked.errors,
+        ["`Hold(f: { -> 1 })`: the type parameter `T` of `Hold` cannot be inferred"]
+    );
+}
+
+#[test]
 fn candidates_of_several_modules_are_ranked() {
     // §5.6.1: the prelude's `size(s: Str)` beats this module's generic
     // one for a string, which takes everything else.

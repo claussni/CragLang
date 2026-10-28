@@ -35,6 +35,8 @@
 //! later (§11.5); what needs it is reported as not supported yet rather
 //! than guessed.
 
+use std::collections::HashMap;
+
 use crag_db::Db;
 use crag_hir::{
     Arm, BindingId, BindingKind, Body, Expr, ExprId, FieldArg, ItemId, ItemKind, Literal, LocalFn,
@@ -93,6 +95,7 @@ pub fn infer_in_group<'db>(
         callees: Vec::new(),
         holes: Vec::new(),
         optional: Vec::new(),
+        typed: HashMap::new(),
         frames: Vec::new(),
         negative: false,
         bool_ty: prelude_type(db, program, "Bool"),
@@ -216,6 +219,10 @@ struct Infer<'a, 'db> {
     callees: Vec<(ExprId, Callee<'db>)>,
     holes: Vec<(ExprId, Ty<'db>)>,
     optional: Vec<(ExprId, Optional<'db>)>,
+    /// Expressions already typed, which their next check takes as they
+    /// are: the field values a construction infers its type arguments
+    /// from.
+    typed: HashMap<ExprId, Ty<'db>>,
     /// The function and closures being checked, innermost last, for
     /// `return`.
     frames: Vec<Frame<'db>>,
@@ -563,6 +570,9 @@ impl<'a, 'db> Infer<'a, 'db> {
     }
 
     fn infer(&mut self, id: ExprId, expected: Option<Ty<'db>>) -> Ty<'db> {
+        if let Some(ty) = self.typed.remove(&id) {
+            return ty;
+        }
         let ty = self.infer_expr(id, expected);
         self.exprs[id.index()] = Some(ty);
         ty
@@ -2788,6 +2798,11 @@ impl<'a, 'db> Infer<'a, 'db> {
                             None if arity == 0 => {
                                 Some(Ty::new(db, TyKind::Named(identity, Vec::new())))
                             }
+                            None if fields.is_some() => {
+                                let fields = fields.unwrap_or_default();
+                                let targs = self.construction_args(id, item, identity, fields);
+                                Some(Ty::new(db, TyKind::Named(identity, targs)))
+                            }
                             _ => None,
                         }
                     }
@@ -2834,6 +2849,74 @@ impl<'a, 'db> Infer<'a, 'db> {
         ty
     }
 
+    /// The type arguments of a construction of the generic type
+    /// `identity`, from the values its fields are given; closures are
+    /// left to the record's check, against the types found. An argument
+    /// nothing fixes is an error.
+    fn construction_args(
+        &mut self,
+        id: ExprId,
+        item: ItemId<'db>,
+        identity: ItemId<'db>,
+        fields: &[FieldArg<'db>],
+    ) -> Vec<Ty<'db>> {
+        let db = self.db;
+        let program = self.program;
+        let names = type_header(db, program, item).params.clone();
+        let params = (0..names.len())
+            .map(|i| Ty::new(db, TyKind::Param(Some(identity), i as u32, names[i])))
+            .collect();
+        let generic = Ty::new(db, TyKind::Named(identity, params));
+        let declared = declared_fields(db, program, generic).unwrap_or_default();
+        let mut args = vec![None; names.len()];
+        for field in fields {
+            let found: Vec<(Name<'db>, Ty<'db>)> = match field {
+                FieldArg::Field { path, value } if path.len() == 1 => {
+                    if matches!(self.body.expr(*value), Expr::Closure { .. }) {
+                        continue;
+                    }
+                    let ty = self.synth(*value);
+                    self.typed.insert(*value, ty);
+                    vec![(path[0], ty)]
+                }
+                // What the list gives anew says nothing of the spread's.
+                FieldArg::Spread(value) => {
+                    let ty = self.synth(*value);
+                    self.typed.insert(*value, ty);
+                    let given = |name: Name<'db>| {
+                        fields.iter().any(
+                            |f| matches!(f, FieldArg::Field { path, .. } if path.len() == 1 && path[0] == name),
+                        )
+                    };
+                    fields_of(db, program, ty)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|(n, _)| !given(*n))
+                        .collect()
+                }
+                FieldArg::Field { .. } => continue,
+            };
+            for (name, ty) in found {
+                if let Some((_, pattern, _)) = declared.iter().find(|(n, ..)| *n == name) {
+                    bind(db, program, identity, *pattern, ty, &mut args);
+                }
+            }
+        }
+        args.into_iter()
+            .zip(names)
+            .map(|(arg, name)| {
+                arg.unwrap_or_else(|| {
+                    let kind = ErrorKind::UninferredTypeArg {
+                        function: item,
+                        name,
+                    };
+                    self.error(Site::Expr(id), kind);
+                    self.err_ty()
+                })
+            })
+            .collect()
+    }
+
     /// Checks a field list that builds a record of type `ty`: each field
     /// given once, by name, by a spread or by its default (§6.7).
     fn build_record(&mut self, site: ExprId, ty: Ty<'db>, fields: &[FieldArg<'db>]) {
@@ -2863,8 +2946,13 @@ impl<'a, 'db> Infer<'a, 'db> {
                     for (i, (name, field_ty, _)) in declared.iter().enumerate() {
                         if let Some((_, t)) = supplied.iter().find(|(n, _)| n == name) {
                             given[i] = true;
-                            let found = *t;
-                            self.expect(Site::Expr(*value), found, *field_ty);
+                            // A field the list gives anew need not fit.
+                            let replaced = fields.iter().any(|f| {
+                                matches!(f, FieldArg::Field { path, .. } if path.len() == 1 && path[0] == *name)
+                            });
+                            if !replaced {
+                                self.expect(Site::Expr(*value), *t, *field_ty);
+                            }
                         }
                     }
                 }
@@ -2901,6 +2989,16 @@ impl<'a, 'db> Infer<'a, 'db> {
                         continue;
                     }
                     self.field_value(name, *value, field_ty, current.is_some(), true);
+                    // A transform takes the spread's value, which must fit.
+                    let transforms = |t: Option<Ty<'db>>| {
+                        matches!(t.map(|t| t.kind(db)), Some(TyKind::Fn { .. }))
+                    };
+                    if let Some(current) = current
+                        && transforms(self.exprs[value.index()])
+                        && !transforms(Some(field_ty))
+                    {
+                        self.expect(Site::Expr(*value), current, field_ty);
+                    }
                 }
             }
         }

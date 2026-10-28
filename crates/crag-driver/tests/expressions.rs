@@ -191,3 +191,17 @@ fn let_else_passes_the_unmatched_value_on() {
         .contains("must leave")
     );
 }
+
+#[test]
+fn generic_records_take_their_type_arguments_from_their_fields() {
+    let mut r = repl();
+    eval(&mut r, "type Pair[A, B](a: A, b: B)");
+    eval(&mut r, "let p = Pair(a: 1, b: 2.5)");
+    assert_eq!(
+        eval(&mut r, "Pair(..p, b: \"now\")"),
+        "Pair(a: 1, b: \"now\")\n"
+    );
+    eval(&mut r, "type Step[T](x: T, f: (T) -> T)");
+    eval(&mut r, "let s = Step(x: 2, f: { n -> n + 1 })");
+    assert_eq!(eval(&mut r, "s.f(s.x)"), "3\n");
+}
