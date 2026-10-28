@@ -2897,6 +2897,12 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             return self.ref_access(expr, access, instance, positional);
         }
         if fields.is_none()
+            && let [value] = positional
+            && let Some(mapping) = self.type_mapping(instance)
+        {
+            return self.map_type(expr, mapping, *value);
+        }
+        if fields.is_none()
             && let Some(intrinsic) = self.intrinsic(instance)
         {
             let ops = positional.iter().map(|&arg| self.expr(arg)).collect();
@@ -3051,6 +3057,85 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             ops[i] = Some(Operand::Local(local));
         }
         Some(())
+    }
+
+    /// The type mapping function of the prelude an instance is, if it is
+    /// one (§8.4).
+    fn type_mapping(&self, instance: &Instance<'db>) -> Option<&'static str> {
+        let db = self.db;
+        let function = instance.function;
+        if function.module(db).path(db) != crag_hir::PRELUDE {
+            return None;
+        }
+        match function.name(db).text(db).as_str() {
+            "discard" => Some("discard"),
+            "check" => Some("check"),
+            "expect" => Some("expect"),
+            _ => None,
+        }
+    }
+
+    /// `~x`, `?x` and `!!x`: the value's errors kept, or its success with
+    /// its errors as `Empty` or as a trap (§8.4).
+    fn map_type(&mut self, expr: ExprId, mapping: &str, value: ExprId) -> Operand<'db> {
+        let (db, program) = (self.db, self.program);
+        let ty = self.ty(value);
+        let result = self.ty(expr);
+        let subject = self.place_of(value);
+        let errors = crag_types::error_members(db, program, ty);
+        let successes = crag_types::success_members(db, program, ty);
+        let out = self.temp(result);
+        let (ok, failed, join) = (self.new_block(), self.new_block(), self.new_block());
+        let cases = errors
+            .members(db)
+            .into_iter()
+            .map(|m| (m, failed))
+            .collect();
+        self.terminate(Terminator::Switch {
+            place: Place::local(subject),
+            cases,
+            otherwise: ok,
+        });
+        // A member of the subject narrowed to `to`, and given as `result`.
+        let give = |b: &mut Self, to: Ty<'db>| {
+            let narrowed = b.temp(to);
+            b.assign_to(narrowed, Operand::Local(subject), ty);
+            b.assign_to(out, Operand::Local(narrowed), to);
+            b.terminate(Terminator::Jump(join));
+        };
+        self.switch_to(ok);
+        match mapping {
+            "discard" => {
+                let unit = Ty::unit(db);
+                self.assign_to(out, self.unit(), unit);
+                self.terminate(Terminator::Jump(join));
+            }
+            _ => give(self, successes),
+        }
+        self.switch_to(failed);
+        match mapping {
+            "discard" => give(self, errors),
+            "check" => {
+                let empty_item = prelude_item(db, program, "Empty");
+                let empty = result.members(db).into_iter().find(
+                    |m| matches!(m.kind(db), TyKind::Named(item, _) if Some(*item) == empty_item),
+                );
+                match empty {
+                    Some(empty) => {
+                        self.assign_to(out, Operand::Const(Constant::Tag(empty)), empty);
+                        self.terminate(Terminator::Jump(join));
+                    }
+                    None => {
+                        self.trap(TrapKind::Error, Some(expr));
+                    }
+                }
+            }
+            _ => {
+                self.trap(TrapKind::Expectation, Some(expr));
+            }
+        }
+        self.switch_to(join);
+        Operand::Local(out)
     }
 
     /// The operation an operator function of the prelude stands for, if

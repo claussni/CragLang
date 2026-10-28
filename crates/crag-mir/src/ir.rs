@@ -536,6 +536,8 @@ pub enum TrapKind {
     Error,
     /// Something the builder does not lower yet.
     Unsupported,
+    /// `!!` met an error (§8.4).
+    Expectation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -996,6 +998,7 @@ fn terminator_text<'db>(db: &'db dyn Db, terminator: &Terminator<'db>) -> String
                 TrapKind::NoMatch => "no match",
                 TrapKind::Error => "error",
                 TrapKind::Unsupported => "unsupported",
+                TrapKind::Expectation => "expectation",
             };
             format!("trap {kind}")
         }

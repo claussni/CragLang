@@ -2831,6 +2831,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                     TrapKind::NoMatch => AbiTrap::NoMatch,
                     TrapKind::Error => AbiTrap::Error,
                     TrapKind::Unsupported => AbiTrap::Unsupported,
+                    TrapKind::Expectation => AbiTrap::Expectation,
                 };
                 // The byte offset of the expression in the module's source.
                 let position = site.and_then(|e| self.positions.get(e.index()).map(|r| r.start));

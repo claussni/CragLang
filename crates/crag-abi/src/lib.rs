@@ -1330,10 +1330,12 @@ pub enum TrapKind {
     /// Values without an order were compared: functions, maps or sets
     /// (Specification §19.11).
     Unordered = 12,
+    /// `!!` met an error (Specification §8.4).
+    Expectation = 13,
 }
 
 impl TrapKind {
-    pub const ALL: [TrapKind; 13] = [
+    pub const ALL: [TrapKind; 14] = [
         TrapKind::Overflow,
         TrapKind::DivideByZero,
         TrapKind::Index,
@@ -1347,6 +1349,7 @@ impl TrapKind {
         TrapKind::Cycle,
         TrapKind::Fault,
         TrapKind::Unordered,
+        TrapKind::Expectation,
     ];
 
     /// The kind with this discriminant, if any.

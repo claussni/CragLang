@@ -77,3 +77,19 @@ fn pass_hands_the_rest_to_the_caller() {
     assert_eq!(eval(&mut r, "next(NotFound)"), "NotFound\n");
     assert!(crag_driver::repl::is_complete("case x {\n  pass\n}"));
 }
+
+#[test]
+fn type_mapping_functions_keep_successes_or_errors() {
+    // §8.4: `~` keeps the errors, `?` turns them into `Empty`, `!!` into
+    // a trap.
+    let mut r = repl();
+    eval(&mut r, "type E(..Error)");
+    eval(&mut r, "fn kept(x: Int | E) -> () | E { ~x }");
+    eval(&mut r, "fn checked(x: Int | E) -> Option[Int] { ?x }");
+    eval(&mut r, "fn expected(x: Int | E) -> Int { !!x }");
+    assert_eq!(eval(&mut r, "kept(E)"), "E()\n");
+    assert_eq!(eval(&mut r, "checked(3)"), "3\n");
+    assert_eq!(eval(&mut r, "checked(E)"), "Empty\n");
+    assert_eq!(eval(&mut r, "expected(4)"), "4\n");
+    assert!(eval(&mut r, "expected(E)").starts_with("trap: `!!` met an error"));
+}
