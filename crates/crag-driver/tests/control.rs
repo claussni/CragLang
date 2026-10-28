@@ -63,3 +63,17 @@ fn for_walks_maps_sets_and_ranges_of_any_discrete_type() {
     );
     assert_eq!(eval(&mut r, "days()"), "28\n");
 }
+
+#[test]
+fn pass_hands_the_rest_to_the_caller() {
+    // §8.2, entered line by line as the REPL reads it.
+    let mut r = repl();
+    eval(&mut r, "type NotFound");
+    eval(
+        &mut r,
+        "fn next(x: Int | NotFound) -> Int | NotFound {\n  case x {\n    n: Int -> n + 1\n    pass\n  }\n}",
+    );
+    assert_eq!(eval(&mut r, "next(4)"), "5\n");
+    assert_eq!(eval(&mut r, "next(NotFound)"), "NotFound\n");
+    assert!(crag_driver::repl::is_complete("case x {\n  pass\n}"));
+}

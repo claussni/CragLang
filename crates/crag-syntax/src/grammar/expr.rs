@@ -581,7 +581,7 @@ fn case_expr(p: &mut Parser) {
 /// `pattern (where guard)? -> body`, or `pass` alone (§7.2).
 fn arm(p: &mut Parser) {
     p.start(S::CaseArm);
-    if p.at(T::Pass) && matches!(p.nth(1), T::Newline | T::RBrace) {
+    if p.at(T::Pass) && matches!(p.nth(1), T::Newline | T::RBrace | T::Eof) {
         p.start(S::PassExpr);
         p.bump();
         p.finish_node();
