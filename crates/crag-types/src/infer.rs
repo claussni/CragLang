@@ -2864,36 +2864,38 @@ impl<'a, 'db> Infer<'a, 'db> {
                     }
                 }
                 FieldArg::Field { path, value } => {
-                    if path.len() > 1 {
-                        self.error(Site::Expr(*value), ErrorKind::Unsupported("field paths"));
+                    let name = path[0];
+                    let Some(i) = declared.iter().position(|(n, ..)| *n == name) else {
+                        self.error(Site::Expr(*value), ErrorKind::UnknownField { name });
                         self.synth(*value);
                         continue;
+                    };
+                    let current = self.current_field(fields, name);
+                    // A field is given once, whole or by distinct paths
+                    // into it.
+                    let again = fields
+                        .iter()
+                        .take_while(|f| !std::ptr::eq(*f, field))
+                        .any(|f| {
+                            matches!(f, FieldArg::Field { path: p, .. }
+                                if p[0] == name && (p.len() == 1 || path.len() == 1 || p == path))
+                        });
+                    if again {
+                        self.error(Site::Expr(*value), ErrorKind::DuplicateField { name });
                     }
-                    let name = path[0];
-                    match declared.iter().position(|(n, ..)| *n == name) {
-                        Some(i) => {
-                            if given[i] && !self.spread_supplies(fields, name) {
-                                self.error(Site::Expr(*value), ErrorKind::DuplicateField { name });
-                            }
-                            given[i] = true;
-                            let field_ty = declared[i].1;
-                            if matches!(self.body.expr(*value), Expr::Closure { .. })
-                                && !matches!(field_ty.kind(db), TyKind::Fn { .. })
-                            {
-                                self.error(
-                                    Site::Expr(*value),
-                                    ErrorKind::Unsupported("field transforms"),
-                                );
+                    given[i] = true;
+                    let field_ty = declared[i].1;
+                    if path.len() > 1 {
+                        match current {
+                            Some(_) => self.path_value(&path[1..], *value, field_ty),
+                            None => {
+                                self.error(Site::Expr(*value), ErrorKind::NoCurrentValue { name });
                                 self.synth(*value);
-                            } else {
-                                self.check(*value, field_ty);
                             }
                         }
-                        None => {
-                            self.error(Site::Expr(*value), ErrorKind::UnknownField { name });
-                            self.synth(*value);
-                        }
+                        continue;
                     }
+                    self.field_value(name, *value, field_ty, current.is_some(), true);
                 }
             }
         }
@@ -2904,15 +2906,87 @@ impl<'a, 'db> Infer<'a, 'db> {
         }
     }
 
-    /// Whether a spread in the list supplies the field, which a named
-    /// field may then override.
-    fn spread_supplies(&self, fields: &[FieldArg<'db>], name: Name<'db>) -> bool {
-        fields.iter().any(|f| match f {
+    /// The type of the field `name` the last spread of the list that has
+    /// it gives: its current value, which an override may change (§6.7).
+    fn current_field(&self, fields: &[FieldArg<'db>], name: Name<'db>) -> Option<Ty<'db>> {
+        fields.iter().rev().find_map(|f| match f {
             FieldArg::Spread(value) => self.exprs[value.index()]
-                .and_then(|t| fields_of(self.db, self.program, t))
-                .is_some_and(|fs| fs.iter().any(|(n, _)| *n == name)),
-            _ => false,
+                .and_then(|t| fields_of(self.db, self.program, t))?
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, t)| t),
+            _ => None,
         })
+    }
+
+    /// An override of a field of type `field_ty`: a new value, or a
+    /// function from the field's type to itself that transforms the
+    /// current value, if there is one (§6.7). A field that holds a
+    /// function takes a new value. A `strict` field keeps its type; one
+    /// of an anonymous record takes a new value's. Gives the field's new
+    /// type.
+    fn field_value(
+        &mut self,
+        name: Name<'db>,
+        value: ExprId,
+        field_ty: Ty<'db>,
+        current: bool,
+        strict: bool,
+    ) -> Ty<'db> {
+        let db = self.db;
+        if field_ty.is_error(db) || matches!(field_ty.kind(db), TyKind::Fn { .. }) {
+            return if strict {
+                self.check(value, field_ty);
+                field_ty
+            } else {
+                self.infer(value, Some(field_ty))
+            };
+        }
+        let transform = Ty::new(
+            db,
+            TyKind::Fn {
+                params: vec![field_ty],
+                result: field_ty,
+                pure: false,
+            },
+        );
+        let found = if matches!(self.body.expr(value), Expr::Closure { .. }) {
+            self.check(value, transform)
+        } else {
+            self.infer(value, Some(field_ty))
+        };
+        if !matches!(found.kind(db), TyKind::Fn { .. }) {
+            if !strict {
+                return found;
+            }
+            self.expect(Site::Expr(value), found, field_ty);
+        } else if !current {
+            self.error(Site::Expr(value), ErrorKind::NoCurrentValue { name });
+        } else {
+            self.expect(Site::Expr(value), found, transform);
+        }
+        field_ty
+    }
+
+    /// `a.b.c: value` below a field of type `ty` whose current value a
+    /// spread gives: the record is rebuilt with the change (§6.7).
+    fn path_value(&mut self, path: &[Name<'db>], value: ExprId, ty: Ty<'db>) {
+        let db = self.db;
+        let name = path[0];
+        let field =
+            fields_of(db, self.program, ty).and_then(|fs| fs.into_iter().find(|(n, _)| *n == name));
+        let Some((_, field_ty)) = field else {
+            if !ty.is_error(db) {
+                self.error(Site::Expr(value), ErrorKind::NoField { ty, name });
+            }
+            self.synth(value);
+            return;
+        };
+        if path.len() > 1 {
+            self.path_value(&path[1..], value, field_ty);
+        } else {
+            self.field_value(name, value, field_ty, true, true);
+        }
     }
 
     /// An anonymous record literal, against the record type expected if
@@ -2948,28 +3022,40 @@ impl<'a, 'db> Infer<'a, 'db> {
                     }
                 }
                 FieldArg::Field { path, value } => {
-                    if path.len() > 1 {
-                        self.error(Site::Expr(*value), ErrorKind::Unsupported("field paths"));
-                        self.synth(*value);
-                        continue;
-                    }
                     let name = path[0];
                     let spread = built.iter().position(|(n, _)| *n == name);
-                    let explicit = fields
-                        .iter()
-                        .take_while(|f| !std::ptr::eq(*f, field))
-                        .any(|f| matches!(f, FieldArg::Field { path, .. } if path == &[name]));
+                    let explicit =
+                        fields
+                            .iter()
+                            .take_while(|f| !std::ptr::eq(*f, field))
+                            .any(|f| {
+                                matches!(f, FieldArg::Field { path: p, .. }
+                                if p[0] == name && (p.len() == 1 || path.len() == 1 || p == path))
+                            });
                     if explicit {
                         self.error(Site::Expr(*value), ErrorKind::DuplicateField { name });
                     }
-                    if spread.is_some() && matches!(self.body.expr(*value), Expr::Closure { .. }) {
-                        self.error(
-                            Site::Expr(*value),
-                            ErrorKind::Unsupported("field transforms"),
-                        );
+                    let current = spread.map(|i| built[i].1);
+                    if path.len() > 1 {
+                        match current {
+                            Some(ty) => self.path_value(&path[1..], *value, ty),
+                            None => {
+                                self.error(Site::Expr(*value), ErrorKind::NoCurrentValue { name });
+                                self.synth(*value);
+                            }
+                        }
+                        continue;
                     }
-                    let field_expected = wanted.iter().find(|(n, _)| *n == name).map(|(_, t)| *t);
-                    let ty = self.infer(*value, field_expected);
+                    // A transform keeps the field's type; a new value
+                    // gives its own.
+                    let ty = match current {
+                        Some(current) => self.field_value(name, *value, current, true, false),
+                        None => {
+                            let field_expected =
+                                wanted.iter().find(|(n, _)| *n == name).map(|(_, t)| *t);
+                            self.infer(*value, field_expected)
+                        }
+                    };
                     match spread {
                         Some(i) => built[i].1 = ty,
                         None => built.push((name, ty)),
@@ -3153,6 +3239,13 @@ impl<'a, 'db> Infer<'a, 'db> {
             self.callees.push((id, Callee::Value));
             return self.call_value(id, field, args, fields);
         }
+        if name.text(db) == "update"
+            && args.is_empty()
+            && let Some(fields) = fields
+            && self.updates_value(receiver_ty, functions)
+        {
+            return self.update_value(id, receiver_ty, fields);
+        }
         if functions.is_empty() {
             self.error(
                 Site::Expr(id),
@@ -3168,6 +3261,48 @@ impl<'a, 'db> Infer<'a, 'db> {
         self.resolve(
             id, None, name, functions, None, receiver, args, fields, expected, None,
         )
+    }
+
+    /// Whether `v.update(list)` rebuilds the value (§6.7.1): `v` is a
+    /// record, and no function `update` takes it.
+    fn updates_value(&self, receiver_ty: Ty<'db>, functions: &[ItemId<'db>]) -> bool {
+        let db = self.db;
+        fields_of(db, self.program, receiver_ty).is_some()
+            && !functions.iter().any(|&f| {
+                signature(db, self.program, f)
+                    .params
+                    .first()
+                    .is_some_and(|p| {
+                        matches!(p.ty.kind(db), TyKind::Param(..))
+                            || is_subtype(db, self.program, receiver_ty, p.ty)
+                    })
+            })
+    }
+
+    /// `v.update(list)`: `v` rebuilt as its own type, each path of the
+    /// list a new value or a transform of the current one (§6.7.1).
+    fn update_value(&mut self, id: ExprId, ty: Ty<'db>, fields: &[FieldArg<'db>]) -> Ty<'db> {
+        for (k, field) in fields.iter().enumerate() {
+            match field {
+                FieldArg::Spread(value) => {
+                    self.error(Site::Expr(*value), ErrorKind::SpreadInUpdate);
+                    self.synth(*value);
+                }
+                FieldArg::Field { path, value } => {
+                    let again = fields[..k].iter().any(|f| {
+                        matches!(f, FieldArg::Field { path: p, .. }
+                            if p[0] == path[0] && (p.len() == 1 || path.len() == 1 || p == path))
+                    });
+                    if again {
+                        let kind = ErrorKind::DuplicateField { name: path[0] };
+                        self.error(Site::Expr(*value), kind);
+                    }
+                    self.path_value(path, *value, ty);
+                }
+            }
+        }
+        self.callees.push((id, Callee::Update(ty)));
+        ty
     }
 
     /// `receiver.name` with the receiver of type `receiver_ty`: a field,

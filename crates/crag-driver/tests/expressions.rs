@@ -66,3 +66,47 @@ fn optional_access_goes_on_only_with_a_value() {
     );
     assert_eq!(eval(&mut r, "step?.next(2)"), "3\n");
 }
+
+#[test]
+fn updates_change_fields_by_paths_and_transforms() {
+    // §6.7: a dotted path rebuilds the record below it, and a function
+    // from the field's type to itself transforms the current value.
+    let mut r = repl();
+    eval(&mut r, "type Pos(x: Int, y: Int)");
+    eval(&mut r, "type Shape(pos: Pos, size: Int)");
+    eval(&mut r, "type Circle(..Shape, r: Int)");
+    eval(&mut r, "let s = Shape(pos: Pos(x: 1, y: 2), size: 10)");
+    assert_eq!(
+        eval(&mut r, "Shape(..s, pos.x: 3, size: 50)"),
+        "Shape(pos: Pos(x: 3, y: 2), size: 50)\n"
+    );
+    assert_eq!(
+        eval(&mut r, "Shape(..s, size: _ * 2, pos.x: _ + 5, pos.y: 7)"),
+        "Shape(pos: Pos(x: 6, y: 7), size: 20)\n"
+    );
+    eval(&mut r, "fn double(n: Int) -> Int { n * 2 }");
+    assert_eq!(
+        eval(&mut r, "Shape(..s, size: double)"),
+        "Shape(pos: Pos(x: 1, y: 2), size: 20)\n"
+    );
+    // Anonymous records take the list too.
+    eval(&mut r, "let p = (x: 1, y: 2)");
+    assert_eq!(eval(&mut r, "(..p, x: _ + 1)"), "(x: 2, y: 2)\n");
+    assert_eq!(
+        eval(&mut r, "(..s, pos.y: 9)"),
+        "(pos: Pos(x: 1, y: 9), size: 10)\n"
+    );
+    // §6.7.1: `update` keeps the value's own type, in generic code too.
+    assert_eq!(
+        eval(&mut r, "s.update(pos.x: _ + 1)"),
+        "Shape(pos: Pos(x: 2, y: 2), size: 10)\n"
+    );
+    eval(
+        &mut r,
+        "fn nudge[S: Shape](v: S) -> S {\n  v.update(pos.x: _ + 1)\n}",
+    );
+    assert_eq!(
+        eval(&mut r, "nudge(Circle(pos: Pos(x: 0, y: 0), size: 1, r: 5))"),
+        "Circle(pos: Pos(x: 1, y: 0), size: 1, r: 5)\n"
+    );
+}

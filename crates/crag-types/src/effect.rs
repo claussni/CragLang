@@ -221,7 +221,8 @@ pub enum Restriction {
 }
 
 /// The effects of a function without a body: a C function does `io`
-/// (§16.1), the prelude's access functions resolve their ref or access
+/// (§16.1), as do the runtime functions of `std.io` and `std.env`, the
+/// prelude's access functions resolve their ref or access
 /// their `ext` (§9.3), and every operation of the prelude calls the
 /// functions passed to it. None for a function with a body.
 pub fn intrinsic_effects<'db>(
@@ -237,6 +238,10 @@ pub fn intrinsic_effects<'db>(
         .is_some()
     {
         return None;
+    }
+    // The runtime's files, network, processes and environment (§3.14).
+    if matches!(function.module(db).path(db).as_str(), "std.io" | "std.env") {
+        return Some(EffectSet::io());
     }
     let params = &signature(db, program, function).params;
     let mut effects = EffectSet::NONE;
@@ -517,6 +522,19 @@ impl<'a, 'db> Walker<'a, 'db> {
         for child in body.children(expr) {
             self.walk(child, found);
         }
+        // An anonymous record's transforms run where it is built (§6.7).
+        if let Expr::Record(_) = body.expr(expr)
+            && let Some(ty) = self.exprs.get(expr.index()).copied().flatten()
+        {
+            let effects = self.transforms(expr, ty);
+            if !effects.is_empty() {
+                found.push(Occurrence {
+                    site: expr,
+                    effects,
+                    cell: None,
+                });
+            }
+        }
         if let Some(&i) = self.by_expr.get(&expr)
             && self.is_call(expr)
         {
@@ -615,8 +633,39 @@ impl<'a, 'db> Walker<'a, 'db> {
                 Expr::Call { callee, .. } => self.value(*callee),
                 _ => EffectSet::all(),
             },
-            Callee::Construct(_) => EffectSet::NONE,
+            Callee::Construct(ty) | Callee::Update(ty) => self.transforms(call, *ty),
         }
+    }
+
+    /// The effects of the transforms a construction of `ty` calls: the
+    /// functions it is given for fields that hold none (§6.7).
+    fn transforms(&mut self, call: ExprId, ty: Ty<'db>) -> EffectSet {
+        let db = self.db;
+        let fields = match self.body.expr(call) {
+            Expr::Call { fields, .. } | Expr::MethodCall { fields, .. } => fields.as_deref(),
+            Expr::Record(fields) => Some(fields.as_slice()),
+            _ => None,
+        };
+        let mut effects = EffectSet::NONE;
+        for field in fields.unwrap_or_default() {
+            let FieldArg::Field { path, value } = field else {
+                continue;
+            };
+            let field_ty = path.iter().try_fold(ty, |t, name| {
+                crate::relate::fields_of(db, self.program, t)?
+                    .into_iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, t)| t)
+            });
+            let is_fn =
+                |t: Option<Ty<'db>>| matches!(t.map(|t| t.kind(db)), Some(TyKind::Fn { .. }));
+            if is_fn(self.exprs.get(value.index()).copied().flatten())
+                && field_ty.is_some_and(|t| !is_fn(Some(t)))
+            {
+                effects = effects.union(self.value(*value));
+            }
+        }
+        effects
     }
 
     /// The effects of calling `function` with the call's arguments and

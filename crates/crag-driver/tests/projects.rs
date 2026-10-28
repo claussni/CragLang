@@ -190,6 +190,25 @@ fn a_more_specific_overload_wins_unless_the_function_is_final() {
 }
 
 #[test]
+fn printing_and_transforms_that_print_are_not_pure() {
+    // §3.14: the runtime functions of `std.io` do `io`, and a transform
+    // runs where the record is built (§6.7).
+    let app = "import std.io\n\
+               type Shape(size: Int)\n\
+               fn shout(n: Int) -> Int is Pure {\n  printLine(\"x\")\n  n\n}\n\
+               fn grow(s: Shape) -> Shape is Pure {\n  Shape(..s, size: { n ->\n    printLine(\"y\")\n    n\n  })\n}\n\
+               fn main() {}\n";
+    let root = project("pure", &[("package.crag", MANIFEST), ("app.crag", app)]);
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 1);
+    let out = text(out);
+    let wrong = "error: this has the effect `io`, which an `is Pure` function does not allow";
+    assert_eq!(out.matches(wrong).count(), 2, "{out}");
+    assert!(out.contains(" --> app.crag:4:3"), "{out}");
+    assert!(out.contains(" --> app.crag:8:3"), "{out}");
+}
+
+#[test]
 fn a_trap_in_main_is_reported_with_its_stack() {
     let root = project(
         "trap",

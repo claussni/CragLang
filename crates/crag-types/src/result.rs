@@ -96,6 +96,9 @@ pub enum Callee<'db> {
     Value,
     /// The construction of a record or collection type (§6.7).
     Construct(Ty<'db>),
+    /// `v.update(list)`: the receiver rebuilt as its own type with a
+    /// field-update list (§6.7.1).
+    Update(Ty<'db>),
     /// A call split by the members of its union arguments, or a function
     /// value that splits its parameters so (§4.6.1).
     Dispatch(Dispatch<'db>),
@@ -212,6 +215,14 @@ pub enum ErrorKind<'db> {
         name: Name<'db>,
     },
     UnknownField {
+        name: Name<'db>,
+    },
+    /// A spread in `v.update(list)`, whose list only changes fields
+    /// (§6.7.1).
+    SpreadInUpdate,
+    /// A transform, or a path into the field, where no spread gives the
+    /// field's current value (§6.7).
+    NoCurrentValue {
         name: Name<'db>,
     },
     DuplicateField {
@@ -432,6 +443,13 @@ impl<'db> ErrorKind<'db> {
             }
             ErrorKind::MissingField { name: n } => format!("the field `{}` is missing", name(n)),
             ErrorKind::UnknownField { name: n } => format!("there is no field `{}`", name(n)),
+            ErrorKind::SpreadInUpdate => {
+                "`update` changes the value's fields; a spread has no place in its list".into()
+            }
+            ErrorKind::NoCurrentValue { name: n } => format!(
+                "`{}` has no current value to change; spread a value that has the field",
+                name(n)
+            ),
             ErrorKind::DuplicateField { name: n } => {
                 format!("the field `{}` is given twice", name(n))
             }

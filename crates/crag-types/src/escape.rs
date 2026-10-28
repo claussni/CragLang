@@ -641,7 +641,7 @@ impl<'a, 'db> EscapeWalker<'a, 'db> {
             // Called, not kept.
             self.walk(callee_expr, Local);
         }
-        let stored = matches!(callee, Callee::Construct(_));
+        let stored = matches!(callee, Callee::Construct(_) | Callee::Update(_));
         let level_of = |this: &Self, position: Option<usize>, name: Option<crag_hir::Name<'db>>| {
             if stored || !known {
                 return Escaping;

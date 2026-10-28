@@ -1335,6 +1335,32 @@ fn f(u: Option[User]) {
 }
 
 #[test]
+fn updates_need_the_current_value() {
+    // §6.7: a transform or a path needs a spread that gives the field;
+    // a field is given once, whole or by distinct paths.
+    let text = "type Pos(x: Int, y: Int)
+type Shape(pos: Pos, size: Int)
+fn f(s: Shape) {
+  let a = Shape(pos: Pos(x: 1, y: 2), size: _ + 1)
+  let b = Shape(..s, pos: Pos(x: 0, y: 0), pos.x: 3)
+  let c = Shape(..s, pos.z: 1)
+  let d = Shape(..s, size.x: 1)
+  let e = s.update(..s)
+  let g = Shape(..s, pos.x: 1, pos.y: 2, size: { n -> n + 1 })
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`_ + 1`: `size` has no current value to change; spread a value that has the field",
+            "`3`: the field `pos` is given twice",
+            "`1`: Pos has no field `z`",
+            "`1`: Int has no field `x`",
+            "`s`: `update` changes the value's fields; a spread has no place in its list",
+        ]
+    );
+}
+
+#[test]
 fn candidates_of_several_modules_are_ranked() {
     // §5.6.1: the prelude's `size(s: Str)` beats this module's generic
     // one for a string, which takes everything else.

@@ -255,6 +255,8 @@ struct Slot<'db> {
     name: crag_hir::Name<'db>,
     ty: Ty<'db>,
     given: Option<ExprId>,
+    /// Paths into the field below its name, with their values (§6.7).
+    paths: Vec<(Vec<crag_hir::Name<'db>>, ExprId)>,
     spread: Option<ExprId>,
     default: Option<FieldDefault<'db>>,
 }
@@ -2576,6 +2578,16 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 let ty = self.subst(ty);
                 self.construct(expr, ty, &positional, fields)
             }
+            Some(Callee::Update(ty)) => {
+                // The receiver spread, then the list (§6.7.1).
+                let ty = self.subst(ty);
+                let list: Vec<FieldArg<'db>> = receiver
+                    .map(FieldArg::Spread)
+                    .into_iter()
+                    .chain(fields.unwrap_or_default().iter().cloned())
+                    .collect();
+                self.record(expr, ty, &[], &list)
+            }
             Some(Callee::Dispatch(dispatch)) => self.dispatch(expr, &dispatch, &positional, fields),
             Some(Callee::Value) => self.call_value(expr, tail),
             None => self.trap(TrapKind::Error, Some(expr)),
@@ -3159,12 +3171,6 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         if ty == Ty::unit(self.db) {
             return self.unit();
         }
-        if fields
-            .iter()
-            .any(|f| matches!(f, FieldArg::Field { path, .. } if path.len() > 1))
-        {
-            return self.unsupported(expr, "field paths");
-        }
         self.record_value(expr, ty, positional, fields)
     }
 
@@ -3202,11 +3208,21 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     .then_some(*e),
                 _ => None,
             });
+            let paths = fields
+                .iter()
+                .filter_map(|f| match f {
+                    FieldArg::Field { path, value } if path.len() > 1 && path[0] == name => {
+                        Some((path[1..].to_vec(), *value))
+                    }
+                    _ => None,
+                })
+                .collect();
             let default = self.field_default(ty, name, field_ty);
             slots.push(Slot {
                 name,
                 ty: field_ty,
                 given,
+                paths,
                 spread,
                 default,
             });
@@ -3293,32 +3309,54 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             name,
             ty: field_ty,
             given,
+            paths,
             spread,
             default,
         } in slots
         {
+            // The field's current value, from the last spread that has it.
+            let mut current = |this: &mut Self| -> Option<(Operand<'db>, Ty<'db>)> {
+                let s = spread?;
+                let local = match spreads.get(&s) {
+                    Some(&l) => l,
+                    None => {
+                        let l = this.materialize(values[&s].clone(), this.ty(s));
+                        spreads.insert(s, l);
+                        l
+                    }
+                };
+                let from = fields_of(this.db, this.program, this.ty(s))
+                    .and_then(|fs| fs.into_iter().find(|(n, _)| *n == name))
+                    .map_or(field_ty, |(_, t)| t);
+                let place = Place {
+                    local,
+                    path: vec![Step::Field(name)],
+                };
+                Some((this.assign(from, Rvalue::Read(place)), from))
+            };
             let op = match (given, spread) {
+                (Some(e), _) if self.transforms(e, field_ty) => {
+                    let Some((old, from)) = current(self) else {
+                        return self.trap(TrapKind::Error, Some(site));
+                    };
+                    let f = values[&e].clone();
+                    self.transform(f, self.ty(e), old, from, field_ty, e)
+                }
                 (Some(e), _) => {
                     let op = values[&e].clone();
                     self.coerce(op, self.ty(e), field_ty)
                 }
-                (None, Some(s)) => {
-                    let local = match spreads.get(&s) {
-                        Some(&l) => l,
-                        None => {
-                            let l = self.materialize(values[&s].clone(), self.ty(s));
-                            spreads.insert(s, l);
-                            l
-                        }
+                (None, Some(_)) if !paths.is_empty() => {
+                    let Some((old, from)) = current(self) else {
+                        return self.trap(TrapKind::Error, Some(site));
                     };
-                    let from = fields_of(self.db, self.program, self.ty(s))
-                        .and_then(|fs| fs.into_iter().find(|(n, _)| *n == name))
-                        .map_or(field_ty, |(_, t)| t);
-                    let place = Place {
-                        local,
-                        path: vec![Step::Field(name)],
+                    let old = self.coerce(old, from, field_ty);
+                    self.rebuild(field_ty, old, &paths, &values, site)
+                }
+                (None, Some(_)) => {
+                    let Some((op, from)) = current(self) else {
+                        return self.trap(TrapKind::Error, Some(site));
                     };
-                    let op = self.assign(from, Rvalue::Read(place));
                     self.coerce(op, from, field_ty)
                 }
                 (None, None) => match default {
@@ -3330,6 +3368,103 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     }
                     None => return self.trap(TrapKind::Error, Some(site)),
                 },
+            };
+            out.push((name, op));
+        }
+        let dispose = self.dispose_code(ty);
+        self.assign(
+            ty,
+            Rvalue::Record {
+                ty,
+                fields: out,
+                dispose,
+            },
+        )
+    }
+
+    /// Whether the value `e` given for a field of type `field_ty`
+    /// transforms its current value: a function, where the field holds
+    /// none (§6.7).
+    fn transforms(&self, e: ExprId, field_ty: Ty<'db>) -> bool {
+        let db = self.db;
+        matches!(self.ty(e).kind(db), TyKind::Fn { .. })
+            && !matches!(field_ty.kind(db), TyKind::Fn { .. })
+    }
+
+    /// Calls the transform `f` on the current value `old` of a field.
+    fn transform(
+        &mut self,
+        f: Operand<'db>,
+        f_ty: Ty<'db>,
+        old: Operand<'db>,
+        from: Ty<'db>,
+        field_ty: Ty<'db>,
+        site: ExprId,
+    ) -> Operand<'db> {
+        let TyKind::Fn { params, result, .. } = f_ty.kind(self.db) else {
+            return self.trap(TrapKind::Error, Some(site));
+        };
+        let (param, result) = (params[0], *result);
+        let callee = self.typed(f, f_ty);
+        let arg = self.coerce(old, from, param);
+        let dst = self.temp(result);
+        let target = self.new_block();
+        self.terminate(Terminator::CallValue {
+            callee,
+            args: vec![arg],
+            dst,
+            target,
+            site,
+            unwind: None,
+        });
+        self.switch_to(target);
+        self.coerce(Operand::Local(dst), result, field_ty)
+    }
+
+    /// The record `old` of type `ty` with the changes the paths below it
+    /// make, each path's value already evaluated (§6.7).
+    fn rebuild(
+        &mut self,
+        ty: Ty<'db>,
+        old: Operand<'db>,
+        paths: &[(Vec<crag_hir::Name<'db>>, ExprId)],
+        values: &HashMap<ExprId, Operand<'db>>,
+        site: ExprId,
+    ) -> Operand<'db> {
+        let Some(fields) = fields_of(self.db, self.program, ty) else {
+            return self.trap(TrapKind::Error, Some(site));
+        };
+        let local = self.materialize(old, ty);
+        let mut out = Vec::new();
+        for (name, field_ty) in fields {
+            let place = Place {
+                local,
+                path: vec![Step::Field(name)],
+            };
+            let whole = paths
+                .iter()
+                .find(|(p, _)| p.len() == 1 && p[0] == name)
+                .map(|(_, e)| *e);
+            let below: Vec<_> = paths
+                .iter()
+                .filter(|(p, _)| p.len() > 1 && p[0] == name)
+                .map(|(p, e)| (p[1..].to_vec(), *e))
+                .collect();
+            let op = match whole {
+                Some(e) if self.transforms(e, field_ty) => {
+                    let current = self.assign(field_ty, Rvalue::Read(place));
+                    let f = values[&e].clone();
+                    self.transform(f, self.ty(e), current, field_ty, field_ty, e)
+                }
+                Some(e) => {
+                    let op = values[&e].clone();
+                    self.coerce(op, self.ty(e), field_ty)
+                }
+                None if !below.is_empty() => {
+                    let current = self.assign(field_ty, Rvalue::Read(place));
+                    self.rebuild(field_ty, current, &below, values, site)
+                }
+                None => self.assign(field_ty, Rvalue::Read(place)),
             };
             out.push((name, op));
         }
