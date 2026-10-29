@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use crag_driver::crag_run;
+use crag_driver::{EXIT_TRAP, crag_run};
 
 /// Ends the test process if the tests take longer than a minute.
 fn watchdog() {
@@ -708,6 +708,73 @@ fn main() -> ExitCode {
     );
     // 1, then 4, then 5: 145.
     assert_eq!(code, 145, "{out}");
+}
+
+#[test]
+fn a_trap_in_a_signal_handler_goes_on_from_the_emit() {
+    // §11.3, §8.3.1: a handler runs where the signal is emitted, so a trap
+    // in it goes to the trap handlers around the `emit`, in the emitting
+    // function or past it, also after an `atomic` block commits; the
+    // handler runs again for the next signal.
+    let (code, out) = run(
+        "signals-trap",
+        r#"type Tick(..Signal, n: Int)
+
+fn emitter() -> Int {
+  on DivisionByZero { t -> 1 }
+  emit Tick(n: 0)
+  0
+}
+
+fn around() -> Int {
+  on Trap { t -> 0 }
+  on Tick { s -> let x = 1 / s.n }
+  emitter()
+}
+
+fn same() -> Int {
+  ref seen = 0
+  on Tick { s ->
+    seen.update { v -> v + 1 }
+    let x = 1 / s.n
+  }
+  let first = {
+    on DivisionByZero { t -> 1 }
+    emit Tick(n: 0)
+    0
+  }
+  emit Tick(n: 1)
+  first * seen.use()
+}
+
+fn committed() -> Int {
+  on DivisionByZero { t -> 1 }
+  on Tick { s -> let x = 1 / s.n }
+  atomic {
+    emit Tick(n: 0)
+  }
+  0
+}
+
+fn main() -> ExitCode {
+  ExitCode(code: around() + 10 * same() + 100 * committed())
+}
+"#,
+    );
+    assert_eq!(code, 121, "{out}");
+    let (code, out) = run(
+        "signals-trap-root",
+        r#"type Tick(..Signal, n: Int)
+
+fn main() -> ExitCode {
+  on Tick { s -> let x = 1 / s.n }
+  emit Tick(n: 0)
+  ExitCode(code: 3)
+}
+"#,
+    );
+    assert_eq!(code, EXIT_TRAP, "{out}");
+    assert!(out.contains("trap: division by zero"), "{out}");
 }
 
 #[test]

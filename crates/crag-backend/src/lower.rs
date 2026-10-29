@@ -125,6 +125,7 @@ pub fn lower_to_lir<'db>(
         layouts: Vec::new(),
         blocks: vec![None; mir.blocks.len()],
         current: (0, Vec::new()),
+        catch: None,
         unsupported: Vec::new(),
         calls: Vec::new(),
         types: Vec::new(),
@@ -164,6 +165,7 @@ pub fn lower_to_lir<'db>(
     let unknown_param = l.layouts[..mir.params].iter().any(Option::is_none);
     for (b, block) in mir.blocks.iter().enumerate() {
         l.current = (b, Vec::new());
+        l.catch = block.catch;
         if unknown_param || returns > 2 {
             l.unsupported("types of parameters or results");
             continue;
@@ -290,6 +292,8 @@ struct Lower<'a, 'db> {
     /// MIR block `i` is LIR block `i`; tests add more.
     blocks: Vec<Option<LirBlock>>,
     current: (usize, Vec<Inst>),
+    /// The handler of the trap handler around the MIR block being lowered.
+    catch: Option<BlockId>,
     unsupported: Vec<Unsupported>,
     calls: Vec<InstanceKey<'db>>,
     /// The types it allocates, with their descriptors.
@@ -1106,8 +1110,11 @@ impl<'a, 'db> Lower<'a, 'db> {
 
     /// Delivers a signal, whose first word is `w0`, to its handler, or to
     /// the root's (§11.3). The handler gets a reference of its own; the
-    /// caller keeps the signal's.
-    fn deliver(&mut self, w0: VReg, info: VReg) {
+    /// caller keeps the signal's. The handler runs where the signal is
+    /// emitted, so a trap in it goes on from there: to the block returned,
+    /// which the caller ends with `pass_trap` once it has released what it
+    /// holds.
+    fn deliver(&mut self, w0: VReg, info: VReg) -> LirBlockId {
         let index = self.reg();
         let (from_box, from_type, found_index) =
             (self.new_block(), self.new_block(), self.new_block());
@@ -1159,18 +1166,21 @@ impl<'a, 'db> Lower<'a, 'db> {
             },
             Some(with_value),
         );
+        let trapped = self.new_block();
         // A handler of one word takes a record: the signal's box.
         self.retain(w0);
-        self.push(Inst::CallIndirect {
+        self.push(Inst::TryCallIndirect {
             callee: code,
             args: vec![env, w0],
             dsts: Vec::new(),
+            handlers: vec![(HandlerKind::Trap, trapped)],
         });
         self.end(Term::Jump(left), Some(without));
-        self.push(Inst::CallIndirect {
+        self.push(Inst::TryCallIndirect {
             callee: code,
             args: vec![env],
             dsts: Vec::new(),
+            handlers: vec![(HandlerKind::Trap, trapped)],
         });
         self.end(Term::Jump(left), Some(left));
         self.push(Inst::CallRuntime {
@@ -1188,6 +1198,23 @@ impl<'a, 'db> Lower<'a, 'db> {
             dsts: Vec::new(),
         });
         self.end(Term::Jump(done), Some(done));
+        trapped
+    }
+
+    /// Ends the block a trap in a signal handler went to: the handler is
+    /// left, and the trap goes on to the trap handler around the emitting
+    /// code, in this function or past it (§8.3.1).
+    fn pass_trap(&mut self, next: LirBlockId) {
+        self.push(Inst::CallRuntime {
+            func: RuntimeFn::SignalLeave,
+            args: Vec::new(),
+            dsts: Vec::new(),
+        });
+        let term = match self.catch {
+            Some(handler) => Term::Jump(block(handler)),
+            None => Term::Rethrow,
+        };
+        self.end(term, Some(next));
     }
 
     /// A box of type `ty`, a `RuntimeStream` or `RuntimeHub`, holding a
@@ -2193,9 +2220,11 @@ impl<'a, 'db> Lower<'a, 'db> {
                     },
                     Some(deliver),
                 );
-                self.deliver(w0, info);
+                let trapped = self.deliver(w0, info);
                 self.count_words(signal_layout, signal_ty, &words, Self::release)?;
-                self.end(Term::Jump(done), Some(done));
+                self.end(Term::Jump(done), Some(trapped));
+                self.count_words(signal_layout, signal_ty, &words, Self::release)?;
+                self.pass_trap(done);
                 Ok(Vec::new())
             }
             (Intrinsic::SignalDrain, []) => {
@@ -2215,8 +2244,9 @@ impl<'a, 'db> Lower<'a, 'db> {
                 );
                 let w0 = self.load(out, 0);
                 let info = self.load(out, 16);
-                self.deliver(w0, info);
-                self.end(Term::Jump(head), Some(done));
+                let trapped = self.deliver(w0, info);
+                self.end(Term::Jump(head), Some(trapped));
+                self.pass_trap(done);
                 Ok(Vec::new())
             }
             (Intrinsic::ScopeNew, [limit]) => {
