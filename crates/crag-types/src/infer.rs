@@ -1900,6 +1900,8 @@ impl<'a, 'db> Infer<'a, 'db> {
         // parameters must agree.
         let mut context: Vec<Option<Ty<'db>>> = vec![None; positional.len() + named.len()];
         let mut differs = false;
+        // The record named arguments build, which every arm must take.
+        let mut record: Option<Ty<'db>> = None;
         let mut arms = Vec::new();
         for (i, at) in &chosen {
             let Some((callee, params, result)) =
@@ -1908,11 +1910,22 @@ impl<'a, 'db> Infer<'a, 'db> {
                 self.unresolved(positional, fields);
                 return Some(self.err_ty());
             };
-            let Some(Plan::Params(given)) = self.plan(&params, at, named, builds_record) else {
-                let kind = ErrorKind::Unsupported("lifted calls that build a record");
-                self.error(Site::Expr(id), kind);
-                self.unresolved(positional, fields);
-                return Some(self.err_ty());
+            let given = match self.plan(&params, at, named, builds_record) {
+                Some(Plan::Params(given)) if record.is_none() => given,
+                Some(Plan::Record) if arms.is_empty() || record.is_some() => {
+                    let ty = params[at.len()].ty;
+                    differs |= record.is_some_and(|r| r != ty);
+                    record = Some(ty);
+                    (0..at.len()).map(Some).collect()
+                }
+                _ => {
+                    let kind = ErrorKind::Unsupported(
+                        "lifted calls whose named arguments build a record for some members only",
+                    );
+                    self.error(Site::Expr(id), kind);
+                    self.unresolved(positional, fields);
+                    return Some(self.err_ty());
+                }
             };
             for (p, g) in given.iter().enumerate() {
                 let Some(g) = *g else { continue };
@@ -1942,6 +1955,10 @@ impl<'a, 'db> Infer<'a, 'db> {
         self.negative = name.text(db) == "negate";
         let mut params = Vec::new();
         for (g, ty) in context.iter().enumerate() {
+            // Named arguments that build a record are checked as one.
+            if g >= positional.len() && record.is_some() {
+                break;
+            }
             let arg = if g < positional.len() {
                 positional[g]
             } else {
@@ -1963,6 +1980,9 @@ impl<'a, 'db> Infer<'a, 'db> {
             }
         }
         self.negative = negative;
+        if let (Some(record), Some(fields)) = (record, fields) {
+            self.build_record(id, record, fields);
+        }
         let result = self.join_all(arms.iter().map(|a| a.result).collect());
         let dispatch = Dispatch {
             args,

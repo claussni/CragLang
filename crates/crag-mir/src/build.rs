@@ -291,6 +291,40 @@ enum FieldDefault<'db> {
     Code(InstanceKey<'db>),
 }
 
+/// The named arguments of a lifted call, evaluated once: each with its
+/// name, or the record they build.
+enum Named<'db> {
+    Params(Vec<(Name<'db>, Local, Ty<'db>)>),
+    Record(Local, Ty<'db>),
+}
+
+/// Where a call puts its arguments, as inference does: the named ones by
+/// name, then the positional ones around them; the positional ones'
+/// places first. None when they do not fit the parameters.
+fn named_places<'db>(
+    params: &[SigParam<'db>],
+    positional: usize,
+    names: &[Name<'db>],
+) -> Option<Vec<usize>> {
+    let mut taken = vec![false; params.len()];
+    let mut named = Vec::new();
+    for name in names {
+        let i = params.iter().position(|p| p.name == Some(*name))?;
+        if std::mem::replace(&mut taken[i], true) {
+            return None;
+        }
+        named.push(i);
+    }
+    let defaults: Vec<bool> = params.iter().map(|p| p.default).collect();
+    let mut places = crag_types::place_positional(&defaults, &taken, positional)?;
+    for &i in &places {
+        taken[i] = true;
+    }
+    let complete = taken.iter().zip(params).all(|(&t, p)| t || p.default);
+    places.extend(named);
+    complete.then_some(places)
+}
+
 /// The `else` part of a `let`, and the pattern of `{ rest -> … }`.
 #[derive(Clone, Copy)]
 struct Otherwise {
@@ -1108,7 +1142,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     expr,
                     &dispatch,
                     &functions,
-                    &args,
+                    (&args, &Named::Params(Vec::new())),
                     &mut Vec::new(),
                     dst,
                     join,
@@ -3598,9 +3632,6 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         positional: &[ExprId],
         fields: Option<&[FieldArg<'db>]>,
     ) -> Operand<'db> {
-        if fields.is_some_and(|f| !f.is_empty()) {
-            return self.unsupported(expr, "lifted calls with named arguments");
-        }
         let functions = match self.dispatch_functions(expr, dispatch, positional) {
             Ok(functions) => functions,
             Err(op) => return op,
@@ -3613,13 +3644,51 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 (self.materialize(op, ty), ty)
             })
             .collect();
+        // Named arguments, once, after the positional ones: parameters of
+        // every arm, or together the record that every arm's last
+        // parameter is (§5.6.2).
+        let named = match fields.filter(|f| !f.is_empty()) {
+            None => Named::Params(Vec::new()),
+            Some(fields) => {
+                let params = self.instance_signature(&functions[0]).params;
+                let simple: Option<Vec<(Name<'db>, ExprId)>> = fields
+                    .iter()
+                    .map(|f| match f {
+                        FieldArg::Field { path, value } if path.len() == 1 => {
+                            Some((path[0], *value))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let names: Vec<Name<'db>> = simple.iter().flatten().map(|(n, _)| *n).collect();
+                match simple.filter(|_| named_places(&params, args.len(), &names).is_some()) {
+                    Some(simple) => Named::Params(
+                        simple
+                            .into_iter()
+                            .map(|(name, value)| {
+                                let ty = self.ty(value);
+                                let op = self.expr(value);
+                                (name, self.materialize(op, ty), ty)
+                            })
+                            .collect(),
+                    ),
+                    None => {
+                        let Some(record) = params.get(args.len()).map(|p| p.ty) else {
+                            return self.trap(TrapKind::Error, Some(expr));
+                        };
+                        let op = self.record_value(expr, record, &[], fields);
+                        Named::Record(self.materialize(op, record), record)
+                    }
+                }
+            }
+        };
         let dst = self.temp(self.ty(expr));
         let join = self.new_block();
         self.dispatch_arms(
             expr,
             dispatch,
             &functions,
-            &args,
+            (&args, &named),
             &mut Vec::new(),
             dst,
             join,
@@ -3657,7 +3726,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         expr: ExprId,
         dispatch: &Dispatch<'db>,
         functions: &[Instance<'db>],
-        args: &[(Local, Ty<'db>)],
+        (args, named): (&[(Local, Ty<'db>)], &Named<'db>),
         indices: &mut Vec<usize>,
         dst: Local,
         join: BlockId,
@@ -3680,7 +3749,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             for (i, block) in blocks.into_iter().enumerate() {
                 self.switch_to(block);
                 indices.push(i);
-                self.dispatch_arms(expr, dispatch, functions, args, indices, dst, join);
+                self.dispatch_arms(expr, dispatch, functions, (args, named), indices, dst, join);
                 indices.pop();
             }
             return;
@@ -3694,13 +3763,28 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let params = self.instance_signature(function).params;
         // The arguments go where a call puts them; the rest take their
         // defaults.
-        let defaults: Vec<bool> = params.iter().map(|p| p.default).collect();
-        let taken = vec![false; params.len()];
-        let Some(places) = crag_types::place_positional(&defaults, &taken, args.len()) else {
-            self.trap(TrapKind::Error, Some(expr));
-            return;
-        };
         let mut given: Vec<Option<Operand<'db>>> = vec![None; params.len()];
+        let places = match named {
+            Named::Params(named) => {
+                let names: Vec<Name<'db>> = named.iter().map(|&(n, ..)| n).collect();
+                let Some(places) = named_places(&params, args.len(), &names) else {
+                    self.trap(TrapKind::Error, Some(expr));
+                    return;
+                };
+                for (&(_, local, ty), &place) in named.iter().zip(&places[args.len()..]) {
+                    given[place] = Some(self.coerce(Operand::Local(local), ty, params[place].ty));
+                }
+                places[..args.len()].to_vec()
+            }
+            Named::Record(local, ty) => {
+                let Some(last) = params.get(args.len()) else {
+                    self.trap(TrapKind::Error, Some(expr));
+                    return;
+                };
+                given[args.len()] = Some(self.coerce(Operand::Local(*local), *ty, last.ty));
+                (0..args.len()).collect()
+            }
+        };
         for (k, (&(local, ty), &place)) in args.iter().zip(&places).enumerate() {
             let (op, from) = match dispatch.args.iter().position(|&a| a == k) {
                 Some(level) => {

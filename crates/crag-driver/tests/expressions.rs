@@ -247,6 +247,28 @@ fn lifted_calls_fill_in_defaults() {
     eval(&mut r, "fn g(x: A | B) -> Int { size(x) }");
     assert_eq!(eval(&mut r, "g(A(n: 3))"), "3\n");
     assert_eq!(eval(&mut r, "g(B(n: 3))"), "30\n");
+    // Named arguments go to every member's call: as parameters, or as
+    // the record they build (§5.6.2).
+    eval(&mut r, "fn h(x: A | B) -> Int { size(x, k: 2) }");
+    assert_eq!(eval(&mut r, "h(A(n: 3))"), "6\n");
+    assert_eq!(eval(&mut r, "h(B(n: 3))"), "6\n");
+    eval(&mut r, "type By(by: Int, plus: Int = 0)");
+    eval(
+        &mut r,
+        "fn scaled(a: A, o: By) -> Int { a.n * o.by + o.plus }",
+    );
+    eval(
+        &mut r,
+        "fn scaled(b: B, o: By) -> Int { -b.n * o.by + o.plus }",
+    );
+    eval(
+        &mut r,
+        "fn s(x: A | B) -> Int { scaled(x, by: 5, plus: 1) }",
+    );
+    assert_eq!(eval(&mut r, "s(A(n: 3))"), "16\n");
+    assert_eq!(eval(&mut r, "s(B(n: 3))"), "-14\n");
+    eval(&mut r, "fn t(x: A | B) -> Int { scaled(x, by: 2) }");
+    assert_eq!(eval(&mut r, "t(B(n: 3))"), "-6\n");
 }
 
 #[test]
