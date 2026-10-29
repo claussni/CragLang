@@ -66,7 +66,9 @@ pub fn build<'db>(
     instance: InstanceKey<'db>,
 ) -> Option<MirBody<'db>> {
     let (owner, entry) = (*instance.owner(db), *instance.entry(db));
-    if let Owner::Item(item) = owner {
+    if let Owner::Item(item) = owner
+        && entry != Entry::Adapter
+    {
         let params = match *item.kind(db) {
             ItemKind::Function => signature(db, program, item).type_params,
             // A type has code only for what its declaration holds.
@@ -104,6 +106,7 @@ pub fn build<'db>(
         Entry::Dispose => b.dispose_entry(),
         Entry::Part => b.part_entry(),
         Entry::Check => b.check_entry(),
+        Entry::Adapter => b.adapter_entry(),
     };
     match start {
         Some(start) if ok => start(&mut b),
@@ -119,6 +122,7 @@ pub fn build<'db>(
     Some(b.finish())
 }
 
+mod convert;
 mod derive;
 
 pub use derive::has_derived_code;
@@ -415,7 +419,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         types: &'a InferenceResult<'db>,
     ) -> Self {
         let owner = *instance.owner(db);
+        // An adapter's type arguments are its types, concrete already.
         let generic = match owner {
+            _ if *instance.entry(db) == Entry::Adapter => None,
             Owner::Item(item) if !instance.args(db).is_empty() => {
                 Some((item, instance.args(db).clone()))
             }
@@ -1062,6 +1068,106 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         };
         self.params = self.locals.len();
         Some(Box::new(move |b| b.eval(default, Dest::Return)))
+    }
+
+    /// The code of an adapter: the environment holding the function value
+    /// and the parameters of the type it is called as, then a call of the
+    /// value with the arguments converted to its parameters.
+    fn adapter_entry(&mut self) -> Option<Start<'a, 'db>> {
+        let db = self.db;
+        let [from, to] = self.instance.args(db)[..] else {
+            return None;
+        };
+        let (
+            TyKind::Fn {
+                params: from_params,
+                result: from_result,
+                ..
+            },
+            TyKind::Fn {
+                params: to_params,
+                result: to_result,
+                ..
+            },
+        ) = (from.kind(db), to.kind(db))
+        else {
+            return None;
+        };
+        self.result = *to_result;
+        let env_ty = Ty::record(db, vec![(capture_name(db, 0), from)], false);
+        let env = self.temp(env_ty);
+        self.env = true;
+        let args: Vec<(Local, Ty<'db>)> = to_params.iter().map(|&t| (self.temp(t), t)).collect();
+        self.params = self.locals.len();
+        let (from_params, from_result) = (from_params.clone(), *from_result);
+        Some(Box::new(move |b| {
+            let place = Place {
+                local: env,
+                path: vec![Step::Field(capture_name(db, 0))],
+            };
+            let callee = b.assign(from, Rvalue::Read(place));
+            let ops = args
+                .iter()
+                .zip(&from_params)
+                .map(|(&(local, ty), &param)| b.coerce(Operand::Local(local), ty, param))
+                .collect();
+            let dst = b.temp(from_result);
+            let target = b.new_block();
+            b.terminate(Terminator::CallValue {
+                callee,
+                args: ops,
+                dst,
+                target,
+                site: ExprId(0),
+                unwind: None,
+                catch: None,
+            });
+            b.switch_to(target);
+            b.finish_dest(Operand::Local(dst), from_result, Dest::Return);
+        }))
+    }
+
+    /// The function value as one of another function type, through an
+    /// adapter when the two lay out parameters or results differently.
+    fn adapted(&mut self, op: Operand<'db>, from: Ty<'db>, to: Ty<'db>) -> Option<Operand<'db>> {
+        let db = self.db;
+        let (
+            TyKind::Fn {
+                params: a,
+                result: r,
+                ..
+            },
+            TyKind::Fn {
+                params: b,
+                result: s,
+                ..
+            },
+        ) = (from.kind(db), to.kind(db))
+        else {
+            return None;
+        };
+        if a == b && r == s {
+            return None;
+        }
+        let value = self.materialize(op, from);
+        let code = InstanceKey::new(
+            db,
+            self.owner,
+            vec![from, to],
+            Vec::new(),
+            Vec::new(),
+            Entry::Adapter,
+        );
+        let env = Ty::record(db, vec![(capture_name(db, 0), from)], false);
+        Some(self.assign(
+            to,
+            Rvalue::Closure {
+                code,
+                env,
+                captures: vec![Operand::Local(value)],
+                placement: ClosurePlacement::Heap,
+            },
+        ))
     }
 
     /// The dispose code of the type: the box, whose count reached zero and
@@ -2247,7 +2353,6 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         },
                         "trapIndex" => Intrinsic::TrapWith(crag_abi::TrapKind::Index as u8),
                         "trapUnordered" => Intrinsic::TrapWith(crag_abi::TrapKind::Unordered as u8),
-                        "trapNotFinite" => Intrinsic::TrapWith(crag_abi::TrapKind::NotFinite as u8),
                         "bytesCount" => Intrinsic::TextMeasure(BYTE_COUNT),
                         "bytesAt" => Intrinsic::TextAt(BYTE_AT),
                         "bytesSlice" => Intrinsic::TextSlice,
@@ -2509,6 +2614,12 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
 
     /// The operand as a value of `to`, which its type `from` fits.
     fn coerce(&mut self, op: Operand<'db>, from: Ty<'db>, to: Ty<'db>) -> Operand<'db> {
+        if let Some(adapted) = self.adapted(op.clone(), from, to) {
+            return adapted;
+        }
+        if let Some(rebuilt) = self.rebuilt(op.clone(), from, to) {
+            return rebuilt;
+        }
         match self.converts(from, to) {
             true => {
                 let op = self.typed(op, from);
@@ -2531,7 +2642,11 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     /// Assigns the operand to a local.
     fn assign_to(&mut self, local: Local, op: Operand<'db>, from: Ty<'db>) {
         let to = self.locals[local.index()].ty;
-        if self.converts(from, to) {
+        if let Some(adapted) = self.adapted(op.clone(), from, to) {
+            self.push(Statement::Assign(local, Rvalue::Use(adapted)));
+        } else if let Some(rebuilt) = self.rebuilt(op.clone(), from, to) {
+            self.push(Statement::Assign(local, Rvalue::Use(rebuilt)));
+        } else if self.converts(from, to) {
             let op = self.typed(op, from);
             self.push(Statement::Assign(local, Rvalue::Convert(op)));
         } else if op != Operand::Local(local) {
@@ -3115,7 +3230,18 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     },
                 )
             }
-            Expr::TypeArgs { .. } => self.unsupported(expr, "type arguments"),
+            // A tag or unit record whose level is written, as `Empty[Int]`.
+            Expr::TypeArgs { base, .. } => match body.expr(*base) {
+                Expr::Name {
+                    item: Some(Resolution::Type(item)),
+                    local: None,
+                    ..
+                } => match type_def(db, self.program, *item).kind {
+                    TypeDefKind::Record { .. } => self.record_value(expr, ty, &[], &[]),
+                    _ => Operand::Const(Constant::Tag(ty)),
+                },
+                _ => self.unsupported(expr, "type arguments"),
+            },
             Expr::Closure { .. } => self.closure_value(expr, ty, None),
             Expr::Pass => self.unsupported(expr, "`pass`"),
             Expr::Atomic(inner) => self.atomic_block(expr, *inner),

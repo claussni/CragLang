@@ -263,7 +263,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
 
     /// Goes by the first of the types the value in the local has, to code
     /// that `case` builds for it by its position; none trapping.
-    fn by_type(
+    pub(super) fn by_type(
         &mut self,
         value: Local,
         cases: &[Ty<'db>],
@@ -563,7 +563,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
 
     /// A loop over the indices below `len`: `body` builds the code for an
     /// index, in a local.
-    fn each_index(&mut self, len: Operand<'db>, mut body: impl FnMut(&mut Self, Local)) {
+    pub(super) fn each_index(&mut self, len: Operand<'db>, mut body: impl FnMut(&mut Self, Local)) {
         let int_ty = self.int();
         let i = self.temp(int_ty);
         self.push(Statement::Assign(i, Rvalue::Use(int(0))));
@@ -595,7 +595,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     }
 
     /// An element of a list, borrowed.
-    fn element(&mut self, list: Local, element: Ty<'db>, i: Local) -> Operand<'db> {
+    pub(super) fn element(&mut self, list: Local, element: Ty<'db>, i: Local) -> Operand<'db> {
         self.assign(
             element,
             Rvalue::Index {

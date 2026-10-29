@@ -393,6 +393,64 @@ fn a_type_s_own_show_writes_its_values() {
 }
 
 #[test]
+fn values_convert_to_the_wider_types_they_fit() {
+    // §3.13.3: an immutable generic type fits one whose arguments its own
+    // fit, and a function one whose parameters fit its own; the value is
+    // built anew where the two lay out their parts differently.
+    let mut r = repl();
+    eval(&mut r, "fn first(xs: List[Int | Str]) -> Int | Str { xs[0] }");
+    eval(&mut r, "let ys: List[Int] = [7, 8]");
+    assert_eq!(eval(&mut r, "first(ys)"), "7\n");
+    eval(&mut r, "let wide: List[Int | Str] = ys");
+    assert_eq!(eval(&mut r, "wide"), "[7, 8]\n");
+    eval(&mut r, "let nested: List[List[Int]] = [[1], [2, 3]]");
+    eval(&mut r, "let wider: List[List[Int | Str]] = nested");
+    assert_eq!(eval(&mut r, "wider"), "[[1], [2, 3]]\n");
+    eval(&mut r, "let m: Map[Str, List[Int]] = [\"x\": [1, 2]]");
+    eval(&mut r, "let mw: Map[Str, List[Int | Str]] = m");
+    assert_eq!(eval(&mut r, "mw"), "[\"x\": [1, 2]]\n");
+    eval(&mut r, "type Box[T](item: T)");
+    eval(&mut r, "let bi = Box(item: 4)");
+    eval(&mut r, "let bu: Box[Int | Str] = bi");
+    assert_eq!(eval(&mut r, "bu"), "Box(item: 4)\n");
+    eval(&mut r, "let o: Option[List[Int]] = [1]");
+    eval(&mut r, "let ow: Option[List[Int | Str]] = o");
+    assert_eq!(eval(&mut r, "ow"), "[1]\n");
+    // Function values: by their parameters and by their results.
+    eval(&mut r, "fn h(x: Int | Str) -> Int { case x {\n n: Int -> n\n _ -> 0\n } }");
+    assert_eq!(eval(&mut r, "[7].map(h)"), "[7]\n");
+    eval(&mut r, "let g: (Int) -> Int = h");
+    assert_eq!(eval(&mut r, "g(9)"), "9\n");
+    eval(&mut r, "fn twice(f: (Int) -> Int | Str, x: Int) -> Int | Str { f(x) }");
+    eval(&mut r, "fn inc(x: Int) -> Int { x + 1 }");
+    assert_eq!(eval(&mut r, "twice(inc, 4)"), "5\n");
+    eval(&mut r, "let fs: List[(Int | Str) -> Int] = [h]");
+    eval(&mut r, "let gs: List[(Int) -> Int] = fs");
+    assert_eq!(eval(&mut r, "gs[0](5)"), "5\n");
+    // `number` as a value converts and names the tag it meets (§3.1.4).
+    assert_eq!(eval(&mut r, "[1.5].map(number)"), "[1.5]\n");
+    eval(&mut r, "fn nan() -> Float | NonFinite { NaN }");
+    eval(
+        &mut r,
+        "fn passed() -> Str {\n  on NotFinite { e -> \"tag {e.tag}\" }\n  \"{[nan()].map(number)}\"\n}",
+    );
+    assert_eq!(eval(&mut r, "passed()"), "\"tag NaN\"\n");
+}
+
+#[test]
+fn a_tag_s_level_is_a_type() {
+    // §3.6.1: `Empty`'s parameter names its level, which is a type.
+    let mut r = repl();
+    assert_eq!(eval(&mut r, "Empty[Int]"), "Empty\n");
+    eval(&mut r, "let o: Option[Int] = Empty[Int]");
+    assert_eq!(eval(&mut r, "o"), "Empty\n");
+    let out = eval(&mut r, "Empty[123]");
+    assert!(out.contains("other types a type"), "{out}");
+    let out = eval(&mut r, "List[123]()");
+    assert!(out.contains("other types a type"), "{out}");
+}
+
+#[test]
 fn named_arguments_build_the_record_a_function_value_takes() {
     // §5.6.2: named arguments to a function value build its last
     // parameter, a record, with the record's defaults.

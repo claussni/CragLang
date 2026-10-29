@@ -737,7 +737,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                     local: None,
                     item: Some(Resolution::Type(item)),
                 } => {
-                    let args = self.type_args(args);
+                    let args = self.type_args(id, Some(*item), args);
                     let ty = self.type_value(id, *name, *item, args, expected);
                     self.exprs[base.index()] = Some(ty);
                     ty
@@ -751,7 +751,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                             functions,
                         }),
                 } => {
-                    let args = self.type_args(args);
+                    let args = self.type_args(id, None, args);
                     let ty = self.function_value(id, *name, functions, Some(args), expected);
                     self.exprs[base.index()] = Some(ty);
                     ty
@@ -1342,11 +1342,29 @@ impl<'a, 'db> Infer<'a, 'db> {
         }
     }
 
-    fn type_args(&mut self, args: &[TypeArg]) -> Vec<Ty<'db>> {
+    /// The type arguments written at `id` for `item`, each a type: a
+    /// number of digits is one only of `Fixed`, whose conversions are
+    /// left to the call, and an `is` clause none of a value.
+    fn type_args(
+        &mut self,
+        id: ExprId,
+        item: Option<ItemId<'db>>,
+        args: &[TypeArg],
+    ) -> Vec<Ty<'db>> {
+        let fixed = item.is_some_and(|item| {
+            matches!(
+                type_header(self.db, self.program, item).kind,
+                HeaderKind::Builtin(Builtin::Fixed(_))
+            )
+        });
         args.iter()
             .map(|arg| match arg {
                 TypeArg::Type(t) => self.lower_type(*t),
-                _ => Ty::error(self.db),
+                TypeArg::Int(_) if fixed => Ty::error(self.db),
+                TypeArg::Int(_) | TypeArg::Is(_) => {
+                    self.error(Site::Expr(id), ErrorKind::TypeArgKind);
+                    Ty::error(self.db)
+                }
             })
             .collect()
     }
@@ -1394,7 +1412,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                     local: None,
                     item: Some(Resolution::Type(item)),
                 } => {
-                    let targs = self.type_args(targs);
+                    let targs = self.type_args(callee, Some(*item), targs);
                     let ty = self.construct(
                         id,
                         *base,
@@ -1417,7 +1435,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                             functions,
                         }),
                 } => {
-                    let targs = self.type_args(targs);
+                    let targs = self.type_args(callee, None, targs);
                     let ty = self.resolve(
                         id,
                         Some(*base),

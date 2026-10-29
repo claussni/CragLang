@@ -107,16 +107,10 @@ pub type PosInfinity
 pub type NegInfinity
 pub type NonFinite = NaN | PosInfinity | NegInfinity
 
-// The `Float`, trapping on a NaN or an infinity.
-pub fn number(x: Float | NonFinite) -> Float {
-  case x {
-    f: Float -> f
-    _ -> {
-      trapNotFinite()
-      0.0
-    }
-  }
-}
+// The `Float`, trapping on a NaN or an infinity. A call is lowered where it
+// is written, so this body, which code that passes `number` as a value
+// runs, traps naming the tag as a call does.
+pub fn number(x: Float | NonFinite) -> Float { number(x) }
 
 // Conversions (§5.6, §19.13): `T(x)` calls the `convert` that takes `x` and
 // gives a `T`. One that may not fit gives `Unconvertible` instead.
@@ -641,7 +635,6 @@ fn valueCompare[T](a: T, b: T) -> Int
 fn valueHash[T](x: T) -> Int
 fn valueShow[T](x: T) -> Str
 fn trapUnordered() -> ()
-fn trapNotFinite() -> ()
 
 // Int
 

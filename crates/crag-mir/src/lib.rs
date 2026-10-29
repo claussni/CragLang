@@ -140,6 +140,12 @@ pub enum Entry {
     /// it gives the number, from one, of the first that fails, or zero
     /// (§3.10.1).
     Check,
+    /// A function value called as a value of another function type, whose
+    /// parameters or result are laid out differently, as a member is from
+    /// its union: its environment holds the value, and it converts the
+    /// arguments to the value's parameters and the value's result to its
+    /// own. Its key's type arguments are the two function types.
+    Adapter,
 }
 
 impl Entry {

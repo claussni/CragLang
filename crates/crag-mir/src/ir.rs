@@ -1125,6 +1125,7 @@ fn func_name<'db>(db: &'db dyn Db, func: InstanceKey<'db>) -> String {
         Entry::Dispose => format!("{owner}#dispose"),
         Entry::Part => format!("{owner}#part"),
         Entry::Check => format!("{owner}#check"),
+        Entry::Adapter => format!("{owner}#adapter"),
     }
 }
 

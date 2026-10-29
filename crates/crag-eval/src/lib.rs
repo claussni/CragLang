@@ -269,7 +269,7 @@ impl<'db> Evaluation<'db> {
             let name = match instance.entry(db) {
                 Entry::Body => name,
                 Entry::Closure(_) => format!("a closure in {name}"),
-                Entry::Function(_) => format!("a function value in {name}"),
+                Entry::Function(_) | Entry::Adapter => format!("a function value in {name}"),
                 Entry::Default(_) => format!("a default in {name}"),
                 Entry::Dispose => format!("the dispose code of {name}"),
                 Entry::Part => name,

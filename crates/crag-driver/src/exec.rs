@@ -141,7 +141,7 @@ pub fn compile<'a>(
         let name = match instance.entry(db) {
             Entry::Body | Entry::Part => owner_name(project, owner),
             Entry::Closure(_) => format!("a closure in {}", owner_name(project, owner)),
-            Entry::Function(_) => {
+            Entry::Function(_) | Entry::Adapter => {
                 format!("a function value in {}", owner_name(project, owner))
             }
             Entry::Default(_) => format!("a default in {}", owner_name(project, owner)),
