@@ -398,7 +398,10 @@ fn values_convert_to_the_wider_types_they_fit() {
     // fit, and a function one whose parameters fit its own; the value is
     // built anew where the two lay out their parts differently.
     let mut r = repl();
-    eval(&mut r, "fn first(xs: List[Int | Str]) -> Int | Str { xs[0] }");
+    eval(
+        &mut r,
+        "fn first(xs: List[Int | Str]) -> Int | Str { xs[0] }",
+    );
     eval(&mut r, "let ys: List[Int] = [7, 8]");
     assert_eq!(eval(&mut r, "first(ys)"), "7\n");
     eval(&mut r, "let wide: List[Int | Str] = ys");
@@ -417,11 +420,17 @@ fn values_convert_to_the_wider_types_they_fit() {
     eval(&mut r, "let ow: Option[List[Int | Str]] = o");
     assert_eq!(eval(&mut r, "ow"), "[1]\n");
     // Function values: by their parameters and by their results.
-    eval(&mut r, "fn h(x: Int | Str) -> Int { case x {\n n: Int -> n\n _ -> 0\n } }");
+    eval(
+        &mut r,
+        "fn h(x: Int | Str) -> Int { case x {\n n: Int -> n\n _ -> 0\n } }",
+    );
     assert_eq!(eval(&mut r, "[7].map(h)"), "[7]\n");
     eval(&mut r, "let g: (Int) -> Int = h");
     assert_eq!(eval(&mut r, "g(9)"), "9\n");
-    eval(&mut r, "fn twice(f: (Int) -> Int | Str, x: Int) -> Int | Str { f(x) }");
+    eval(
+        &mut r,
+        "fn twice(f: (Int) -> Int | Str, x: Int) -> Int | Str { f(x) }",
+    );
     eval(&mut r, "fn inc(x: Int) -> Int { x + 1 }");
     assert_eq!(eval(&mut r, "twice(inc, 4)"), "5\n");
     eval(&mut r, "let fs: List[(Int | Str) -> Int] = [h]");
