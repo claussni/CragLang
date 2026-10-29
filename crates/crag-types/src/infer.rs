@@ -53,7 +53,7 @@ use crate::def::{
 use crate::effect::{EffectSet, Walker};
 use crate::escape::{EscapeLevel, EscapeWalker, Escapes};
 use crate::generic::{
-    CallSite, Slot, bind, function_at, instantiate, mentions, slots, type_param_names,
+    CallSite, Filling, Slot, bind, function_at, instantiate, mentions, slots, type_param_names,
 };
 use crate::group::{
     GroupMember, error_type, function_effects, group_of, param_escapes, result_type,
@@ -98,6 +98,7 @@ pub fn infer_in_group<'db>(
         holes: Vec::new(),
         optional: Vec::new(),
         iterations: Vec::new(),
+        shows: Vec::new(),
         trap_handlers: Vec::new(),
         typed: HashMap::new(),
         frames: Vec::new(),
@@ -191,6 +192,7 @@ pub fn infer_in_group<'db>(
         holes: cx.holes,
         optional: cx.optional,
         iterations: cx.iterations,
+        shows: cx.shows,
         trap_handlers: cx.trap_handlers,
         effects,
         escapes,
@@ -227,6 +229,7 @@ struct Infer<'a, 'db> {
     holes: Vec<(ExprId, Ty<'db>)>,
     optional: Vec<(ExprId, Optional<'db>)>,
     iterations: Vec<(ExprId, Iteration<'db>)>,
+    shows: Vec<(ExprId, Filling<'db>)>,
     trap_handlers: Vec<(ExprId, Ty<'db>)>,
     /// Expressions already typed, which their next check takes as they
     /// are: the field values a construction infers its type arguments
@@ -646,7 +649,8 @@ impl<'a, 'db> Infer<'a, 'db> {
                 }
                 for part in parts {
                     if let crag_hir::StrPart::Expr(e) = part {
-                        self.synth(*e);
+                        let ty = self.synth(*e);
+                        self.interpolated(*e, ty);
                     }
                 }
                 self.builtin(Builtin::Str)
@@ -2997,6 +3001,23 @@ impl<'a, 'db> Infer<'a, 'db> {
         self.exprs[callee.index()] = Some(ty);
         self.callees.push((id, Callee::Construct(ty)));
         ty
+    }
+
+    /// An interpolated value is written by the `show` its type has where
+    /// the string is, when that is its own rather than the derived one; a
+    /// string or a code point is written as it is (§19.11).
+    fn interpolated(&mut self, id: ExprId, ty: Ty<'db>) {
+        let (db, program) = (self.db, self.program);
+        let plain = matches!(
+            crate::relate::unrefined(db, program, ty).as_builtin(db),
+            Some((Builtin::Str | Builtin::CodePoint, _))
+        );
+        if plain {
+            return;
+        }
+        if let Some(filling) = crate::generic::own_show(db, program, ty, self.call_site()) {
+            self.shows.push((id, filling));
+        }
     }
 
     /// A construction whose fields are literals that fails a condition of

@@ -214,17 +214,19 @@ impl Scratch {
     }
 
     /// Ships a root without parameters and runs it in the image, which
-    /// shows its result, of type `ty`, and releases it.
+    /// shows its result, of type `ty`, and releases it; with `text`, a
+    /// `Str` as it is.
     pub fn show(
         &mut self,
         project: &Project,
         root: InstanceKey,
         ty: Ty,
+        text: bool,
     ) -> Result<RunResult, String> {
         self.ship(project, &[root])?;
         let (shapes, shape) = shapes(&project.db, project.program, ty);
         self.session
-            .show(func_id(root), &shapes, shape)
+            .show(func_id(root), &shapes, shape, text)
             .map_err(|e| e.to_string())
     }
 

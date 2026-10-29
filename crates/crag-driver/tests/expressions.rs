@@ -342,4 +342,30 @@ fn grids_have_rows_and_columns() {
     );
     assert_eq!(eval(&mut r, "total(m)"), "21\n");
     assert!(eval(&mut r, "[1, 2; 3]").contains("a grid's rows are of one width"));
+    // A grid is shown as its literal, or as its record without one.
+    assert_eq!(eval(&mut r, "m"), "[1, 2, 3; 4, 5, 6]\n");
+    assert_eq!(eval(&mut r, "[\"a\"; \"b\"]"), "[\"a\"; \"b\"]\n");
+    assert_eq!(
+        eval(&mut r, "grid(2, 1, 0)"),
+        "Grid(width: 2, height: 1, cells: [0, 0])\n"
+    );
+}
+
+#[test]
+fn a_type_s_own_show_writes_its_values() {
+    // §19.11: a type's own `show` is chosen over the derived one where a
+    // value is shown: in the REPL, in interpolation and through `Show`.
+    let mut r = repl();
+    eval(&mut r, "type P(x: Int)");
+    eval(&mut r, "fn show(p: P) -> Str { \"p{p.x}\" }");
+    assert_eq!(eval(&mut r, "P(x: 1)"), "p1\n");
+    assert_eq!(eval(&mut r, "\"<{P(x: 2)}>\""), "\"<p2>\"\n");
+    eval(&mut r, "fn angled[T: Show](x: T) -> Str { \"<{x}>\" }");
+    assert_eq!(eval(&mut r, "angled(P(x: 3))"), "\"<p3>\"\n");
+    assert_eq!(
+        eval(&mut r, "[P(x: 1), P(x: 2); P(x: 3), P(x: 4)]"),
+        "[p1, p2; p3, p4]\n"
+    );
+    // Strings and numbers are written as before.
+    assert_eq!(eval(&mut r, "\"{\"a\"} {3}\""), "\"a 3\"\n");
 }

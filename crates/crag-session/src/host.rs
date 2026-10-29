@@ -822,17 +822,20 @@ impl Session {
     }
 
     /// Runs a loaded function as `run` does, and has the image show its
-    /// result, of the shape `root` of `shapes`, and release it.
+    /// result, of the shape `root` of `shapes`, and release it; with
+    /// `text`, a `Str` as it is.
     pub fn show(
         &mut self,
         func: FuncId,
         shapes: &Shapes,
         root: u32,
+        text: bool,
     ) -> Result<RunResult, SessionError> {
         let show = Message::Show {
             func,
             shapes: shapes.clone(),
             root,
+            text,
         };
         match self.request(&show)? {
             Message::Shown(text) => Ok(RunResult::Shown(text)),

@@ -1659,6 +1659,14 @@ pub fn transpose[T](g: Grid[T]) -> Grid[T] {
 // The cells row by row, which `for` walks.
 pub fn toList[T](g: Grid[T]) -> List[T] { g.cells }
 
+// A grid is written as its literal; one of fewer than two rows, which has
+// none, as its record (§12.3, §19.11).
+pub fn show[T: Show](g: Grid[T]) -> Str {
+  if g.height < 2 or g.width == 0 { return valueShow(g) }
+  let lines = rows(g).map { r -> r.map { x -> x.show() }.join(", ") }
+  "[" + lines.join("; ") + "]"
+}
+
 // Ranges
 
 pub fn toList[T](r: Range[T]) -> List[T] {

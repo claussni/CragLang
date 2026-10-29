@@ -41,7 +41,7 @@ use crate::group::result_type;
 use crate::overload::{Ranked, most_specific};
 use crate::relate::{is_subtype, join, normalize, parent, subst};
 use crate::result::{ErrorKind, Site, TypeError};
-use crate::ty::{Ty, TyKind};
+use crate::ty::{Builtin, Ty, TyKind};
 
 /// A form applied to types: what a requirement asks of them.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
@@ -581,7 +581,7 @@ fn fit_slots<'db>(
                 pure: false,
             },
         );
-        match fill(db, program, name, &params, result, at, depth) {
+        match fill(db, program, name, &params, result, at, depth, false) {
             Ok(filling) => fillings.push(filling),
             Err(candidates) if candidates.is_empty() => {
                 return Err(FitError::Missing {
@@ -615,13 +615,45 @@ pub fn function_at<'db>(
     at: CallSite<'db>,
 ) -> Option<Filling<'db>> {
     let name = Name::new(db, name.to_string());
-    fill(db, program, name, params, result, at, 0).ok()
+    fill(db, program, name, params, result, at, 0, false).ok()
+}
+
+/// The `show` that a value of `ty` is written by where `at` is, when it is
+/// the type's own rather than the derived one (§19.11).
+pub fn own_show<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    ty: Ty<'db>,
+    at: CallSite<'db>,
+) -> Option<Filling<'db>> {
+    if ty.is_error(db) {
+        return None;
+    }
+    let text = Ty::new(db, TyKind::Builtin(Builtin::Str, Vec::new()));
+    // A `show` that writes its parts through itself is looked up in its own
+    // body, before its errors are known: its written success type counts.
+    let name = Name::new(db, "show".to_string());
+    let filling = fill(db, program, name, &[ty], text, at, 0, true).ok()?;
+    let derived = match &filling {
+        Filling::Function(instance) => {
+            let f = instance.function;
+            f.module(db).path(db) == crag_hir::PRELUDE
+                && crate::def::signature(db, program, f)
+                    .params
+                    .first()
+                    .is_some_and(|p| matches!(p.ty.kind(db), TyKind::Param(..)))
+        }
+        Filling::Slot(_) => false,
+    };
+    (!derived).then_some(filling)
 }
 
 /// The function that fills a slot with these parameter and result types:
 /// the most specific of the visible functions that accept the parameters
 /// and give the result, and the slots of the caller (§5.6.1). Without
-/// one, the functions that tie.
+/// one, the functions that tie. With `written`, a function's written
+/// success type stands for its result.
+#[allow(clippy::too_many_arguments)]
 fn fill<'db>(
     db: &'db dyn Db,
     program: Program,
@@ -630,8 +662,15 @@ fn fill<'db>(
     result: Ty<'db>,
     at: CallSite<'db>,
     depth: u32,
+    written: bool,
 ) -> Result<Filling<'db>, Vec<ItemId<'db>>> {
     let fits = |s: Ty<'db>, t: Ty<'db>| is_subtype(db, program, s, t);
+    let result_type = |db: &'db dyn Db, program: Program, f: ItemId<'db>| match written {
+        true => signature(db, program, f)
+            .result
+            .or_else(|| result_type(db, program, f)),
+        false => result_type(db, program, f),
+    };
     let mut found: Vec<(Filling<'db>, Ranked<'db>)> = Vec::new();
     let ranked = |function: ItemId<'db>, module: ModuleId, params: &[SigParam<'db>]| Ranked {
         function,
@@ -650,11 +689,13 @@ fn fill<'db>(
         if sig.params.len() != params.len() {
             continue;
         }
-        let Some(given) = result_type(db, program, f) else {
-            continue;
-        };
+        // The parameters are checked first: the result of a function that
+        // leaves its errors to inference is its body's, which may itself
+        // look for a function of the name.
         if sig.type_params == 0 {
-            if params.iter().zip(&sig.params).all(|(&p, q)| fits(p, q.ty)) && fits(given, result) {
+            if params.iter().zip(&sig.params).all(|(&p, q)| fits(p, q.ty))
+                && result_type(db, program, f).is_some_and(|given| fits(given, result))
+            {
                 let instance = Instance {
                     function: f,
                     args: Vec::new(),
@@ -683,7 +724,7 @@ fn fill<'db>(
             .zip(&sig.params)
             .all(|(&p, q)| fits(p, at_args(q.ty)));
         if accepts
-            && fits(at_args(given), result)
+            && result_type(db, program, f).is_some_and(|given| fits(at_args(given), result))
             && let Ok(instance) = instantiate_at(db, program, f, &args, at, depth + 1)
         {
             found.push((

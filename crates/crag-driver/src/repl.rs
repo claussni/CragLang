@@ -34,7 +34,7 @@ use crag_hir::{ItemKind, ModuleId, Owner, SourceFile, item_tree, module_scope};
 use crag_mir::{InstanceKey, Tier, mir};
 use crag_session::RunResult;
 use crag_syntax::{TokenKind, lex};
-use crag_types::Ty;
+use crag_types::{CallSite, Ty, own_show};
 
 use crate::debug::{Pause, Resume};
 use crate::diagnostics::{check, render_at};
@@ -44,6 +44,10 @@ use crate::scratch::Scratch;
 
 /// The name of the function an expression is the body of.
 pub const INPUT: &str = "__input";
+
+/// The name of the function that writes the input's value with the `show`
+/// its type has of its own (§19.11).
+const SHOWN: &str = "__shown";
 
 /// The path of the session's module.
 const SESSION: &str = "repl";
@@ -84,6 +88,8 @@ pub struct Repl {
     scratch: Scratch,
     /// The expression being run, while it is.
     input: Option<String>,
+    /// Whether its value is written by its type's own `show`.
+    own_show: bool,
     /// The definition being added, whose errors are shown as the input's.
     fresh: Option<usize>,
     /// The text of each file as the app runs it, while it runs.
@@ -115,7 +121,7 @@ struct Placed {
 }
 
 impl SessionModule {
-    fn layout(&self, input: Option<&str>) -> Placed {
+    fn layout(&self, input: Option<&str>, own_show: bool) -> Placed {
         let mut text = String::new();
         let mut starts = Vec::new();
         for entry in &self.entries {
@@ -128,6 +134,9 @@ impl SessionModule {
             let start = text.len() as u32;
             text += input;
             text += "\n}\n";
+            if own_show {
+                text += &format!("fn {SHOWN}() -> Str {{ show({INPUT}()) }}\n");
+            }
             start
         });
         Placed {
@@ -159,6 +168,23 @@ impl SessionModule {
             .filter_map(|&i| self.entries[i].names.first().cloned())
             .collect()
     }
+}
+
+/// The body of the session's function of this name, and its result.
+fn root<'a>(project: &'a Project, module: ModuleId, name: &str) -> (InstanceKey<'a>, Ty<'a>) {
+    let (db, program) = (&project.db, project.program);
+    let item = item_tree(db, module)
+        .items
+        .iter()
+        .map(|i| i.id)
+        .find(|id| *id.kind(db) == ItemKind::Function && id.name(db).text(db) == name)
+        .expect("the input's function");
+    let key = InstanceKey::body(db, Owner::Item(item));
+    let ty = mir(db, program, key, Tier::Baseline)
+        .as_ref()
+        .expect("the input's function has a body")
+        .result;
+    (key, ty)
 }
 
 /// Whether the text names one of the names. A name after `.` or `?.` is
@@ -263,6 +289,7 @@ impl Repl {
             },
             scratch,
             input: None,
+            own_show: false,
             fresh: None,
             app: None,
             shown_type: None,
@@ -802,6 +829,7 @@ impl Repl {
         self.apply();
         let result = self.run_input();
         self.input = None;
+        self.own_show = false;
         self.apply();
         result
     }
@@ -811,23 +839,23 @@ impl Repl {
         if !errors.is_empty() {
             return Err(errors);
         }
-        let (db, program) = (&self.project.db, self.project.program);
-        let item = item_tree(db, self.session.module)
-            .items
-            .iter()
-            .map(|i| i.id)
-            .find(|id| *id.kind(db) == ItemKind::Function && id.name(db).text(db) == INPUT)
-            .expect("the input's function");
-        let key = InstanceKey::body(db, Owner::Item(item));
-        let ty = mir(db, program, key, Tier::Baseline)
-            .as_ref()
-            .expect("the input's function has a body")
-            .result;
+        let (key, ty) = root(&self.project, self.session.module, INPUT);
+        let db = &self.project.db;
         self.shown_type = (ty != Ty::unit(db)).then(|| ty.display(db));
-        // `()` shows nothing.
-        let ran = match ty == Ty::unit(db) {
-            true => self.scratch.execute(&self.project, key),
-            false => self.scratch.show(&self.project, key, ty),
+        let at = CallSite {
+            module: self.session.module,
+            caller: None,
+        };
+        // `()` shows nothing, and a type's own `show` writes its value.
+        let ran = if ty == Ty::unit(db) {
+            self.scratch.execute(&self.project, key)
+        } else if own_show(db, self.project.program, ty, at).is_some() {
+            self.own_show = true;
+            self.apply();
+            let (key, text) = root(&self.project, self.session.module, SHOWN);
+            self.scratch.show(&self.project, key, text, true)
+        } else {
+            self.scratch.show(&self.project, key, ty, false)
         };
         Ok(match ran.map_err(|e| format!("error: {e}\n"))? {
             RunResult::Finished(_) => EvalOutput::Value(None),
@@ -839,7 +867,10 @@ impl Repl {
 
     /// Gives the session's module its text.
     fn apply(&mut self) {
-        let text = self.session.layout(self.input.as_deref()).text;
+        let text = self
+            .session
+            .layout(self.input.as_deref(), self.own_show)
+            .text;
         let file = self.session.module.file(&self.project.db);
         file.set_text(&mut self.project.db).to(text);
         self.project.read_resources();
@@ -891,7 +922,7 @@ impl Sources for Repl {
         if module != self.session.module {
             return self.project.locate(module, position);
         }
-        let layout = self.session.layout(self.input.as_deref());
+        let layout = self.session.layout(self.input.as_deref(), self.own_show);
         if let (Some(start), Some(input)) = (layout.input, &self.input)
             && position >= start
         {

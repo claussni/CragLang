@@ -59,7 +59,7 @@ pub use effect::{EffectSet, Restriction};
 pub use escape::{BindingsOnly, EscapeLevel, Escapes};
 pub use generic::{
     Bounds, CallSite, Filling, FitError, FormBound, FormDef, Instance, Slot, bounds, form_def,
-    instantiate, param_bound, slots, type_param_names,
+    instantiate, own_show, param_bound, slots, type_param_names,
 };
 pub use group::{
     Group, GroupMember, callees, error_members, error_type, function_effects, group_errors,

@@ -66,6 +66,9 @@ pub struct InferenceResult<'db> {
     pub holes: Vec<(ExprId, Ty<'db>)>,
     /// What a `for` calls to walk what it iterates, by the iterable.
     pub iterations: Vec<(ExprId, Iteration<'db>)>,
+    /// The `show` of its own that an interpolated value's type has, by the
+    /// value (§19.11).
+    pub shows: Vec<(ExprId, crate::generic::Filling<'db>)>,
     /// The trap handlers, by their `{ t -> … }`, with the trap type each
     /// takes; their bodies run in the function's frame (§8.3.1).
     pub trap_handlers: Vec<(ExprId, Ty<'db>)>,
@@ -105,6 +108,10 @@ impl<'db> InferenceResult<'db> {
             .iter()
             .find(|(e, _)| *e == id)
             .map(|(_, i)| i)
+    }
+
+    pub fn show(&self, id: ExprId) -> Option<&crate::generic::Filling<'db>> {
+        self.shows.iter().find(|(e, _)| *e == id).map(|(_, f)| f)
     }
 
     pub fn optional(&self, id: ExprId) -> Option<&Optional<'db>> {

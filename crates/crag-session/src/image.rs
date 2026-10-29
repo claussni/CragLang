@@ -251,7 +251,12 @@ impl Image {
                 Ok(words) => Message::Finished(words),
                 Err(reply) => reply,
             },
-            Message::Show { func, shapes, root } => self.show(func, &shapes, root),
+            Message::Show {
+                func,
+                shapes,
+                root,
+                text,
+            } => self.show(func, &shapes, root, text),
             Message::Start(func) => self.start(func),
             Message::Status => self.status(),
             Message::Stop => self.stop(),
@@ -480,8 +485,8 @@ impl Image {
     }
 
     /// Runs a function as `run` does and shows its result, which it then
-    /// releases.
-    fn show(&mut self, func: FuncId, shapes: &Shapes, root: u32) -> Message {
+    /// releases: with `as_text`, a string as it is.
+    fn show(&mut self, func: FuncId, shapes: &Shapes, root: u32, as_text: bool) -> Message {
         let words = match self.run(func) {
             Ok(words) => words,
             Err(reply) => return reply,
@@ -498,7 +503,10 @@ impl Image {
         // SAFETY: the host describes the function's result, which the run
         // left to the image.
         let text = unsafe {
-            let text = print_value(&words, shapes, root, &types, PrintLimits::default());
+            let text = match as_text {
+                true => String::from_utf8_lossy(crag_runtime::text::bytes_of(&words)).into_owned(),
+                false => print_value(&words, shapes, root, &types, PrintLimits::default()),
+            };
             release_value(self.worker.heap(), &types, &words, shapes, root);
             text
         };

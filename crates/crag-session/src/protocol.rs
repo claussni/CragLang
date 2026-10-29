@@ -34,7 +34,7 @@ use crag_abi::{
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -83,11 +83,14 @@ pub enum Message {
     /// From the image: SIGINT stopped the run at a safepoint.
     Interrupted,
     /// From the host: runs a function as `Run` does, and shows its result,
-    /// of the shape `root` of `shapes`, then releases it (§11.6.5).
+    /// of the shape `root` of `shapes`, then releases it (§11.6.5). With
+    /// `text`, the result is a `Str` that is shown as it is: what a type's
+    /// own `show` wrote (§19.11).
     Show {
         func: FuncId,
         shapes: Shapes,
         root: u32,
+        text: bool,
     },
     /// From the image: the result of a `Show`, as text.
     Shown(String),
@@ -275,11 +278,17 @@ impl Message {
                 w.text(why);
             }
             Message::Interrupted => w.u8(INTERRUPTED),
-            Message::Show { func, shapes, root } => {
+            Message::Show {
+                func,
+                shapes,
+                root,
+                text,
+            } => {
                 w.u8(SHOW);
                 w.u32(func.0);
                 w.shapes(shapes);
                 w.u32(*root);
+                w.u8(u8::from(*text));
             }
             Message::Shown(text) => {
                 w.u8(SHOWN);
@@ -394,7 +403,16 @@ impl Message {
                 if root as usize >= shapes.shapes.len() {
                     return Err(invalid(format!("the shape {root} of a shorter table")));
                 }
-                Message::Show { func, shapes, root }
+                let text = r.u8()? != 0;
+                if text && !matches!(shapes.shapes[root as usize], crag_abi::Shape::Str) {
+                    return Err(invalid("text shown of another shape than a string".into()));
+                }
+                Message::Show {
+                    func,
+                    shapes,
+                    root,
+                    text,
+                }
             }
             SHOWN => Message::Shown(r.text()?),
             START => Message::Start(FuncId(r.u32()?)),
@@ -1059,6 +1077,7 @@ mod tests {
                     boxes: vec![(0, 7, 32), (4, 9, 16), (5, 10, 40)],
                 },
                 root: 2,
+                text: false,
             },
             Message::Shown("Point(x: 1.50, next: Nil)".into()),
         ]
@@ -1257,6 +1276,7 @@ mod tests {
                 func: FuncId(1),
                 shapes,
                 root: 0,
+                text: false,
             };
             let err = Message::decode(&show.encode()).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidData);

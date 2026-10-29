@@ -1317,6 +1317,17 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
 
     /// The signature of a concrete instance, its type arguments in place,
     /// with the result inference gives when none is written.
+    /// Whether a type's own `show` gives a plain `Str`, so it writes the
+    /// value; one that may fail leaves it to the derived `show`.
+    fn writes_text(&self, show: Option<&Filling<'db>>) -> bool {
+        let (db, program) = (self.db, self.program);
+        let Some(instance) = show.and_then(|f| self.filled(f)) else {
+            return false;
+        };
+        let result = result_type(db, program, instance.function);
+        result.is_some_and(|t| matches!(t.as_builtin(db), Some((Builtin::Str, _))))
+    }
+
     fn instance_signature(&self, instance: &Instance<'db>) -> Signature<'db> {
         let (db, program) = (self.db, self.program);
         let sig = signature(db, program, instance.function);
@@ -2892,6 +2903,19 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         {
                             let op = self.expr(*e);
                             ops.push(self.coerce(op, self.ty(*e), ty));
+                        }
+                        // A value whose type has a `show` of its own is
+                        // written by it (§19.11).
+                        StrPart::Expr(e) if self.writes_text(self.types.show(*e)) => {
+                            let filling = self.types.show(*e).cloned().expect("a show");
+                            let op = self.expr(*e);
+                            let args = vec![(op, self.ty(*e))];
+                            match self.call_filled(&filling, args, *e) {
+                                Some((text, text_ty)) => {
+                                    ops.push(self.coerce(Operand::Local(text), text_ty, ty))
+                                }
+                                None => return self.trap(TrapKind::Error, Some(*e)),
+                            }
                         }
                         // Any other value is written as text, a number as
                         // such and the rest as `show` writes it by its
