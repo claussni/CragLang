@@ -55,12 +55,12 @@ pub use def::{
     c_out, c_signature, is_cstr, place_positional, prelude_item, signature, success_type, type_def,
     type_header, type_parent, value_type,
 };
-pub use derive::{Derived, own_derived, reaches_own};
+pub use derive::{Derived, derived_op, derived_parts};
 pub use effect::{EffectSet, Restriction};
 pub use escape::{BindingsOnly, EscapeLevel, Escapes};
 pub use generic::{
     Bounds, CallSite, Filling, FitError, FormBound, FormDef, Instance, Slot, bounds, form_def,
-    instantiate, own_show, param_bound, slots, type_param_names,
+    instantiate, param_bound, slots, type_param_names, written_show,
 };
 pub use group::{
     Group, GroupMember, callees, error_members, error_type, function_effects, group_errors,

@@ -3004,8 +3004,8 @@ impl<'a, 'db> Infer<'a, 'db> {
     }
 
     /// An interpolated value is written by the `show` its type has where
-    /// the string is, when that is its own rather than the derived one; a
-    /// string or a code point is written as it is (§19.11).
+    /// the string is, unless the runtime's walk writes it; a string or a
+    /// code point is written as it is (§19.11).
     fn interpolated(&mut self, id: ExprId, ty: Ty<'db>) {
         let (db, program) = (self.db, self.program);
         let plain = matches!(
@@ -3015,7 +3015,7 @@ impl<'a, 'db> Infer<'a, 'db> {
         if plain {
             return;
         }
-        if let Some(filling) = crate::generic::own_show(db, program, ty, self.call_site()) {
+        if let Some(filling) = crate::generic::written_show(db, program, ty, self.call_site()) {
             self.shows.push((id, filling));
         }
     }

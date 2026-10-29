@@ -120,6 +120,10 @@ pub struct Instance<'db> {
     pub args: Vec<Ty<'db>>,
     /// One per slot of the function, in the order of `slots`.
     pub fillings: Vec<Filling<'db>>,
+    /// For one of the prelude's derived functions, the functions of their
+    /// own that the parts of its type argument have where the call is
+    /// written, each with the part's type (§19.11).
+    pub parts: Vec<(Ty<'db>, Filling<'db>)>,
 }
 
 /// The function that fills a slot.
@@ -477,7 +481,34 @@ pub fn instantiate<'db>(
     args: &[Ty<'db>],
     at: CallSite<'db>,
 ) -> Result<Instance<'db>, FitError<'db>> {
-    instantiate_at(db, program, function, args, at, 0)
+    instantiate_at(db, program, function, args, at, 0).map(|i| with_parts(db, program, i, at))
+}
+
+/// How `fill` looks a function up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lookup {
+    /// For a call: a derived function the lookup chooses gets its parts.
+    Call,
+    /// For a function of a type's own: one that writes its parts through
+    /// itself is looked up in its own body, before its errors are known,
+    /// so its written success type counts; a derived one needs no parts.
+    Own,
+}
+
+/// The instance with the parts of its type argument, when it is one of
+/// the prelude's derived functions.
+fn with_parts<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    mut instance: Instance<'db>,
+    at: CallSite<'db>,
+) -> Instance<'db> {
+    if let Some(op) = crate::derive::derived_op(db, program, instance.function)
+        && let [ty] = instance.args[..]
+    {
+        instance.parts = crate::derive::own_parts(db, program, op, ty, at);
+    }
+    instance
 }
 
 fn instantiate_at<'db>(
@@ -527,6 +558,7 @@ fn instantiate_at<'db>(
         function,
         args: args.to_vec(),
         fillings,
+        parts: Vec::new(),
     })
 }
 
@@ -581,7 +613,7 @@ fn fit_slots<'db>(
                 pure: false,
             },
         );
-        match fill(db, program, name, &params, result, at, depth, false) {
+        match fill(db, program, name, &params, result, at, depth, Lookup::Call) {
             Ok(filling) => fillings.push(filling),
             Err(candidates) if candidates.is_empty() => {
                 return Err(FitError::Missing {
@@ -615,12 +647,13 @@ pub fn function_at<'db>(
     at: CallSite<'db>,
 ) -> Option<Filling<'db>> {
     let name = Name::new(db, name.to_string());
-    fill(db, program, name, params, result, at, 0, false).ok()
+    fill(db, program, name, params, result, at, 0, Lookup::Call).ok()
 }
 
-/// The `show` that a value of `ty` is written by where `at` is, when it is
-/// the type's own rather than the derived one (§19.11).
-pub fn own_show<'db>(
+/// The `show` that a value of `ty` is written by where `at` is, unless the
+/// runtime's walk writes it: the type's own, or the derived one when the
+/// value has parts with a `show` of their own there (§19.11).
+pub fn written_show<'db>(
     db: &'db dyn Db,
     program: Program,
     ty: Ty<'db>,
@@ -630,7 +663,12 @@ pub fn own_show<'db>(
         return None;
     }
     let text = Ty::new(db, TyKind::Builtin(Builtin::Str, Vec::new()));
-    own_filling(db, program, "show", &[ty], text, at)
+    if let Some(own) = own_filling(db, program, "show", &[ty], text, at) {
+        return Some(own);
+    }
+    let derived = crate::derive::derived_function(db, program, crate::derive::Derived::Show)?;
+    let instance = instantiate(db, program, derived, &[ty], at).ok()?;
+    (!instance.parts.is_empty()).then_some(Filling::Function(instance))
 }
 
 /// The function of the name that these parameter and result types call
@@ -646,7 +684,7 @@ pub(crate) fn own_filling<'db>(
     at: CallSite<'db>,
 ) -> Option<Filling<'db>> {
     let name = Name::new(db, name.to_string());
-    let filling = fill(db, program, name, params, result, at, 0, true).ok()?;
+    let filling = fill(db, program, name, params, result, at, 0, Lookup::Own).ok()?;
     let derived = match &filling {
         Filling::Function(instance) => {
             let f = instance.function;
@@ -664,8 +702,7 @@ pub(crate) fn own_filling<'db>(
 /// The function that fills a slot with these parameter and result types:
 /// the most specific of the visible functions that accept the parameters
 /// and give the result, and the slots of the caller (§5.6.1). Without
-/// one, the functions that tie. With `written`, a function's written
-/// success type stands for its result.
+/// one, the functions that tie.
 #[allow(clippy::too_many_arguments)]
 fn fill<'db>(
     db: &'db dyn Db,
@@ -675,14 +712,14 @@ fn fill<'db>(
     result: Ty<'db>,
     at: CallSite<'db>,
     depth: u32,
-    written: bool,
+    lookup: Lookup,
 ) -> Result<Filling<'db>, Vec<ItemId<'db>>> {
     let fits = |s: Ty<'db>, t: Ty<'db>| is_subtype(db, program, s, t);
-    let result_type = |db: &'db dyn Db, program: Program, f: ItemId<'db>| match written {
-        true => signature(db, program, f)
+    let result_type = |db: &'db dyn Db, program: Program, f: ItemId<'db>| match lookup {
+        Lookup::Own => signature(db, program, f)
             .result
             .or_else(|| result_type(db, program, f)),
-        false => result_type(db, program, f),
+        Lookup::Call => result_type(db, program, f),
     };
     let mut found: Vec<(Filling<'db>, Ranked<'db>)> = Vec::new();
     let ranked = |function: ItemId<'db>, module: ModuleId, params: &[SigParam<'db>]| Ranked {
@@ -713,6 +750,7 @@ fn fill<'db>(
                     function: f,
                     args: Vec::new(),
                     fillings: Vec::new(),
+                    parts: Vec::new(),
                 };
                 found.push((
                     Filling::Function(instance),
@@ -760,7 +798,12 @@ fn fill<'db>(
     }
     let ranks: Vec<Ranked<'db>> = found.iter().map(|(_, r)| r.clone()).collect();
     match most_specific(db, program, &ranks).as_slice() {
-        [one] => Ok(found.swap_remove(*one).0),
+        [one] => Ok(match found.swap_remove(*one).0 {
+            Filling::Function(instance) if lookup == Lookup::Call => {
+                Filling::Function(with_parts(db, program, instance, at))
+            }
+            filling => filling,
+        }),
         _ => Err(ranks.into_iter().map(|r| r.function).collect()),
     }
 }

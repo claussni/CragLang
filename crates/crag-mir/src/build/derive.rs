@@ -22,17 +22,18 @@
 //! `show` meets such a part, `valueEquals[T]` and the others get code for
 //! the structure of `T` instead: a record field by field, a union by its
 //! member, a list element by element, a map entry by entry. Each part goes
-//! to its type's own function, as the module that declares the type sees
-//! it, to the code for its structure in turn, or else to the runtime's
-//! walk. A record type with subtypes goes by the type of the value's box,
-//! as the walk does. Entries of maps and sets are shown in the order the
-//! map holds them.
+//! to its type's own function where the derived function is called, which
+//! the instance carries as its parts and which its walks share, to the
+//! code for its structure in turn, or else to the runtime's walk. A record
+//! type with subtypes goes by the type of the value's box, as the walk
+//! does. Entries of maps and sets are shown in the order the map holds
+//! them.
 
 use crag_db::Db;
 use crag_hir::{ItemId, ItemKind, Name, Owner, PRELUDE, Program, item_tree, module_index};
 use crag_types::{
-    Builtin, Derived, Instance, Step, Ty, TyKind, TypeDefKind, fields_of, own_derived, parent,
-    prelude_item, reaches_own, record_subtypes, subst, type_def,
+    Builtin, Derived, Instance, Step, Ty, TyKind, TypeDefKind, derived_parts, fields_of, parent,
+    prelude_item, record_subtypes, subst, type_def,
 };
 
 use super::{MirBuilder, Start, int};
@@ -65,15 +66,12 @@ pub(super) fn value_function<'db>(
 
 /// Whether an instance is the walk of a derived function that has code for
 /// the structure of its type, though the function has no body.
-pub fn has_derived_code<'db>(
-    db: &'db dyn Db,
-    program: Program,
-    instance: InstanceKey<'db>,
-) -> bool {
+pub fn has_derived_code<'db>(db: &'db dyn Db, instance: InstanceKey<'db>) -> bool {
     match (*instance.owner(db), instance.args(db).as_slice()) {
-        (Owner::Item(item), &[ty]) => {
+        (Owner::Item(item), [_]) => {
             *instance.entry(db) == Entry::Body
-                && value_op(db, item).is_some_and(|op| reaches_own(db, program, op, ty))
+                && value_op(db, item).is_some()
+                && !instance.parts(db).is_empty()
         }
         _ => false,
     }
@@ -125,7 +123,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         ty: Ty<'db>,
         values: Vec<Operand<'db>>,
     ) -> Operand<'db> {
-        if !reaches_own(self.db, self.program, op, ty) {
+        if !self.reaches(op, ty) {
             return self.walked(op, ty, values);
         }
         let Some(item) = value_function(self.db, self.program, op) else {
@@ -136,16 +134,46 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Owner::Item(item),
             vec![ty],
             Vec::new(),
+            self.instance.parts(self.db).clone(),
             Entry::Body,
         );
         let result = self.derived_result(op);
         Operand::Local(self.call_code(code, values, result, SITE))
     }
 
+    /// The function of its own a part of a type has where the derived
+    /// function was called.
+    fn own_part(&self, ty: Ty<'db>) -> Option<Instance<'db>> {
+        let parts = self.instance.parts(self.db);
+        parts.iter().find(|(t, _)| *t == ty).map(|(_, f)| f.clone())
+    }
+
+    /// Whether the derived function of a form, for a type, meets one of
+    /// the parts with a function of its own; otherwise the runtime walks
+    /// its values by their structure alone.
+    pub(super) fn reaches(&self, op: Derived, ty: Ty<'db>) -> bool {
+        if self.instance.parts(self.db).is_empty() {
+            return false;
+        }
+        let mut seen = vec![ty];
+        let mut pending = derived_parts(self.db, self.program, op, ty);
+        while let Some(part) = pending.pop() {
+            if seen.contains(&part) {
+                continue;
+            }
+            if self.own_part(part).is_some() {
+                return true;
+            }
+            seen.push(part);
+            pending.extend(derived_parts(self.db, self.program, op, part));
+        }
+        false
+    }
+
     /// What the walk gives for a part: by its type's own function, else as
     /// for the whole.
     fn part(&mut self, op: Derived, ty: Ty<'db>, values: Vec<Operand<'db>>) -> Operand<'db> {
-        match own_derived(self.db, self.program, op, ty) {
+        match self.own_part(ty) {
             Some(own) => self.own(op, &own, ty, values),
             None => self.derived(op, ty, values),
         }
@@ -283,7 +311,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         cases.sort_by_key(key);
                         cases.push(ty);
                         self.by_case(op, ty, &cases, values, |b, op, case, values| {
-                            match own_derived(db, program, op, case).filter(|_| case != ty) {
+                            match b.own_part(case).filter(|_| case != ty) {
                                 Some(own) => b.own(op, &own, case, values),
                                 None => b.fields(op, case, values),
                             }
@@ -415,7 +443,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let db = self.db;
         if let TyKind::Named(item, _) = case.kind(db)
             && let TypeDefKind::Tag = type_def(db, self.program, *item).kind
-            && own_derived(db, self.program, op, case).is_none()
+            && self.own_part(case).is_none()
         {
             return match op {
                 Derived::Show => Operand::Const(Constant::Str(item.name(db).text(db).clone())),

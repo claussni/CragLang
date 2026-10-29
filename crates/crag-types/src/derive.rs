@@ -30,7 +30,7 @@ use crag_hir::{
 };
 
 use crate::def::{TypeDefKind, signature, type_def};
-use crate::generic::{CallSite, Filling, Instance, form_def, own_filling};
+use crate::generic::{CallSite, Filling, form_def, own_filling};
 use crate::relate::{fields_of, parent, record_subtypes, subst};
 use crate::result::{ErrorKind, Site, TypeError};
 use crate::ty::{Builtin, Ty, TyKind};
@@ -74,96 +74,123 @@ impl Derived {
 
 /// The prelude's generic function the form derives, which serves every
 /// type by its structure.
-fn derived_function<'db>(db: &'db dyn Db, program: Program, op: Derived) -> Option<ItemId<'db>> {
+pub(crate) fn derived_function<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    op: Derived,
+) -> Option<ItemId<'db>> {
     let module = *crag_hir::module_index(db, program).modules.get(PRELUDE)?;
     let name = Name::new(db, op.name().to_string());
     let Some(Resolution::Value { functions, .. }) = module_scope(db, program, module).resolve(name)
     else {
         return None;
     };
-    functions.iter().copied().find(|&f| {
-        let sig = signature(db, program, f);
-        sig.type_params == 1
-            && sig
-                .params
-                .first()
-                .is_some_and(|p| matches!(p.ty.kind(db), TyKind::Param(..)))
-    })
+    functions
+        .iter()
+        .copied()
+        .find(|&f| derived_op(db, program, f) == Some(op))
 }
 
-/// A named type's own function of a derived form, as the module that
-/// declares the type sees it: the most specific function there that takes
-/// the type, unless that is the prelude's derived one (§19.11).
-pub fn own_derived<'db>(
-    db: &'db dyn Db,
-    program: Program,
-    op: Derived,
-    ty: Ty<'db>,
-) -> Option<Instance<'db>> {
-    let TyKind::Named(item, _) = ty.kind(db) else {
+/// The derived function a function is, if it is one of the prelude's.
+pub fn derived_op(db: &dyn Db, program: Program, function: ItemId<'_>) -> Option<Derived> {
+    if function.module(db).path(db) != PRELUDE {
         return None;
-    };
-    let result = signature(db, program, derived_function(db, program, op)?).result?;
-    let at = CallSite {
-        module: *item.module(db),
-        caller: None,
-    };
-    match own_filling(db, program, op.name(), &vec![ty; op.arity()], result, at)? {
-        Filling::Function(instance) => Some(instance),
-        Filling::Slot(_) => None,
     }
+    let op = match function.name(db).text(db).as_str() {
+        "equals" => Derived::Equals,
+        "compare" => Derived::Compare,
+        "hash" => Derived::Hash,
+        "show" => Derived::Show,
+        _ => return None,
+    };
+    let sig = signature(db, program, function);
+    let generic = sig.type_params == 1
+        && sig
+            .params
+            .first()
+            .is_some_and(|p| matches!(p.ty.kind(db), TyKind::Param(..)));
+    generic.then_some(op)
 }
 
-/// Whether the derived function of a form, for a type, meets a part of a
-/// value with a function of its own: a field, a member, an element, a
-/// map's value, or a subtype's value of a record type. Without one, it
-/// walks the value by its structure alone (Plan §11.6.5). Map keys and set
-/// members are found by their structure, so they count only for `show`.
-pub fn reaches_own<'db>(db: &'db dyn Db, program: Program, op: Derived, ty: Ty<'db>) -> bool {
-    reaches(db, program, op, ty, &mut Vec::new())
-}
-
-fn reaches<'db>(
+/// The parts of a type's values that the derived function of a form
+/// meets: the fields of a record, the subtypes of a record type, a
+/// conditioned alias's target, the members of a union, the elements of a
+/// list, and the entries of a map or set. Map keys and set members are
+/// found by their structure, so they count only for `show`; maps and sets
+/// have no order.
+pub fn derived_parts<'db>(
     db: &'db dyn Db,
     program: Program,
     op: Derived,
     ty: Ty<'db>,
-    seen: &mut Vec<Ty<'db>>,
-) -> bool {
-    if seen.contains(&ty) {
-        return false;
-    }
-    seen.push(ty);
-    let any = |tys: Vec<Ty<'db>>, seen: &mut Vec<Ty<'db>>| {
-        tys.into_iter()
-            .any(|t| own_derived(db, program, op, t).is_some() || reaches(db, program, op, t, seen))
-    };
+) -> Vec<Ty<'db>> {
     match ty.kind(db) {
         TyKind::Named(item, args) => match &type_def(db, program, *item).kind {
             TypeDefKind::Record { .. } => {
                 let fields = fields_of(db, program, ty).unwrap_or_default();
-                any(fields.into_iter().map(|(_, t)| t).collect(), seen)
-                    || any(record_subtypes(db, program, ty), seen)
+                let mut parts: Vec<Ty<'db>> = fields.into_iter().map(|(_, t)| t).collect();
+                parts.extend(record_subtypes(db, program, ty));
+                parts
             }
             TypeDefKind::Refined(target) | TypeDefKind::Alias(target) => {
-                any(vec![subst(db, program, *target, *item, args)], seen)
+                vec![subst(db, program, *target, *item, args)]
             }
-            _ => false,
+            _ => Vec::new(),
         },
         TyKind::Record {
             fields,
             open: false,
-        } => any(fields.iter().map(|&(_, t)| t).collect(), seen),
-        TyKind::Union(members) => any(members.clone(), seen),
-        TyKind::Builtin(Builtin::List, args) => any(args.clone(), seen),
+        } => fields.iter().map(|&(_, t)| t).collect(),
+        TyKind::Union(members) => members.clone(),
+        TyKind::Builtin(Builtin::List, args) => args.clone(),
         TyKind::Builtin(Builtin::Map, args) => match op {
-            Derived::Show => any(args.clone(), seen),
-            Derived::Equals | Derived::Hash => any(args.iter().skip(1).copied().collect(), seen),
-            Derived::Compare => false,
+            Derived::Show => args.clone(),
+            Derived::Equals | Derived::Hash => args.iter().skip(1).copied().collect(),
+            Derived::Compare => Vec::new(),
         },
-        TyKind::Builtin(Builtin::Set, args) => op == Derived::Show && any(args.clone(), seen),
-        _ => false,
+        TyKind::Builtin(Builtin::Set, args) if op == Derived::Show => args.clone(),
+        _ => Vec::new(),
     }
+}
+
+/// The parts of a type's values, at any depth, that have a function of
+/// the form of their own where `at` is, each with that function: the
+/// functions the derived one for the type calls (§19.11). A part with one
+/// is not looked into. Only named types and type parameters have one; the
+/// prelude's functions of numbers and text agree with the runtime's walk.
+pub(crate) fn own_parts<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    op: Derived,
+    ty: Ty<'db>,
+    at: CallSite<'db>,
+) -> Vec<(Ty<'db>, Filling<'db>)> {
+    let Some(result) =
+        derived_function(db, program, op).and_then(|f| signature(db, program, f).result)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen = vec![ty];
+    let mut pending: std::collections::VecDeque<Ty<'db>> =
+        derived_parts(db, program, op, ty).into();
+    while let Some(part) = pending.pop_front() {
+        if seen.contains(&part) {
+            continue;
+        }
+        seen.push(part);
+        let own = match part.kind(db) {
+            TyKind::Named(..) | TyKind::Param(..) => {
+                own_filling(db, program, op.name(), &vec![part; op.arity()], result, at)
+            }
+            _ => None,
+        };
+        match own {
+            Some(filling) => out.push((part, filling)),
+            None => pending.extend(derived_parts(db, program, op, part)),
+        }
+    }
+    out
 }
 
 /// Whether a type forbids the form named `form`, itself or through a

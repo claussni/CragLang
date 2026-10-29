@@ -61,31 +61,39 @@ pub struct InstanceKey<'db> {
     pub args: Vec<Ty<'db>>,
     #[returns(ref)]
     pub fillings: Vec<Instance<'db>>,
+    /// For a derived function and its walk, the functions of their own
+    /// that the parts of its type argument have where it is called
+    /// (§19.11), each with the part's type, as concrete as the instance.
+    #[returns(ref)]
+    pub parts: Vec<(Ty<'db>, Instance<'db>)>,
     pub entry: Entry,
 }
 
 impl<'db> InstanceKey<'db> {
     /// The body of an owner that is not generic.
     pub fn body(db: &'db dyn Db, owner: Owner<'db>) -> InstanceKey<'db> {
-        InstanceKey::new(db, owner, Vec::new(), Vec::new(), Entry::Body)
+        InstanceKey::new(db, owner, Vec::new(), Vec::new(), Vec::new(), Entry::Body)
     }
 
     /// The body of a concrete instance of a function: its type arguments,
-    /// and slot fillings that name no slot.
+    /// and slot fillings and parts that name no slot.
     pub fn of(db: &'db dyn Db, instance: &Instance<'db>) -> InstanceKey<'db> {
-        let fillings: Vec<Instance<'db>> = instance
-            .fillings
+        let function = |f: &Filling<'db>| match f {
+            Filling::Function(i) => Some(i.clone()),
+            Filling::Slot(_) => None,
+        };
+        let fillings: Vec<Instance<'db>> = instance.fillings.iter().filter_map(function).collect();
+        let parts: Vec<(Ty<'db>, Instance<'db>)> = instance
+            .parts
             .iter()
-            .filter_map(|f| match f {
-                Filling::Function(i) => Some(i.clone()),
-                Filling::Slot(_) => None,
-            })
+            .filter_map(|(ty, f)| Some((*ty, function(f)?)))
             .collect();
         InstanceKey::new(
             db,
             Owner::Item(instance.function),
             instance.args.clone(),
             fillings,
+            parts,
             Entry::Body,
         )
     }
@@ -97,6 +105,7 @@ impl<'db> InstanceKey<'db> {
             *self.owner(db),
             self.args(db).clone(),
             self.fillings(db).clone(),
+            self.parts(db).clone(),
             entry,
         )
     }
@@ -152,6 +161,7 @@ pub fn handler_code<'db>(db: &'db dyn Db, handler: &Handler<'db>) -> InstanceKey
             db,
             Owner::Item(*item),
             args.clone(),
+            Vec::new(),
             Vec::new(),
             Entry::Closure(*expr),
         ),

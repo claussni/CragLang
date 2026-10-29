@@ -3274,7 +3274,7 @@ impl<'a, 'db> Lower<'a, 'db> {
         if *func.entry(db) == Entry::Body
             && hir_body(db, self.program, Owner::Item(item)).root.is_none()
             && crag_hir::c_function(db, item).is_none()
-            && !crag_mir::has_derived_code(db, self.program, func)
+            && !crag_mir::has_derived_code(db, func)
         {
             return Err("builtin functions");
         }

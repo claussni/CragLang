@@ -41,11 +41,11 @@ use crag_hir::{
     lower_body,
 };
 use crag_types::{
-    Builtin, CForm, Callee, DecisionTree, Derived, Dispatch, EscapeLevel, Filling, Handler,
-    HandlerCode, InferenceResult, Instance, Iteration, ListLen, Position, SigParam, Signature,
-    Step, Ty, TyKind, TypeDefKind, Value, body_types, decision_tree_with, declared_fields,
-    dispose_handler, fields_of, lifecycle_handler, literal_value, prelude_item, reaches_own,
-    result_type, signature, subst, type_def, type_header, value_type,
+    Builtin, CForm, Callee, DecisionTree, Dispatch, EscapeLevel, Filling, Handler, HandlerCode,
+    InferenceResult, Instance, Iteration, ListLen, Position, SigParam, Signature, Step, Ty, TyKind,
+    TypeDefKind, Value, body_types, decision_tree_with, declared_fields, derived_op,
+    dispose_handler, fields_of, lifecycle_handler, literal_value, prelude_item, result_type,
+    signature, subst, type_def, type_header, value_type,
 };
 
 use crate::ir::{
@@ -89,7 +89,7 @@ pub fn build<'db>(
     // The derived walk of a type that meets parts with functions of their
     // own has code for its structure.
     let derived = match (owner, instance.args(db).as_slice()) {
-        (Owner::Item(item), &[ty]) if derive::has_derived_code(db, program, instance) => {
+        (Owner::Item(item), &[ty]) if derive::has_derived_code(db, instance) => {
             derive::value_op(db, item).map(|op| (op, ty))
         }
         _ => None,
@@ -750,6 +750,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 Owner::Item(*item),
                 args.clone(),
                 Vec::new(),
+                Vec::new(),
                 Entry::Check,
             );
             let int_ty = self.int();
@@ -800,6 +801,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             db,
             Owner::Item(*item),
             args.clone(),
+            Vec::new(),
             Vec::new(),
             Entry::Check,
         );
@@ -1067,6 +1069,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             Owner::Item(*item),
             args.clone(),
             Vec::new(),
+            Vec::new(),
             Entry::Dispose,
         ))
     }
@@ -1292,24 +1295,36 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
 
     /// An instance a call in the body names, with the instance's type
     /// arguments in place and its slots replaced by their fillings: one
-    /// that names no slot.
+    /// that names no slot. A part that a slot fills with the derived
+    /// function itself is left to the walk.
     fn concrete(&self, instance: &Instance<'db>) -> Option<Instance<'db>> {
+        let concrete = |f: &Filling<'db>| match f {
+            Filling::Function(i) => self.concrete(i).map(Filling::Function),
+            Filling::Slot(k) => self
+                .fillings
+                .get(*k as usize)
+                .cloned()
+                .map(Filling::Function),
+        };
         let fillings = instance
             .fillings
             .iter()
-            .map(|f| match f {
-                Filling::Function(i) => self.concrete(i).map(Filling::Function),
-                Filling::Slot(k) => self
-                    .fillings
-                    .get(*k as usize)
-                    .cloned()
-                    .map(Filling::Function),
-            })
+            .map(concrete)
             .collect::<Option<Vec<_>>>()?;
+        let mut parts = Vec::new();
+        for (ty, f) in &instance.parts {
+            let filling = concrete(f)?;
+            let walked = matches!(&filling, Filling::Function(i)
+                if i.parts.is_empty() && derived_op(self.db, self.program, i.function).is_some());
+            if !walked {
+                parts.push((self.subst(*ty), filling));
+            }
+        }
         Some(Instance {
             function: instance.function,
             args: instance.args.iter().map(|&t| self.subst(t)).collect(),
             fillings,
+            parts,
         })
     }
 
@@ -1321,6 +1336,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 function: *function,
                 args: Vec::new(),
                 fillings: Vec::new(),
+                parts: Vec::new(),
             }),
             Callee::Instance(instance) => self.concrete(instance),
             Callee::Slot(slot) => self.fillings.get(*slot as usize).cloned(),
@@ -2074,13 +2090,6 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     fn intrinsic(&self, instance: &Instance<'db>) -> Option<Intrinsic<'db>> {
         let db = self.db;
         let function = instance.function;
-        // A walk that meets parts with functions of their own has code.
-        if let Some(op) = derive::value_op(db, function)
-            && let Some(&ty) = instance.args.first()
-            && reaches_own(db, self.program, op, ty)
-        {
-            return None;
-        }
         if hir_body(db, self.program, Owner::Item(function))
             .root
             .is_some()
@@ -2937,13 +2946,6 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                                 None => return self.trap(TrapKind::Error, Some(*e)),
                             }
                         }
-                        // So is a value with such a part.
-                        StrPart::Expr(e)
-                            if reaches_own(db, self.program, Derived::Show, self.ty(*e)) =>
-                        {
-                            let op = self.expr(*e);
-                            ops.push(self.derived(Derived::Show, self.ty(*e), vec![op]));
-                        }
                         // Any other value is written as text, a number as
                         // such and the rest as `show` writes it by its
                         // structure; in a local, so its type stays known.
@@ -3205,7 +3207,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let (func, ty) = match single {
             true => (InstanceKey::body(db, owner), ty),
             false => {
-                let part = InstanceKey::new(db, owner, Vec::new(), Vec::new(), Entry::Part);
+                let part =
+                    InstanceKey::new(db, owner, Vec::new(), Vec::new(), Vec::new(), Entry::Part);
                 (part, self.ty(expr))
             }
         };
@@ -3770,6 +3773,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 return self.number_value(expr, *value);
             }
             return self.map_type(expr, mapping, *value);
+        }
+        // A walk that meets parts with functions of their own has code.
+        if fields.is_none()
+            && let Some(op) = derive::value_op(self.db, instance.function)
+            && let Some(&ty) = instance.args.first()
+            && self.reaches(op, ty)
+        {
+            let ops = positional.iter().map(|&arg| self.expr(arg)).collect();
+            return self.derived(op, ty, ops);
         }
         if fields.is_none()
             && let Some(intrinsic) = self.intrinsic(instance)
@@ -4391,6 +4403,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     db,
                     Owner::Item(*item),
                     args.clone(),
+                    Vec::new(),
                     Vec::new(),
                     Entry::Default(default),
                 );

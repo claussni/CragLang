@@ -34,7 +34,7 @@ use crag_hir::{ItemKind, ModuleId, Owner, SourceFile, item_tree, module_scope};
 use crag_mir::{InstanceKey, Tier, mir};
 use crag_session::RunResult;
 use crag_syntax::{TokenKind, lex};
-use crag_types::{CallSite, Derived, Ty, own_show, reaches_own};
+use crag_types::{CallSite, Ty, written_show};
 
 use crate::debug::{Pause, Resume};
 use crate::diagnostics::{check, render_at};
@@ -88,7 +88,8 @@ pub struct Repl {
     scratch: Scratch,
     /// The expression being run, while it is.
     input: Option<String>,
-    /// Whether its value is written by its type's own `show`.
+    /// Whether its value is written by compiled code: its type's own
+    /// `show`, or the derived one meeting parts with their own.
     own_show: bool,
     /// The definition being added, whose errors are shown as the input's.
     fresh: Option<usize>,
@@ -847,13 +848,10 @@ impl Repl {
             caller: None,
         };
         // `()` shows nothing, and a type's own `show` writes its value, as
-        // it writes the parts of a value that have one.
-        let program = self.project.program;
+        // those of its parts write them.
         let ran = if ty == Ty::unit(db) {
             self.scratch.execute(&self.project, key)
-        } else if own_show(db, program, ty, at).is_some()
-            || reaches_own(db, program, Derived::Show, ty)
-        {
+        } else if written_show(db, self.project.program, ty, at).is_some() {
             self.own_show = true;
             self.apply();
             let (key, text) = root(&self.project, self.session.module, SHOWN);

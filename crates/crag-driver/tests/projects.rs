@@ -190,6 +190,38 @@ fn a_more_specific_overload_wins_unless_the_function_is_final() {
 }
 
 #[test]
+fn derived_functions_take_the_own_functions_seen_where_they_are_called() {
+    // §19.11, §5.6.1: a part's own `show` counts where the call is
+    // written: the app's `show` of the library's `P` writes the parts of
+    // the app's values, not those the library shows, and fills a `Show`
+    // bound, but an unbounded type parameter is shown by its structure.
+    let lib = "pub type P(x: Int)\npub type Pair(a: P, b: Int)\n\
+               pub fn pairs() -> Str { \"{[Pair(a: P(x: 1), b: 2)]}\" }\n";
+    let app = "import demo.lib.{P, Pair, pairs}\n\
+               fn show(p: P) -> Str { \"p{p.x}\" }\n\
+               fn bounded[T: Show](xs: List[T]) -> Str { \"{xs}\" }\n\
+               fn unbounded[T](xs: List[T]) -> Str { \"{xs}\" }\n\
+               fn bit(holds: Bool, n: Int) -> Int { if holds { n } else { 0 } }\n\
+               fn main() -> ExitCode {\n\
+               \x20 let mine = \"{[Pair(a: P(x: 1), b: 2)]}\" == \"[Pair(a: p1, b: 2)]\"\n\
+               \x20 let theirs = pairs() == \"[Pair(a: P(x: 1), b: 2)]\"\n\
+               \x20 let filled = bounded([P(x: 3)]) == \"[p3]\"\n\
+               \x20 let walked = unbounded([P(x: 4)]) == \"[P(x: 4)]\"\n\
+               \x20 ExitCode(code: bit(mine, 1) + bit(theirs, 2) + bit(filled, 4) + bit(walked, 8))\n\
+               }\n";
+    let root = project(
+        "derived-parts",
+        &[
+            ("package.crag", MANIFEST),
+            ("lib.crag", lib),
+            ("app.crag", app),
+        ],
+    );
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 15, "{}", text(out));
+}
+
+#[test]
 fn printing_and_transforms_that_print_are_not_pure() {
     // §3.14: the runtime functions of `std.io` do `io`, and a transform
     // runs where the record is built (§6.7).
