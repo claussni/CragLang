@@ -1460,6 +1460,10 @@ pub enum TrapKind {
     Expectation = 13,
     /// A value failed a condition of its type (Specification §3.10.1).
     ConditionFailed = 14,
+    /// `number()` met a NaN or an infinity (Specification §3.1.4).
+    NotFinite = 15,
+    /// A C function broke what its import declares (Specification §16.1).
+    ForeignFault = 16,
 }
 
 impl TrapKind {
@@ -1481,6 +1485,8 @@ impl TrapKind {
             TrapKind::Unordered => "compared values that have no order",
             TrapKind::Expectation => "`!!` met an error",
             TrapKind::ConditionFailed => "a value failed a condition of its type",
+            TrapKind::NotFinite => "a number was not finite",
+            TrapKind::ForeignFault => "a C function broke what its import declares",
         }
     }
 
@@ -1496,7 +1502,7 @@ impl TrapKind {
 }
 
 impl TrapKind {
-    pub const ALL: [TrapKind; 15] = [
+    pub const ALL: [TrapKind; 17] = [
         TrapKind::Overflow,
         TrapKind::DivideByZero,
         TrapKind::Index,
@@ -1512,6 +1518,8 @@ impl TrapKind {
         TrapKind::Unordered,
         TrapKind::Expectation,
         TrapKind::ConditionFailed,
+        TrapKind::NotFinite,
+        TrapKind::ForeignFault,
     ];
 
     /// The kind with this discriminant, if any.

@@ -595,9 +595,11 @@ pub enum TrapKind {
     Rethrow,
     /// A value failed a condition of its type (§3.10.1).
     ConditionFailed,
+    /// `number()` met a NaN or an infinity (§3.1.4).
+    NotFinite,
     /// Foreign code broke what its import declares: a null or a value
     /// that is not finite where none may come (§16.1).
-    Fault,
+    ForeignFault,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -1097,7 +1099,8 @@ fn terminator_text<'db>(db: &'db dyn Db, terminator: &Terminator<'db>) -> String
                 TrapKind::Expectation => "expectation",
                 TrapKind::Rethrow => "rethrow",
                 TrapKind::ConditionFailed => "condition failed",
-                TrapKind::Fault => "fault",
+                TrapKind::NotFinite => "not finite",
+                TrapKind::ForeignFault => "foreign fault",
             };
             format!("trap {kind}")
         }

@@ -920,7 +920,7 @@ fn main() {
     assert_eq!(crag_run(&root, &mut out), EXIT_TRAP);
     let out = text(out);
     assert!(
-        out.starts_with("trap: the environment failed: a C function gave a float that its import does not allow\n --> app.crag:3:20"),
+        out.starts_with("trap: a C function broke what its import declares: a C function gave a float that its import does not allow\n --> app.crag:3:20"),
         "{out}"
     );
     fs::write(
@@ -935,7 +935,64 @@ fn main() {
     assert_eq!(crag_run(&root, &mut out), EXIT_TRAP);
     let out = text(out);
     assert!(
-        out.starts_with("trap: the environment failed: a C function gave a null pointer where its import allows none\n"),
+        out.starts_with("trap: a C function broke what its import declares: a C function gave a null pointer where its import allows none\n"),
+        "{out}"
+    );
+    // A handler of `Fault` takes it, and one of `ForeignFault` before it.
+    fs::write(
+        root.join("app.crag"),
+        r#"import std.c
+
+import cLib("c").{ atof(s: CStr) -> Float }
+
+fn read(text: Str) -> Float {
+  on Fault { t -> -1.0 }
+  atof(!! CStr(text))
+}
+
+fn specific(text: Str) -> Float {
+  on Fault { t -> -1.0 }
+  on ForeignFault { t -> -2.0 }
+  atof(!! CStr(text))
+}
+
+fn main() -> ExitCode {
+  if read("inf") != -1.0 or specific("inf") != -2.0 or read("0.5") != 0.5 {
+    return ExitCode(code: 2)
+  }
+  ExitCode(code: 0)
+}
+"#,
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 0, "{}", text(out));
+}
+
+#[test]
+fn number_traps_with_the_tag_it_met() {
+    let app = r#"import std.c
+
+fn tag(x: Float | NonFinite) -> Str {
+  on NotFinite { t -> t.tag }
+  "{x.number()}"
+}
+
+fn main() -> ExitCode {
+  if tag(NaN) != "NaN" or tag(NegInfinity) != "NegInfinity" or tag(1.5) != "1.5" {
+    return ExitCode(code: 2)
+  }
+  let x: Float | NaN = NaN
+  let y = x.number()
+  ExitCode(code: 0)
+}
+"#;
+    let root = project("number", &[("package.crag", MANIFEST), ("app.crag", app)]);
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), EXIT_TRAP);
+    let out = text(out);
+    assert!(
+        out.starts_with("trap: a number was not finite: NaN\n  --> app.crag:13:11"),
         "{out}"
     );
 }

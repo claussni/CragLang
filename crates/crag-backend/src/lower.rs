@@ -3134,7 +3134,8 @@ impl<'a, 'db> Lower<'a, 'db> {
                     TrapKind::Unsupported => AbiTrap::Unsupported,
                     TrapKind::Expectation => AbiTrap::Expectation,
                     TrapKind::ConditionFailed => AbiTrap::ConditionFailed,
-                    TrapKind::Fault => AbiTrap::Fault,
+                    TrapKind::NotFinite => AbiTrap::NotFinite,
+                    TrapKind::ForeignFault => AbiTrap::ForeignFault,
                 };
                 // The byte offset of the expression in the module's source,
                 // with the detail it names in the upper half.

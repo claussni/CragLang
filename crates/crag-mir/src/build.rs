@@ -287,7 +287,7 @@ struct Otherwise {
 
 /// The trap kinds a handler may take, with the prelude's types for them
 /// (§8.3).
-const TRAP_TYPES: [(crag_abi::TrapKind, &str); 12] = [
+const TRAP_TYPES: [(crag_abi::TrapKind, &str); 14] = [
     (crag_abi::TrapKind::Overflow, "Overflow"),
     (crag_abi::TrapKind::DivideByZero, "DivisionByZero"),
     (crag_abi::TrapKind::Index, "OutOfBounds"),
@@ -300,6 +300,8 @@ const TRAP_TYPES: [(crag_abi::TrapKind, &str); 12] = [
     (crag_abi::TrapKind::Unordered, "Unordered"),
     (crag_abi::TrapKind::Expectation, "Expectation"),
     (crag_abi::TrapKind::ConditionFailed, "ConditionFailed"),
+    (crag_abi::TrapKind::NotFinite, "NotFinite"),
+    (crag_abi::TrapKind::ForeignFault, "ForeignFault"),
 ];
 
 /// The state of lowering one decision tree.
@@ -626,7 +628,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         Operand::Local(dst)
     }
 
-    /// The `Fault` of a C result its import does not allow, naming what
+    /// The `ForeignFault` of a C result its import does not allow, naming what
     /// came.
     fn c_fault(&mut self, form: CForm) {
         let what = match form {
@@ -634,7 +636,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             _ => "a C function gave a null pointer where its import allows none",
         };
         self.terminate(Terminator::Trap {
-            kind: TrapKind::Fault,
+            kind: TrapKind::ForeignFault,
             site: None,
             detail: Some(what.to_string()),
             catch: None,
@@ -2170,9 +2172,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         },
                         "trapIndex" => Intrinsic::TrapWith(crag_abi::TrapKind::Index as u8),
                         "trapUnordered" => Intrinsic::TrapWith(crag_abi::TrapKind::Unordered as u8),
-                        "trapExpectation" => {
-                            Intrinsic::TrapWith(crag_abi::TrapKind::Expectation as u8)
-                        }
+                        "trapNotFinite" => Intrinsic::TrapWith(crag_abi::TrapKind::NotFinite as u8),
                         "bytesCount" => Intrinsic::TextMeasure(BYTE_COUNT),
                         "bytesAt" => Intrinsic::TextAt(BYTE_AT),
                         "bytesSlice" => Intrinsic::TextSlice,
@@ -3715,6 +3715,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             && let [value] = positional
             && let Some(mapping) = self.type_mapping(instance)
         {
+            if mapping == "number" {
+                return self.number_value(expr, *value);
+            }
             return self.map_type(expr, mapping, *value);
         }
         if fields.is_none()
@@ -3887,8 +3890,43 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             "discard" => Some("discard"),
             "check" => Some("check"),
             "expect" => Some("expect"),
+            "number" => Some("number"),
             _ => None,
         }
+    }
+
+    /// `x.number()`: the `Float`, or a `NotFinite` trap at the call that
+    /// names the tag it met (§3.1.4).
+    fn number_value(&mut self, expr: ExprId, value: ExprId) -> Operand<'db> {
+        let db = self.db;
+        let ty = self.ty(value);
+        let result = self.ty(expr);
+        let subject = self.place_of(value);
+        let tags: Vec<Ty<'db>> = ty
+            .members(db)
+            .into_iter()
+            .filter(|m| !matches!(m.as_builtin(db), Some((Builtin::Float, _))))
+            .collect();
+        let raises: Vec<BlockId> = tags.iter().map(|_| self.new_block()).collect();
+        let ok = self.new_block();
+        self.terminate(Terminator::Switch {
+            place: Place::local(subject),
+            cases: tags.iter().copied().zip(raises.iter().copied()).collect(),
+            otherwise: ok,
+        });
+        for (&tag, &raise) in tags.iter().zip(&raises) {
+            self.switch_to(raise);
+            self.terminate(Terminator::Trap {
+                kind: TrapKind::NotFinite,
+                site: Some(expr),
+                detail: Some(tag.display(db)),
+                catch: None,
+            });
+        }
+        self.switch_to(ok);
+        let out = self.temp(result);
+        self.assign_to(out, Operand::Local(subject), ty);
+        Operand::Local(out)
     }
 
     /// `~x`, `?x` and `!!x`: the value's errors kept, or its success with
