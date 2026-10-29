@@ -41,11 +41,11 @@ use crag_hir::{
     lower_body,
 };
 use crag_types::{
-    Builtin, CForm, Callee, DecisionTree, Dispatch, EscapeLevel, Filling, Handler, HandlerCode,
-    InferenceResult, Instance, Iteration, ListLen, Position, SigParam, Signature, Step, Ty, TyKind,
-    TypeDefKind, Value, body_types, decision_tree_with, declared_fields, dispose_handler,
-    fields_of, lifecycle_handler, literal_value, prelude_item, result_type, signature, subst,
-    type_def, type_header, value_type,
+    Builtin, CForm, Callee, DecisionTree, Derived, Dispatch, EscapeLevel, Filling, Handler,
+    HandlerCode, InferenceResult, Instance, Iteration, ListLen, Position, SigParam, Signature,
+    Step, Ty, TyKind, TypeDefKind, Value, body_types, decision_tree_with, declared_fields,
+    dispose_handler, fields_of, lifecycle_handler, literal_value, prelude_item, reaches_own,
+    result_type, signature, subst, type_def, type_header, value_type,
 };
 
 use crate::ir::{
@@ -86,7 +86,16 @@ pub fn build<'db>(
         Owner::Item(item) => crag_hir::c_function(db, item).map(|_| item),
         Owner::Test(_) => None,
     };
+    // The derived walk of a type that meets parts with functions of their
+    // own has code for its structure.
+    let derived = match (owner, instance.args(db).as_slice()) {
+        (Owner::Item(item), &[ty]) if derive::has_derived_code(db, program, instance) => {
+            derive::value_op(db, item).map(|op| (op, ty))
+        }
+        _ => None,
+    };
     let start = match entry {
+        Entry::Body if derived.is_some() => derived.and_then(|(op, ty)| b.derived_entry(op, ty)),
         Entry::Body if c.is_some() => c.and_then(|item| b.c_entry(item)),
         Entry::Body => b.body_entry(lowered.body.root?),
         Entry::Closure(frame) => b.closure_entry(frame),
@@ -109,6 +118,10 @@ pub fn build<'db>(
     }
     Some(b.finish())
 }
+
+mod derive;
+
+pub use derive::has_derived_code;
 
 /// What a builder does once its parameters are in place.
 type Start<'a, 'db> = Box<dyn FnOnce(&mut MirBuilder<'a, 'db>) + 'a>;
@@ -2061,6 +2074,13 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     fn intrinsic(&self, instance: &Instance<'db>) -> Option<Intrinsic<'db>> {
         let db = self.db;
         let function = instance.function;
+        // A walk that meets parts with functions of their own has code.
+        if let Some(op) = derive::value_op(db, function)
+            && let Some(&ty) = instance.args.first()
+            && reaches_own(db, self.program, op, ty)
+        {
+            return None;
+        }
         if hir_body(db, self.program, Owner::Item(function))
             .root
             .is_some()
@@ -2916,6 +2936,13 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                                 }
                                 None => return self.trap(TrapKind::Error, Some(*e)),
                             }
+                        }
+                        // So is a value with such a part.
+                        StrPart::Expr(e)
+                            if reaches_own(db, self.program, Derived::Show, self.ty(*e)) =>
+                        {
+                            let op = self.expr(*e);
+                            ops.push(self.derived(Derived::Show, self.ty(*e), vec![op]));
                         }
                         // Any other value is written as text, a number as
                         // such and the rest as `show` writes it by its

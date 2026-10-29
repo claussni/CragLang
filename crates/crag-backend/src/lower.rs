@@ -2743,6 +2743,11 @@ impl<'a, 'db> Lower<'a, 'db> {
         boxed: bool,
     ) -> Result<Vec<VReg>, Unsupported> {
         let db = self.db;
+        // Typed as the value itself, the key is known to be there.
+        if ty == value && !boxed {
+            let words = self.layout_of(value)?.words();
+            return Ok((0..words).map(|k| self.load(at, 8 * k as i32)).collect());
+        }
         let present = value.members(db);
         let empty = ty
             .members(db)
@@ -3269,6 +3274,7 @@ impl<'a, 'db> Lower<'a, 'db> {
         if *func.entry(db) == Entry::Body
             && hir_body(db, self.program, Owner::Item(item)).root.is_none()
             && crag_hir::c_function(db, item).is_none()
+            && !crag_mir::has_derived_code(db, self.program, func)
         {
             return Err("builtin functions");
         }

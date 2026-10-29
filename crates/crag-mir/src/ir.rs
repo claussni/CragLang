@@ -222,7 +222,9 @@ pub enum Rvalue<'db> {
     /// The value of a map at a key, or `Empty`: an `Option`, borrowed,
     /// unless the values take two words, strings, bytes or function values:
     /// then the `Option` holds the value found in a member box of its own
-    /// (Compiler Architecture §11), and is the code's.
+    /// (Compiler Architecture §11), and is the code's. Into a local of the
+    /// value's own type and without a box, it is the value of a key known
+    /// to be there, borrowed.
     MapGet {
         map: Place<'db>,
         key: Operand<'db>,
@@ -492,7 +494,7 @@ pub enum Intrinsic<'db> {
     MapInsert,
     SetInsert,
     MapRemove,
-    /// Whether a set has the key: 1 or 0.
+    /// Whether a set or a map has the key: 1 or 0.
     SetContains,
     /// The keys of a map or set, or the values of a map, as a list.
     MapKeys,

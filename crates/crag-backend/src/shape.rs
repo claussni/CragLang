@@ -22,9 +22,9 @@ use std::collections::HashMap;
 use crag_abi::{LIST_SIZE, MAP_SIZE, Number, Shape, ShapeField, Shapes};
 use crag_db::Db;
 use crag_hir::Program;
-use crag_types::{Builtin, Ty, TyKind, declared_fields};
+use crag_types::{Builtin, Ty, TyKind, declared_fields, record_subtypes};
 
-use crate::layout::{Layout, layout, record_layout, record_subtypes, type_index};
+use crate::layout::{Layout, layout, record_layout, type_index};
 
 /// The shapes a value of `ty` is printed by, and the index of its own.
 pub fn shapes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> (Shapes, u32) {

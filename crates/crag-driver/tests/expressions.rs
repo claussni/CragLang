@@ -369,3 +369,94 @@ fn a_type_s_own_show_writes_its_values() {
     // Strings and numbers are written as before.
     assert_eq!(eval(&mut r, "\"{\"a\"} {3}\""), "\"a 3\"\n");
 }
+
+#[test]
+fn derived_functions_use_the_own_functions_of_parts() {
+    // §19.11: a part with a function of its own is written, compared and
+    // hashed by it inside the derived functions: in fields, members,
+    // elements, map values and the fields of a subtype's value.
+    let mut r = repl();
+    eval(&mut r, "type P(x: Int)");
+    eval(&mut r, "fn show(p: P) -> Str { \"p{p.x}\" }");
+    eval(
+        &mut r,
+        "fn equals(a: P, b: P) -> Bool { a.x % 10 == b.x % 10 }",
+    );
+    eval(&mut r, "fn hash(p: P) -> Int { p.x % 10 }");
+    eval(
+        &mut r,
+        "fn compare(a: P, b: P) -> Ordering { compare(a.x % 10, b.x % 10) }",
+    );
+    eval(&mut r, "type Pair(a: P, b: Int)");
+    eval(&mut r, "type Shape(name: Str)");
+    eval(&mut r, "type Circle(..Shape, centre: P)");
+    eval(&mut r, "type Tree(label: P, kids: List[Tree])");
+    assert_eq!(eval(&mut r, "[P(x: 1), P(x: 2)]"), "[p1, p2]\n");
+    assert_eq!(
+        eval(&mut r, "Pair(a: P(x: 3), b: 4)"),
+        "Pair(a: p3, b: 4)\n"
+    );
+    assert_eq!(eval(&mut r, "(q: P(x: 9), r: 1)"), "(q: p9, r: 1)\n");
+    assert_eq!(eval(&mut r, "[\"a\": P(x: 1)]"), "[\"a\": p1]\n");
+    assert_eq!(eval(&mut r, "[[1, 2; 3, 4]]"), "[[1, 2; 3, 4]]\n");
+    assert_eq!(
+        eval(&mut r, "\"{[Circle(name: \"c\", centre: P(x: 5))]}\""),
+        "\"[Circle(name: \\\"c\\\", centre: p5)]\"\n"
+    );
+    assert_eq!(
+        eval(
+            &mut r,
+            "Tree(label: P(x: 1), kids: [Tree(label: P(x: 2), kids: [])])"
+        ),
+        "Tree(label: p1, kids: [Tree(label: p2, kids: [])])\n"
+    );
+    eval(&mut r, "fn shape(s: Shape) -> Shape { s }");
+    assert_eq!(
+        eval(&mut r, "shape(Circle(name: \"c\", centre: P(x: 5)))"),
+        "Circle(name: \"c\", centre: p5)\n"
+    );
+    assert_eq!(eval(&mut r, "[P(x: 1)] == [P(x: 11)]"), "True\n");
+    assert_eq!(eval(&mut r, "[P(x: 1)] == [P(x: 12)]"), "False\n");
+    assert_eq!(eval(&mut r, "[P(x: 1)] == [P(x: 1), P(x: 1)]"), "False\n");
+    assert_eq!(
+        eval(&mut r, "Pair(a: P(x: 3), b: 4) == Pair(a: P(x: 13), b: 4)"),
+        "True\n"
+    );
+    assert_eq!(
+        eval(&mut r, "Pair(a: P(x: 3), b: 4) == Pair(a: P(x: 13), b: 5)"),
+        "False\n"
+    );
+    assert_eq!(
+        eval(&mut r, "[\"a\": P(x: 1)] == [\"a\": P(x: 21)]"),
+        "True\n"
+    );
+    assert_eq!(
+        eval(&mut r, "[\"a\": P(x: 1)] == [\"b\": P(x: 1)]"),
+        "False\n"
+    );
+    assert_eq!(
+        eval(
+            &mut r,
+            "hash(Pair(a: P(x: 3), b: 4)) == hash(Pair(a: P(x: 23), b: 4))"
+        ),
+        "True\n"
+    );
+    assert_eq!(eval(&mut r, "compare([P(x: 1)], [P(x: 12)])"), "Less\n");
+    assert_eq!(eval(&mut r, "compare([P(x: 3)], [P(x: 12)])"), "Greater\n");
+    assert_eq!(
+        eval(&mut r, "compare([P(x: 1)], [P(x: 11), P(x: 0)])"),
+        "Less\n"
+    );
+    assert_eq!(eval(&mut r, "compare([P(x: 1)], [P(x: 11)])"), "Equal\n");
+    // Members compare in the order the union is written.
+    eval(&mut r, "fn either(x: Str | P) -> Str | P { x }");
+    assert_eq!(eval(&mut r, "either(P(x: 4))"), "p4\n");
+    assert_eq!(
+        eval(&mut r, "compare(either(P(x: 4)), either(\"x\"))"),
+        "Greater\n"
+    );
+    assert_eq!(
+        eval(&mut r, "either(P(x: 4)) == either(P(x: 14))"),
+        "True\n"
+    );
+}

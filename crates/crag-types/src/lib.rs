@@ -55,6 +55,7 @@ pub use def::{
     c_out, c_signature, is_cstr, place_positional, prelude_item, signature, success_type, type_def,
     type_header, type_parent, value_type,
 };
+pub use derive::{Derived, own_derived, reaches_own};
 pub use effect::{EffectSet, Restriction};
 pub use escape::{BindingsOnly, EscapeLevel, Escapes};
 pub use generic::{
@@ -73,7 +74,8 @@ pub use overload::{
     FinalError, Ranked, Specificity, compare_param, final_errors, most_specific, overload_errors,
 };
 pub use relate::{
-    declared_fields, fields_of, is_subtype, join, normalize, parent, subst, unrefined,
+    declared_fields, fields_of, is_subtype, join, normalize, parent, record_subtypes, subst,
+    unrefined,
 };
 pub use result::{
     Callee, Dispatch, DispatchArm, ErrorKind, InferenceResult, Iteration, Optional, Site, TypeError,

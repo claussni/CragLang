@@ -39,7 +39,7 @@ use crag_db::Db;
 use crag_hir::{ExprId, Owner, Program};
 use crag_types::{Filling, Handler, HandlerCode, Instance, Ty};
 
-pub use build::place;
+pub use build::{has_derived_code, place};
 pub use checks::insert_overflow_checks;
 pub use ir::{
     BinOp, Block, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Intrinsic, Local, LocalDecl,

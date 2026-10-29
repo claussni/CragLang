@@ -29,8 +29,8 @@ use crag_db::Db;
 use crag_db::plumbing::AsId;
 use crag_hir::{ItemKind, Name, Program, item_tree, module_index};
 use crag_types::{
-    Builtin, Ty, TyKind, TypeDefKind, dispose_handler, fields_of, is_subtype, parent, type_def,
-    type_header,
+    Builtin, Ty, TyKind, TypeDefKind, dispose_handler, fields_of, is_subtype, parent,
+    record_subtypes, type_def, type_header,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,32 +224,6 @@ pub fn subtypes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Vec<i64>
         .map(type_index)
         .collect();
     out.sort_unstable();
-    out
-}
-
-/// The record types of the program without type parameters that are
-/// subtypes of `ty`, other than `ty`; none when `ty` is not a named type
-/// without arguments.
-pub fn record_subtypes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Vec<Ty<'db>> {
-    let mut out = Vec::new();
-    if !matches!(ty.kind(db), TyKind::Named(_, args) if args.is_empty()) {
-        return out;
-    }
-    for &module in module_index(db, program).modules.values() {
-        for item in &item_tree(db, module).items {
-            let id = item.id;
-            if *id.kind(db) != ItemKind::Type || !type_header(db, program, id).params.is_empty() {
-                continue;
-            }
-            let candidate = Ty::new(db, TyKind::Named(id, Vec::new()));
-            if candidate != ty
-                && matches!(type_def(db, program, id).kind, TypeDefKind::Record { .. })
-                && is_subtype(db, program, candidate, ty)
-            {
-                out.push(candidate);
-            }
-        }
-    }
     out
 }
 

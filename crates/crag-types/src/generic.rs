@@ -630,10 +630,23 @@ pub fn own_show<'db>(
         return None;
     }
     let text = Ty::new(db, TyKind::Builtin(Builtin::Str, Vec::new()));
-    // A `show` that writes its parts through itself is looked up in its own
-    // body, before its errors are known: its written success type counts.
-    let name = Name::new(db, "show".to_string());
-    let filling = fill(db, program, name, &[ty], text, at, 0, true).ok()?;
+    own_filling(db, program, "show", &[ty], text, at)
+}
+
+/// The function of the name that these parameter and result types call
+/// where `at` is, when it is not the prelude's derived one (§19.11). A
+/// function that writes its parts through itself is looked up in its own
+/// body, before its errors are known: its written success type counts.
+pub(crate) fn own_filling<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    name: &str,
+    params: &[Ty<'db>],
+    result: Ty<'db>,
+    at: CallSite<'db>,
+) -> Option<Filling<'db>> {
+    let name = Name::new(db, name.to_string());
+    let filling = fill(db, program, name, params, result, at, 0, true).ok()?;
     let derived = match &filling {
         Filling::Function(instance) => {
             let f = instance.function;

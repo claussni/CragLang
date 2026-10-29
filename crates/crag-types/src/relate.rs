@@ -19,9 +19,9 @@
 //! arguments.
 
 use crag_db::Db;
-use crag_hir::{ItemId, Name, Program};
+use crag_hir::{ItemId, ItemKind, Name, Program, item_tree, module_index};
 
-use crate::def::{TypeDefKind, type_def, type_parent};
+use crate::def::{TypeDefKind, type_def, type_header, type_parent};
 use crate::generic::param_bound;
 use crate::ty::{Builtin, Ty, TyKind};
 
@@ -372,4 +372,30 @@ pub fn subst<'db>(
         }
     };
     Ty::new(db, kind)
+}
+
+/// The record types of the program without type parameters that are
+/// subtypes of `ty`, other than `ty`; none when `ty` is not a named type
+/// without arguments.
+pub fn record_subtypes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Vec<Ty<'db>> {
+    let mut out = Vec::new();
+    if !matches!(ty.kind(db), TyKind::Named(_, args) if args.is_empty()) {
+        return out;
+    }
+    for &module in module_index(db, program).modules.values() {
+        for item in &item_tree(db, module).items {
+            let id = item.id;
+            if *id.kind(db) != ItemKind::Type || !type_header(db, program, id).params.is_empty() {
+                continue;
+            }
+            let candidate = Ty::new(db, TyKind::Named(id, Vec::new()));
+            if candidate != ty
+                && matches!(type_def(db, program, id).kind, TypeDefKind::Record { .. })
+                && is_subtype(db, program, candidate, ty)
+            {
+                out.push(candidate);
+            }
+        }
+    }
+    out
 }
