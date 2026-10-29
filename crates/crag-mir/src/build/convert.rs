@@ -42,7 +42,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         };
         match (from.kind(db), to.kind(db)) {
             (TyKind::Builtin(a, xs), TyKind::Builtin(b, ys)) if a == b => all(xs, ys),
-            (TyKind::Named(a, xs), TyKind::Named(b, ys)) if a == b => all(xs, ys),
+            // A tag is its type alone, whatever its level.
+            (TyKind::Named(a, xs), TyKind::Named(b, ys)) if a == b => {
+                matches!(type_def(db, program, *a).kind, TypeDefKind::Tag) || all(xs, ys)
+            }
             // A subtype's box starts as its parent's.
             (TyKind::Named(a, xs), TyKind::Named(_, ys)) => {
                 xs.is_empty()
@@ -66,6 +69,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     /// a test has ruled out.
     fn target(&self, from: Ty<'db>, to: Ty<'db>) -> Option<Ty<'db>> {
         match to.kind(self.db) {
+            // A member of the value's own type first, as of its own level.
+            TyKind::Union(members) if members.contains(&from) => Some(from),
             TyKind::Union(_) => to
                 .members(self.db)
                 .into_iter()

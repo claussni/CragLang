@@ -30,7 +30,7 @@ use crag_db::Db;
 use crag_hir::{BindingId, Body, Literal, Name, Pat, PatId, PatLiteral, Program};
 
 use crate::infer::{fixed_scale, signed};
-use crate::relate::{declared_fields, fields_of, is_subtype};
+use crate::relate::{declared_fields, fields_of};
 use crate::ty::{Builtin, Ty, TyKind};
 
 /// A pattern as the test sees it, with fields by name. The test looks
@@ -297,8 +297,9 @@ impl<'db> Checker<'db> {
         Checker { db, program }
     }
 
+    /// Whether a pattern's test for `t` holds for a value of `s`.
     pub(crate) fn fits(&self, s: Ty<'db>, t: Ty<'db>) -> bool {
-        is_subtype(self.db, self.program, s, t)
+        crate::relate::tested(self.db, self.program, s, t)
     }
 
     /// The pattern of a body for the test, given the types inference gave

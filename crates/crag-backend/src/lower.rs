@@ -3377,7 +3377,7 @@ impl<'a, 'db> Lower<'a, 'db> {
         let shape = self.layout_of(ty)?;
         for &(case, target) in cases {
             // Every value of the place's type has the case's.
-            if crag_types::is_subtype(db, self.program, ty, case) {
+            if crag_types::tested(db, self.program, ty, case) {
                 self.end(Term::Jump(block(target)), None);
                 return Ok(());
             }

@@ -139,6 +139,29 @@ pub fn join<'db>(db: &'db dyn Db, program: Program, a: Ty<'db>, b: Ty<'db>) -> T
     normalize(db, program, vec![a, b]).0
 }
 
+/// Whether a test for `t` holds for every value of `s`: each member of `s`
+/// fits a member of `t`, but a level of a tag, such as `Empty[Int]`, only
+/// its own level, though it fits a wider one where its own is missing
+/// (§3.6.1). A union keeps both levels apart for the same reason.
+pub fn tested<'db>(db: &'db dyn Db, program: Program, s: Ty<'db>, t: Ty<'db>) -> bool {
+    let targets = t.members(db);
+    s.members(db).into_iter().all(|m| {
+        targets
+            .iter()
+            .any(|&u| is_subtype(db, program, m, u) && !other_levels(db, program, m, u))
+    })
+}
+
+/// Whether two types are different levels of one tag.
+fn other_levels<'db>(db: &'db dyn Db, program: Program, a: Ty<'db>, b: Ty<'db>) -> bool {
+    match (a.kind(db), b.kind(db)) {
+        (TyKind::Named(x, xs), TyKind::Named(y, ys)) => {
+            x == y && xs != ys && matches!(type_def(db, program, *x).kind, TypeDefKind::Tag)
+        }
+        _ => false,
+    }
+}
+
 /// The union of the members, flattened and absorbed: a member that
 /// another member contains is dropped (§3.6.1). Returns the union and the
 /// dropped members, each with the member containing it. A union with the
@@ -164,9 +187,9 @@ pub fn normalize<'db>(
     for (i, &m) in flat.iter().enumerate() {
         let container = flat.iter().enumerate().find(|&(j, &other)| {
             j != i
-                && is_subtype(db, program, m, other)
+                && tested(db, program, m, other)
                 // Of two members that fit each other, the first stays.
-                && (j < i || !is_subtype(db, program, other, m))
+                && (j < i || !tested(db, program, other, m))
         });
         match container {
             Some((_, &other)) => absorbed.push((m, other)),

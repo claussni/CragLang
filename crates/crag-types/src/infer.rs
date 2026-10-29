@@ -4223,15 +4223,16 @@ impl<'a, 'db> Infer<'a, 'db> {
     /// A union of finer types than the subject's members is never made,
     /// because a union value is tagged with the member it was made as.
     fn refine(&self, subject: Ty<'db>, target: Ty<'db>) -> Option<Ty<'db>> {
-        let db = self.db;
+        let (db, program) = (self.db, self.program);
+        let tested = |s, t| crate::relate::tested(db, program, s, t);
         let targets = target.members(db);
-        if targets.len() == 1 && self.fits(target, subject) {
+        if targets.len() == 1 && tested(target, subject) {
             return Some(target);
         }
         let members: Vec<Ty<'db>> = subject
             .members(db)
             .into_iter()
-            .filter(|&m| self.fits(m, target) || targets.iter().any(|&t| self.fits(t, m)))
+            .filter(|&m| tested(m, target) || targets.iter().any(|&t| tested(t, m)))
             .collect();
         (!members.is_empty()).then(|| self.join_all(members))
     }
@@ -4241,7 +4242,7 @@ impl<'a, 'db> Infer<'a, 'db> {
         let members = subject
             .members(self.db)
             .into_iter()
-            .filter(|&m| !self.fits(m, target))
+            .filter(|&m| !crate::relate::tested(self.db, self.program, m, target))
             .collect();
         self.join_all(members)
     }

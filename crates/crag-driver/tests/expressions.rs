@@ -448,7 +448,7 @@ fn values_convert_to_the_wider_types_they_fit() {
 
 #[test]
 fn a_tag_s_level_is_a_type() {
-    // §3.6.1: `Empty`'s parameter names its level, which is a type.
+    // §3.6.1: a tag's type argument names its level, which is a type.
     let mut r = repl();
     assert_eq!(eval(&mut r, "Empty[Int]"), "Empty\n");
     eval(&mut r, "let o: Option[Int] = Empty[Int]");
@@ -457,6 +457,29 @@ fn a_tag_s_level_is_a_type() {
     assert!(out.contains("other types a type"), "{out}");
     let out = eval(&mut r, "List[123]()");
     assert!(out.contains("other types a type"), "{out}");
+    // Levels stay apart: "missing" and "present but empty".
+    eval(
+        &mut r,
+        "fn lookup(m: Map[Str, Option[Int]], k: Str) -> Str {\n  case m[k] {\n    Empty[Option[Int]] -> \"missing\"\n    Empty[Int] -> \"present, empty\"\n    n: Int -> \"value {n}\"\n  }\n}",
+    );
+    eval(
+        &mut r,
+        "let cache: Map[Str, Option[Int]] = [\"a\": Empty, \"b\": 3]",
+    );
+    assert_eq!(eval(&mut r, "lookup(cache, \"a\")"), "\"present, empty\"\n");
+    assert_eq!(eval(&mut r, "lookup(cache, \"b\")"), "\"value 3\"\n");
+    assert_eq!(eval(&mut r, "lookup(cache, \"c\")"), "\"missing\"\n");
+    eval(&mut r, "let oi: Option[Int] = Empty");
+    eval(&mut r, "let ooi: Option[Option[Int]] = oi");
+    assert_eq!(eval(&mut r, "ooi is Empty[Int]"), "True\n");
+    assert_eq!(eval(&mut r, "ooi is Empty[Option[Int]]"), "False\n");
+    // A level fits a wider one where its own is missing.
+    eval(&mut r, "let wide: Option[Int | Str] = oi");
+    assert_eq!(eval(&mut r, "wide is Empty[Int | Str]"), "True\n");
+    eval(&mut r, "let xs: List[Option[Int]] = [Empty, 2]");
+    eval(&mut r, "let ys: List[Option[Int | Str]] = xs");
+    assert_eq!(eval(&mut r, "ys"), "[Empty, 2]\n");
+    assert_eq!(eval(&mut r, "ys[0] is Empty[Int | Str]"), "True\n");
 }
 
 #[test]

@@ -75,7 +75,7 @@ pub use overload::{
 };
 pub use relate::{
     declared_fields, fields_of, is_subtype, join, normalize, parent, record_subtypes, subst,
-    unrefined,
+    tested, unrefined,
 };
 pub use result::{
     Callee, Dispatch, DispatchArm, ErrorKind, InferenceResult, Iteration, Optional, Site, TypeError,
