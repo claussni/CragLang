@@ -371,6 +371,34 @@ fn a_type_s_own_show_writes_its_values() {
 }
 
 #[test]
+fn named_arguments_build_the_record_a_function_value_takes() {
+    // §5.6.2: named arguments to a function value build its last
+    // parameter, a record, with the record's defaults.
+    let mut r = repl();
+    eval(&mut r, "fn both(r: (a: Int, b: Int)) -> Int { r.a + r.b }");
+    eval(&mut r, "let f = both");
+    assert_eq!(eval(&mut r, "f(a: 1, b: 2)"), "3\n");
+    eval(
+        &mut r,
+        "fn apply(g: ((a: Int, b: Int)) -> Int) -> Int { g(a: 3, b: 4) }",
+    );
+    assert_eq!(eval(&mut r, "apply(both)"), "7\n");
+    assert_eq!(eval(&mut r, "apply { r -> r.a * r.b }"), "12\n");
+    eval(&mut r, "type Opts(width: Int, fill: Str = \"-\")");
+    eval(
+        &mut r,
+        "fn pad(n: Int, o: Opts) -> Str { \"{n}{o.fill}{o.width}\" }",
+    );
+    eval(&mut r, "let p = pad");
+    assert_eq!(eval(&mut r, "p(1, width: 3)"), "\"1-3\"\n");
+    assert_eq!(eval(&mut r, "p(1, width: 3, fill: \"*\")"), "\"1*3\"\n");
+    assert!(eval(&mut r, "f(a: 1)").contains("the field `b` is missing"));
+    // Its parameters have no names of their own.
+    eval(&mut r, "let h = { x: Int -> x }");
+    assert!(eval(&mut r, "h(x: 1)").contains("there is no parameter `x`"));
+}
+
+#[test]
 fn derived_functions_use_the_own_functions_of_parts() {
     // §19.11: a part with a function of its own is written, compared and
     // hashed by it inside the derived functions: in fields, members,

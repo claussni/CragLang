@@ -3521,15 +3521,20 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     fn call_value(&mut self, expr: ExprId, tail: bool) -> Operand<'db> {
         let db = self.db;
         let body = self.body;
-        let (callee, fn_ty, args) = match body.expr(expr) {
-            Expr::Call { callee, args, .. } => {
+        let (callee, fn_ty, args, fields) = match body.expr(expr) {
+            Expr::Call {
+                callee,
+                args,
+                fields,
+            } => {
                 let op = self.expr(*callee);
-                (op, self.ty(*callee), args)
+                (op, self.ty(*callee), args, fields)
             }
             Expr::MethodCall {
                 receiver,
                 name,
                 args,
+                fields,
                 ..
             } => {
                 let local = self.place_of(*receiver);
@@ -3542,7 +3547,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     local,
                     path: vec![Step::Field(*name)],
                 };
-                (self.assign(field_ty, Rvalue::Read(place)), field_ty, args)
+                let value = self.assign(field_ty, Rvalue::Read(place));
+                (value, field_ty, args, fields)
             }
             _ => return self.trap(TrapKind::Error, Some(expr)),
         };
@@ -3554,6 +3560,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         for (&arg, &param) in args.iter().zip(params) {
             let op = self.expr(arg);
             ops.push(self.coerce(op, self.ty(arg), param));
+        }
+        // Named arguments build the last parameter (§5.6.2).
+        if let (Some(fields), Some(&record)) = (fields, params.get(args.len())) {
+            ops.push(self.record_value(expr, record, &[], fields));
         }
         if tail && *result == self.result {
             self.terminate(Terminator::TailCallValue {

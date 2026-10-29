@@ -1457,7 +1457,9 @@ impl<'a, 'db> Infer<'a, 'db> {
         }
     }
 
-    /// A call of a function value: positional arguments only.
+    /// A call of a function value: positional arguments, and named ones
+    /// that build its last parameter, a record (§5.6.2). Its parameters
+    /// have no names of their own.
     fn call_value(
         &mut self,
         id: ExprId,
@@ -1474,10 +1476,23 @@ impl<'a, 'db> Infer<'a, 'db> {
             return self.err_ty();
         };
         if let Some(fields) = fields {
-            let kind = ErrorKind::Unsupported("named arguments to function values");
-            self.error(Site::Expr(id), kind);
+            let record = params.get(args.len()).copied().filter(|&p| {
+                params.len() == args.len() + 1 && fields_of(db, self.program, p).is_some()
+            });
+            if let Some(record) = record {
+                for (&arg, &param) in args.iter().zip(params) {
+                    self.check(arg, param);
+                }
+                self.build_record(id, record, fields);
+                return *result;
+            }
             for field in fields {
-                self.synth(field_value(field));
+                let value = field_value(field);
+                if let FieldArg::Field { path, .. } = field {
+                    let kind = ErrorKind::UnknownParam { name: path[0] };
+                    self.error(Site::Expr(value), kind);
+                }
+                self.synth(value);
             }
         }
         if args.len() != params.len() {
