@@ -111,6 +111,7 @@ pub fn infer_in_group<'db>(
         error: error_type(db, program),
         generic: generic_owner.filter(|&item| *item.kind(db) == ItemKind::Function),
         embed: generic_owner.filter(|&item| *item.kind(db) == ItemKind::Embed),
+        in_type: generic_owner.is_some_and(|item| *item.kind(db) == ItemKind::Type),
     };
     let result = match owner {
         Owner::Item(item) => match *item.kind(db) {
@@ -234,6 +235,9 @@ struct Infer<'a, 'db> {
     /// The function and closures being checked, innermost last, for
     /// `return`.
     frames: Vec<Frame<'db>>,
+    /// Whether the body is a type's, whose conditions and handlers are
+    /// typed together: its constructions are checked when they run.
+    in_type: bool,
     /// Whether the literal being checked is the operand of `negate`, so
     /// `-128` fits an `Int8`.
     negative: bool,
@@ -2958,6 +2962,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                     self.synth_args(args, None);
                 }
                 self.build_record(id, ty, fields.unwrap_or_default());
+                self.known_conditions(id, ty, fields.unwrap_or_default());
                 ty
             }
             HeaderKind::Refined if matches!((args, fields), ([_], None)) => {
@@ -2992,6 +2997,60 @@ impl<'a, 'db> Infer<'a, 'db> {
         self.exprs[callee.index()] = Some(ty);
         self.callees.push((id, Callee::Construct(ty)));
         ty
+    }
+
+    /// A construction whose fields are literals that fails a condition of
+    /// its type or of a parent's: a failure the compiler can see is a
+    /// compile error (§3.10.1). A condition it cannot decide is checked
+    /// when the value is built.
+    fn known_conditions(&mut self, id: ExprId, ty: Ty<'db>, fields: &[FieldArg<'db>]) {
+        let (db, program, body) = (self.db, self.program, self.body);
+        if self.in_type {
+            return;
+        }
+        let known: Vec<(String, crate::refine::Known)> = fields
+            .iter()
+            .filter_map(|field| {
+                let FieldArg::Field { path, value } = field else {
+                    return None;
+                };
+                let [name] = path.as_slice() else {
+                    return None;
+                };
+                let literal = match body.expr(*value) {
+                    Expr::Literal(literal) => literal.clone(),
+                    Expr::Str(parts) => match parts.as_slice() {
+                        [crag_hir::StrPart::Text(text)] => Literal::Str(text.clone()),
+                        [] => Literal::Str(String::new()),
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                let k = crate::refine::known(&literal, body.is_negative(*value))?;
+                Some((name.text(db).to_string(), k))
+            })
+            .collect();
+        if known.is_empty() {
+            return;
+        }
+        let value = crate::refine::Known::Record(known);
+        let mut checked = Some(ty);
+        while let Some(t) = checked {
+            checked = crate::relate::parent(db, program, t);
+            let TyKind::Named(item, _) = t.kind(db) else {
+                continue;
+            };
+            if let crate::refine::Verdict::Fails(condition) =
+                crate::refine::verdict(db, program, *item, &value)
+            {
+                let kind = ErrorKind::ConditionNotMet {
+                    alias: t,
+                    condition,
+                };
+                self.error(Site::Expr(id), kind);
+                return;
+            }
+        }
     }
 
     /// `A(x)` for a conditioned alias `A`: `x` as the alias's target,

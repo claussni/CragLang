@@ -14,14 +14,16 @@
 // You should have received a copy of the GNU General Public License along with
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
-//! The conditions of a conditioned alias on a value known where it is
-//! written (Specification §3.10.1).
+//! The conditions of a type on a value known where it is written
+//! (Specification §3.10.1).
 //!
-//! A literal may stand where the alias is expected once its conditions
-//! hold for it. They are evaluated here as far as they compare, combine
-//! and compute with the prelude's operators on `this` and literals; a
-//! condition beyond that cannot be decided, and the value must be
-//! converted.
+//! A literal may stand where a conditioned alias is expected once its
+//! conditions hold for it, and a record built of literals that fails a
+//! condition of its type is a compile error. The conditions are evaluated
+//! here as far as they compare, combine and compute with the prelude's
+//! operators on `this`, the fields and literals; a condition beyond that
+//! cannot be decided, and the value must be converted or is checked when
+//! it is built.
 
 use crag_hir::{Expr, ExprId, ItemId, Literal, Owner, PRELUDE, Program, hir_body};
 
@@ -34,6 +36,8 @@ pub(crate) enum Known {
     Float(f64),
     Text(String),
     Bool(bool),
+    /// A record with the fields known, by name.
+    Record(Vec<(String, Known)>),
 }
 
 /// How a literal's conditions came out: all hold, one fails, by its label,
@@ -58,7 +62,7 @@ pub(crate) fn known(literal: &Literal, negative: bool) -> Option<Known> {
     })
 }
 
-/// Whether the conditions of the alias `item` hold for `value`.
+/// Whether the conditions of the type `item` hold for `value`.
 pub(crate) fn verdict(
     db: &dyn crag_db::Db,
     program: Program,
@@ -75,6 +79,7 @@ pub(crate) fn verdict(
         body,
         types,
         this: decl.this,
+        fields: &decl.field_bindings,
         value,
     };
     for condition in &decl.conditions {
@@ -92,6 +97,7 @@ struct Eval<'a, 'db> {
     body: &'a crag_hir::Body<'db>,
     types: &'a crate::InferenceResult<'db>,
     this: Option<crag_hir::BindingId>,
+    fields: &'a [(crag_hir::Name<'db>, crag_hir::BindingId)],
     value: &'a Known,
 }
 
@@ -109,6 +115,16 @@ impl Eval<'_, '_> {
                 _ => None,
             },
             Expr::Name { local: Some(b), .. } if Some(*b) == self.this => Some(self.value.clone()),
+            Expr::Name { local: Some(b), .. } => {
+                let (name, _) = self.fields.iter().find(|(_, f)| f == b)?;
+                self.field(self.value, name.text(self.db))
+            }
+            Expr::Field {
+                receiver,
+                name,
+                optional: false,
+                ..
+            } => self.field(&self.expr(*receiver)?, name.text(self.db)),
             Expr::And(a, b) => Some(Known::Bool(
                 bool_of(self.expr(*a))? && bool_of(self.expr(*b))?,
             )),
@@ -129,6 +145,16 @@ impl Eval<'_, '_> {
                     args.iter().map(|&a| self.expr(a)).collect::<Option<_>>()?;
                 operator(f.name(self.db).text(self.db), &values)
             }
+            _ => None,
+        }
+    }
+
+    fn field(&self, value: &Known, name: &str) -> Option<Known> {
+        match value {
+            Known::Record(fields) => fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, k)| k.clone()),
             _ => None,
         }
     }

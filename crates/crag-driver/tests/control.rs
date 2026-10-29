@@ -181,6 +181,22 @@ fn constructions_check_the_conditions_of_their_types() {
         "{out}"
     );
     assert!(eval(&mut r, "sub(3, 1)").contains("y > this.x"));
+    // A failure the compiler can see is a compile error, in a function
+    // too; one it cannot decide is checked when the value is built.
+    let out = eval(&mut r, "fn full() -> Percent { Percent(value: 150) }");
+    assert!(
+        out.contains("the value fails the condition `atMost100` of Percent"),
+        "{out}"
+    );
+    let out = eval(&mut r, "fn low() -> Int { Percent(value: -1).value }");
+    assert!(out.contains("`nonNegative` of Percent"), "{out}");
+    let out = eval(&mut r, "fn bad() -> Sub { Sub(x: 4, y: 2) }");
+    assert!(out.contains("`y > this.x` of Sub"), "{out}");
+    let out = eval(&mut r, "fn zero(b: Int) -> Sub { Sub(x: 0, y: b) }");
+    assert!(out.contains("`x != 0` of Base"), "{out}");
+    eval(&mut r, "fn fine(b: Int) -> Sub { Sub(x: 1, y: b) }");
+    assert_eq!(eval(&mut r, "fine(7)"), "Sub(x: 1, y: 7)\n");
+    assert!(eval(&mut r, "fine(0)").contains("y > this.x"));
 }
 
 #[test]

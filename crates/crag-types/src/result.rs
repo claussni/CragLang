@@ -258,8 +258,9 @@ pub enum ErrorKind<'db> {
         from: Ty<'db>,
         to: Ty<'db>,
     },
-    /// A literal where a conditioned alias is expected that fails one of
-    /// its conditions, or one the compiler cannot decide (§3.10.1).
+    /// A literal where a conditioned alias is expected, or a record built
+    /// of literals, that fails a condition of its type; or a literal whose
+    /// condition the compiler cannot decide (§3.10.1).
     ConditionNotMet {
         alias: Ty<'db>,
         condition: String,
