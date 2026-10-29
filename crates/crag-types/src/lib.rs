@@ -69,7 +69,7 @@ pub use group::{
 pub use handler::{
     Handler, HandlerCode, Handlers, dispose_handler, lifecycle_handler, type_handlers,
 };
-pub use infer::{constant as literal_value, is_source};
+pub use infer::{constant as literal_value, is_source, is_text};
 pub use overload::{
     FinalError, Ranked, Specificity, compare_param, final_errors, most_specific, overload_errors,
 };

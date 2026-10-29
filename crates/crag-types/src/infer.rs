@@ -3061,14 +3061,18 @@ impl<'a, 'db> Infer<'a, 'db> {
     /// code point is written as it is (§19.11).
     fn interpolated(&mut self, id: ExprId, ty: Ty<'db>) {
         let (db, program) = (self.db, self.program);
-        let plain = matches!(
-            crate::relate::unrefined(db, program, ty).as_builtin(db),
-            Some((Builtin::Str | Builtin::CodePoint, _))
-        );
-        if plain {
+        // A union's members that are text are written as they are too, and
+        // the rest by their `show`.
+        let rest: Vec<Ty<'db>> = ty
+            .members(db)
+            .into_iter()
+            .filter(|&m| !is_text(db, program, m))
+            .collect();
+        if rest.is_empty() {
             return;
         }
-        if let Some(filling) = crate::generic::written_show(db, program, ty, self.call_site()) {
+        let shown = self.join_all(rest);
+        if let Some(filling) = crate::generic::written_show(db, program, shown, self.call_site()) {
             self.shows.push((id, filling));
         }
     }
@@ -5240,4 +5244,13 @@ pub fn is_source(db: &dyn Db, item: ItemId<'_>) -> bool {
             item.name(db).text(db).as_str(),
             "Source" | "Finite" | "Infinite"
         )
+}
+
+/// Whether interpolation writes values of a type as they are: a `Str` or
+/// a `CodePoint`, or a conditioned alias of one (§19.11).
+pub fn is_text<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
+    matches!(
+        crate::relate::unrefined(db, program, ty).as_builtin(db),
+        Some((Builtin::Str | Builtin::CodePoint, _))
+    )
 }

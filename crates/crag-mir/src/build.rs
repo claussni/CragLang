@@ -44,8 +44,8 @@ use crag_types::{
     Builtin, CForm, Callee, DecisionTree, Dispatch, EscapeLevel, Filling, Handler, HandlerCode,
     InferenceResult, Instance, Iteration, ListLen, Position, SigParam, Signature, Step, Ty, TyKind,
     TypeDefKind, Value, body_types, decision_tree_with, declared_fields, derived_op,
-    dispose_handler, fields_of, lifecycle_handler, literal_value, prelude_item, result_type,
-    signature, subst, type_def, type_header, value_type,
+    dispose_handler, fields_of, is_text, lifecycle_handler, literal_value, prelude_item,
+    result_type, signature, subst, type_def, type_header, value_type,
 };
 
 use crate::ir::{
@@ -1487,6 +1487,61 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
 
     /// The signature of a concrete instance, its type arguments in place,
     /// with the result inference gives when none is written.
+    /// Whether a union has members that interpolation writes as they are.
+    fn has_text_member(&self, ty: Ty<'db>) -> bool {
+        let members = ty.members(self.db);
+        members.len() > 1 && members.iter().any(|&m| is_text(self.db, self.program, m))
+    }
+
+    /// An interpolated union value as text: a member that is text as it
+    /// is, any other as its `show` writes it (§19.11).
+    fn text_or_shown(&mut self, e: ExprId, str_ty: Ty<'db>) -> Operand<'db> {
+        let (db, program) = (self.db, self.program);
+        let ty = self.ty(e);
+        let op = self.expr(e);
+        let value = self.materialize(op, ty);
+        let (text, rest): (Vec<Ty<'db>>, Vec<Ty<'db>>) = ty
+            .members(db)
+            .into_iter()
+            .partition(|&m| is_text(db, program, m));
+        let out = self.temp(str_ty);
+        let join = self.new_block();
+        let blocks: Vec<BlockId> = text.iter().map(|_| self.new_block()).collect();
+        let otherwise = self.new_block();
+        self.terminate(Terminator::Switch {
+            place: Place::local(value),
+            cases: text.iter().copied().zip(blocks.iter().copied()).collect(),
+            otherwise,
+        });
+        for (&member, block) in text.iter().zip(blocks) {
+            self.switch_to(block);
+            let part = self.coerce(Operand::Local(value), ty, member);
+            let part = Operand::Local(self.materialize(part, member));
+            let written = self.assign(str_ty, Rvalue::Concat(vec![part]));
+            self.assign_to(out, written, str_ty);
+            self.terminate(Terminator::Jump(join));
+        }
+        self.switch_to(otherwise);
+        let rest = crag_types::normalize(db, program, rest).0;
+        let part = self.coerce(Operand::Local(value), ty, rest);
+        let shown = match self.types.show(e).cloned() {
+            Some(filling) if self.writes_text(Some(&filling)) => {
+                match self.call_filled(&filling, vec![(part, rest)], e) {
+                    Some((text, text_ty)) => self.coerce(Operand::Local(text), text_ty, str_ty),
+                    None => return self.trap(TrapKind::Error, Some(e)),
+                }
+            }
+            _ => {
+                let part = Operand::Local(self.materialize(part, rest));
+                self.assign(str_ty, Rvalue::Concat(vec![part]))
+            }
+        };
+        self.assign_to(out, shown, str_ty);
+        self.terminate(Terminator::Jump(join));
+        self.switch_to(join);
+        Operand::Local(out)
+    }
+
     /// Whether a type's own `show` gives a plain `Str`, so it writes the
     /// value; one that may fail leaves it to the derived `show`.
     fn writes_text(&self, show: Option<&Filling<'db>>) -> bool {
@@ -3082,6 +3137,12 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         {
                             let op = self.expr(*e);
                             ops.push(self.coerce(op, self.ty(*e), ty));
+                        }
+                        // A union with members that are text writes those
+                        // as they are and the rest by their `show`.
+                        StrPart::Expr(e) if self.has_text_member(self.ty(*e)) => {
+                            let part = self.text_or_shown(*e, ty);
+                            ops.push(part);
                         }
                         // A value whose type has a `show` of its own is
                         // written by it (§19.11).

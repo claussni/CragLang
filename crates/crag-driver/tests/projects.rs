@@ -754,7 +754,7 @@ fn main() {
     assert_eq!(output.status.code(), Some(0), "{}", text(output.stderr));
     assert_eq!(
         text(output.stdout),
-        "[\"a\", \"b c\"]\n\"hello\"\nEmpty\n\"hello\"\nTrue\n"
+        "[\"a\", \"b c\"]\nhello\nEmpty\nhello\nTrue\n"
     );
 }
 

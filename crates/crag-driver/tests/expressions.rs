@@ -511,6 +511,27 @@ fn named_arguments_build_the_record_a_function_value_takes() {
 }
 
 #[test]
+fn interpolation_writes_text_members_as_they_are() {
+    // §19.11: a `Str` or `CodePoint` is written as it is, also as the
+    // member a union value holds; only the value itself, not its parts.
+    let mut r = repl();
+    eval(&mut r, "let u: Int | Str = \"s\"");
+    assert_eq!(eval(&mut r, "\"{u}\""), "\"s\"\n");
+    eval(&mut r, "let v: Int | Str = 4");
+    assert_eq!(eval(&mut r, "\"{v}\""), "\"4\"\n");
+    eval(&mut r, "let w: Int | CodePoint = 'b'");
+    assert_eq!(eval(&mut r, "\"{w}\""), "\"b\"\n");
+    eval(&mut r, "type P(x: Int)");
+    eval(&mut r, "fn show(p: P) -> Str { \"p{p.x}\" }");
+    eval(&mut r, "let q: P | Str = P(x: 2)");
+    assert_eq!(eval(&mut r, "\"{q}\""), "\"p2\"\n");
+    eval(&mut r, "let t: P | Str = \"raw\"");
+    assert_eq!(eval(&mut r, "\"{t} {[t]}\""), "\"raw [\\\"raw\\\"]\"\n");
+    // `show` and the REPL still write it as source.
+    assert_eq!(eval(&mut r, "t"), "\"raw\"\n");
+}
+
+#[test]
 fn derived_functions_use_the_own_functions_of_parts() {
     // §19.11: a part with a function of its own is written, compared and
     // hashed by it inside the derived functions: in fields, members,
