@@ -95,7 +95,7 @@ pub type Unfinished(..Trap)
 pub type Cycle(..Trap)
 pub type Unordered(..Trap)
 pub type Exhausted(..Trap)
-pub type StackOverflow(..Trap)
+pub type StackOverflow(..Trap)  // a stack grew past its maximum size
 pub type Fault(..Trap)
 pub type NotFinite(..Trap, tag: Str)
 pub type ForeignFault(..Fault)

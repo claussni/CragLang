@@ -146,7 +146,7 @@ pub enum FiberState {
 pub struct FiberConfig {
     /// Usable bytes of the first stack, rounded up to whole pages.
     pub initial_stack: usize,
-    /// Growth beyond this many bytes ends the process with a stack overflow.
+    /// Growth beyond this many bytes traps with `StackOverflow`.
     pub max_stack: usize,
     /// Stress mode (Plan §11.3.9): the stack limit is kept so tight that
     /// every call fails its check, and every failure moves the stack to a

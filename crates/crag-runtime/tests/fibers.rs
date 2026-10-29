@@ -324,6 +324,28 @@ fn deep_recursion_grows_the_stack_by_doubling() {
 }
 
 #[test]
+fn a_stack_that_would_pass_its_maximum_traps() {
+    // Specification §13.6: reaching the maximum is a trap, not an abort,
+    // and the trap names every frame.
+    for config in [FiberConfig::normal(), FiberConfig::tortured()] {
+        let mut image = Image::new(&[sum_squares_fn(0)]);
+        let mut worker = Worker::new();
+        worker.set_code_map(Arc::new(std::mem::take(&mut image.code)));
+        let config = FiberConfig {
+            max_stack: 1 << 20,
+            ..config
+        };
+        let mut fiber = image.fiber(0, &[100_000], config);
+        assert_eq!(worker.resume(&mut fiber), FiberState::Trapped);
+        let trap = fiber.trap().unwrap();
+        assert_eq!(trap.kind, TrapKind::StackOverflow);
+        assert!(trap.stack.len() > 1000, "{} frames", trap.stack.len());
+        assert!(trap.stack.iter().all(|&f| f == FuncId(0)));
+        assert!(fiber.stack_size() <= 1 << 20);
+    }
+}
+
+#[test]
 fn a_frame_over_the_budget_grows_the_stack_before_it_is_allocated() {
     let functions = [wide_fn(600, 1), add_fn()];
     let wide = compile(&functions[0], &Image::new(&[]).settings).unwrap();

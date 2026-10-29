@@ -300,7 +300,7 @@ struct Otherwise {
 
 /// The trap kinds a handler may take, with the prelude's types for them
 /// (§8.3).
-const TRAP_TYPES: [(crag_abi::TrapKind, &str); 14] = [
+const TRAP_TYPES: [(crag_abi::TrapKind, &str); 15] = [
     (crag_abi::TrapKind::Overflow, "Overflow"),
     (crag_abi::TrapKind::DivideByZero, "DivisionByZero"),
     (crag_abi::TrapKind::Index, "OutOfBounds"),
@@ -315,6 +315,7 @@ const TRAP_TYPES: [(crag_abi::TrapKind, &str); 14] = [
     (crag_abi::TrapKind::ConditionFailed, "ConditionFailed"),
     (crag_abi::TrapKind::NotFinite, "NotFinite"),
     (crag_abi::TrapKind::ForeignFault, "ForeignFault"),
+    (crag_abi::TrapKind::StackOverflow, "StackOverflow"),
 ];
 
 /// The state of lowering one decision tree.

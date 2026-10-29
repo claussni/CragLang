@@ -1464,6 +1464,8 @@ pub enum TrapKind {
     NotFinite = 15,
     /// A C function broke what its import declares (Specification §16.1).
     ForeignFault = 16,
+    /// A fiber's stack would grow past its maximum size.
+    StackOverflow = 17,
 }
 
 impl TrapKind {
@@ -1487,6 +1489,7 @@ impl TrapKind {
             TrapKind::ConditionFailed => "a value failed a condition of its type",
             TrapKind::NotFinite => "a number was not finite",
             TrapKind::ForeignFault => "a C function broke what its import declares",
+            TrapKind::StackOverflow => "the stack overflowed",
         }
     }
 
@@ -1502,7 +1505,7 @@ impl TrapKind {
 }
 
 impl TrapKind {
-    pub const ALL: [TrapKind; 17] = [
+    pub const ALL: [TrapKind; 18] = [
         TrapKind::Overflow,
         TrapKind::DivideByZero,
         TrapKind::Index,
@@ -1520,6 +1523,7 @@ impl TrapKind {
         TrapKind::ConditionFailed,
         TrapKind::NotFinite,
         TrapKind::ForeignFault,
+        TrapKind::StackOverflow,
     ];
 
     /// The kind with this discriminant, if any.

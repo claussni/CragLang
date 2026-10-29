@@ -166,13 +166,16 @@ const _: () = assert!(SAVE_BYTES + SWITCH_FRAME_BYTES <= RUNTIME_RESERVE as usiz
 struct Resume {
     /// The save area's address, which changes when the stack moves.
     sp: usize,
-    /// Zero to continue, [`UNWIND`] to trap with `Cancelled`, anything else
-    /// to stop.
+    /// Zero to continue, [`UNWIND`] to trap with `Cancelled`, [`OVERFLOW`]
+    /// to trap with `StackOverflow`, anything else to stop.
     stop: usize,
 }
 
 /// The `stop` of a cancelled fiber.
 const UNWIND: usize = 2;
+
+/// The `stop` of a fiber whose stack cannot grow as far as it needs.
+const OVERFLOW: usize = 3;
 
 /// `rt_morestack(ctx, needed)`: see `crag_abi::RuntimeFn::Morestack`.
 ///
@@ -202,6 +205,8 @@ pub(crate) unsafe extern "C" fn rt_morestack(ctx: *const TaskContext, needed: us
         "jz 2f",
         "cmp rdx, {unwind}",
         "je 3f",
+        "cmp rdx, {overflow}",
+        "je 4f",
         // Stop: leave a switch frame that continues at label 2, record the
         // stack pointer and return into the worker's `switch` call.
         "mov rdi, [rsp + {rdi_slot}]",
@@ -232,12 +237,23 @@ pub(crate) unsafe extern "C" fn rt_morestack(ctx: *const TaskContext, needed: us
         "mov esi, {cancelled}",
         "mov rdx, {no_position}",
         "jmp {trap}",
+        // Overflowed: trap the same way with `StackOverflow`, on the stack
+        // as it is.
+        "4:",
+        "mov rdi, [rsp + {rdi_slot}]",
+        "mov rbp, [rsp + {rbp_slot}]",
+        "add rsp, {save}",
+        "mov esi, {stack_overflow}",
+        "mov rdx, {no_position}",
+        "jmp {trap}",
         rdi_slot = const RDI_SLOT,
         rbp_slot = const RBP_SLOT,
         worker = const offset_of!(TaskContext, worker),
         saved_sp = const offset_of!(TaskContext, saved_sp),
         slow = sym morestack_slow,
         unwind = const UNWIND,
+        overflow = const OVERFLOW,
+        stack_overflow = const TrapKind::StackOverflow as u32,
         save = const SAVE_BYTES - 8,
         cancelled = const TrapKind::Cancelled as u32,
         no_position = const NO_POSITION,
@@ -267,7 +283,17 @@ unsafe extern "C" fn morestack_slow(ctx: *const TaskContext, needed: usize, sp: 
         let check_sp = sp + SAVE_BYTES;
         if check_sp.wrapping_sub(needed) < fiber.limit || check_sp < needed {
             let before = fiber.stack.size();
-            sp = grow_stack(fiber, needed, sp);
+            let Some(grown) = grow_stack(fiber, needed, sp) else {
+                // The trap ends the frames that would not fit; a
+                // cancellation goes first.
+                finish_check(ctx, fiber.limit);
+                let stop = match crate::cancel::due(ctx) {
+                    true => UNWIND,
+                    false => OVERFLOW,
+                };
+                return Resume { sp, stop };
+            };
+            sp = grown;
             // A metered fiber's stack is charged to its memory budget.
             if fiber.metering.is_some() {
                 let heap = &mut *ctx.heap.load(Ordering::Relaxed);
@@ -302,7 +328,7 @@ unsafe extern "C" fn morestack_slow(ctx: *const TaskContext, needed: usize, sp: 
 }
 
 /// Moves the fiber to a larger stack and returns the new address of the
-/// save area at `sp`.
+/// save area at `sp`; none when the stack would grow past its maximum.
 ///
 /// The used part of the old stack, from `sp` to the top, is copied to the
 /// top of the new one, so every byte keeps its distance from the top. The
@@ -314,7 +340,7 @@ unsafe extern "C" fn morestack_slow(ctx: *const TaskContext, needed: usize, sp: 
 ///
 /// The fiber must be suspended in `rt_morestack` with its save area at `sp`,
 /// and the caller must be running on another stack.
-unsafe fn grow_stack(fiber: &mut Fiber, needed: usize, sp: usize) -> usize {
+unsafe fn grow_stack(fiber: &mut Fiber, needed: usize, sp: usize) -> Option<usize> {
     let old_low = fiber.stack.low();
     let old_top = fiber.stack.top();
     if !(old_low..old_top).contains(&sp) {
@@ -331,7 +357,7 @@ unsafe fn grow_stack(fiber: &mut Fiber, needed: usize, sp: usize) -> usize {
         required.max(2 * fiber.stack.size())
     };
     if size > fiber.config.max_stack {
-        die("stack overflow: a fiber's stack reached its maximum size");
+        return None;
     }
     let new = match StackMemory::new(size) {
         Ok(stack) => stack,
@@ -371,5 +397,5 @@ unsafe fn grow_stack(fiber: &mut Fiber, needed: usize, sp: usize) -> usize {
     };
     fiber.stack = new; // Unmaps the old stack.
     fiber.growths += 1;
-    new_sp
+    Some(new_sp)
 }
