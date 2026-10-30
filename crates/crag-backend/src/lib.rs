@@ -62,7 +62,7 @@ pub use layout::{
 };
 pub use lower::{Lowered, StepInfo, func_id, lower_to_lir};
 pub use shape::{shapes, split_shapes};
-pub use split::{flat_layouts, flat_params, scalar_replace};
+pub use split::{flat_layouts, flat_params, flat_result, scalar_replace};
 
 /// The code of an instance, ready for the loader.
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -242,6 +242,13 @@ fn slot_signature<'db>(db: &'db dyn Db, program: Program, instance: InstanceKey<
             .hash(&mut hasher);
         hash = hasher.finish();
     }
+    {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        hash.hash(&mut hasher);
+        split::flat_result(db, program, instance).hash(&mut hasher);
+        hash = hasher.finish();
+    }
     // Zero is for what has no signature, and the top bit for steps.
     (((hash >> 32) as u32 ^ hash as u32) & !crag_abi::STEP_CELL).max(1)
 }
@@ -353,8 +360,7 @@ pub fn code<'db>(
     let value = matches!(owner, Owner::Item(item) if item.kind(db).is_value());
     let cell =
         (value && *instance.entry(db) == Entry::Body).then(|| slot_key(db, program, instance));
-    let flat = flat_params(db, program, instance);
-    let lowered = lower_to_lir(db, program, owner, func_id(instance), &body, cell, flat);
+    let lowered = lower_to_lir(db, program, instance, &body, cell);
     let settings = CodegenSettings {
         target: host().clone(),
         opt: OptLevel::None,

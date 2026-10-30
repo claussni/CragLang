@@ -61,12 +61,13 @@ use crag_mir::{
 };
 use crag_types::{Builtin, CForm, Step, Ty, TyKind, prelude_item, signature};
 
+use crate::flat::MAX_FLAT_SIZE;
 use crate::layout::{
     Layout, boxed_indices, deferred, dispose_word, is_text, layout, record_layout, signal_types,
     subtypes, type_descriptor, type_index, word_keys,
 };
 use crate::slot_key;
-use crate::split::{Form, Slot, SlotKind, flat_params, form, place_form, storage};
+use crate::split::{Form, Slot, SlotKind, flat_params, flat_result, form, place_form, storage};
 
 /// The LIR of a body, with what it could not lower.
 pub struct Lowered<'db> {
@@ -106,19 +107,21 @@ type Unsupported = &'static str;
 /// bytes and its slots.
 type Incoming = (Vec<VReg>, u32, Vec<Slot>);
 
-/// Lowers the MIR of a body of `owner`, loaded as `func`, whose source map
-/// gives the positions of traps and steps. The code of a module-level
-/// value keeps the value in `cell` (§11.6.2). The parameters `flat` names
-/// pass by value in storage form (Plan §11.10.10).
+/// Lowers the MIR of an instance, whose owner's source map gives the
+/// positions of traps and steps. The code of a module-level value keeps
+/// the value in `cell` (§11.6.2). Flat records pass to and from it by
+/// value as `flat_params` and `flat_result` say (Plan §11.10.10).
 pub fn lower_to_lir<'db>(
     db: &'db dyn Db,
     program: Program,
-    owner: Owner<'db>,
-    func: FuncId,
+    instance: InstanceKey<'db>,
     mir: &MirBody<'db>,
     cell: Option<SlotKey>,
-    flat: &[bool],
 ) -> Lowered<'db> {
+    let owner = *instance.owner(db);
+    let func = func_id(instance);
+    let flat = flat_params(db, program, instance);
+    let result = flat_result(db, program, instance).as_ref();
     let named = |name: &str| {
         prelude_item(db, program, name).map(|i| Ty::new(db, TyKind::Named(i, Vec::new())))
     };
@@ -151,6 +154,9 @@ pub fn lower_to_lir<'db>(
         details: Vec::new(),
         natives: Vec::new(),
         c_buffer: None,
+        result: result.cloned(),
+        sret: None,
+        results: None,
     };
     // The parameters' words come first: a parameter that passes by value
     // has its storage form's, and registers of its own besides.
@@ -160,6 +166,14 @@ pub fn lower_to_lir<'db>(
     l.forms = vec![None; n];
     let mut incoming: Vec<Option<Incoming>> = vec![None; mir.params];
     let mut params = 0;
+    // A result of more than two words given by value goes to a buffer
+    // the caller gives first.
+    if let Some((size, _)) = result
+        && size.div_ceil(8) > 2
+    {
+        l.sret = Some(l.reg());
+        params += 1;
+    }
     for (i, decl) in mir.locals.iter().enumerate().take(mir.params) {
         match flat.get(i) == Some(&true) {
             true => {
@@ -179,7 +193,11 @@ pub fn lower_to_lir<'db>(
             l.local(i, decl);
         }
     }
-    let returns = layout(db, program, mir.result).map_or(0, Layout::words);
+    let returns = match result {
+        Some((size, _)) if size.div_ceil(8) > 2 => 0,
+        Some((size, _)) => size.div_ceil(8) as usize,
+        None => layout(db, program, mir.result).map_or(0, Layout::words),
+    };
     let unknown_param = l.layouts[..mir.params].iter().any(Option::is_none);
     for (b, block) in mir.blocks.iter().enumerate() {
         l.current = (b, Vec::new());
@@ -201,6 +219,16 @@ pub fn lower_to_lir<'db>(
     }
     // MIR's entry block is no branch target, so the scratch words are
     // pushed once.
+    if let (Some(dst), Some(entry)) = (l.results, l.blocks[0].as_mut()) {
+        entry.insts.insert(
+            0,
+            Inst::SidePush {
+                dst,
+                size: MAX_FLAT_SIZE,
+                align: 8,
+            },
+        );
+    }
     if let (Some(dst), Some(entry)) = (l.scratch, l.blocks[0].as_mut()) {
         entry.insts.insert(
             0,
@@ -342,6 +370,13 @@ struct Lower<'a, 'db> {
     /// call needs.
     natives: Vec<NativeSymbol>,
     c_buffer: Option<(VReg, u32)>,
+    /// The storage form of the result when the code gives it by value,
+    /// and the buffer its caller gave for one of more than two words.
+    result: Option<(u32, Vec<Slot>)>,
+    sret: Option<VReg>,
+    /// A buffer on the side stack for the results of more than two words
+    /// that calls give by value, pushed at the entry.
+    results: Option<VReg>,
 }
 
 impl<'a, 'db> Lower<'a, 'db> {
@@ -535,15 +570,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             None => {
                 let f = form(self.db, self.program, ty).ok_or("records of this type")?;
                 let ptr = word(&self.locals[l.index()].clone())?;
-                let regs = self.unbox(ty, &f, ptr)?;
-                for (at, leaf, t) in f.leaves(ty) {
-                    self.count_words(Some(leaf), t, &regs[at..at + leaf.words()], Self::retain)?;
-                }
-                match deferred(self.db, self.program, ty) {
-                    true => self.release_deferred(ptr),
-                    false => self.release(ptr),
-                }
-                regs
+                self.owned_fields(ty, &f, ptr)?
             }
         };
         Ok(self.pack(&slots, size, &regs))
@@ -3457,28 +3484,61 @@ impl<'a, 'db> Lower<'a, 'db> {
                 ..
             } => {
                 let args = self.arguments(*func, args)?;
-                let dsts = self.locals[dst.index()].clone();
                 self.layouts[dst.index()].ok_or("values of this type")?;
-                let func = self.slot(*func);
                 let handlers = handlers(unwind, catch);
-                self.push(match handlers.is_empty() {
-                    true => Inst::Call { func, args, dsts },
-                    false => Inst::TryCall {
-                        func,
-                        args,
-                        dsts,
-                        handlers,
-                    },
-                });
+                match flat_result(self.db, self.program, *func).clone() {
+                    None => {
+                        let dsts = self.locals[dst.index()].clone();
+                        self.call(*func, args, dsts, handlers);
+                    }
+                    // A record given by value goes into the local's
+                    // registers, or into a box.
+                    Some((size, slots)) => {
+                        let words = self.call_flat(*func, args, size, handlers);
+                        let ty = self.local_ty(*dst);
+                        let f = form(self.db, self.program, ty).ok_or("records of this type")?;
+                        let regs = self.unpack(&slots, &words, f.words());
+                        let values = match self.forms[dst.index()] {
+                            Some(_) => regs,
+                            None => vec![self.box_split(ty, &f, &regs)?],
+                        };
+                        self.assign(*dst, values)?;
+                    }
+                }
                 self.end(Term::Jump(block(*target)), None);
             }
             Terminator::TailCall { func, args, .. } => {
-                let args = self.arguments(*func, args)?;
-                let term = Term::TailCall {
-                    func: self.slot(*func),
-                    args,
-                };
-                self.end(term, None);
+                let mut args = self.arguments(*func, args)?;
+                let callee = flat_result(self.db, self.program, *func).clone();
+                if callee == self.result {
+                    // A result given by value goes where this function's
+                    // caller wants it.
+                    args.splice(0..0, self.sret);
+                    let term = Term::TailCall {
+                        func: self.slot(*func),
+                        args,
+                    };
+                    self.end(term, None);
+                    return Ok(());
+                }
+                // The callee gives its result otherwise: a call, then the
+                // result returned as this function gives it.
+                let ty = self.mir.result;
+                let f = form(self.db, self.program, ty).ok_or("records of this type")?;
+                match callee {
+                    Some((size, slots)) => {
+                        let words = self.call_flat(*func, args, size, Vec::new());
+                        let regs = self.unpack(&slots, &words, f.words());
+                        let ptr = self.box_split(ty, &f, &regs)?;
+                        self.give(vec![ptr], true)?;
+                    }
+                    None => {
+                        let ptr = self.reg();
+                        self.call(*func, args, vec![ptr], Vec::new());
+                        let regs = self.owned_fields(ty, &f, ptr)?;
+                        self.give_flat(regs)?;
+                    }
+                }
             }
             Terminator::CallValue {
                 callee,
@@ -3510,18 +3570,45 @@ impl<'a, 'db> Lower<'a, 'db> {
             }
             Terminator::TailCallValue { callee, args, .. } => {
                 let (code, args) = self.value_arguments(callee, args)?;
+                // A function value gives a record in its box, which this
+                // function may give by value.
+                if self.result.is_some() {
+                    let ty = self.mir.result;
+                    let f = form(self.db, self.program, ty).ok_or("records of this type")?;
+                    let ptr = self.reg();
+                    self.push(Inst::CallIndirect {
+                        callee: code,
+                        args,
+                        dsts: vec![ptr],
+                    });
+                    let regs = self.owned_fields(ty, &f, ptr)?;
+                    return self.give_flat(regs);
+                }
                 let term = Term::TailCallIndirect { callee: code, args };
                 self.end(term, None);
             }
             Terminator::Return(op) => {
+                if self.result.is_some() {
+                    let ty = self.mir.result;
+                    let regs = match op {
+                        Operand::Local(l) if self.forms[l.index()].is_some() => {
+                            self.locals[l.index()].clone()
+                        }
+                        Operand::Local(l) => {
+                            let f =
+                                form(self.db, self.program, ty).ok_or("records of this type")?;
+                            let ptr = word(&self.locals[l.index()].clone())?;
+                            self.owned_fields(ty, &f, ptr)?
+                        }
+                        Operand::Const(_) => return Err("this conversion"),
+                    };
+                    return self.give_flat(regs);
+                }
                 let values = self.operand(op, self.mir.result)?;
                 if values.len() != returns {
                     return Err("this conversion");
                 }
-                if let Some(cell) = self.cell {
-                    self.keep(cell, op, &values)?;
-                }
-                self.end(Term::Return(values), None);
+                self.give(values, matches!(op, Operand::Local(_)))?;
             }
             Terminator::Trap {
                 kind,
@@ -3593,12 +3680,103 @@ impl<'a, 'db> Lower<'a, 'db> {
 
     /// Keeps the value the code of a module-level value gives in its cell,
     /// with a reference of the cell's own, and marks the cell full.
-    fn keep(
+    /// Returns the words of the result, which a module value's cell keeps
+    /// too, with a reference of its own unless they are a constant's.
+    fn give(&mut self, values: Vec<VReg>, counted: bool) -> Result<(), Unsupported> {
+        if let Some(cell) = self.cell {
+            self.keep(cell, counted, &values)?;
+        }
+        self.end(Term::Return(values), None);
+        Ok(())
+    }
+
+    /// Returns a record given by value from its registers: its storage
+    /// form's words, or in the buffer the caller gave.
+    fn give_flat(&mut self, regs: Vec<VReg>) -> Result<(), Unsupported> {
+        let (size, slots) = self.result.clone().ok_or("this conversion")?;
+        let words = self.pack(&slots, size, &regs);
+        let values = match self.sret {
+            Some(buffer) => {
+                for (k, src) in words.into_iter().enumerate() {
+                    self.push(Inst::Store {
+                        src,
+                        addr: buffer,
+                        offset: 8 * k as i32,
+                    });
+                }
+                Vec::new()
+            }
+            None => words,
+        };
+        self.end(Term::Return(values), None);
+        Ok(())
+    }
+
+    /// Calls an instance.
+    fn call(
         &mut self,
-        cell: SlotKey,
-        op: &Operand<'db>,
-        values: &[VReg],
-    ) -> Result<(), Unsupported> {
+        func: InstanceKey<'db>,
+        args: Vec<VReg>,
+        dsts: Vec<VReg>,
+        handlers: Vec<(HandlerKind, LirBlockId)>,
+    ) {
+        let func = self.slot(func);
+        self.push(match handlers.is_empty() {
+            true => Inst::Call { func, args, dsts },
+            false => Inst::TryCall {
+                func,
+                args,
+                dsts,
+                handlers,
+            },
+        });
+    }
+
+    /// Calls an instance that gives a record of `size` bytes by value:
+    /// the words of its storage form, which one of more than two words
+    /// writes to a buffer on this function's side stack.
+    fn call_flat(
+        &mut self,
+        func: InstanceKey<'db>,
+        mut args: Vec<VReg>,
+        size: u32,
+        handlers: Vec<(HandlerKind, LirBlockId)>,
+    ) -> Vec<VReg> {
+        let n = size.div_ceil(8) as usize;
+        if n <= 2 {
+            let dsts: Vec<VReg> = (0..n).map(|_| self.reg()).collect();
+            self.call(func, args, dsts.clone(), handlers);
+            return dsts;
+        }
+        let buffer = *self.results.get_or_insert_with(|| {
+            self.vregs += 1;
+            VReg(self.vregs - 1)
+        });
+        args.insert(0, buffer);
+        self.call(func, args, Vec::new(), handlers);
+        (0..n).map(|k| self.load(buffer, 8 * k as i32)).collect()
+    }
+
+    /// The fields of a record in a box the code owns, loaded with
+    /// references of their own as it gives up the box's.
+    fn owned_fields(
+        &mut self,
+        ty: Ty<'db>,
+        f: &Form<'db>,
+        ptr: VReg,
+    ) -> Result<Vec<VReg>, Unsupported> {
+        let regs = self.unbox(ty, f, ptr)?;
+        for (at, leaf, t) in f.leaves(ty) {
+            self.count_words(Some(leaf), t, &regs[at..at + leaf.words()], Self::retain)?;
+        }
+        match deferred(self.db, self.program, ty) {
+            true => self.release_deferred(ptr),
+            false => self.release(ptr),
+        }
+        Ok(regs)
+    }
+
+    fn keep(&mut self, cell: SlotKey, counted: bool, values: &[VReg]) -> Result<(), Unsupported> {
         let addr = self.reg();
         self.push(Inst::CellAddr { dst: addr, cell });
         for (i, &src) in values.iter().enumerate() {
@@ -3606,7 +3784,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             self.push(Inst::Store { src, addr, offset });
         }
         // The words returned, a split local boxed among them.
-        if let Operand::Local(_) = op {
+        if counted {
             let ty = self.mir.result;
             let layout = self.layout_of(ty)?;
             self.count_words(Some(layout), ty, values, Self::retain)?;

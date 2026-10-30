@@ -520,6 +520,19 @@ impl Module {
         shapes(db, program, ty)
     }
 
+    /// The bytes of the result a function of the module gives by value.
+    fn flat_result(&self, name: &str) -> Option<u32> {
+        let (db, program) = (&self.db, self.program);
+        let module = program.modules(db)[1];
+        let owner = owners(db, module)
+            .into_iter()
+            .find(|o| matches!(o, Owner::Item(i) if i.name(db).text(db) == name))
+            .unwrap();
+        crag_backend::flat_result(db, program, InstanceKey::body(db, owner))
+            .as_ref()
+            .map(|(size, _)| *size)
+    }
+
     /// Which parameters of a function of the module pass by value.
     fn flat(&self, name: &str) -> Vec<bool> {
         let (db, program) = (&self.db, self.program);
@@ -988,13 +1001,13 @@ fn zeroNamed() -> List[Int] {
     };
     // Boxed where it is returned, the points within it too.
     assert_eq!(split("line"), on(&["p", "l"]));
-    // Loaded from the box a call returned.
-    assert_eq!(split("ends"), on(&["from", "to"]));
+    // Given by value, through a buffer on the side stack.
+    assert_eq!(split("ends"), on(&["l", "from", "to"]));
+    assert_eq!(split("passed"), on(&["l", "from"]));
     // Used twice where it must be in a box: one box, shared.
     assert_eq!(split("listed"), on(&[]));
     // An element is loaded from its list.
     assert_eq!(split("first"), on(&["p"]));
-    assert_eq!(split("passed"), on(&["from"]));
     assert_eq!(split("named"), on(&["n", "m"]));
     assert_eq!(m.int("ends", &[7]), 7 * 100 + 7 * 10 + 1);
     assert_eq!(m.int("first", &[4]), 8);
@@ -1044,6 +1057,55 @@ fn run(n: Int) -> Int {
     assert_eq!(m.flat("spot"), on(&[false]));
     assert_eq!(m.flat("wide"), on(&[false]));
     assert_eq!(m.int("run", &[3]), 2301);
+    assert_eq!(m.heap.live_blocks(), 0);
+}
+
+#[test]
+fn flat_records_are_returned_by_value() {
+    let mut m = Module::new(
+        r#"type Point(x: Int, y: Int)
+type Line(from: Point, to: Point)
+
+fn point(a: Int) -> Point { Point(x: a, y: a + 1) }
+
+fn line(a: Int) -> Line { Line(from: point(a), to: point(a * 10)) }
+
+fn walk(l: Line, n: Int) -> Line {
+  if n == 0 { l } else { walk(Line(from: l.to, to: l.from), n - 1) }
+}
+
+fn origin() -> Point { point(0) }
+
+fn viaValue(a: Int) -> Point {
+  let f: (Int) -> Point = { b -> Point(x: b, y: b) }
+  f(a)
+}
+
+fn run(a: Int) -> Int {
+  let p = point(a)
+  let l = walk(line(a), 1001)
+  let o = origin()
+  let v = viaValue(a)
+  p.y * 1000000 + l.from.x * 1000 + l.to.y * 10 + o.y + v.x
+}
+
+fn zeroLine() -> Line { walk(line(1), 2) }
+"#,
+    );
+    let on = |r: Option<u32>| match flat_layouts() {
+        true => r,
+        false => None,
+    };
+    let size = |name: &str| m.flat_result(name);
+    assert_eq!(size("point"), on(Some(16)));
+    assert_eq!(size("line"), on(Some(32)));
+    // The host runs a function without parameters as a root.
+    assert_eq!(size("origin"), None);
+    assert_eq!(m.int("run", &[2]), 3 * 1000000 + 20 * 1000 + 3 * 10 + 1 + 2);
+    assert_eq!(
+        m.shown("zeroLine"),
+        "Line(from: Point(x: 1, y: 2), to: Point(x: 10, y: 11))"
+    );
     assert_eq!(m.heap.live_blocks(), 0);
 }
 

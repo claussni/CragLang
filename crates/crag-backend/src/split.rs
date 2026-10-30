@@ -38,10 +38,13 @@
 //! A flat record passes to a parameter of a function's body by value, in
 //! its storage form packed into at most four words (Compiler Architecture
 //! §A11.4.6): the parameter is split, and an argument is packed from its
-//! registers or loaded from its box. Records whose register form keeps a
-//! member in a box, as a union with a record member does, still pass in
-//! their box. Results, and the code that function values and the runtime
-//! call, take records in their boxes.
+//! registers or loaded from its box. A function's body with parameters
+//! returns a flat record by value too: in at most two words, or written
+//! to a buffer the caller pushes on its side stack, which a tail call
+//! passes on; a tail call to code that returns otherwise becomes a call.
+//! Records whose register form keeps a member in a box, as a union with a
+//! record member does, still pass in their box, and so do the records of
+//! the code that function values, the runtime and the host call.
 //!
 //! With `CRAG_FLAT=0` in the environment no local is split and every
 //! record passes in its box.
@@ -54,7 +57,7 @@ use crag_mir::{
     ClosurePlacement, Entry, InstanceKey, MirBody, Operand, Place, Rvalue, Statement, Terminator,
     Tier, mir,
 };
-use crag_types::{Builtin, Step, Ty, TyKind, TypeDefKind, type_def};
+use crag_types::{Builtin, Step, Ty, TyKind, TypeDefKind, lifecycle_handler, type_def};
 
 use crate::flat::{self, LayoutClass, TagPlace};
 use crate::layout::{self, Layout, type_index};
@@ -221,6 +224,7 @@ pub fn scalar_replace<'db>(
         let mut check = Check {
             db,
             program,
+            gives_flat: flat_result(db, program, instance).is_some(),
             body,
             forms: &forms,
             split: &split,
@@ -264,6 +268,8 @@ pub fn scalar_replace<'db>(
 struct Check<'a, 'db> {
     db: &'db dyn Db,
     program: Program,
+    /// Whether the body gives its result by value.
+    gives_flat: bool,
     body: &'a MirBody<'db>,
     forms: &'a [Option<Form<'db>>],
     split: &'a [bool],
@@ -436,7 +442,10 @@ impl<'db> Check<'_, 'db> {
                 func, args, dst, ..
             } => {
                 self.arguments(*func, args);
-                self.keep[dst.index()] = true;
+                // A result given by value is in registers.
+                if flat_result(self.db, self.program, *func).is_none() {
+                    self.keep[dst.index()] = true;
+                }
             }
             Terminator::TailCall { func, args, .. } => self.arguments(*func, args),
             Terminator::CallValue {
@@ -450,6 +459,9 @@ impl<'db> Check<'_, 'db> {
                 self.consumed(callee);
                 args.iter().for_each(|o| self.consumed(o));
             }
+            // A result given by value is packed from registers, or loaded
+            // from its box.
+            Terminator::Return(_) if self.gives_flat => {}
             Terminator::Return(o) => self.consumed(o),
             Terminator::Branch { cond, .. } => self.borrowed(cond),
             Terminator::Jump(_) | Terminator::Trap { .. } => {}
@@ -460,7 +472,7 @@ impl<'db> Check<'_, 'db> {
 /// Where a value of a flat record's register form is in its storage form
 /// (Compiler Architecture §A11.4): the register it starts at, and how its
 /// bytes or bits hold it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
 pub struct Slot {
     pub at: usize,
     /// The byte it starts at, and its bytes.
@@ -471,7 +483,7 @@ pub struct Slot {
     pub kind: SlotKind,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
 pub enum SlotKind {
     /// An integer, stored in `size` bytes and extended to a word with its
     /// sign or with zeros.
@@ -560,20 +572,26 @@ fn slots_into<'db>(
     Some(())
 }
 
+/// Whether an instance is a function's body, which takes and gives flat
+/// records by value. Other code, which the runtime or a function value
+/// calls, takes every record in its box.
+fn by_value<'db>(db: &'db dyn Db, instance: InstanceKey<'db>) -> bool {
+    let Owner::Item(item) = *instance.owner(db) else {
+        return false;
+    };
+    let function = *item.kind(db) == ItemKind::Function && c_function(db, item).is_none();
+    flat_layouts() && function && *instance.entry(db) == Entry::Body
+}
+
 /// Which parameters of an instance pass by value in storage form: those
-/// of flat record types of a function's body. Other code, which the
-/// runtime or a function value calls, takes every record in its box.
+/// of flat record types of a function's body.
 #[crag_db::tracked(returns(ref))]
 pub fn flat_params<'db>(
     db: &'db dyn Db,
     program: Program,
     instance: InstanceKey<'db>,
 ) -> Vec<bool> {
-    let Owner::Item(item) = *instance.owner(db) else {
-        return Vec::new();
-    };
-    let function = *item.kind(db) == ItemKind::Function && c_function(db, item).is_none();
-    if !flat_layouts() || !function || *instance.entry(db) != Entry::Body {
+    if !by_value(db, instance) {
         return Vec::new();
     }
     let Some(body) = mir(db, program, instance, Tier::Baseline) else {
@@ -583,4 +601,25 @@ pub fn flat_params<'db>(
         .iter()
         .map(|l| storage(db, program, l.ty).is_some())
         .collect()
+}
+
+/// The storage form of an instance's result when it gives it by value: a
+/// flat record that a function's body with parameters returns. The host
+/// runs functions without parameters as roots, and the `Embed` handlers
+/// of types, which return records in their boxes: so do all functions
+/// with no parameters, or a result of a type with an `Embed` handler.
+#[crag_db::tracked(returns(ref))]
+pub fn flat_result<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    instance: InstanceKey<'db>,
+) -> Option<(u32, Vec<Slot>)> {
+    if !by_value(db, instance) {
+        return None;
+    }
+    let body = mir(db, program, instance, Tier::Baseline).as_ref()?;
+    if body.params == 0 || lifecycle_handler(db, program, body.result, "Embed").is_some() {
+        return None;
+    }
+    storage(db, program, body.result)
 }
