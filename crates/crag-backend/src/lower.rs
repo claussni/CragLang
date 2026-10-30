@@ -66,6 +66,7 @@ use crate::layout::{
     subtypes, type_descriptor, type_index, word_keys,
 };
 use crate::slot_key;
+use crate::split::{Form, form, place_form};
 
 /// The LIR of a body, with what it could not lower.
 pub struct Lowered<'db> {
@@ -90,7 +91,8 @@ pub struct Lowered<'db> {
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
 pub struct StepInfo<'db> {
     pub position: Option<u32>,
-    pub locals: Vec<(Name<'db>, Ty<'db>)>,
+    /// The named locals whose words it passes, and whether each is split.
+    pub locals: Vec<(Name<'db>, Ty<'db>, bool)>,
 }
 
 /// The function an instance is loaded as.
@@ -123,6 +125,7 @@ pub fn lower_to_lir<'db>(
         vregs: 0,
         locals: Vec::new(),
         layouts: Vec::new(),
+        forms: Vec::new(),
         blocks: vec![None; mir.blocks.len()],
         current: (0, Vec::new()),
         catch: None,
@@ -150,15 +153,27 @@ pub fn lower_to_lir<'db>(
         if i == 0 && mir.env {
             words = words.max(1);
         }
+        // A split local's registers are its fields' (Plan §11.10.10).
+        let form = decl.split.then(|| form(db, program, decl.ty)).flatten();
+        let leaves = match &form {
+            Some(f) => {
+                words = f.words();
+                f.leaves(decl.ty)
+            }
+            None => layout.map_or(Vec::new(), |l| vec![(0, l, decl.ty)]),
+        };
         let regs: Vec<VReg> = (0..words).map(|_| l.reg()).collect();
-        match layout {
-            Some(Layout::Box) => l.tracked.extend(&regs),
-            Some(Layout::Closure) => l.tracked.push(regs[1]),
-            Some(Layout::Pair) => l.tracked.push(regs[0]),
-            _ => {}
+        for (at, leaf, _) in leaves {
+            match leaf {
+                Layout::Box => l.tracked.push(regs[at]),
+                Layout::Closure => l.tracked.push(regs[at + 1]),
+                Layout::Pair => l.tracked.push(regs[at]),
+                _ => {}
+            }
         }
         l.locals.push(regs);
         l.layouts.push(layout);
+        l.forms.push(form);
     }
     let params: usize = l.locals[..mir.params].iter().map(Vec::len).sum();
     let returns = layout(db, program, mir.result).map_or(0, Layout::words);
@@ -289,6 +304,8 @@ struct Lower<'a, 'db> {
     /// The registers of each local.
     locals: Vec<Vec<VReg>>,
     layouts: Vec<Option<Layout>>,
+    /// The register form of each split local.
+    forms: Vec<Option<Form<'db>>>,
     /// MIR block `i` is LIR block `i`; tests add more.
     blocks: Vec<Option<LirBlock>>,
     current: (usize, Vec<Inst>),
@@ -501,11 +518,20 @@ impl<'a, 'db> Lower<'a, 'db> {
             Statement::Retain(local) => self.count(*local, Self::retain),
             Statement::Release(local) => {
                 // A long chain of boxes is freed between fibers (§13.5).
-                let op = match deferred(self.db, self.program, self.local_ty(*local)) {
+                let op = |this: &Self, ty| match deferred(this.db, this.program, ty) {
                     true => Self::release_deferred,
                     false => Self::release,
                 };
-                self.count(*local, op)
+                let ty = self.local_ty(*local);
+                let Some(form) = self.forms[local.index()].clone() else {
+                    return self.count(*local, op(self, ty));
+                };
+                let regs = self.locals[local.index()].clone();
+                for (at, leaf, ty) in form.leaves(ty) {
+                    let op = op(self, ty);
+                    self.count_words(Some(leaf), ty, &regs[at..at + leaf.words()], op)?;
+                }
+                Ok(())
             }
             Statement::Poll => {
                 self.push(Inst::Poll);
@@ -524,7 +550,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                     if let (Some((_, name)), Some(_)) = (decl.binding, self.layouts[local.index()])
                     {
                         values.extend(self.locals[local.index()].iter().copied());
-                        named.push((name, decl.ty));
+                        named.push((name, decl.ty, decl.split));
                     }
                 }
                 self.steps.push(StepInfo {
@@ -545,7 +571,14 @@ impl<'a, 'db> Lower<'a, 'db> {
     fn count(&mut self, local: Local, op: fn(&mut Self, VReg)) -> Result<(), Unsupported> {
         let regs = self.locals[local.index()].clone();
         let (layout, ty) = (self.layouts[local.index()], self.local_ty(local));
-        self.count_words(layout, ty, &regs, op)
+        let Some(form) = self.forms[local.index()].clone() else {
+            return self.count_words(layout, ty, &regs, op);
+        };
+        // Each field of a split local that holds a box.
+        for (at, leaf, ty) in form.leaves(ty) {
+            self.count_words(Some(leaf), ty, &regs[at..at + leaf.words()], op)?;
+        }
+        Ok(())
     }
 
     /// Retains or releases the box the words of a value hold, if they hold
@@ -881,6 +914,21 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let cond = compare_cond(*op, *b)?;
                 let flag = self.cmp(cond, word(&x)?, word(&y)?);
                 Ok(vec![self.bool_of(flag)])
+            }
+            // A split record is its fields' words.
+            Rvalue::Record { fields, .. } if self.forms[dst.index()].is_some() => {
+                let Some(Form::Fields(places)) = self.forms[dst.index()].clone() else {
+                    return Err("records of this type");
+                };
+                let mut values = Vec::new();
+                for (name, ty, _) in places {
+                    let (_, op) = fields
+                        .iter()
+                        .find(|(n, _)| *n == name)
+                        .ok_or("records of this type")?;
+                    values.extend(self.operand(op, ty)?);
+                }
+                Ok(values)
             }
             Rvalue::Record {
                 ty: record,
@@ -2593,7 +2641,15 @@ impl<'a, 'db> Lower<'a, 'db> {
         let db = self.db;
         let mut ty = self.local_ty(place.local);
         let mut values = self.operand(&Operand::Local(place.local), ty)?;
-        for step in &place.path {
+        let mut path = &place.path[..];
+        // A split local's fields are its registers.
+        if let Some(form) = &self.forms[place.local.index()] {
+            let (at, t, f, rest) = place_form(form, ty, path).ok_or("this place")?;
+            values = values[at..at + f.words()].to_vec();
+            ty = t;
+            path = &place.path[place.path.len() - rest.len()..];
+        }
+        for step in path {
             let current = self.layout_of(ty)?;
             match step {
                 Step::As(member) => {
@@ -3381,6 +3437,15 @@ impl<'a, 'db> Lower<'a, 'db> {
         let db = self.db;
         let values = self.read(place)?;
         let ty = self.place_ty(place)?;
+        // A split record is of its own type alone.
+        if self.split_place(place) {
+            let hit = cases
+                .iter()
+                .find(|&&(case, _)| crag_types::tested(db, self.program, ty, case));
+            let target = hit.map_or(otherwise, |&(_, b)| block(b));
+            self.end(Term::Jump(target), None);
+            return Ok(());
+        }
         let members = ty.members(db);
         let shape = self.layout_of(ty)?;
         for &(case, target) in cases {
@@ -3428,6 +3493,18 @@ impl<'a, 'db> Lower<'a, 'db> {
         }
         self.end(Term::Jump(otherwise), None);
         Ok(())
+    }
+
+    /// Whether the value at a place is a record split in registers.
+    fn split_place(&self, place: &Place<'db>) -> bool {
+        let Some(form) = &self.forms[place.local.index()] else {
+            return false;
+        };
+        let ty = self.local_ty(place.local);
+        matches!(
+            place_form(form, ty, &place.path),
+            Some((_, _, Form::Fields(_), _))
+        )
     }
 
     /// Ends the block with a test whether the box is of a type that fits

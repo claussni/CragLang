@@ -22,9 +22,10 @@
 //! its fields, `Bool`s and tag-only unions as bits of a flag byte after the
 //! other fields, integers a `where` condition bounds narrowed, a union's
 //! local tag, the niche a `T | Empty` can use instead of a tag, and the
-//! pointer map. It depends on the type alone. Code does not use it yet:
-//! every record is still boxed as `layout::record_layout` places it, and
-//! the REPL's `:layout` shows what flattening would do.
+//! pointer map. It depends on the type alone. So far only locals use it
+//! (see `split`): a local of a flat record type may be kept in registers,
+//! but every record in memory is still boxed as `layout::record_layout`
+//! places it. The REPL's `:layout` shows what flattening does.
 //!
 //! A field that would contain its own type is the recursive edge, and
 //! holds a box: a field's member is boxed when it reaches the record it is

@@ -135,7 +135,7 @@ pub fn compile<'a>(
         values: Vec::new(),
     };
     // Steps name the same types again and again.
-    let mut shaped: HashMap<crag_types::Ty, (std::sync::Arc<Shapes>, u32)> = HashMap::new();
+    let mut shaped: HashMap<(crag_types::Ty, bool), (std::sync::Arc<Shapes>, u32)> = HashMap::new();
     for instance in collect_instances(db, program, roots, Tier::Baseline) {
         let owner = *instance.owner(db);
         let name = match instance.entry(db) {
@@ -196,11 +196,14 @@ pub fn compile<'a>(
                         locals: step
                             .locals
                             .iter()
-                            .map(|&(name, ty)| {
+                            .map(|&(name, ty, split)| {
                                 let (shapes, root) = shaped
-                                    .entry(ty)
+                                    .entry((ty, split))
                                     .or_insert_with(|| {
-                                        let (shapes, root) = crag_backend::shapes(db, program, ty);
+                                        let (shapes, root) = match split {
+                                            true => crag_backend::split_shapes(db, program, ty),
+                                            false => crag_backend::shapes(db, program, ty),
+                                        };
                                         (std::sync::Arc::new(shapes), root)
                                     })
                                     .clone();

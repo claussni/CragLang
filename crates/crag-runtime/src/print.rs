@@ -153,6 +153,26 @@ impl Printer<'_> {
                 }
                 self.out.push(')');
             }
+            Shape::Inline { name, fields, .. } => {
+                self.out.push_str(name.as_deref().unwrap_or(""));
+                self.out.push('(');
+                for (i, f) in fields.iter().enumerate() {
+                    if i > 0 {
+                        self.out.push_str(", ");
+                    }
+                    self.out.push_str(&f.name);
+                    self.out.push_str(": ");
+                    let at = f.offset as usize;
+                    let n = self.shape(f.shape).words() as usize;
+                    // SAFETY: the field's words are the value's from its
+                    // offset.
+                    unsafe { self.value(&words[at..at + n], f.shape, depth + 1) };
+                    if self.full {
+                        return;
+                    }
+                }
+                self.out.push(')');
+            }
             Shape::List(element) => {
                 let list = word as *mut u8;
                 let n = self.shape(element).words() as usize;
@@ -345,6 +365,15 @@ pub unsafe fn release_value(
     };
     let ptr = match &shapes.shapes[shape as usize] {
         _ if boxed(shape) => words[0],
+        // Each field of a split record holds its own.
+        Shape::Inline { fields, .. } => {
+            for f in fields {
+                let (at, n) = (f.offset as usize, shapes.shapes[f.shape as usize].words());
+                // SAFETY: as the caller promises, for the field's words.
+                unsafe { release_value(heap, types, &words[at..at + n as usize], shapes, f.shape) };
+            }
+            0
+        }
         Shape::Union { members, words: 2 } => {
             match members.iter().find(|m| u64::from(m.0) == words[0]) {
                 Some(&(_, m)) if boxed(m) || shapes.shapes[m as usize].member_box().is_some() => {

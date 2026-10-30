@@ -2629,6 +2629,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             ty,
             binding,
             counted,
+            split: false,
         });
         Local(self.locals.len() as u32 - 1)
     }

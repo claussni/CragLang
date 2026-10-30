@@ -25,6 +25,7 @@ use crag_hir::Program;
 use crag_types::{Builtin, Ty, TyKind, declared_fields, record_subtypes};
 
 use crate::layout::{Layout, layout, record_layout, type_index};
+use crate::split::{Form, form};
 
 /// The shapes a value of `ty` is printed by, and the index of its own.
 pub fn shapes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> (Shapes, u32) {
@@ -35,6 +36,22 @@ pub fn shapes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> (Shapes, u
         done: HashMap::new(),
     };
     let root = b.shape(ty);
+    (b.shapes, root)
+}
+
+/// The shapes of a value of `ty` kept split in registers (Plan
+/// §11.10.10), as a step passes a split local: its root is inline.
+pub fn split_shapes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> (Shapes, u32) {
+    let mut b = Builder {
+        db,
+        program,
+        shapes: Shapes::default(),
+        done: HashMap::new(),
+    };
+    let root = match form(db, program, ty) {
+        Some(f) => b.inline(ty, &f),
+        None => b.shape(ty),
+    };
     (b.shapes, root)
 }
 
@@ -117,6 +134,41 @@ impl<'db> Builder<'db> {
                 self.shape(sub);
             }
         }
+        index
+    }
+
+    /// A split record: its fields' words in its register form, shown as a
+    /// record's are.
+    fn inline(&mut self, ty: Ty<'db>, f: &Form<'db>) -> u32 {
+        let db = self.db;
+        let Form::Fields(places) = f else {
+            return self.shape(ty);
+        };
+        let index = self.shapes.shapes.len() as u32;
+        self.shapes.shapes.push(Shape::Unit);
+        let mut fields = Vec::new();
+        let mut at = 0;
+        for (name, t, inner) in places {
+            fields.push(ShapeField {
+                name: name.text(db).clone(),
+                offset: at as u32,
+                shape: self.inline(*t, inner),
+            });
+            at += inner.words();
+        }
+        if let Some(declared) = declared_fields(db, self.program, ty) {
+            let place = |n: &str| declared.iter().position(|(d, ..)| d.text(db) == n);
+            fields.sort_by_key(|f| place(&f.name));
+        }
+        let name = match ty.kind(db) {
+            TyKind::Named(item, _) => Some(item.name(db).text(db).clone()),
+            _ => None,
+        };
+        self.shapes.shapes[index as usize] = Shape::Inline {
+            name,
+            fields,
+            words: f.words() as u32,
+        };
         index
     }
 

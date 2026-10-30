@@ -44,6 +44,7 @@ pub mod flat;
 mod layout;
 mod lower;
 mod shape;
+mod split;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -60,7 +61,8 @@ pub use layout::{
     FieldSlot, Layout, element_layout, layout, record_layout, type_descriptor, type_index,
 };
 pub use lower::{Lowered, StepInfo, func_id, lower_to_lir};
-pub use shape::shapes;
+pub use shape::{shapes, split_shapes};
+pub use split::{flat_layouts, scalar_replace};
 
 /// The code of an instance, ready for the loader.
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -335,12 +337,13 @@ pub fn code<'db>(
     instance: InstanceKey<'db>,
     tier: Tier,
 ) -> Option<Result<Code<'db>, String>> {
-    let body = mir(db, program, instance, tier).as_ref()?;
+    let mut body = mir(db, program, instance, tier).as_ref()?.clone();
+    scalar_replace(db, program, &mut body);
     let owner = *instance.owner(db);
     let value = matches!(owner, Owner::Item(item) if item.kind(db).is_value());
     let cell =
         (value && *instance.entry(db) == Entry::Body).then(|| slot_key(db, program, instance));
-    let lowered = lower_to_lir(db, program, owner, func_id(instance), body, cell);
+    let lowered = lower_to_lir(db, program, owner, func_id(instance), &body, cell);
     let settings = CodegenSettings {
         target: host().clone(),
         opt: OptLevel::None,

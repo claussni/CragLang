@@ -34,7 +34,7 @@ use crag_abi::{
     HEADER_SIZE, HEAP_OFFSET, Number, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, Shapes,
     TrapKind, inline_text,
 };
-use crag_backend::{code, shapes, type_index};
+use crag_backend::{code, flat_layouts, scalar_replace, shapes, type_index};
 use crag_codegen::{
     CodeObject, CodegenSettings, OptLevel, SlotKey, compile_entry_stub, target_for,
 };
@@ -520,6 +520,26 @@ impl Module {
         shapes(db, program, ty)
     }
 
+    /// The named locals of a function of the module that scalar
+    /// replacement keeps split.
+    fn split(&self, name: &str) -> Vec<String> {
+        let (db, program) = (&self.db, self.program);
+        let module = program.modules(db)[1];
+        let owner = owners(db, module)
+            .into_iter()
+            .find(|o| matches!(o, Owner::Item(i) if i.name(db).text(db) == name))
+            .unwrap();
+        let mut body = crag_mir::mir(db, program, InstanceKey::body(db, owner), Tier::Baseline)
+            .clone()
+            .unwrap();
+        scalar_replace(db, program, &mut body);
+        body.locals
+            .iter()
+            .filter(|l| l.split)
+            .filter_map(|l| Some(l.binding?.1.text(db).clone()))
+            .collect()
+    }
+
     fn shown_with(&mut self, name: &str, limits: PrintLimits) -> String {
         let words = self.call(name, &[]);
         let (shapes, root) = self.result_shapes(name);
@@ -835,6 +855,66 @@ fn run(x: Int) -> Int {
 }
 
 #[test]
+fn flat_locals_stay_in_registers() {
+    let mut m = Module::new(
+        r#"type Point(x: Int, y: Int)
+type Line(from: Point, to: Point)
+type Named(items: List[Int], at: Point)
+type Node(value: Int, next: Node | Nil)
+type Nil
+
+fn lines(a: Int, b: Int) -> Int {
+  let p = Point(x: a, y: b)
+  let q = Point(x: b, y: a)
+  let l = Line(from: p, to: q)
+  let r = l.to
+  l.from.x * 1000 + r.x * 100 + p.y * 10 + q.y
+}
+
+fn label() -> List[Int] {
+  let n = Named(items: [1, 2], at: Point(x: 1, y: 2))
+  let m = n
+  m.items
+}
+
+fn node(a: Int) -> Int {
+  let tail = Node(value: a, next: Nil)
+  let head = Node(value: 1, next: tail)
+  case head.next {
+    Nil -> 0
+    n: Node -> n.value + head.value
+  }
+}
+
+fn escapes(a: Int) -> Point {
+  let p = Point(x: a, y: a)
+  let kept = Point(x: p.x, y: 1)
+  kept
+}
+"#,
+    );
+    let split = |name| match flat_layouts() {
+        true => m.split(name),
+        false => Vec::new(),
+    };
+    let on = |names: &[&str]| match flat_layouts() {
+        true => names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+        false => Vec::new(),
+    };
+    assert_eq!(split("lines"), on(&["p", "q", "l", "r"]));
+    assert_eq!(split("label"), on(&["n", "m"]));
+    // `tail` goes into a field that holds a box.
+    assert_eq!(split("node"), on(&["head"]));
+    // A returned record keeps its box.
+    assert_eq!(split("escapes"), on(&["p"]));
+    RELEASED.set(0);
+    assert_eq!(m.int("lines", &[3, 4]), 3443);
+    assert_eq!(m.int("node", &[5]), 6);
+    assert_eq!(m.shown("label"), "[1, 2]");
+    assert_eq!(m.heap.live_blocks(), 0);
+}
+
+#[test]
 fn fields_are_released_with_their_box() {
     let mut m = Module::new(
         r#"type Nil
@@ -902,12 +982,12 @@ fn shared(x: Int) -> Int {
 #[test]
 fn boxes_come_from_the_free_list() {
     let mut m = Module::new(
-        r#"type Point(x: Int, y: Int)
+        r#"type Point(x: Int, y: Int, a: Int, b: Int, c: Int)
 
 fn total(n: Int) -> Int {
   var sum = 0
   for i in 1..n {
-    let p = Point(x: i, y: 1)
+    let p = Point(x: i, y: 1, a: 0, b: 0, c: 0)
     sum = sum + p.x + p.y
   }
   sum
@@ -917,11 +997,16 @@ fn total(n: Int) -> Int {
     SLOW_ALLOCS.set(0);
     RELEASED.set(0);
     assert_eq!(m.int("total", &[10_000]), 10_000 * 10_001 / 2 + 10_000);
-    // Each point is freed before the next is made, and the next takes its
-    // block from the free list inline. Only the first box, the range, finds
-    // the heap's page for its class empty.
-    assert_eq!((SLOW_ALLOCS.get(), RELEASED.get()), (1, 10_001));
-    assert_eq!(m.heap.pages_in_use(), 1);
+    // Each point, too large to be flat, is freed before the next is made,
+    // and the next takes its block from the free list inline. Only the
+    // first point finds the heap's page for its class empty, and so does
+    // the range when it is boxed, with flat layouts off.
+    let range = usize::from(!flat_layouts());
+    assert_eq!(
+        (SLOW_ALLOCS.get(), RELEASED.get()),
+        (1 + range, 10_000 + range)
+    );
+    assert_eq!(m.heap.pages_in_use(), 1 + range);
     assert_eq!(m.heap.live_blocks(), 0);
 }
 
@@ -1634,11 +1719,11 @@ fn depth(n: Int) -> Int {
     );
 
     // A chain holds its nodes of 40 bytes, made in a loop, so only the
-    // heap grows. The loop's range is a box of 32 bytes, whose refill
-    // carves 4 KiB; a refill of nodes carves 102 of them, 4080 bytes, and
-    // seven fit what is left of 32 KiB: the 715th node goes beyond it. The
-    // trap comes at the next step, the loop's back-edge, which a chain of
-    // 715 never reaches.
+    // heap grows. A refill of nodes carves 102 of them, 4080 bytes, and
+    // eight fit 32 KiB, or seven when the loop's range is a box of 32
+    // bytes, with flat layouts off, whose refill carves 4 KiB. The node
+    // after them goes beyond it; the trap comes at the next step, the
+    // loop's back-edge, which a chain one longer never reaches.
     let budget = |memory| Meter {
         steps: u64::MAX,
         memory,
@@ -1649,9 +1734,10 @@ fn depth(n: Int) -> Int {
         assert_eq!(m.worker.heap().live_blocks(), 0);
         result
     };
-    assert_eq!(fresh(714), Ok(vec![714]));
-    assert_eq!(fresh(715), Ok(vec![715]));
-    let trap = fresh(716).unwrap_err();
+    let fit = if flat_layouts() { 8 } else { 7 } * 102;
+    assert_eq!(fresh(fit), Ok(vec![fit as u64]));
+    assert_eq!(fresh(fit + 1), Ok(vec![fit as u64 + 1]));
+    let trap = fresh(fit + 2).unwrap_err();
     assert_eq!((trap.kind, trap.stack.len()), (TrapKind::OutOfMemory, 1));
     // A point made and dropped each turn reuses its block.
     let mut m = Module::metered(text);

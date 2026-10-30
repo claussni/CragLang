@@ -71,6 +71,10 @@ pub struct LocalDecl<'db> {
     pub binding: Option<(BindingId, Name<'db>)>,
     /// Whether its values are reference-counted.
     pub counted: bool,
+    /// Whether code generation keeps it in registers as the fields of a
+    /// flat record, not as a box: scalar replacement decides it (Plan
+    /// §11.10.10).
+    pub split: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -883,7 +887,8 @@ impl<'db> MirBody<'db> {
                 Some((_, name)) => format!(" ({})", name.text(db)),
                 None => String::new(),
             };
-            out += &format!("{kind} _{i}: {}{name}\n", local.ty.display(db));
+            let split = if local.split { " split" } else { "" };
+            out += &format!("{kind} _{i}: {}{name}{split}\n", local.ty.display(db));
         }
         for (i, block) in self.blocks.iter().enumerate() {
             out += &format!("bb{i}:\n");

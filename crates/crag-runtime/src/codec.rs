@@ -152,6 +152,11 @@ unsafe fn encode(
         }
         Shape::Function => return Err(NotSolid("a function value".into())),
         Shape::Opaque { name, .. } => return Err(NotSolid(format!("a value of type {name}"))),
+        // Values cross into the runtime boxed.
+        Shape::Inline { name, .. } => {
+            let name = name.as_deref().unwrap_or("a record");
+            return Err(NotSolid(format!("{name} split into registers")));
+        }
     }
     Ok(())
 }
@@ -360,6 +365,7 @@ impl Decoder<'_> {
             Shape::Opaque { name, .. } => {
                 return Err(DecodeError(format!("a value of type {name}")));
             }
+            Shape::Inline { .. } => return Err(DecodeError("a split record".into())),
         }
         Ok(())
     }
@@ -442,7 +448,9 @@ impl Decoder<'_> {
                 let bytes = self.bytes(n).expect(ok);
                 make_text(heap, &[bytes]).to_vec()
             }
-            Shape::Function | Shape::Opaque { .. } => unreachable!("checked"),
+            Shape::Function | Shape::Opaque { .. } | Shape::Inline { .. } => {
+                unreachable!("checked")
+            }
         }
     }
 

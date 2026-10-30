@@ -1072,6 +1072,15 @@ mod tests {
                         },
                         Shape::Str,
                         Shape::Bytes,
+                        Shape::Inline {
+                            name: Some("Twice".into()),
+                            fields: vec![ShapeField {
+                                name: "n".into(),
+                                offset: 0,
+                                shape: 9,
+                            }],
+                            words: 1,
+                        },
                     ],
                     records: vec![(7, 0)],
                     boxes: vec![(0, 7, 32), (4, 9, 16), (5, 10, 40)],

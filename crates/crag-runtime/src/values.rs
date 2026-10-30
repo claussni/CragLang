@@ -271,6 +271,10 @@ impl Walk<'_> {
                         self.equals(field(pa, f.offset, n), field(pb, f.offset, n), f.shape)
                     })
                 }
+                Shape::Inline { fields, .. } => fields.iter().all(|f| {
+                    let (at, n) = (f.offset as usize, self.shape(f.shape).words() as usize);
+                    self.equals(&a[at..at + n], &b[at..at + n], f.shape)
+                }),
                 Shape::List(element) => {
                     let (la, lb) = (a[0] as *mut u8, b[0] as *mut u8);
                     let len = list::length(la);
@@ -366,6 +370,16 @@ impl Walk<'_> {
                     }
                     Ordering::Equal
                 }
+                Shape::Inline { fields, .. } => {
+                    for f in fields {
+                        let (at, n) = (f.offset as usize, self.shape(f.shape).words() as usize);
+                        let o = self.compare(&a[at..at + n], &b[at..at + n], f.shape)?;
+                        if o != Ordering::Equal {
+                            return Some(o);
+                        }
+                    }
+                    Ordering::Equal
+                }
                 Shape::List(element) => {
                     let (la, lb) = (a[0] as *mut u8, b[0] as *mut u8);
                     let (na, nb) = (list::length(la), list::length(lb));
@@ -415,6 +429,12 @@ impl Walk<'_> {
                     for f in self.record_fields(index, shape) {
                         let n = self.shape(f.shape).words();
                         self.hash(field(ptr, f.offset, n), f.shape, h);
+                    }
+                }
+                Shape::Inline { fields, .. } => {
+                    for f in fields {
+                        let (at, n) = (f.offset as usize, self.shape(f.shape).words() as usize);
+                        self.hash(&a[at..at + n], f.shape, h);
                     }
                 }
                 Shape::List(element) => {

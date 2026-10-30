@@ -2022,8 +2022,11 @@ impl Shapes {
                     }
                     u32(&mut out, *words);
                 }
-                Shape::Record { name, fields } => {
-                    out.push(4);
+                Shape::Record { name, fields } | Shape::Inline { name, fields, .. } => {
+                    out.push(match shape {
+                        Shape::Record { .. } => 4,
+                        _ => 12,
+                    });
                     match name {
                         None => out.push(0),
                         Some(name) => {
@@ -2036,6 +2039,9 @@ impl Shapes {
                         text(&mut out, &f.name);
                         u32(&mut out, f.offset);
                         u32(&mut out, f.shape);
+                    }
+                    if let Shape::Inline { words, .. } = shape {
+                        u32(&mut out, *words);
                     }
                 }
                 Shape::List(element) => {
@@ -2091,7 +2097,9 @@ impl Shapes {
         let inside = |i: &u32| *i < n;
         let named = shapes.shapes.iter().all(|s| match s {
             Shape::Union { members, .. } => members.iter().map(|m| &m.1).all(inside),
-            Shape::Record { fields, .. } => fields.iter().map(|f| &f.shape).all(inside),
+            Shape::Record { fields, .. } | Shape::Inline { fields, .. } => {
+                fields.iter().map(|f| &f.shape).all(inside)
+            }
             Shape::List(e) | Shape::Set(e) => inside(e),
             Shape::Map(k, v) => inside(k) && inside(v),
             _ => true,
@@ -2183,6 +2191,21 @@ impl ShapeReader<'_> {
             },
             10 => Shape::Str,
             11 => Shape::Bytes,
+            12 => Shape::Inline {
+                name: match self.u8()? {
+                    0 => None,
+                    1 => Some(self.text()?),
+                    tag => return Err(format!("an option with the tag {tag}")),
+                },
+                fields: self.seq(|r| {
+                    Ok(ShapeField {
+                        name: r.text()?,
+                        offset: r.u32()?,
+                        shape: r.u32()?,
+                    })
+                })?,
+                words: self.u32()?,
+            },
             tag => return Err(format!("a shape with the tag {tag}")),
         })
     }
@@ -2222,6 +2245,14 @@ pub enum Shape {
     /// What cannot be shown yet, by its type, and its words.
     Opaque {
         name: String,
+        words: u32,
+    },
+    /// A record split into registers (Implementation Plan §11.10.10): its
+    /// fields' words one after another, each field's offset the index of
+    /// its first word, in the order they are shown.
+    Inline {
+        name: Option<String>,
+        fields: Vec<ShapeField>,
         words: u32,
     },
 }
@@ -2281,7 +2312,9 @@ impl Shape {
             | Shape::List(_)
             | Shape::Set(_)
             | Shape::Map(..) => 1,
-            Shape::Union { words, .. } | Shape::Opaque { words, .. } => *words,
+            Shape::Union { words, .. }
+            | Shape::Opaque { words, .. }
+            | Shape::Inline { words, .. } => *words,
             Shape::Function | Shape::Str | Shape::Bytes => 2,
         }
     }

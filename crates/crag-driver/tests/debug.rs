@@ -44,10 +44,13 @@ const SERVER: &str = r#"import std.io
 
 fn answer(n: Int) -> Bytes { if n > 2 { b"many" } else { b"one" } }
 
+type Twice(n: Int, doubled: Int)
+
 fn reply(c: Connection, n: Int) -> () {
   case c.read() {
     bytes: Bytes -> {
-      let doubled = n * 2
+      let twice = Twice(n: n, doubled: n * 2)
+      let doubled = twice.doubled
       let written = c.write(answer(doubled))
     }
     _ -> ()
@@ -175,9 +178,14 @@ fn a_breakpoint_stops_the_task_that_reaches_it() {
     assert_eq!((pause.file.as_str(), pause.line), ("app.crag", line));
     assert_eq!(pause.callers.first().map(String::as_str), Some("serve"));
     // The locals that hold values there, `n` of the second connection
-    // among them; `bytes`, which nothing uses any more, is gone.
+    // among them, and `twice`, a flat record kept in registers; `bytes`,
+    // which nothing uses any more, is gone.
     let locals = s.scratch.locals(pause.task).unwrap();
     assert!(locals.contains(&("n".into(), "2".into())), "{locals:?}");
+    assert!(
+        locals.contains(&("twice".into(), "Twice(n: 2, doubled: 4)".into())),
+        "{locals:?}"
+    );
     assert!(
         locals
             .iter()
