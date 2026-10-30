@@ -61,10 +61,11 @@ use crag_mir::{
 };
 use crag_types::{Builtin, CForm, Step, Ty, TyKind, prelude_item, signature};
 
+use crate::boxes::{BoxForm, box_form, member_slots, rebase, select, span};
 use crate::flat::MAX_FLAT_SIZE;
 use crate::layout::{
-    Layout, boxed_indices, deferred, dispose_word, is_text, layout, record_layout, signal_types,
-    subtypes, type_descriptor, type_index, word_keys,
+    Layout, boxed_indices, deferred, is_text, layout, signal_types, subtypes, type_descriptor,
+    type_index, word_keys,
 };
 use crate::slot_key;
 use crate::split::{
@@ -399,28 +400,16 @@ impl<'a, 'db> Lower<'a, 'db> {
             words = words.max(1);
         }
         let form = decl.split.then(|| form(db, program, decl.ty)).flatten();
-        // A union's members are not tracked, as a union's payload is not.
-        let leaves: Vec<(usize, Layout)> = match &form {
+        let pointers = match &form {
             Some(f) => {
                 words = f.words();
-                f.leaves(decl.ty)
-                    .into_iter()
-                    .filter_map(|(at, leaf, _)| match leaf {
-                        Form::Words(l) => Some((at, *l)),
-                        _ => None,
-                    })
-                    .collect()
+                pointer_regs(f)
             }
-            None => layout.map_or(Vec::new(), |l| vec![(0, l)]),
+            None => layout.map_or(Vec::new(), |l| pointer_regs(&Form::Words(l))),
         };
         let regs: Vec<VReg> = (0..words).map(|_| self.reg()).collect();
-        for (at, leaf) in leaves {
-            match leaf {
-                Layout::Box => self.tracked.push(regs[at]),
-                Layout::Closure => self.tracked.push(regs[at + 1]),
-                Layout::Pair => self.tracked.push(regs[at]),
-                _ => {}
-            }
+        for at in pointers {
+            self.tracked.push(regs[at]);
         }
         self.locals[i] = regs;
         self.layouts[i] = layout;
@@ -874,9 +863,10 @@ impl<'a, 'db> Lower<'a, 'db> {
         f: &Form<'db>,
     ) -> Result<Vec<VReg>, Unsupported> {
         if let Operand::Local(l) = op
-            && self.forms[l.index()].as_ref() == Some(f)
+            && let Some(own) = self.forms[l.index()].clone()
         {
-            return Ok(self.locals[l.index()].clone());
+            let regs = self.locals[l.index()].clone();
+            return self.reform(ty, &own, f, &regs);
         }
         let words = self.operand(op, ty)?;
         match words_form(f) {
@@ -1013,70 +1003,124 @@ impl<'a, 'db> Lower<'a, 'db> {
         }
     }
 
-    /// A box holding the words of a split record, nested split records
-    /// boxed in turn.
+    /// A box holding the registers of a split record, which takes their
+    /// references.
     fn box_split(
         &mut self,
         ty: Ty<'db>,
         form: &Form<'db>,
         regs: &[VReg],
     ) -> Result<VReg, Unsupported> {
-        let Form::Fields(places) = form else {
+        let Form::Fields(_) = form else {
             return word(regs);
         };
-        let (slots, size) =
-            record_layout(self.db, self.program, ty).ok_or("records of this type")?;
+        let b = box_form(self.db, self.program, ty).ok_or("records of this type")?;
         self.describe(ty)?;
-        let mut stores = Vec::new();
-        let mut at = 0;
-        for (name, t, f) in places {
-            let n = f.words();
-            let words = self.boxed(*t, f, &regs[at..at + n])?;
-            let slot = slots
-                .iter()
-                .find(|s| s.name == *name)
-                .ok_or("records of this type")?;
-            stores.push((slot.offset, words));
-            at += n;
-        }
-        let ptr = self.alloc(size, type_index(ty));
+        let regs = self.reform(ty, form, &b.form, regs)?;
+        let ptr = self.alloc(b.size, type_index(ty));
         // A trap unwinding the frame releases it, as a boxed local's.
         self.tracked.push(ptr);
-        for (offset, words) in stores {
-            for (k, src) in words.into_iter().enumerate() {
-                self.push(Inst::Store {
-                    src,
-                    addr: ptr,
-                    offset: (offset + 8 * k as u32) as i32,
-                });
-            }
-        }
+        self.store_box(&b, ptr, &regs);
         Ok(ptr)
     }
 
-    /// The words of a split record loaded from its box, borrowed from it.
+    /// Writes the registers of a record's fields into its new box.
+    fn store_box(&mut self, b: &BoxForm<'db>, ptr: VReg, regs: &[VReg]) {
+        let words = self.pack(&b.slots, b.size, regs);
+        let header = (HEADER_SIZE / 8) as usize;
+        for (k, src) in words.into_iter().enumerate().skip(header) {
+            self.push(Inst::Store {
+                src,
+                addr: ptr,
+                offset: 8 * k as i32,
+            });
+        }
+    }
+
+    /// The `n` registers of a value stored as `slots` in the box at
+    /// `ptr`, from the words that hold it.
+    fn load_stored(&mut self, ptr: VReg, slots: &[Slot], n: usize) -> Vec<VReg> {
+        let Some((from, to)) = span(slots) else {
+            return (0..n).map(|_| self.constant(0)).collect();
+        };
+        let first = from / 8 * 8;
+        let words: Vec<VReg> = (first..to)
+            .step_by(8)
+            .map(|at| self.load(ptr, at as i32))
+            .collect();
+        let slots: Vec<Slot> = slots.iter().map(|s| rebase(s, first)).collect();
+        self.unpack(&slots, &words, n)
+    }
+
+    /// The registers of a split record loaded from its box, borrowed from
+    /// it.
     fn unbox(
         &mut self,
         ty: Ty<'db>,
         form: &Form<'db>,
         ptr: VReg,
     ) -> Result<Vec<VReg>, Unsupported> {
-        let Form::Fields(places) = form else {
+        let Form::Fields(_) = form else {
             return Ok(vec![ptr]);
         };
-        let (slots, _) = record_layout(self.db, self.program, ty).ok_or("records of this type")?;
-        let mut out = Vec::new();
-        for (name, t, f) in places {
-            let slot = slots
-                .iter()
-                .find(|s| s.name == *name)
-                .ok_or("records of this type")?;
-            let words: Vec<VReg> = (0..slot.layout.words())
-                .map(|k| self.load(ptr, (slot.offset + 8 * k as u32) as i32))
-                .collect();
-            out.extend(self.unboxed(*t, f, &words)?);
+        let b = box_form(self.db, self.program, ty).ok_or("records of this type")?;
+        let regs = self.load_stored(ptr, &b.slots, b.form.words());
+        self.lend(ty, &b.form, form, &regs)
+    }
+
+    /// The registers of a value in the form `to`, borrowed from its
+    /// registers in the form `from`: a record or union in a box loaded
+    /// from it.
+    fn lend(
+        &mut self,
+        ty: Ty<'db>,
+        from: &Form<'db>,
+        to: &Form<'db>,
+        regs: &[VReg],
+    ) -> Result<Vec<VReg>, Unsupported> {
+        match (from, to) {
+            _ if from == to => Ok(regs.to_vec()),
+            (Form::Words(_), _) => self.unboxed(ty, to, regs),
+            (Form::Fields(_), Form::Fields(fields)) => {
+                let mut out = Vec::new();
+                for (name, t, f) in fields {
+                    let (at, _, inner) = from.field(*name).ok_or("records of this type")?;
+                    let part = regs[at..at + inner.words()].to_vec();
+                    out.extend(self.lend(*t, inner, f, &part)?);
+                }
+                Ok(out)
+            }
+            _ => Err("records of this type"),
         }
-        Ok(out)
+    }
+
+    /// The registers of a value in the form `to`, from its registers in
+    /// the form `from`, which they take the references of.
+    fn reform(
+        &mut self,
+        ty: Ty<'db>,
+        from: &Form<'db>,
+        to: &Form<'db>,
+        regs: &[VReg],
+    ) -> Result<Vec<VReg>, Unsupported> {
+        match (from, to) {
+            _ if from == to => Ok(regs.to_vec()),
+            (Form::Fields(_), Form::Fields(fields)) => {
+                let mut out = Vec::new();
+                for (name, t, f) in fields {
+                    let (at, _, inner) = from.field(*name).ok_or("records of this type")?;
+                    let part = regs[at..at + inner.words()].to_vec();
+                    out.extend(self.reform(*t, inner, f, &part)?);
+                }
+                Ok(out)
+            }
+            (_, Form::Words(_)) => self.boxed(ty, from, regs),
+            (Form::Words(_), _) => self.owned_fields(ty, to, regs),
+            _ => {
+                let words = self.boxed(ty, from, regs)?;
+                self.owned_fields(ty, to, &words)
+            }
+        }
     }
 
     fn constant_words(&mut self, c: &Constant<'db>, ty: Ty<'db>) -> Result<Vec<VReg>, Unsupported> {
@@ -1537,8 +1581,13 @@ impl<'a, 'db> Lower<'a, 'db> {
             // split union read into a local that is not split has its
             // member boxed, a value of its own.
             Rvalue::Read(place) => {
-                let values = self.read(place)?;
-                match (self.forms[dst.index()].clone(), self.split_form(place)) {
+                let (values, from) = match self.find(place)? {
+                    Found::Words(values) => (values, self.split_form(place)),
+                    Found::Stored { ptr, form, slots } => {
+                        (self.load_stored(ptr, &slots, form.words()), Some(form))
+                    }
+                };
+                match (self.forms[dst.index()].clone(), from) {
                     (Some(form), None) => self.unboxed(ty, &form, &values),
                     // A cycle's edge has a form of its own.
                     (Some(form), Some(f)) if form != f && words_form(&f) => {
@@ -1675,33 +1724,28 @@ impl<'a, 'db> Lower<'a, 'db> {
                 fields,
                 dispose,
             } => {
-                let (slots, size) =
-                    record_layout(self.db, self.program, *record).ok_or("records of this type")?;
-                let index = type_index(*record);
+                let b = box_form(self.db, self.program, *record).ok_or("records of this type")?;
                 self.describe(*record)?;
-                let mut values = Vec::new();
-                for (name, op) in fields {
-                    let slot = slots
+                let Form::Fields(places) = &b.form else {
+                    return Err("records of this type");
+                };
+                let mut regs = Vec::new();
+                for (name, t, f) in places {
+                    let (_, op) = fields
                         .iter()
-                        .find(|s| s.name == *name)
+                        .find(|(n, _)| n == name)
                         .ok_or("records of this type")?;
-                    values.push((slot.offset, self.operand(op, slot.ty)?));
+                    regs.extend(match f {
+                        Form::Words(_) => self.operand(op, *t)?,
+                        _ => self.split_value(op, *t, f)?,
+                    });
                 }
-                let ptr = self.alloc(size, index);
-                for (offset, words) in values {
-                    for (k, src) in words.into_iter().enumerate() {
-                        self.push(Inst::Store {
-                            src,
-                            addr: ptr,
-                            offset: (offset + 8 * k as u32) as i32,
-                        });
-                    }
-                }
+                let ptr = self.alloc(b.size, type_index(*record));
+                self.store_box(&b, ptr, &regs);
                 // The box holds the address of its dispose code, which the
                 // runtime gives generated code when the count reaches zero.
                 if let Some(code) = dispose {
-                    let at = dispose_word(self.db, self.program, *record)
-                        .ok_or("records of this type")?;
+                    let at = b.dispose.ok_or("records of this type")?;
                     if !self.calls.contains(code) {
                         self.calls.push(*code);
                     }
@@ -1799,28 +1843,44 @@ impl<'a, 'db> Lower<'a, 'db> {
                 if captures.is_empty() {
                     return Ok(vec![addr, self.constant(0)]);
                 }
-                let (slots, size) =
-                    record_layout(self.db, self.program, *env).ok_or("captures of this type")?;
-                let mut values = Vec::new();
-                for (i, op) in captures.iter().enumerate() {
-                    let name = i.to_string();
-                    let slot = slots
-                        .iter()
-                        .find(|s| *s.name.text(self.db) == name)
-                        .ok_or("captures of this type")?;
-                    values.push((slot.offset, self.operand(op, slot.ty)?));
+                let b = box_form(self.db, self.program, *env).ok_or("captures of this type")?;
+                let Form::Fields(places) = &b.form else {
+                    return Err("captures of this type");
+                };
+                // An environment on the side stack borrows what it holds.
+                let borrows = *placement == ClosurePlacement::SideStack;
+                let mut regs = Vec::new();
+                for (name, t, f) in places {
+                    let i: usize = name
+                        .text(self.db)
+                        .parse()
+                        .map_err(|_| "captures of this type")?;
+                    let op = captures.get(i).ok_or("captures of this type")?;
+                    regs.extend(match (f, op) {
+                        (Form::Words(_), _) => self.operand(op, *t)?,
+                        (_, Operand::Local(l)) if borrows => {
+                            let own = self.forms[l.index()].clone();
+                            let words = self.locals[l.index()].clone();
+                            let from = match own {
+                                Some(own) => own,
+                                None => Form::Words(self.layout_of(*t)?),
+                            };
+                            self.lend(*t, &from, f, &words)?
+                        }
+                        _ => self.split_value(op, *t, f)?,
+                    });
                 }
                 let index = type_index(*env);
                 let ptr = match placement {
                     ClosurePlacement::Heap => {
                         self.describe(*env)?;
-                        self.alloc(size, index)
+                        self.alloc(b.size, index)
                     }
                     ClosurePlacement::SideStack => {
                         let ptr = self.reg();
                         self.push(Inst::SidePush {
                             dst: ptr,
-                            size,
+                            size: b.size,
                             align: 8,
                         });
                         let count = self.constant(STATIC_COUNT as i64);
@@ -1838,15 +1898,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                         ptr
                     }
                 };
-                for (offset, words) in values {
-                    for (k, src) in words.into_iter().enumerate() {
-                        self.push(Inst::Store {
-                            src,
-                            addr: ptr,
-                            offset: (offset + 8 * k as u32) as i32,
-                        });
-                    }
-                }
+                self.store_box(&b, ptr, &regs);
                 Ok(vec![addr, ptr])
             }
             Rvalue::FnValue { code, env } => {
@@ -3380,8 +3432,21 @@ impl<'a, 'db> Lower<'a, 'db> {
         Ok((words, returns))
     }
 
-    /// The words of the value at a place.
+    /// The words of the value at a place, borrowed: a record or union
+    /// stored inline in a box is none.
     fn read(&mut self, place: &Place<'db>) -> Result<Vec<VReg>, Unsupported> {
+        match self.find(place)? {
+            Found::Words(values) => Ok(values),
+            Found::Stored { ptr, form, slots } if words_form(&form) => {
+                Ok(self.load_stored(ptr, &slots, form.words()))
+            }
+            Found::Stored { .. } => Err("this place"),
+        }
+    }
+
+    /// Where the value at a place is: in registers, or stored inline in a
+    /// box, a record's or a union's form there.
+    fn find(&mut self, place: &Place<'db>) -> Result<Found<'db>, Unsupported> {
         let db = self.db;
         let mut ty = self.local_ty(place.local);
         let mut values = self.split_operand(&Operand::Local(place.local), ty)?;
@@ -3393,7 +3458,30 @@ impl<'a, 'db> Lower<'a, 'db> {
             ty = t;
             path = &place.path[place.path.len() - rest.len()..];
         }
+        let mut stored: Option<(VReg, Form<'db>, Vec<Slot>)> = None;
         for step in path {
+            // Within a box's storage, a field or a member is where its
+            // slots say.
+            if let Some((ptr, form, slots)) = stored.take() {
+                let (t, f, slots) = match step {
+                    Step::Field(name) => {
+                        let (at, t, f) = form.field(*name).ok_or("this place")?;
+                        (t, f.clone(), select(&slots, at, f.words()))
+                    }
+                    Step::As(t) if *t == ty => (ty, form, slots),
+                    Step::As(t) => {
+                        let f = form.member(*t).ok_or("this conversion")?.clone();
+                        (*t, f, member_slots(&slots, *t).ok_or("this conversion")?)
+                    }
+                    _ => return Err("this place"),
+                };
+                ty = t;
+                match f {
+                    Form::Words(_) => values = self.load_stored(ptr, &slots, f.words()),
+                    f => stored = Some((ptr, f, slots)),
+                }
+                continue;
+            }
             let current = self.layout_of(ty)?;
             match step {
                 Step::As(member) => {
@@ -3411,17 +3499,15 @@ impl<'a, 'db> Lower<'a, 'db> {
                     ty = *member;
                 }
                 Step::Field(name) => {
-                    let (slots, _) =
-                        record_layout(db, self.program, ty).ok_or("records of this type")?;
-                    let slot = slots
-                        .iter()
-                        .find(|s| s.name == *name)
-                        .ok_or("records of this type")?;
+                    let b = box_form(db, self.program, ty).ok_or("records of this type")?;
+                    let (at, t, f) = b.form.field(*name).ok_or("records of this type")?;
+                    let slots = select(&b.slots, at, f.words());
                     let ptr = word(&values)?;
-                    values = (0..slot.layout.words())
-                        .map(|k| self.load(ptr, (slot.offset + 8 * k as u32) as i32))
-                        .collect();
-                    ty = slot.ty;
+                    ty = t;
+                    match f {
+                        Form::Words(_) => values = self.load_stored(ptr, &slots, f.words()),
+                        f => stored = Some((ptr, f.clone(), slots)),
+                    }
                 }
                 Step::Elem(i) => {
                     let index = self.constant(i64::from(*i));
@@ -3439,7 +3525,10 @@ impl<'a, 'db> Lower<'a, 'db> {
                 Step::Slice { .. } => return Err("this place"),
             }
         }
-        Ok(values)
+        Ok(match stored {
+            Some((ptr, form, slots)) => Found::Stored { ptr, form, slots },
+            None => Found::Words(values),
+        })
     }
 
     /// The type of the value at a place.
@@ -4346,10 +4435,20 @@ impl<'a, 'db> Lower<'a, 'db> {
         otherwise: LirBlockId,
     ) -> Result<(), Unsupported> {
         let db = self.db;
-        let values = self.read(place)?;
+        let (values, record) = match self.find(place)? {
+            Found::Words(values) => (values, self.split_record(place)),
+            Found::Stored {
+                form: Form::Fields(_),
+                ..
+            } => (Vec::new(), true),
+            // A union's type index, and its member's words.
+            Found::Stored { ptr, form, slots } => {
+                (self.load_stored(ptr, &slots, form.words()), false)
+            }
+        };
         let ty = self.place_ty(place)?;
-        // A split record is of its own type alone.
-        if self.split_record(place) {
+        // A split or stored record is of its own type alone.
+        if record {
             let hit = cases
                 .iter()
                 .find(|&&(case, _)| crag_types::tested(db, self.program, ty, case));
@@ -4439,6 +4538,19 @@ impl<'a, 'db> Lower<'a, 'db> {
     }
 }
 
+/// Where the value at a place is.
+enum Found<'db> {
+    /// In registers: its layout's words, or a split value's.
+    Words(Vec<VReg>),
+    /// Stored inline in the box at `ptr`, a record or a union, as `slots`
+    /// say.
+    Stored {
+        ptr: VReg,
+        form: Form<'db>,
+        slots: Vec<Slot>,
+    },
+}
+
 /// How `count_form` counts.
 #[derive(Clone, Copy)]
 enum Count {
@@ -4458,6 +4570,49 @@ fn words_form(f: &Form<'_>) -> bool {
                 Form::Words(Layout::Zero | Layout::Imm(_) | Layout::Tag | Layout::Box)
             )
         }),
+    }
+}
+
+/// The registers of a value in a form that hold a reference or nothing,
+/// which a trap releases: a box pointer, a string's first word and a
+/// function value's environment. A union's register is one when it is for
+/// each member that has it, and the others leave it zero; one that holds
+/// a number for some member is not.
+fn pointer_regs(f: &Form<'_>) -> Vec<usize> {
+    match f {
+        Form::Words(Layout::Box | Layout::Pair) => vec![0],
+        Form::Words(Layout::Closure) => vec![1],
+        Form::Words(_) => Vec::new(),
+        Form::Fields(fields) => {
+            let mut out = Vec::new();
+            let mut at = 0;
+            for (_, _, inner) in fields {
+                out.extend(pointer_regs(inner).into_iter().map(|r| at + r));
+                at += inner.words();
+            }
+            out
+        }
+        Form::Union(members) => {
+            let own: Vec<(usize, Vec<usize>)> = members
+                .iter()
+                .map(|(_, m)| (m.words(), pointer_regs(m)))
+                .collect();
+            (0..f.words() - 1)
+                .filter(|r| {
+                    let mut any = false;
+                    for (n, pointers) in &own {
+                        if r < n {
+                            if !pointers.contains(r) {
+                                return false;
+                            }
+                            any = true;
+                        }
+                    }
+                    any
+                })
+                .map(|r| r + 1)
+                .collect()
+        }
     }
 }
 

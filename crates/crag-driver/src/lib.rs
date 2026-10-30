@@ -40,7 +40,7 @@ pub mod ui;
 use std::io::Write;
 use std::path::Path;
 
-use crag_backend::{func_id, record_layout};
+use crag_backend::{field_words, func_id};
 use crag_hir::{ItemKind, Owner, item_tree, owners};
 use crag_mir::{InstanceKey, Tier, mir};
 use crag_types::{Ty, TyKind, prelude_item, signature};
@@ -111,28 +111,24 @@ fn run(root: &Path, out: &mut dyn Write) -> Result<u8, String> {
         .result;
     let exit_code =
         prelude_item(db, program, "ExitCode").map(|i| Ty::new(db, TyKind::Named(i, Vec::new())));
-    // Where the code lies in an `ExitCode`'s box.
-    let code_offset = if result == Ty::unit(db) {
+    // An `ExitCode`'s box holds the code.
+    let exit_code = if result == Ty::unit(db) {
         None
     } else if Some(result) == exit_code {
-        let (slots, _) = record_layout(db, program, result).ok_or("`ExitCode` has no layout")?;
-        let slot = slots
-            .iter()
-            .find(|s| s.name.text(db) == "code")
-            .ok_or("`ExitCode` has no `code`")?;
-        Some(slot.offset as usize)
+        Some(result)
     } else {
         return Err("`main` must return `()` or `ExitCode`".into());
     };
     open_natives(&project)?;
     let mut image = Image::build(&project, &[key])?;
     match image.run(func_id(key)) {
-        Ok(words) => Ok(match code_offset {
+        Ok(words) => Ok(match exit_code {
             None => 0,
-            Some(offset) => {
+            Some(ty) => {
                 // SAFETY: the result is a live `ExitCode`, whose reference
                 // the finished fiber left to its caller.
-                let code = unsafe { ((words[0] as usize + offset) as *const i64).read() };
+                let code = unsafe { field_words(db, program, ty, "code", words[0] as *const u8) }
+                    .ok_or("`ExitCode` has no `code`")?[0] as i64;
                 u8::try_from(code).map_err(|_| format!("the exit code {code} is out of range"))?
             }
         }),

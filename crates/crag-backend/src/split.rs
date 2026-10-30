@@ -66,6 +66,7 @@ use crag_mir::{
 };
 use crag_types::{Builtin, Step, Ty, TyKind, TypeDefKind, lifecycle_handler, type_def};
 
+use crate::boxes::stored_form;
 use crate::flat::{self, LayoutClass, NicheKind, TagPlace};
 use crate::layout::{self, Layout, type_index};
 
@@ -185,7 +186,7 @@ pub fn form<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Form<
 }
 
 /// The fields of a record, each in its form inside a split value.
-fn fields_form<'db>(
+pub(crate) fn fields_form<'db>(
     db: &'db dyn Db,
     program: Program,
     places: &[flat::FieldPlace<'db>],
@@ -401,6 +402,23 @@ impl<'db> Check<'_, 'db> {
         Some(matches!(form, Form::Fields(_) | Form::Union(_)))
     }
 
+    /// Whether the value at the place is a record or a union a box
+    /// stores inline.
+    fn inline(&self, place: &Place<'db>) -> bool {
+        let mut ty = self.body.locals[place.local.index()].ty;
+        let mut path = &place.path[..];
+        if let Some(form) = &self.forms[place.local.index()]
+            && self.split[place.local.index()]
+        {
+            let Some((_, t, _, rest)) = place_form(form, ty, path) else {
+                return false;
+            };
+            ty = t;
+            path = rest;
+        }
+        stored_form(self.db, self.program, ty, path).is_some()
+    }
+
     /// Whether the value at the place is a union split in registers.
     fn union_at(&self, place: &Place<'db>) -> bool {
         let Some(form) = self.forms[place.local.index()].as_ref() else {
@@ -450,11 +468,12 @@ impl<'db> Check<'_, 'db> {
                     // A split union goes into one that is not with its
                     // member boxed.
                     (true, Some(true)) if !into_split && self.union_at(place) => {}
-                    // Words, or a record read from its box.
+                    // Words, or a record read from its box or from where
+                    // a box stores it inline, which is not a box of its own.
                     (false, _) | (true, Some(false)) => {
                         if into_split {
                             defines = true;
-                            self.from_box[dst.index()] = true;
+                            self.from_box[dst.index()] = !self.inline(place);
                         }
                     }
                     _ => self.keep[source] = true,
@@ -736,8 +755,9 @@ fn slots_of<'db>(
                     | Builtin::UInt16
                     | Builtin::UInt32
                     | Builtin::UInt64
-                    | Builtin::CodePoint => SlotKind::Int { signed: false },
-                    Builtin::Float | Builtin::Fixed(_) => SlotKind::Words,
+                    | Builtin::CodePoint
+                    | Builtin::CF32 => SlotKind::Int { signed: false },
+                    Builtin::Float | Builtin::Fixed(_) | Builtin::CPtr => SlotKind::Words,
                     _ => return None,
                 },
                 Layout::Box | Layout::Pair | Layout::Closure => SlotKind::Words,
@@ -769,7 +789,7 @@ fn slots_of<'db>(
 
 /// The slots of a record's fields in their places, from register `at`
 /// and byte `offset` on.
-fn fields_slots<'db>(
+pub(crate) fn fields_slots<'db>(
     db: &'db dyn Db,
     program: Program,
     places: &[flat::FieldPlace<'db>],

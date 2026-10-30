@@ -40,6 +40,7 @@
 
 extern crate crag_db as salsa;
 
+mod boxes;
 pub mod flat;
 mod layout;
 mod lower;
@@ -57,6 +58,7 @@ use crag_hir::{Owner, Program};
 use crag_mir::{Entry, InstanceKey, Tier, mir};
 use crag_types::{Ty, TyKind};
 
+pub use boxes::{BoxForm, box_form, field_words};
 pub use layout::{
     FieldSlot, Layout, element_layout, layout, record_layout, type_descriptor, type_index,
 };
@@ -294,13 +296,15 @@ fn structure<'db>(
                 cut = true;
             } else {
                 open.push(ty);
-                match record_layout(db, program, ty) {
-                    Some((slots, size)) => {
-                        size.hash(&mut hasher);
-                        for slot in slots {
-                            slot.name.text(db).hash(&mut hasher);
-                            slot.offset.hash(&mut hasher);
-                            structure(db, program, slot.ty, open, memo).hash(&mut hasher);
+                match box_form(db, program, ty) {
+                    Some(b) => {
+                        b.size.hash(&mut hasher);
+                        b.slots.hash(&mut hasher);
+                        if let split::Form::Fields(places) = &b.form {
+                            for (name, t, _) in places {
+                                name.text(db).hash(&mut hasher);
+                                structure(db, program, *t, open, memo).hash(&mut hasher);
+                            }
                         }
                     }
                     None => 0u32.hash(&mut hasher),

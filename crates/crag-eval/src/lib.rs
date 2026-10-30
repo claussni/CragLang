@@ -48,7 +48,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use crag_abi::{CELL_FULL, CELL_VALUE_OFFSET, FuncId, RuntimeFn, Shapes, SlotKey, TrapKind};
-use crag_backend::{Layout, code, func_id, layout, record_layout, shapes, type_index};
+use crag_backend::{Layout, code, field_words, func_id, layout, shapes, type_index};
 use crag_codegen::{CodegenSettings, OptLevel, Target, compile_entry_stub, target_for};
 use crag_db::{Db, catch_cancelled, check_cancelled};
 use crag_hir::{ItemId, ItemKind, ModuleId, Owner, Program, embed_content};
@@ -203,17 +203,12 @@ pub fn evaluate<'db>(
 unsafe fn embed_error(db: &dyn Db, program: Program, ptr: u64) -> Option<EvalError> {
     let error = crag_types::prelude_item(db, program, "EmbedError")?;
     let error = Ty::new(db, TyKind::Named(error, Vec::new()));
-    let (slots, _) = record_layout(db, program, error)?;
-    let field = |name: &str| slots.iter().find(|s| s.name.text(db) == name);
-    let at = |offset: u32, k: u32| {
-        // SAFETY: as the caller promises; the field is inside the box.
-        unsafe { ((ptr as *const u8).add((offset + 8 * k) as usize) as *const u64).read() }
-    };
-    let message = field("message")?;
-    let words = [at(message.offset, 0), at(message.offset, 1)];
+    // SAFETY: as the caller promises.
+    let field = |name: &str| unsafe { field_words(db, program, error, name, ptr as *const u8) };
+    let words = field("message")?;
     // SAFETY: the field holds a live string.
     let message = unsafe { String::from_utf8_lossy(bytes_of(&words)).into_owned() };
-    let number = |name: &str| field(name).map_or(0, |s| at(s.offset, 0) as i64);
+    let number = |name: &str| field(name).map_or(0, |w| w[0] as i64);
     Some(EvalError::Embed {
         message,
         line: number("line"),

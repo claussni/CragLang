@@ -1093,6 +1093,67 @@ fn run(n: Int) -> Int {
 }
 
 #[test]
+fn flat_fields_are_stored_in_their_box() {
+    let mut m = Module::new(
+        r#"type Point(x: Int, y: Int)
+type Line(from: Point, to: Point, dashed: Bool, label: Str)
+type Glyph(code: CodePoint, size: Int, bold: Bool, italic: Bool, at: Point)
+type Row(glyph: Glyph, next: Option[Point])
+
+fn line(a: Int) -> Line {
+  Line(from: Point(x: a, y: a + 1), to: Point(x: a * 10, y: 0 - a), dashed: True, label: "a label long enough for a buffer")
+}
+fn length(l: Line) -> Int { l.to.x - l.from.x + l.from.y }
+fn row(a: Int) -> Row {
+  let next: Option[Point] = if a == 1 { Empty } else { Point(x: a, y: a) }
+  Row(glyph: Glyph(code: 'A', size: a, bold: True, italic: False, at: Point(x: 4, y: 20)), next: next)
+}
+fn size(r: Row) -> Int {
+  let n = case r.next {
+    Empty -> 0
+    p: Point -> p.x
+  }
+  if r.glyph.bold and not r.glyph.italic { r.glyph.size + r.glyph.at.y + n } else { 0 }
+}
+fn ends(l: Line) -> List[Point] { [l.from, l.to] }
+fn spread(a: Int) -> Int {
+  let ps = ends(line(a))
+  ps[0].x + ps[1].x
+}
+fn three() -> Line { line(3) }
+fn two() -> Row { row(2) }
+
+fn run(a: Int) -> Int { length(line(a)) * 1000 + size(row(a)) }
+"#,
+    );
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    assert_eq!(m.int("run", &[3]), 31 * 1000 + 26);
+    assert_eq!(m.int("run", &[1]), 11 * 1000 + 21);
+    assert_eq!(m.int("spread", &[4]), 44);
+    assert_eq!(m.heap.live_blocks(), 0);
+    // The points are in the line's box, which is all that is made: the
+    // label is a literal, in static data.
+    let words = m.call("three", &[]);
+    let boxes = if flat_layouts() { 1 } else { 3 };
+    assert_eq!(m.heap.live_blocks(), boxes);
+    let (shapes, root) = m.result_shapes("three");
+    // SAFETY: the words are the function's result, of the shape.
+    unsafe { release_value(&mut m.heap, &m.types, &words, &shapes, root) };
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(
+        m.shown("three"),
+        "Line(from: Point(x: 3, y: 4), to: Point(x: 30, y: -3), dashed: True, \
+         label: \"a label long enough for a buffer\")"
+    );
+    assert_eq!(
+        m.shown("two"),
+        "Row(glyph: Glyph(code: 'A', size: 2, bold: True, italic: False, at: Point(x: 4, \
+         y: 20)), next: Point(x: 2, y: 2))"
+    );
+    assert_eq!(m.heap.live_blocks(), 0);
+}
+
+#[test]
 fn flat_records_are_returned_by_value() {
     let mut m = Module::new(
         r#"type Point(x: Int, y: Int)
@@ -2041,14 +2102,15 @@ fn depth(n: Int) -> Int {
         Ok(vec![2000])
     );
 
-    // A chain holds its nodes of 40 bytes, made in a loop, so only the
-    // heap grows. A refill of nodes carves 102 of them, 4080 bytes, and
-    // eight fit 32 KiB, or seven when the loop's range is a box of 32
-    // bytes, with flat layouts off, whose refill carves 4 KiB. The node
+    // A chain holds its nodes, made in a loop, so only the heap grows.
+    // With flat layouts off a node takes 40 bytes; a refill of nodes
+    // carves 102 of them, 4080 bytes, and seven fit 32 KiB beside the
+    // loop's range, a box of 32 bytes whose refill carves 4 KiB. The node
     // after them goes beyond it; the trap comes at the next step, the
     // loop's back-edge, which a chain one longer never reaches. With flat
-    // layouts the chain's head is in registers, and a node is boxed when
-    // the next takes it, so the chain holds one more.
+    // layouts a node takes 32 bytes, its `next` a pointer with null for
+    // `End`, so a refill carves 128 and eight fit, and the chain's head is
+    // in registers, boxed when the next node takes it: one more.
     let budget = |memory| Meter {
         steps: u64::MAX,
         memory,
@@ -2059,7 +2121,7 @@ fn depth(n: Int) -> Int {
         assert_eq!(m.worker.heap().live_blocks(), 0);
         result
     };
-    let fit = if flat_layouts() { 8 * 102 + 1 } else { 7 * 102 };
+    let fit = if flat_layouts() { 8 * 128 + 1 } else { 7 * 102 };
     assert_eq!(fresh(fit), Ok(vec![fit as u64]));
     assert_eq!(fresh(fit + 1), Ok(vec![fit as u64 + 1]));
     let trap = fresh(fit + 2).unwrap_err();
@@ -2119,6 +2181,7 @@ fn mixed() -> (a: Fixed[2], b: List[Option[Int]], c: Float) { (a: 1.25, b: [1, E
 fn empty() -> List[Int] { [] }
 fn nothing() -> Map[Int, Int] { [:] }
 type Pair(u: Int, v: Int)
+type Pair3(..Pair, w: Int)
 fn both() -> (p: Point, w: Pair) { (p: Point(x: 1, y: 2), w: Pair(u: 1, v: 2)) }
 fn words() -> Map[Str, List[Str]] {
   ["k": ["a", "a string long enough for a buffer"], "a key long enough for a buffer": []]
@@ -2189,7 +2252,8 @@ fn boxed() -> List[Option[Str] | Bytes] {
         assert!(result.is_err(), "broken {i}");
     }
     // A box of a record type that is no subtype of the field's, though laid
-    // out alike: `Pair` for the `Point` of `both`, and the other way.
+    // out alike: `Pair` for the `Point` of `both`, and the other way. Both
+    // have subtypes, so neither is stored inline.
     let words = m.call("both", &[]);
     let (shapes, root) = m.result_shapes("both");
     // SAFETY: as above.

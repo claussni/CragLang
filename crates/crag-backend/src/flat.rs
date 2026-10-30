@@ -24,10 +24,11 @@
 //! local tag, the niche a `T | Empty` can use instead of a tag, and the
 //! pointer map. It depends on the type alone. Locals, parameters and
 //! results use it (see `split`): a flat record or union is kept in
-//! registers and passes between functions in its storage form, but every
-//! record in memory is still boxed as `layout::record_layout` places it.
-//! The REPL's `:layout` shows what flattening does, and `check_flat`
-//! holds a type marked `is Flat` to it.
+//! registers and passes between functions in its storage form. A record's
+//! box holds its storage form too, `box_layout`, with the flat records
+//! and unions of its fields inline (see `boxes`); elements of collections
+//! are still boxed. The REPL's `:layout` shows what flattening does, and
+//! `check_flat` holds a type marked `is Flat` to it.
 //!
 //! A field that would contain its own type is the recursive edge, and
 //! holds a box: a field's member is boxed when it reaches the record it is
@@ -73,6 +74,8 @@ pub struct Layout<'db> {
     pub managed: u32,
     /// A pattern no value has, which a union with one tag can use for it.
     pub niche: Option<Niche>,
+    /// In a box, where the word with the address of its dispose code is.
+    pub dispose: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -203,6 +206,7 @@ impl Layout<'_> {
             pointers: Vec::new(),
             managed: 0,
             niche: None,
+            dispose: None,
         }
     }
 
@@ -341,8 +345,9 @@ fn builtin(b: Builtin) -> Option<Layout<'static>> {
         | Builtin::Lazy
         | Builtin::RuntimeStream
         | Builtin::RuntimeHub
-        | Builtin::RuntimeSocket
-        | Builtin::CPtr => Layout::boxed(BoxReason::Lifecycle),
+        | Builtin::RuntimeSocket => Layout::boxed(BoxReason::Lifecycle),
+        // A C pointer is a word no count covers.
+        Builtin::CPtr => Layout::sized(8, LayoutClass::Boxed(BoxReason::Lifecycle)),
         Builtin::COut | Builtin::Oks | Builtin::Errs => return None,
     })
 }
@@ -514,6 +519,7 @@ fn union<'db>(
             pointers,
             managed: payload.managed,
             niche: None,
+            dispose: None,
         };
     }
     let align = members.iter().map(|(_, l, _)| l.align).max().unwrap_or(1);
@@ -550,6 +556,7 @@ fn union<'db>(
         pointers,
         managed,
         niche: spare_tag,
+        dispose: None,
     }
 }
 
@@ -591,33 +598,61 @@ fn shift_niche(n: Niche, by: u32) -> Niche {
 /// then its own by alignment, largest first, and name, then its flag
 /// bytes. One that does not fit is boxed.
 fn record<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Layout<'db>> {
-    let flat = record_form(db, program, ty, &[ty])?;
+    let flat = record_form(db, program, ty, &[ty], false)?;
     Some(match flat.class {
         LayoutClass::Boxed(reason) => Layout::boxed(reason),
         _ => flat,
     })
 }
 
-/// A record's storage form, of whatever size. `owners` are the record
-/// and the types that spread it, whose layout is being made: a field's
-/// member that contains one of them is boxed.
+/// The storage form of a record type in its box, after the header
+/// (Compiler Architecture §A11.1), of whatever size: its parent's box
+/// first, as the parent's code reads it, then the word with the address
+/// of its dispose code if it is the first type with a handler, then its
+/// own fields as a flat record has them, but with the integers its `where`
+/// conditions bound at full width: construction checks the conditions
+/// against the box. An amended field keeps its parent's place and
+/// storage. None for what has no layout, or an amended field whose words
+/// differ from its parent's.
+#[crag_db::tracked(returns(ref))]
+pub fn box_layout<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Layout<'db>> {
+    record_form(db, program, ty, &[ty], true)
+}
+
+/// A record's storage form, of whatever size, flat or `in_box`. `owners`
+/// are the record and the types that spread it, whose layout is being
+/// made: a field's member that contains one of them is boxed.
 fn record_form<'db>(
     db: &'db dyn Db,
     program: Program,
     ty: Ty<'db>,
     owners: &[Ty<'db>],
+    in_box: bool,
 ) -> Option<Layout<'db>> {
     let all = fields_of(db, program, ty)?;
     let mut out = Layout::empty(LayoutClass::Zero);
     if let TyKind::Named(..) = ty.kind(db)
         && let Some(p) = parent(db, program, ty)
     {
-        let mut owners = owners.to_vec();
-        owners.push(p);
-        out = record_form(db, program, p, &owners)?;
+        out = match in_box {
+            true => box_layout(db, program, p).clone()?,
+            false => {
+                let mut owners = owners.to_vec();
+                owners.push(p);
+                record_form(db, program, p, &owners, false)?
+            }
+        };
     }
+    if in_box && crate::layout::own_dispose_word(db, program, ty) {
+        let at = out.size.next_multiple_of(8);
+        out.dispose = Some(at);
+        out.size = at + 8;
+        out.align = out.align.max(8);
+    }
+    // A box is where construction checks the conditions, so it keeps
+    // what they bound at full width (§A11.4.4).
     let bounds = match ty.kind(db) {
-        TyKind::Named(item, _) => int_bounds(db, program, *item),
+        TyKind::Named(item, _) if !in_box => int_bounds(db, program, *item),
         _ => Vec::new(),
     };
     let mut bytes: Vec<(FieldPlace<'db>, Layout<'db>)> = Vec::new();
@@ -628,9 +663,17 @@ fn record_form<'db>(
             l = narrow(l, lo, hi);
         }
         let edges = boxed.map(|_| Box::new(l.clone()));
-        // An amended field keeps its parent's place if it keeps its size.
+        // An amended field keeps its parent's place if it keeps its size,
+        // and in a box always, where its parent's code reads it.
         if let Some(i) = out.fields.iter().position(|f| f.name == name) {
             let place = &out.fields[i];
+            if in_box {
+                let words = |t| crate::layout::layout(db, program, t);
+                if words(place.ty) != words(field_ty) {
+                    return None;
+                }
+                continue;
+            }
             if place.ty == field_ty || (place.bits.is_none() && place.size == l.size) {
                 out.fields[i].ty = field_ty;
                 continue;

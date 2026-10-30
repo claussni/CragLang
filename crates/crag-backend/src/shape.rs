@@ -19,13 +19,14 @@
 
 use std::collections::HashMap;
 
-use crag_abi::{LIST_SIZE, MAP_SIZE, Number, Shape, ShapeField, Shapes};
+use crag_abi::{HEADER_SIZE, LIST_SIZE, MAP_SIZE, Number, Shape, ShapeField, Shapes};
 use crag_db::Db;
-use crag_hir::Program;
+use crag_hir::{Name, Program};
 use crag_types::{Builtin, Ty, TyKind, declared_fields, record_subtypes};
 
-use crate::layout::{Layout, layout, record_layout, type_index};
-use crate::split::{Form, form};
+use crate::boxes::{box_form, rebase, select, span, stored_slots};
+use crate::layout::{Layout, layout, type_index};
+use crate::split::{Form, Slot, SlotKind, form};
 
 /// The shapes a value of `ty` is printed by, and the index of its own.
 pub fn shapes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> (Shapes, u32) {
@@ -34,6 +35,8 @@ pub fn shapes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> (Shapes, u
         program,
         shapes: Shapes::default(),
         done: HashMap::new(),
+        inlined: Vec::new(),
+        stored: HashMap::new(),
     };
     let root = b.shape(ty);
     (b.shapes, root)
@@ -47,6 +50,8 @@ pub fn split_shapes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> (Sha
         program,
         shapes: Shapes::default(),
         done: HashMap::new(),
+        inlined: Vec::new(),
+        stored: HashMap::new(),
     };
     let root = match form(db, program, ty) {
         Some(f) => b.inline(ty, &f),
@@ -60,6 +65,10 @@ struct Builder<'db> {
     program: Program,
     shapes: Shapes,
     done: HashMap<Ty<'db>, u32>,
+    /// The shapes of split values by type and form, and of stored fields,
+    /// made once, so that a subtype's box keeps its parent's.
+    inlined: Vec<(Ty<'db>, Form<'db>, u32)>,
+    stored: HashMap<Shape, u32>,
 }
 
 impl<'db> Builder<'db> {
@@ -118,7 +127,7 @@ impl<'db> Builder<'db> {
             Shape::List(_) => Some(LIST_SIZE),
             // A set is a map whose values have no words.
             Shape::Set(_) | Shape::Map(..) => Some(MAP_SIZE),
-            Shape::Record { .. } => record_layout(db, program, ty).map(|(_, size)| size),
+            Shape::Record { .. } => box_form(db, program, ty).map(|b| b.size),
             _ => None,
         };
         if let Some(size) = size {
@@ -140,6 +149,18 @@ impl<'db> Builder<'db> {
     /// A split record: its fields' words in its register form, shown as a
     /// record's are.
     fn inline(&mut self, ty: Ty<'db>, f: &Form<'db>) -> u32 {
+        if let Form::Words(_) = f {
+            return self.shape(ty);
+        }
+        if let Some(&(_, _, index)) = self.inlined.iter().find(|(t, g, _)| *t == ty && g == f) {
+            return index;
+        }
+        let index = self.split(ty, f);
+        self.inlined.push((ty, f.clone(), index));
+        index
+    }
+
+    fn split(&mut self, ty: Ty<'db>, f: &Form<'db>) -> u32 {
         let db = self.db;
         if let Form::Union(members) = f {
             let index = self.shapes.shapes.len() as u32;
@@ -169,9 +190,12 @@ impl<'db> Builder<'db> {
             });
             at += inner.words();
         }
-        if let Some(declared) = declared_fields(db, self.program, ty) {
-            let place = |n: &str| declared.iter().position(|(d, ..)| d.text(db) == n);
-            fields.sort_by_key(|f| place(&f.name));
+        match declared_fields(db, self.program, ty) {
+            Some(declared) => {
+                let place = |n: &str| declared.iter().position(|(d, ..)| d.text(db) == n);
+                fields.sort_by_key(|f| place(&f.name));
+            }
+            None => fields.sort_by(|a, b| a.name.cmp(&b.name)),
         }
         let name = match ty.kind(db) {
             TyKind::Named(item, _) => Some(item.name(db).text(db).clone()),
@@ -185,28 +209,81 @@ impl<'db> Builder<'db> {
         index
     }
 
-    /// A record's fields at their offsets: a named type's in the order it
-    /// declares them, an anonymous record's by name.
+    /// A record's fields at their offsets in its box: a named type's in
+    /// the order it declares them, an anonymous record's by name.
     fn record(&mut self, ty: Ty<'db>) -> Option<Shape> {
         let (db, program) = (self.db, self.program);
-        let (mut slots, _) = record_layout(db, program, ty)?;
+        let b = box_form(db, program, ty)?;
+        let Form::Fields(places) = &b.form else {
+            return None;
+        };
+        let mut fields = Vec::new();
+        let mut at = 0;
+        for (name, t, f) in places {
+            let n = f.words();
+            let slots = select(&b.slots, at, n);
+            at += n;
+            fields.push((*name, self.field(*name, *t, f, &slots)));
+        }
+        match declared_fields(db, program, ty) {
+            Some(declared) => {
+                let place = |n| declared.iter().position(|(d, ..)| *d == n);
+                fields.sort_by_key(|(n, _)| place(*n));
+            }
+            None => fields.sort_by(|a, b| a.1.name.cmp(&b.1.name)),
+        }
         let name = match ty.kind(db) {
             TyKind::Named(item, _) => Some(item.name(db).text(db).clone()),
             _ => None,
         };
-        if let Some(declared) = declared_fields(db, program, ty) {
-            let place = |n| declared.iter().position(|(d, ..)| *d == n);
-            slots.sort_by_key(|s| place(s.name));
-        }
-        let fields = slots
-            .into_iter()
-            .map(|s| ShapeField {
-                name: s.name.text(db).clone(),
-                offset: s.offset,
-                shape: self.shape(s.ty),
-            })
-            .collect();
+        let fields = fields.into_iter().map(|(_, f)| f).collect();
         Some(Shape::Record { name, fields })
+    }
+
+    /// A field of a box: its words at a word offset as they are, or
+    /// stored flat (Compiler Architecture §A11.4).
+    fn field(&mut self, name: Name<'db>, ty: Ty<'db>, f: &Form<'db>, slots: &[Slot]) -> ShapeField {
+        let name_text = name.text(self.db).clone();
+        let Some((from, to)) = span(slots) else {
+            // Nothing is stored: a unit or a tag.
+            return ShapeField {
+                name: name_text,
+                offset: HEADER_SIZE,
+                shape: self.shape(ty),
+            };
+        };
+        if let (Form::Words(_), [slot]) = (f, slots)
+            && slot.kind == SlotKind::Words
+            && slot.offset.is_multiple_of(8)
+        {
+            return ShapeField {
+                name: name_text,
+                offset: slot.offset,
+                shape: self.shape(ty),
+            };
+        }
+        let form = self.inline(ty, f);
+        let slots: Vec<Slot> = slots.iter().map(|s| rebase(s, from)).collect();
+        let stored = Shape::Stored {
+            form,
+            size: to - from,
+            slots: stored_slots(&slots),
+            words: f.words() as u32,
+        };
+        let shape = match self.stored.get(&stored) {
+            Some(&index) => index,
+            None => {
+                let index = self.shapes.shapes.len() as u32;
+                self.shapes.shapes.push(stored.clone());
+                self.stored.insert(stored, index);
+                index
+            }
+        };
+        ShapeField {
+            name: name_text,
+            offset: from,
+            shape,
+        }
     }
 }
 

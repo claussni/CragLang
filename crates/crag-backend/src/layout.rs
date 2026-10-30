@@ -24,7 +24,9 @@
 //! and its environment, a box or null (§11.5.9). A union holds a member of
 //! two words in a member box, whose pointer is the payload (`crag_abi`).
 
-use crag_abi::{CountedField, ElementLayout, HEADER_SIZE, TypeDescriptor};
+use crate::flat;
+use crate::split::flat_layouts;
+use crag_abi::{CountedField, ElementLayout, FieldGuard, HEADER_SIZE, TypeDescriptor};
 use crag_db::Db;
 use crag_db::plumbing::AsId;
 use crag_hir::{ItemKind, Name, Program, item_tree, module_index};
@@ -196,7 +198,7 @@ fn inherited_layout<'db>(
 
 /// Whether a type has a dispose handler that none of the types it spreads
 /// has, so its boxes need a word for the address of their dispose code.
-fn own_dispose_word<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
+pub(crate) fn own_dispose_word<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
     matches!(ty.kind(db), TyKind::Named(..))
         && dispose_handler(db, program, ty).is_some()
         && parent(db, program, ty).is_none_or(|p| dispose_handler(db, program, p).is_none())
@@ -418,6 +420,16 @@ pub fn type_descriptor<'db>(
         }
         _ => {}
     }
+    // A box stores its record flat: its pointer map says where the
+    // references are, and when a union's member holds one.
+    if flat_layouts() {
+        let l = flat::box_layout(db, program, ty).as_ref()?;
+        let counted = l.pointers.iter().map(counted_pointer).collect();
+        return Some(TypeDescriptor::Record {
+            counted,
+            dispose: l.dispose.map(|d| HEADER_SIZE + d),
+        });
+    }
     let (slots, _) = record_layout(db, program, ty)?;
     let mut counted = Vec::new();
     for slot in slots {
@@ -441,6 +453,37 @@ pub fn type_descriptor<'db>(
         counted,
         dispose: dispose_word(db, program, ty),
     })
+}
+
+/// A pointer of a box's storage form, after its header, as the runtime
+/// releases it.
+fn counted_pointer(p: &flat::Pointer) -> CountedField {
+    let offset = HEADER_SIZE + p.offset;
+    if p.guards.is_empty() {
+        return CountedField::Box(offset);
+    }
+    let guards = p
+        .guards
+        .iter()
+        .map(|g| match g {
+            flat::Guard::Tag { offset, tags } => FieldGuard::Tag {
+                offset: HEADER_SIZE + offset,
+                tags: tags.clone(),
+            },
+            flat::Guard::NotNiche(n) => match n.kind {
+                flat::NicheKind::Value { size, value } => FieldGuard::NotValue {
+                    offset: HEADER_SIZE + n.offset,
+                    size,
+                    value,
+                },
+                flat::NicheKind::Bit(bit) => FieldGuard::BitClear {
+                    offset: HEADER_SIZE + n.offset,
+                    bit,
+                },
+            },
+        })
+        .collect();
+    CountedField::Guarded { offset, guards }
 }
 
 /// Whether a value of `ty` goes through deferred teardown when its last

@@ -404,6 +404,38 @@ fn flat_values_pass_by_value() {
 }
 
 #[test]
+fn flat_fields_live_in_their_box() {
+    // A record's box holds the flat records and unions of its fields in
+    // their storage form: narrowed, packed, with tags and niches.
+    let mut r = session(&[
+        "type Point(x: Float, y: Float)",
+        "type Glyph(code: CodePoint, size: Int, bold: Bool, italic: Bool, at: Point)
+    where size >= 1 and size <= 255",
+        "type Line(first: Glyph, rest: Option[Glyph], label: Str, count: Int)",
+        "fn glyph(n: Int) -> Glyph { Glyph(code: 'A', size: n, bold: n == 200, italic: False, at: Point(x: 1.5, y: -2.0)) }",
+        "fn line(n: Int) -> Line { Line(first: glyph(n), rest: if n == 1 { Empty } else { glyph(n - 1) }, label: \"a label made at {n}\", count: n) }",
+        "fn lines(n: Int) -> List[Line] { [line(n), line(1)] }",
+        "fn sizes(ls: List[Line]) -> Int { ls.fold(0) { t, l -> t + l.first.size + (case l.rest { Empty -> 0\n g: Glyph -> g.size }) } }",
+    ]);
+    assert_eq!(
+        eval(&mut r, "line(200)"),
+        "Line(first: Glyph(code: 'A', size: 200, bold: True, italic: False, \
+         at: Point(x: 1.5, y: -2.0)), rest: Glyph(code: 'A', size: 199, bold: False, \
+         italic: False, at: Point(x: 1.5, y: -2.0)), label: \"a label made at 200\", count: 200)\n"
+    );
+    assert_eq!(eval(&mut r, "line(1).rest"), "Empty\n");
+    assert_eq!(
+        eval(&mut r, "\"{line(200).first.size} {line(200).first.at.x}\""),
+        "\"200 1.5\"\n"
+    );
+    assert_eq!(eval(&mut r, "sizes(lines(250))"), "500\n");
+    assert_eq!(eval(&mut r, "line(7) == line(7)"), "True\n");
+    assert_eq!(eval(&mut r, "line(7) == line(8)"), "False\n");
+    let out = eval(&mut r, "line(256)");
+    assert!(out.contains("size <= 255"), "{out}");
+}
+
+#[test]
 fn types_marked_flat_must_not_be_boxed() {
     let mut r = session(&["type Point(x: Int, y: Int)\n  is Flat"]);
     // A type too large, or one with a lifecycle, is an error that says

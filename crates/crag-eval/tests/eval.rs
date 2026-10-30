@@ -274,10 +274,12 @@ embed shout: Shout from "who.txt"
     .concat();
     assert_eq!(value, expected);
     // The handler of a generic type, for one of its instances: its box,
-    // the name's box, the name, its length and the empty list.
+    // the name's box, the name, its length and the empty list. With flat
+    // layouts the name is stored in the box, without a shape of its own.
     let names = p.bytes("names");
+    let name = if crag_backend::flat_layouts() { 4 } else { 8 };
     assert_eq!(
-        names[8..],
+        names[name..],
         [
             &3u64.to_le_bytes()[..],
             b"Ada",
