@@ -24,7 +24,9 @@
 //! record allocates nothing and reading a field picks its registers. A
 //! flat union with a member that is a flat record splits too: its
 //! member's type index, then the member's words in its own form, as many
-//! as the widest member's. Where it meets a box, it has its layout's two
+//! as the widest member's. Within a split value, every union with a
+//! payload splits that way, a string member too, and a cycle's edge
+//! holds its box. Where a union meets a box, it has its layout's two
 //! words, the member boxed.
 //!
 //! A split local is used in registers by field reads, type tests,
@@ -47,11 +49,9 @@
 //! to a buffer the caller pushes on its side stack, which a tail call
 //! passes on; a tail call to code that returns otherwise becomes a call.
 //! A flat union passes the same way: its member's local tag, or for a
-//! `T | Empty` the niche of `T`, and the member's storage form. Values
-//! whose register form keeps a member in a box, as a union with a member
-//! of two words or a cycle's edge does, still pass in their box, and so
-//! do the values of the code that function values, the runtime and the
-//! host call.
+//! `T | Empty` the niche of `T`, and the member's storage form. The
+//! values of the code that function values, the runtime and the host call
+//! still pass in their box.
 //!
 //! With `CRAG_FLAT=0` in the environment no local is split and every
 //! record passes in its box.
@@ -148,30 +148,21 @@ impl<'db> Form<'db> {
 }
 
 /// The register form of a split value of `ty`: none unless it is a flat
-/// record, or a flat union with a member that is one. Flat records within
-/// it are split too, but a field or a member that is the edge of a cycle
-/// holds a box.
+/// record, or a flat union with a member that is one. Within it, flat
+/// records are split too, and so are unions with a payload: a field or a
+/// member that is the edge of a cycle holds a box.
 pub fn form<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Form<'db>> {
     if let TyKind::Union(_) = ty.kind(db) {
         let flat = flat::layout(db, program, ty).as_ref()?;
         if flat.is_boxed() {
             return None;
         }
-        let mut members = Vec::new();
-        let mut records = false;
-        for place in &flat.union.as_ref()?.members {
-            let inner = match place.boxed {
-                Some(_) => None,
-                None => form(db, program, place.ty),
-            };
-            records |= inner.is_some();
-            let inner = match inner {
-                Some(f) => f,
-                None => Form::Words(layout::layout(db, program, place.ty)?),
-            };
-            members.push((place.ty, inner));
-        }
-        return records.then_some(Form::Union(members));
+        let f = union_form(db, program, flat)?;
+        let Form::Union(members) = &f else {
+            return None;
+        };
+        let records = members.iter().any(|(_, m)| matches!(m, Form::Fields(_)));
+        return records.then_some(f);
     }
     let record = match ty.kind(db) {
         TyKind::Named(item, _) => {
@@ -190,19 +181,60 @@ pub fn form<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Form<
     if let LayoutClass::Boxed(_) = flat.class {
         return None;
     }
+    fields_form(db, program, &flat.fields)
+}
+
+/// The fields of a record, each in its form inside a split value.
+fn fields_form<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    places: &[flat::FieldPlace<'db>],
+) -> Option<Form<'db>> {
     let mut fields = Vec::new();
-    for place in &flat.fields {
-        let inner = match place.boxed {
-            Some(_) => None,
-            None => form(db, program, place.ty),
-        };
-        let inner = match inner {
-            Some(f) => f,
-            None => Form::Words(layout::layout(db, program, place.ty)?),
+    for place in places {
+        let inner = match &place.edges {
+            Some(l) if l.union.is_some() => union_form(db, program, l)?,
+            Some(_) => Form::Words(Layout::Box),
+            None => inner_form(db, program, place.ty)?,
         };
         fields.push((place.name, place.ty, inner));
     }
     Some(Form::Fields(fields))
+}
+
+/// The form of a value inside a split one: a flat record split, a union
+/// with a payload as its member's type index and the member's words, and
+/// anything else as the words of its layout.
+pub fn inner_form<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Form<'db>> {
+    if let Some(f) = form(db, program, ty) {
+        return Some(f);
+    }
+    let l = layout::layout(db, program, ty)?;
+    if l == Layout::Union
+        && let Some(flat) = flat::layout(db, program, ty)
+        && flat.union.is_some()
+    {
+        return union_form(db, program, flat);
+    }
+    Some(Form::Words(l))
+}
+
+/// A union's members, each in its form inside a split value; a member
+/// that is the edge of a cycle holds a box.
+fn union_form<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    flat: &flat::Layout<'db>,
+) -> Option<Form<'db>> {
+    let mut members = Vec::new();
+    for place in &flat.union.as_ref()?.members {
+        let inner = match place.boxed {
+            Some(_) => Form::Words(Layout::Box),
+            None => inner_form(db, program, place.ty)?,
+        };
+        members.push((place.ty, inner));
+    }
+    Some(Form::Union(members))
 }
 
 /// The form of the value a place reaches when the local is split: the
@@ -369,6 +401,18 @@ impl<'db> Check<'_, 'db> {
         Some(matches!(form, Form::Fields(_) | Form::Union(_)))
     }
 
+    /// Whether the value at the place is a union split in registers.
+    fn union_at(&self, place: &Place<'db>) -> bool {
+        let Some(form) = self.forms[place.local.index()].as_ref() else {
+            return false;
+        };
+        let ty = self.body.locals[place.local.index()].ty;
+        matches!(
+            place_form(form, ty, &place.path),
+            Some((_, _, Form::Union(_), _))
+        )
+    }
+
     /// The form of a member of a split union that a value of `from` is.
     fn member(&self, union: &Form<'db>, from: Ty<'db>, to: Ty<'db>) -> Option<Form<'db>> {
         let members = to.members(self.db);
@@ -403,6 +447,9 @@ impl<'db> Check<'_, 'db> {
                 match (self.split[source], self.place(place)) {
                     // A split record goes into a split local.
                     (true, Some(true)) if into_split && self.split[source] => defines = true,
+                    // A split union goes into one that is not with its
+                    // member boxed.
+                    (true, Some(true)) if !into_split && self.union_at(place) => {}
                     // Words, or a record read from its box.
                     (false, _) | (true, Some(false)) => {
                         if into_split {
@@ -430,13 +477,12 @@ impl<'db> Check<'_, 'db> {
                 let form = self.forms[dst.index()].as_ref();
                 for (name, op) in fields {
                     // A split record or union goes into a field split in
-                    // turn.
+                    // turn; a boxed union's member is loaded.
                     let field = form.and_then(|f| f.field(*name));
-                    let split_field =
-                        matches!(field, Some((_, _, Form::Fields(_) | Form::Union(_))));
-                    match op {
-                        Operand::Local(l) if split_field && self.split[l.index()] => {}
-                        _ if split_field => {
+                    match (op, field) {
+                        (Operand::Local(l), Some((_, _, Form::Fields(_) | Form::Union(_))))
+                            if self.split[l.index()] => {}
+                        (_, Some((_, _, Form::Fields(_)))) => {
                             self.consumed(op);
                             self.keep[dst.index()] = true;
                         }
@@ -636,9 +682,7 @@ pub enum NicheTest {
 }
 
 /// The storage form of a flat record or union that passes by value, as
-/// slots, with its bytes: none for what is not one, or holds a value its
-/// register form keeps in a box, as a union with a member of two words
-/// does.
+/// slots, with its bytes: none for what is not one.
 pub fn storage<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<(u32, Vec<Slot>)> {
     let f = form(db, program, ty)?;
     let flat = flat::layout(db, program, ty).as_ref()?;
@@ -675,21 +719,11 @@ fn slots_of<'db>(
     match f {
         Form::Fields(fields) => {
             let flat = flat::layout(db, program, ty).as_ref()?;
-            let mut at = at;
-            for (name, t, inner) in fields {
-                let place = flat.fields.iter().find(|p| p.name == *name)?;
-                let leaf = Leaf {
-                    size: place.size,
-                    bits: place.bits,
-                    narrowed: place.narrowed,
-                };
-                slots_of(db, program, *t, inner, at, offset + place.offset, leaf, out)?;
-                at += inner.words();
-            }
+            fields_slots(db, program, &flat.fields, fields, at, offset, out)?;
         }
         Form::Union(members) => {
-            let forms: Vec<(Ty<'db>, &Form<'db>)> = members.iter().map(|(m, f)| (*m, f)).collect();
-            out.push(union_slot(db, program, ty, &forms, at, offset)?);
+            let flat = flat::layout(db, program, ty).as_ref()?;
+            out.push(union_slot(db, program, flat, members, at, offset)?);
         }
         Form::Words(l) => {
             let kind = match l {
@@ -707,8 +741,7 @@ fn slots_of<'db>(
                     _ => return None,
                 },
                 Layout::Box | Layout::Pair | Layout::Closure => SlotKind::Words,
-                // A union of two words keeps a member in a box, or is a
-                // cycle's edge, laid out where its record is.
+                // Split values split their unions.
                 Layout::Union => return None,
                 Layout::Tag => {
                     let union = flat::layout(db, program, ty).as_ref()?.union.as_ref()?;
@@ -734,17 +767,50 @@ fn slots_of<'db>(
     Some(())
 }
 
-/// The slot of a union at `offset`, whose type index is register `at`
-/// and whose members' words follow it.
+/// The slots of a record's fields in their places, from register `at`
+/// and byte `offset` on.
+fn fields_slots<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    places: &[flat::FieldPlace<'db>],
+    fields: &[(Name<'db>, Ty<'db>, Form<'db>)],
+    at: usize,
+    offset: u32,
+    out: &mut Vec<Slot>,
+) -> Option<()> {
+    let mut at = at;
+    for (name, t, inner) in fields {
+        let place = places.iter().find(|p| p.name == *name)?;
+        let offset = offset + place.offset;
+        match (inner, &place.edges) {
+            // A union with edges is laid out where its record is.
+            (Form::Union(members), Some(l)) => {
+                out.push(union_slot(db, program, l, members, at, offset)?)
+            }
+            _ => {
+                let leaf = Leaf {
+                    size: place.size,
+                    bits: place.bits,
+                    narrowed: place.narrowed,
+                };
+                slots_of(db, program, *t, inner, at, offset, leaf, out)?;
+            }
+        }
+        at += inner.words();
+    }
+    Some(())
+}
+
+/// The slot of a union laid out as `flat` at `offset`, whose type index
+/// is register `at` and whose members' words follow it.
 fn union_slot<'db>(
     db: &'db dyn Db,
     program: Program,
-    ty: Ty<'db>,
-    members: &[(Ty<'db>, &Form<'db>)],
+    flat: &flat::Layout<'db>,
+    members: &[(Ty<'db>, Form<'db>)],
     at: usize,
     offset: u32,
 ) -> Option<Slot> {
-    let flat = flat::layout(db, program, ty).as_ref()?;
     let union = flat.union.as_ref()?;
     let tag = match union.tag {
         TagPlace::Bytes(size) => UnionTag::Bytes { offset, size },

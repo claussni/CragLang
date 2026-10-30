@@ -158,6 +158,7 @@ pub fn lower_to_lir<'db>(
         c_buffer: None,
         result: result.cloned(),
         sret: None,
+        fresh: None,
         results: None,
     };
     // The parameters' words come first: a parameter that passes by value
@@ -203,6 +204,7 @@ pub fn lower_to_lir<'db>(
     let unknown_param = l.layouts[..mir.params].iter().any(Option::is_none);
     for (b, block) in mir.blocks.iter().enumerate() {
         l.current = (b, Vec::new());
+        l.fresh = None;
         l.catch = block.catch;
         if unknown_param || returns > 2 {
             l.unsupported("types of parameters or results");
@@ -376,6 +378,10 @@ struct Lower<'a, 'db> {
     /// and the buffer its caller gave for one of more than two words.
     result: Option<(u32, Vec<Slot>)>,
     sret: Option<VReg>,
+    /// A local a read gave a value of its own, which owns its reference
+    /// already: the retain that follows the read is its own, and without
+    /// one the value dies at once.
+    fresh: Option<Local>,
     /// A buffer on the side stack for the results of more than two words
     /// that calls give by value, pushed at the entry.
     results: Option<VReg>,
@@ -859,6 +865,26 @@ impl<'a, 'db> Lower<'a, 'db> {
         }
     }
 
+    /// The registers of an operand in a split form, which take its
+    /// references: a split local's as they are, a boxed value's loaded.
+    fn split_value(
+        &mut self,
+        op: &Operand<'db>,
+        ty: Ty<'db>,
+        f: &Form<'db>,
+    ) -> Result<Vec<VReg>, Unsupported> {
+        if let Operand::Local(l) = op
+            && self.forms[l.index()].as_ref() == Some(f)
+        {
+            return Ok(self.locals[l.index()].clone());
+        }
+        let words = self.operand(op, ty)?;
+        match words_form(f) {
+            true => Ok(words),
+            false => self.owned_fields(ty, f, &words),
+        }
+    }
+
     /// The words of a split value as its layout has them: a record's box,
     /// a union's two words, or the words as they are.
     fn boxed(
@@ -1124,6 +1150,12 @@ impl<'a, 'db> Lower<'a, 'db> {
     // Statements.
 
     fn statement(&mut self, statement: &Statement<'db>) -> Result<(), Unsupported> {
+        if let Some(fresh) = self.fresh.take() {
+            if matches!(statement, Statement::Retain(l) if *l == fresh) {
+                return Ok(());
+            }
+            self.count(fresh, Count::Release)?;
+        }
         match statement {
             Statement::Assign(local, rvalue) => {
                 let values = self.rvalue(*local, rvalue)?;
@@ -1501,11 +1533,28 @@ impl<'a, 'db> Lower<'a, 'db> {
         match rvalue {
             Rvalue::Use(op) if self.forms[dst.index()].is_some() => self.split_operand(op, ty),
             Rvalue::Use(op) => self.operand(op, ty),
-            // A record read from its box into a split local is loaded.
+            // A record read from its box into a split local is loaded. A
+            // split union read into a local that is not split has its
+            // member boxed, a value of its own.
             Rvalue::Read(place) => {
                 let values = self.read(place)?;
-                match self.forms[dst.index()].clone() {
-                    Some(form) if !self.split_place(place) => self.unboxed(ty, &form, &values),
+                match (self.forms[dst.index()].clone(), self.split_form(place)) {
+                    (Some(form), None) => self.unboxed(ty, &form, &values),
+                    // A cycle's edge has a form of its own.
+                    (Some(form), Some(f)) if form != f && words_form(&f) => {
+                        self.unboxed(ty, &form, &values)
+                    }
+                    (Some(form), Some(f)) if form != f => {
+                        self.fresh = Some(dst);
+                        self.count_form(&f, ty, &values, Count::Retain)?;
+                        let words = self.boxed(ty, &f, &values)?;
+                        self.owned_fields(ty, &form, &words)
+                    }
+                    (None, Some(f)) if !words_form(&f) => {
+                        self.fresh = Some(dst);
+                        self.count_form(&f, ty, &values, Count::Retain)?;
+                        self.boxed(ty, &f, &values)
+                    }
                     _ => Ok(values),
                 }
             }
@@ -1616,7 +1665,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                         .ok_or("records of this type")?;
                     values.extend(match form {
                         Form::Words(_) => self.operand(op, ty)?,
-                        _ => self.split_operand(op, ty)?,
+                        _ => self.split_value(op, ty, &form)?,
                     });
                 }
                 Ok(values)
@@ -3803,6 +3852,9 @@ impl<'a, 'db> Lower<'a, 'db> {
     // Terminators.
 
     fn terminator(&mut self, term: &Terminator<'db>, returns: usize) -> Result<(), Unsupported> {
+        if let Some(fresh) = self.fresh.take() {
+            self.count(fresh, Count::Release)?;
+        }
         match term {
             Terminator::Jump(b) => self.end(Term::Jump(block(*b)), None),
             Terminator::Branch {
@@ -4354,17 +4406,15 @@ impl<'a, 'db> Lower<'a, 'db> {
         Ok(())
     }
 
-    /// Whether the value at a place is a record or a union split in
-    /// registers.
-    fn split_place(&self, place: &Place<'db>) -> bool {
-        let Some(form) = &self.forms[place.local.index()] else {
-            return false;
-        };
+    /// The form of the value at a place when it is a record or a union
+    /// split in registers.
+    fn split_form(&self, place: &Place<'db>) -> Option<Form<'db>> {
+        let form = self.forms[place.local.index()].as_ref()?;
         let ty = self.local_ty(place.local);
-        matches!(
-            place_form(form, ty, &place.path),
-            Some((_, _, Form::Fields(_) | Form::Union(_), _))
-        )
+        match place_form(form, ty, &place.path)? {
+            (_, _, f @ (Form::Fields(_) | Form::Union(_)), _) => Some(f.clone()),
+            _ => None,
+        }
     }
 
     /// Whether the value at a place is a record split in registers.
@@ -4394,6 +4444,21 @@ impl<'a, 'db> Lower<'a, 'db> {
 enum Count {
     Retain,
     Release,
+}
+
+/// Whether a split value's registers are the words of its layout: a
+/// union's whose members are a word or none.
+fn words_form(f: &Form<'_>) -> bool {
+    match f {
+        Form::Words(_) => true,
+        Form::Fields(_) => false,
+        Form::Union(members) => members.iter().all(|(_, m)| {
+            matches!(
+                m,
+                Form::Words(Layout::Zero | Layout::Imm(_) | Layout::Tag | Layout::Box)
+            )
+        }),
+    }
 }
 
 /// Whether a split value's registers may hold references.

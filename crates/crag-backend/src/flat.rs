@@ -122,6 +122,8 @@ pub struct FieldPlace<'db> {
     pub narrowed: Option<Builtin>,
     /// Why its members that contain the record are boxed.
     pub boxed: Option<BoxReason>,
+    /// Its layout with those members boxed, which is not its type's.
+    pub edges: Option<Box<Layout<'db>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -625,6 +627,7 @@ fn record_form<'db>(
         if let Some(&(_, lo, hi)) = bounds.iter().find(|(s, _, _)| *s == Some(name)) {
             l = narrow(l, lo, hi);
         }
+        let edges = boxed.map(|_| Box::new(l.clone()));
         // An amended field keeps its parent's place if it keeps its size.
         if let Some(i) = out.fields.iter().position(|f| f.name == name) {
             let place = &out.fields[i];
@@ -642,6 +645,7 @@ fn record_form<'db>(
             bits: None,
             narrowed: l.narrowed,
             boxed,
+            edges,
         };
         match l.tag_bits() {
             Some(width) => flags.push((place, width)),

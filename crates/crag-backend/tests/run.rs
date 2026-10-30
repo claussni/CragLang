@@ -1062,6 +1062,37 @@ fn run(n: Int) -> Int {
 }
 
 #[test]
+fn union_fields_split_with_their_records() {
+    let mut m = Module::new(
+        r#"type Named(name: Str | Empty[Str], n: Int)
+
+fn label(s: Str | Empty[Str]) -> Int {
+  case s {
+    Empty[Str] -> 0
+    t: Str -> if t == "hello" { 1 } else { 2 }
+  }
+}
+
+fn named(r: Named) -> Int { label(r.name) * 10 + r.n }
+
+fn run(n: Int) -> Int {
+  let long = Named(name: "a name longer than fifteen bytes", n: n)
+  named(Named(name: "hello", n: n)) * 10000 + named(long) * 100 + named(Named(name: Empty[Str], n: n))
+}
+"#,
+    );
+    let on = |flags: &[bool]| match flat_layouts() {
+        true => flags.to_vec(),
+        false => Vec::new(),
+    };
+    // The union is its member's type index and the string's two words,
+    // with no member box.
+    assert_eq!(m.flat("named"), on(&[true]));
+    assert_eq!(m.int("run", &[3]), 130_000 + 2_300 + 3);
+    assert_eq!(m.heap.live_blocks(), 0);
+}
+
+#[test]
 fn flat_records_are_returned_by_value() {
     let mut m = Module::new(
         r#"type Point(x: Int, y: Int)
@@ -1252,7 +1283,10 @@ fn shared(x: Int) -> Int {
     RELEASED.set(0);
     assert_eq!(m.int("twice", &[n]), n * (n + 1));
     // The second walk owns the list and frees each cell as it passes it.
-    assert_eq!(RELEASED.get(), n as usize);
+    // With flat layouts `build` returns the first cell by value, so it
+    // has no box.
+    let boxes = n as usize - usize::from(flat_layouts());
+    assert_eq!(RELEASED.get(), boxes);
     assert_eq!(m.heap.live_blocks(), 0);
     // A list nothing reads goes with its first cell, in one call of the
     // runtime.
