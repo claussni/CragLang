@@ -101,7 +101,7 @@ pub(crate) fn unpin(ctx: &TaskContext, heap: &mut Heap) {
 /// Retires the cell's reference to a value of the elements of list type
 /// `list` that a write replaced.
 pub(crate) fn retire(heap: &mut Heap, types: &Arc<Types>, words: [u64; 2], list: u64) {
-    if types.element_of(list).counted.is_empty() {
+    if types.cell_of(list).counted.is_empty() {
         return;
     }
     let epoch = EPOCH.now.load(Ordering::SeqCst);
@@ -135,7 +135,7 @@ fn collect(heap: &mut Heap) {
     drop(retired);
     EPOCH.pending.fetch_sub(due.len(), Ordering::Relaxed);
     for mut r in due {
-        let element = r.types.element_of(r.list);
+        let element = r.types.cell_of(r.list);
         // SAFETY: the cell's reference came with the value, and no task
         // pinned when it could still read it is pinned any more.
         unsafe { release_value(heap, &r.types, r.words.as_mut_ptr().cast(), element) }

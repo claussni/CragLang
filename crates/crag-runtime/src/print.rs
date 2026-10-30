@@ -163,8 +163,12 @@ impl Printer<'_> {
                     None => self.out.push_str(&format!("<a member of type {word}>")),
                 }
             }
-            // Only a field of a box is stored, and `field_words` widens it.
-            Shape::Stored { .. } => self.out.push_str("<a stored value>"),
+            // An element of a collection: `field_words` widens a field.
+            Shape::Stored { .. } => {
+                let (words, form) = element_value(self.shapes, words, shape);
+                // SAFETY: the words are a live value of the shape.
+                unsafe { self.value(&words, form, depth) }
+            }
             Shape::Inline { name, fields, .. } => {
                 self.out.push_str(name.as_deref().unwrap_or(""));
                 self.out.push('(');
@@ -187,7 +191,7 @@ impl Printer<'_> {
             }
             Shape::List(element) => {
                 let list = word as *mut u8;
-                let n = self.shape(element).words() as usize;
+                let n = self.shape(element).element_words() as usize;
                 // SAFETY: a live list of the element's shape.
                 let len = unsafe { list::length(list) };
                 self.out.push('[');
@@ -278,8 +282,8 @@ impl Printer<'_> {
     /// The entries of a map, or of a set without values, in the map's order.
     unsafe fn entries(&mut self, word: u64, key: u32, value: Option<u32>, depth: usize) {
         let map = word as *mut u8;
-        let kw = self.shape(key).words() as usize;
-        let vw = value.map_or(0, |v| self.shape(v).words() as usize);
+        let kw = self.shape(key).element_words() as usize;
+        let vw = value.map_or(0, |v| self.shape(v).element_words() as usize);
         // SAFETY: as the caller promises.
         let entries: Vec<&[u64]> = unsafe { map::iter(self.types, map) }
             // SAFETY: each entry is its key's words, then its value's.
@@ -337,8 +341,6 @@ pub(crate) fn number(n: Number, word: u64) -> String {
     }
 }
 
-/// Gives up the references a value's words hold, freeing what only they
-/// held.
 /// The words of a field of a record's box, and the shape they have: a
 /// field stored flat (Compiler Architecture §A11.4) widened to its
 /// register form, of its shape's `form`.
@@ -376,7 +378,30 @@ pub(crate) unsafe fn field_words<'a>(
     }
 }
 
-///
+/// The register form of a value of a collection stored flat, from its
+/// storage words, and its shape there (Compiler Architecture §A11.4); any
+/// other value's words as they are.
+pub(crate) fn element_value<'a>(
+    shapes: &Shapes,
+    words: &'a [u64],
+    shape: u32,
+) -> (Cow<'a, [u64]>, u32) {
+    match &shapes.shapes[shape as usize] {
+        Shape::Stored {
+            form,
+            size,
+            slots,
+            words: n,
+        } => {
+            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let mut out = vec![0; *n as usize];
+            widen(slots, &bytes[..*size as usize], &mut out);
+            (Cow::Owned(out), *form)
+        }
+        _ => (Cow::Borrowed(words), shape),
+    }
+}
+
 /// The words of a union's member, from its payload: the payload itself, or
 /// for a member of two words the words of the member box it points at.
 ///
@@ -396,6 +421,9 @@ pub(crate) unsafe fn member_words<'a>(payload: &'a [u64], member: &Shape) -> &'a
     }
 }
 
+/// Gives up the references a value's words hold, freeing what only they
+/// held.
+///
 /// # Safety
 ///
 /// The caller owns the value, of the shape, and gives it up.

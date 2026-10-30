@@ -68,7 +68,8 @@ unsafe extern "C" fn set_entry(
         if at as usize >= list::length(list) {
             die("a list element set outside the list");
         }
-        list::set(heap, types, list, at as usize, &[w0, w1])
+        let words = list::passed(list::element(types, list), w0, w1);
+        list::set(heap, types, list, at as usize, &words)
     }
 }
 
@@ -118,7 +119,7 @@ unsafe extern "C" fn list_entry(
             let words = at.add(skip);
             retain_value(words.cast(), layout);
             let n = layout.words as usize;
-            let mut element = [0u64; 2];
+            let mut element = [0u64; 4];
             element[..n].copy_from_slice(std::slice::from_raw_parts(words, n));
             list = list::push(heap, types, list, &element);
         }

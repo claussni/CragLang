@@ -68,11 +68,12 @@ impl Types {
         self.descriptors.get(index as usize)?.as_ref()
     }
 
-    /// The layout of the elements of list type `list`, which a stream or
-    /// a ref gives for the layout of its values.
-    pub(crate) fn element_of(&self, list: u64) -> &ElementLayout {
+    /// How a cell holds a value of the elements of list type `list`, which
+    /// a ref, a lazy value, a stream, a hub or a signal gives for the
+    /// layout of its values.
+    pub(crate) fn cell_of(&self, list: u64) -> &ElementLayout {
         match u32::try_from(list).ok().and_then(|i| self.get(i)) {
-            Some(TypeDescriptor::List { element }) => element,
+            Some(TypeDescriptor::List { cell, .. }) => cell,
             _ => die(&format!("values of type {list}, which is not a list type")),
         }
     }
@@ -361,7 +362,9 @@ pub(crate) unsafe fn free_chain(
                         }
                     }
                 }
-                TypeDescriptor::List { element } => list::boxes_of(ptr, kind, element, &mut dead),
+                TypeDescriptor::List { element, .. } => {
+                    list::boxes_of(ptr, kind, element, &mut dead)
+                }
                 TypeDescriptor::Map { key, value, .. } => {
                     map::boxes_of(ptr, kind, key, value, &mut dead)
                 }

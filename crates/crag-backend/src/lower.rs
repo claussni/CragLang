@@ -69,7 +69,8 @@ use crate::layout::{
 };
 use crate::slot_key;
 use crate::split::{
-    Form, NicheTest, Slot, SlotKind, UnionTag, flat_params, flat_result, form, place_form, storage,
+    Form, NicheTest, Slot, SlotKind, UnionTag, element_storage, flat_params, flat_result, form,
+    place_form, storage,
 };
 
 /// The LIR of a body, with what it could not lower.
@@ -1572,6 +1573,44 @@ impl<'a, 'db> Lower<'a, 'db> {
         }
     }
 
+    /// The words a read gives a local, from where the value is: `from` is
+    /// its form when it is split in registers. A record or union stored
+    /// flat is loaded into a split local, borrowed, and boxed for one that
+    /// is not split, a value of its own, as is a split union's member.
+    fn take(
+        &mut self,
+        dst: Local,
+        found: Found<'db>,
+        from: Option<Form<'db>>,
+    ) -> Result<Vec<VReg>, Unsupported> {
+        let ty = self.local_ty(dst);
+        let (values, from) = match found {
+            Found::Words(values) => (values, from),
+            Found::Stored { ptr, form, slots } => {
+                (self.load_stored(ptr, &slots, form.words()), Some(form))
+            }
+        };
+        match (self.forms[dst.index()].clone(), from) {
+            (Some(form), None) => self.unboxed(ty, &form, &values),
+            // A cycle's edge has a form of its own.
+            (Some(form), Some(f)) if form != f && words_form(&f) => {
+                self.unboxed(ty, &form, &values)
+            }
+            (Some(form), Some(f)) if form != f => {
+                self.fresh = Some(dst);
+                self.count_form(&f, ty, &values, Count::Retain)?;
+                let words = self.boxed(ty, &f, &values)?;
+                self.owned_fields(ty, &form, &words)
+            }
+            (None, Some(f)) if !words_form(&f) => {
+                self.fresh = Some(dst);
+                self.count_form(&f, ty, &values, Count::Retain)?;
+                self.boxed(ty, &f, &values)
+            }
+            _ => Ok(values),
+        }
+    }
+
     fn rvalue(&mut self, dst: Local, rvalue: &Rvalue<'db>) -> Result<Vec<VReg>, Unsupported> {
         let ty = self.local_ty(dst);
         match rvalue {
@@ -1581,31 +1620,9 @@ impl<'a, 'db> Lower<'a, 'db> {
             // split union read into a local that is not split has its
             // member boxed, a value of its own.
             Rvalue::Read(place) => {
-                let (values, from) = match self.find(place)? {
-                    Found::Words(values) => (values, self.split_form(place)),
-                    Found::Stored { ptr, form, slots } => {
-                        (self.load_stored(ptr, &slots, form.words()), Some(form))
-                    }
-                };
-                match (self.forms[dst.index()].clone(), from) {
-                    (Some(form), None) => self.unboxed(ty, &form, &values),
-                    // A cycle's edge has a form of its own.
-                    (Some(form), Some(f)) if form != f && words_form(&f) => {
-                        self.unboxed(ty, &form, &values)
-                    }
-                    (Some(form), Some(f)) if form != f => {
-                        self.fresh = Some(dst);
-                        self.count_form(&f, ty, &values, Count::Retain)?;
-                        let words = self.boxed(ty, &f, &values)?;
-                        self.owned_fields(ty, &form, &words)
-                    }
-                    (None, Some(f)) if !words_form(&f) => {
-                        self.fresh = Some(dst);
-                        self.count_form(&f, ty, &values, Count::Retain)?;
-                        self.boxed(ty, &f, &values)
-                    }
-                    _ => Ok(values),
-                }
+                let found = self.find(place)?;
+                let from = self.split_form(place);
+                self.take(dst, found, from)
             }
             Rvalue::Convert(op) => {
                 let from = self.operand_ty(op, ty);
@@ -1769,11 +1786,11 @@ impl<'a, 'db> Lower<'a, 'db> {
                     let element = *element;
                     let values = items
                         .iter()
-                        .map(|op| self.operand(op, element))
+                        .map(|op| self.element_value(op, element))
                         .collect::<Result<Vec<_>, _>>()?;
                     let mut list = self.empty(ty, LIST_SIZE)?;
                     for words in values {
-                        let [w0, w1] = self.pad(words);
+                        let [w0, w1] = self.pass_element(words);
                         list = self.runtime(RuntimeFn::ListPush, vec![list, w0, w1]);
                     }
                     Ok(vec![list])
@@ -1805,11 +1822,8 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let ptr = word(&self.read(list)?)?;
                 let int = Ty::builtin(self.db, Builtin::Int);
                 let index = word(&self.operand(index, int)?)?;
-                let values = self.element(ptr, list_ty, index)?;
-                match self.forms[dst.index()].clone() {
-                    Some(form) => self.unboxed(ty, &form, &values),
-                    None => Ok(values),
-                }
+                let found = self.element(ptr, list_ty, index)?;
+                self.take(dst, found, None)
             }
             Rvalue::MapGet { map, key, boxed } => {
                 let map_ty = self.place_ty(map)?;
@@ -1820,7 +1834,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let ptr = word(&self.read(map)?)?;
                 let [k0, k1] = self.key(key, k)?;
                 let at = self.runtime(RuntimeFn::MapGet, vec![ptr, k0, k1]);
-                self.option(at, v, ty, *boxed)
+                self.option(dst, at, v, ty, *boxed)
             }
             Rvalue::Slice { list, front, back } => {
                 let list_ty = self.place_ty(list)?;
@@ -2152,7 +2166,8 @@ impl<'a, 'db> Lower<'a, 'db> {
         }
     }
 
-    /// The side-stack words of the C calls' arguments, at least `words`.
+    /// The side-stack words of the C calls' arguments, and of the elements
+    /// of more than two words passed to the runtime, at least `words`.
     fn c_buffer(&mut self, words: u32) -> VReg {
         let reg = match self.c_buffer {
             Some((reg, _)) => reg,
@@ -2919,8 +2934,8 @@ impl<'a, 'db> Lower<'a, 'db> {
                 self.describe(list_ty)?;
                 let list = word(&self.operand(list, list_ty)?)?;
                 let at = word(&self.operand(at, int)?)?;
-                let words = self.operand(value, element)?;
-                let [w0, w1] = self.pad(words);
+                let words = self.element_value(value, element)?;
+                let [w0, w1] = self.pass_element(words);
                 Ok(vec![
                     self.runtime(RuntimeFn::ListSet, vec![list, at, w0, w1]),
                 ])
@@ -2954,8 +2969,8 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let [k0, k1] = self.key(key, k)?;
                 let [v0, v1] = match (value, v) {
                     ([value], Some(v)) => {
-                        let value = self.operand(value, v)?;
-                        self.pad(value)
+                        let value = self.element_value(value, v)?;
+                        self.pass_element(value)
                     }
                     _ => self.pad(Vec::new()),
                 };
@@ -2994,8 +3009,8 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let element = element_of(self.db, list_ty)?;
                 self.describe(list_ty)?;
                 let list = word(&self.operand(list, list_ty)?)?;
-                let words = self.operand(value, element)?;
-                let [w0, w1] = self.pad(words);
+                let words = self.element_value(value, element)?;
+                let [w0, w1] = self.pass_element(words);
                 Ok(vec![self.runtime(RuntimeFn::ListPush, vec![list, w0, w1])])
             }
             (Intrinsic::SignalMark, []) => {
@@ -3509,17 +3524,21 @@ impl<'a, 'db> Lower<'a, 'db> {
                         f => stored = Some((ptr, f.clone(), slots)),
                     }
                 }
-                Step::Elem(i) => {
-                    let index = self.constant(i64::from(*i));
-                    values = self.element(word(&values)?, ty, index)?;
-                    ty = element_of(db, ty)?;
-                }
-                Step::ElemBack(i) => {
+                Step::Elem(_) | Step::ElemBack(_) => {
                     let list = word(&values)?;
-                    let len = self.load(list, LEN_OFFSET);
-                    let from_end = self.constant(i64::from(*i) + 1);
-                    let index = self.bin(LirBin::Sub, len, from_end);
-                    values = self.element(list, ty, index)?;
+                    let index = match step {
+                        Step::Elem(i) => self.constant(i64::from(*i)),
+                        Step::ElemBack(i) => {
+                            let len = self.load(list, LEN_OFFSET);
+                            let from_end = self.constant(i64::from(*i) + 1);
+                            self.bin(LirBin::Sub, len, from_end)
+                        }
+                        _ => unreachable!("an element step"),
+                    };
+                    match self.element(list, ty, index)? {
+                        Found::Words(words) => values = words,
+                        Found::Stored { ptr, form, slots } => stored = Some((ptr, form, slots)),
+                    }
                     ty = element_of(db, ty)?;
                 }
                 Step::Slice { .. } => return Err("this place"),
@@ -3607,6 +3626,39 @@ impl<'a, 'db> Lower<'a, 'db> {
         out
     }
 
+    /// The words of a value that goes into a list, map or grid, which take
+    /// the operand's references: a value stored flat there packed into its
+    /// storage form (`split::element_storage`), anything else in its
+    /// layout's words.
+    fn element_value(&mut self, op: &Operand<'db>, ty: Ty<'db>) -> Result<Vec<VReg>, Unsupported> {
+        match element_storage(self.db, self.program, ty) {
+            Some((size, slots)) => {
+                let regs = self.flat_value(op, ty)?;
+                Ok(self.pack(&slots, size, &regs))
+            }
+            None => self.operand(op, ty),
+        }
+    }
+
+    /// An element's words as the two arguments of a runtime function: as
+    /// `pad` gives them, or more than two at the address of side-stack
+    /// words that hold them (`crag_abi::ElementLayout`), valid until the
+    /// next element is passed.
+    fn pass_element(&mut self, words: Vec<VReg>) -> [VReg; 2] {
+        if words.len() <= 2 {
+            return self.pad(words);
+        }
+        let buffer = self.c_buffer(words.len() as u32);
+        for (k, src) in words.into_iter().enumerate() {
+            self.push(Inst::Store {
+                src,
+                addr: buffer,
+                offset: 8 * k as i32,
+            });
+        }
+        [buffer, self.constant(0)]
+    }
+
     /// A new empty list or map of `size` bytes: its header, and zero for
     /// the rest (see `crag_abi`).
     fn empty(&mut self, ty: Ty<'db>, size: u32) -> Result<VReg, Unsupported> {
@@ -3635,14 +3687,14 @@ impl<'a, 'db> Lower<'a, 'db> {
         for (k, v) in entries {
             let k = self.key(k, key)?;
             let v = match (v, value) {
-                (Some(v), Some(value)) => self.operand(v, value)?,
+                (Some(v), Some(value)) => self.element_value(v, value)?,
                 _ => Vec::new(),
             };
             words.push((k, v));
         }
         let mut map = self.empty(ty, MAP_SIZE)?;
         for ([k0, k1], v) in words {
-            let [v0, v1] = self.pad(v);
+            let [v0, v1] = self.pass_element(v);
             map = self.runtime(RuntimeFn::MapInsert, vec![map, k0, k1, v0, v1]);
         }
         // A key written twice releases the value it had first.
@@ -3650,20 +3702,34 @@ impl<'a, 'db> Lower<'a, 'db> {
         Ok(map)
     }
 
-    /// The words of element `index` of a list of type `ty`, borrowed.
-    fn element(&mut self, list: VReg, ty: Ty<'db>, index: VReg) -> Result<Vec<VReg>, Unsupported> {
-        let element = element_of(self.db, ty)?;
+    /// Where element `index` of a list of type `ty` is: its words loaded,
+    /// borrowed, or a record or union the list stores flat.
+    fn element(&mut self, list: VReg, ty: Ty<'db>, index: VReg) -> Result<Found<'db>, Unsupported> {
+        let (db, program) = (self.db, self.program);
+        let element = element_of(db, ty)?;
         self.describe(ty)?;
-        let words = self.layout_of(element)?.words();
         let at = self.runtime(RuntimeFn::ListElem, vec![list, index]);
-        Ok((0..words).map(|k| self.load(at, 8 * k as i32)).collect())
+        if let Some((_, slots)) = element_storage(db, program, element) {
+            let form = form(db, program, element).ok_or("records of this type")?;
+            return Ok(Found::Stored {
+                ptr: at,
+                form,
+                slots,
+            });
+        }
+        let words = self.layout_of(element)?.words();
+        Ok(Found::Words(
+            (0..words).map(|k| self.load(at, 8 * k as i32)).collect(),
+        ))
     }
 
-    /// The `Option` of a map's value: the value at `at`, or `Empty` when
-    /// `at` is null. A `boxed` value gets a reference of its own, which
-    /// its member box takes.
+    /// The `Option` of a map's value for `dst`: the value at `at`, or
+    /// `Empty` when `at` is null. A `boxed` value gets a reference of its
+    /// own, which its member box takes; so does a value the map stores
+    /// flat, which is boxed.
     fn option(
         &mut self,
+        dst: Local,
         at: VReg,
         value: Ty<'db>,
         ty: Ty<'db>,
@@ -3672,8 +3738,7 @@ impl<'a, 'db> Lower<'a, 'db> {
         let db = self.db;
         // Typed as the value itself, the key is known to be there.
         if ty == value && !boxed {
-            let words = self.layout_of(value)?.words();
-            return Ok((0..words).map(|k| self.load(at, 8 * k as i32)).collect());
+            return self.map_value(dst, at, value);
         }
         let present = value.members(db);
         let empty = ty
@@ -3691,8 +3756,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             otherwise: miss,
         };
         self.end(term, Some(hit));
-        let words = self.layout_of(value)?.words();
-        let found: Vec<VReg> = (0..words).map(|k| self.load(at, 8 * k as i32)).collect();
+        let found = self.map_value(dst, at, value)?;
         let layout = self.layout_of(value)?;
         if boxed != matches!(layout, Layout::Pair | Layout::Closure) {
             return Err("this conversion");
@@ -3707,6 +3771,26 @@ impl<'a, 'db> Lower<'a, 'db> {
         self.moves(&out, nothing)?;
         self.end(Term::Jump(done), Some(done));
         Ok(out)
+    }
+
+    /// The words of a map's value at `at` for `dst`: borrowed, or a value
+    /// stored flat in a box of its own, which a retain of `dst` takes.
+    fn map_value(
+        &mut self,
+        dst: Local,
+        at: VReg,
+        value: Ty<'db>,
+    ) -> Result<Vec<VReg>, Unsupported> {
+        let (db, program) = (self.db, self.program);
+        let Some((_, slots)) = element_storage(db, program, value) else {
+            let words = self.layout_of(value)?.words();
+            return Ok((0..words).map(|k| self.load(at, 8 * k as i32)).collect());
+        };
+        let f = form(db, program, value).ok_or("records of this type")?;
+        let regs = self.load_stored(at, &slots, f.words());
+        self.fresh = Some(dst);
+        self.count_form(&f, value, &regs, Count::Retain)?;
+        self.boxed(value, &f, &regs)
     }
 
     /// Copies values into registers.
@@ -4542,8 +4626,8 @@ impl<'a, 'db> Lower<'a, 'db> {
 enum Found<'db> {
     /// In registers: its layout's words, or a split value's.
     Words(Vec<VReg>),
-    /// Stored inline in the box at `ptr`, a record or a union, as `slots`
-    /// say.
+    /// Stored inline in the box or the list element at `ptr`, a record or
+    /// a union, as `slots` say.
     Stored {
         ptr: VReg,
         form: Form<'db>,

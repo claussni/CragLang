@@ -107,7 +107,7 @@ impl TxLog {
                     heap,
                     types,
                     w.words.as_mut_ptr().cast(),
-                    types.element_of(w.list),
+                    types.cell_of(w.list),
                 )
             };
         }
@@ -310,14 +310,7 @@ unsafe extern "C" fn write_entry(
     if !unsafe { log.write(cell, words, list) } {
         // SAFETY: the cell or the log holds a reference besides the
         // caller's, and the pin keeps the cell's.
-        unsafe {
-            release_value(
-                heap,
-                types,
-                words.as_mut_ptr().cast(),
-                types.element_of(list),
-            )
-        };
+        unsafe { release_value(heap, types, words.as_mut_ptr().cast(), types.cell_of(list)) };
     }
 }
 

@@ -34,7 +34,10 @@
 //! one. A use that gives it away to a call, a return or a box boxes it
 //! there, which takes its fields' references; a use that only borrows it
 //! where it must be in a box keeps it boxed. A record read from a box, a
-//! field or an element, is loaded into a split local field by field.
+//! field or an element, is loaded into a split local field by field. A
+//! list, map or grid stores a flat record or union in its storage form
+//! too (`element_storage`): it goes in packed from registers and comes out
+//! loaded into them.
 //!
 //! Splitting makes no more boxes than there are: a local that is boxed
 //! where it escapes must not be retained, which a second use needs, nor
@@ -484,7 +487,10 @@ impl<'db> Check<'_, 'db> {
                 self.borrowed(index);
                 if into_split {
                     defines = true;
-                    self.from_box[dst.index()] = true;
+                    // An element stored flat is no box of its own.
+                    let ty = self.body.locals[dst.index()].ty;
+                    self.from_box[dst.index()] =
+                        element_storage(self.db, self.program, ty).is_none();
                 }
             }
             Rvalue::Record {
@@ -713,6 +719,20 @@ pub fn storage<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<(u
     };
     slots_of(db, program, ty, &f, 0, 0, leaf, &mut slots)?;
     Some((flat.size, slots))
+}
+
+/// The storage form of a value of `ty` where a list, map or grid stores it
+/// flat (Compiler Architecture §A11.4.2–§A11.4.5): that of a flat record
+/// or union that passes by value. None without flat layouts.
+pub fn element_storage<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    ty: Ty<'db>,
+) -> Option<(u32, Vec<Slot>)> {
+    if !flat_layouts() {
+        return None;
+    }
+    storage(db, program, ty)
 }
 
 /// How a value is stored where its parent places it: its bytes, its bits

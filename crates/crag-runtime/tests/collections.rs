@@ -203,6 +203,7 @@ fn check(config: FiberConfig) {
             LIST as u32,
             TypeDescriptor::List {
                 element: word.clone(),
+                cell: word.clone(),
             },
         ),
         (

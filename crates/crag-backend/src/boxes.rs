@@ -40,7 +40,8 @@ use crag_types::{Builtin, Step, Ty};
 use crate::flat;
 use crate::layout::{self, type_index};
 use crate::split::{
-    Form, NicheTest, Slot, SlotKind, UnionTag, fields_form, fields_slots, flat_layouts,
+    Form, NicheTest, Slot, SlotKind, UnionTag, element_storage, fields_form, fields_slots,
+    flat_layouts,
 };
 
 /// A record's box as code makes and reads it.
@@ -255,8 +256,8 @@ pub unsafe fn field_words<'db>(
 }
 
 /// The form of the value a place's path reaches from a value of `ty` in
-/// its layout's words, when it lies inline in a box: a record or a union
-/// stored flat, which a read loads or boxes.
+/// its layout's words, when it lies inline in a box or in a list: a record
+/// or a union stored flat, which a read loads or boxes.
 pub fn stored_form<'db>(
     db: &'db dyn Db,
     program: Program,
@@ -277,12 +278,16 @@ pub fn stored_form<'db>(
                 ty = *t;
                 continue;
             }
+            // A list stores an element flat in its storage form.
             (None, Step::Elem(_) | Step::ElemBack(_)) => {
                 let Some((Builtin::List, [element])) = ty.as_builtin(db) else {
                     return None;
                 };
                 ty = *element;
-                continue;
+                if element_storage(db, program, ty).is_none() {
+                    continue;
+                }
+                crate::split::form(db, program, ty)?
             }
             (None, Step::Slice { .. }) => continue,
             (Some(f), Step::Field(name)) => {

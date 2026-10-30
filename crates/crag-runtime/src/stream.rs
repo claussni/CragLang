@@ -369,7 +369,7 @@ unsafe extern "C" fn new_entry(ctx: *const TaskContext, capacity: u64, list: u64
     let chan = Arc::new(Channel::new(
         Kind::Stream,
         capacity as usize,
-        types.element_of(list).clone(),
+        types.cell_of(list).clone(),
     ));
     {
         let mut state = chan.state.lock().unwrap();
@@ -671,7 +671,7 @@ unsafe extern "C" fn hub_new_entry(
     } else {
         Kind::FanOut
     };
-    let chan = Channel::new(kind, capacity as usize, types.element_of(list).clone());
+    let chan = Channel::new(kind, capacity as usize, types.cell_of(list).clone());
     Arc::into_raw(Arc::new(chan)) as u64
 }
 

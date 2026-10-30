@@ -426,8 +426,12 @@ fn busy_alone() -> LirFunction {
 }
 
 fn types() -> Arc<Types> {
-    let list = |counted| TypeDescriptor::List {
-        element: ElementLayout { words: 1, counted },
+    let list = |counted: Vec<CountedField>| TypeDescriptor::List {
+        element: ElementLayout {
+            words: 1,
+            counted: counted.clone(),
+        },
+        cell: ElementLayout { words: 1, counted },
     };
     Arc::new(Types::new([
         (INTS as u32, list(vec![])),

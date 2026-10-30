@@ -85,7 +85,7 @@ impl LazyCell {
         // SAFETY: the cell holds the value's references; the place is the
         // reader's.
         unsafe {
-            retain_value(words.as_mut_ptr().cast(), types.element_of(self.list));
+            retain_value(words.as_mut_ptr().cast(), types.cell_of(self.list));
             out.cast::<[u64; 2]>().write_unaligned(words);
         }
     }
@@ -320,12 +320,5 @@ unsafe extern "C" fn free_entry(ctx: *const TaskContext, lazy: *const LazyCell) 
 
 fn release(heap: &mut Heap, types: &Types, list: u64, mut words: [u64; 2]) {
     // SAFETY: the cell owned the value's references.
-    unsafe {
-        release_value(
-            heap,
-            types,
-            words.as_mut_ptr().cast(),
-            types.element_of(list),
-        )
-    };
+    unsafe { release_value(heap, types, words.as_mut_ptr().cast(), types.cell_of(list)) };
 }

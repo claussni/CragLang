@@ -93,7 +93,7 @@ impl<'a> Lists<'a> {
     unsafe fn new(heap: &'a mut Heap, types: &'a Types, list: *mut u8) -> Lists<'a> {
         // SAFETY: as the caller promises.
         let (descriptor, index) = unsafe { (types.of(list), header(list) & 0xffff_ffff) };
-        let TypeDescriptor::List { element } = descriptor else {
+        let TypeDescriptor::List { element, .. } = descriptor else {
             die(&format!("a list of type {index}, which is not a list type"));
         };
         Lists {
@@ -545,6 +545,20 @@ unsafe fn set_tree(list: *mut u8, tree: *mut u8, h: usize) {
     }
 }
 
+/// The layout of a list's elements.
+///
+/// # Safety
+///
+/// `list` points at a live list whose type `types` describes.
+pub unsafe fn element(types: &Types, list: *mut u8) -> &ElementLayout {
+    // SAFETY: as the caller promises; `types.of` dies for a list without a
+    // descriptor.
+    match unsafe { types.of(list) } {
+        TypeDescriptor::List { element, .. } => element,
+        _ => die("a list whose type is not a list type"),
+    }
+}
+
 /// A new empty list of the type with this index, as generated code
 /// allocates it.
 pub fn empty(heap: &mut Heap, index: u32) -> *mut u8 {
@@ -574,12 +588,9 @@ pub unsafe fn length(list: *mut u8) -> usize {
 /// `list` points at a live list whose type `types` describes, and `i` is
 /// less than its length.
 pub unsafe fn get(types: &Types, list: *mut u8, mut i: usize) -> *mut u64 {
-    // SAFETY: as the caller promises; `types.of` dies for a list without a
-    // descriptor.
+    // SAFETY: as the caller promises.
     unsafe {
-        let TypeDescriptor::List { element } = types.of(list) else {
-            die("a list whose type is not a list type");
-        };
+        let element = element(types, list);
         let mut node = tree(list);
         if element.words == 0 {
             return list.cast();
@@ -774,6 +785,24 @@ pub unsafe fn concat(heap: &mut Heap, types: &Types, a: *mut u8, b: *mut u8) -> 
     }
 }
 
+/// The words of an element as generated code passes them: `w0` and `w1`,
+/// or for an element of more than two words the words at the address in
+/// `w0` (`crag_abi::ElementLayout`).
+///
+/// # Safety
+///
+/// For an element of more than two words, `w0` is the address of its words.
+pub unsafe fn passed(element: &ElementLayout, w0: u64, w1: u64) -> [u64; 4] {
+    let mut out = [w0, w1, 0, 0];
+    let n = element.words as usize;
+    if n > 2 {
+        // SAFETY: as the caller promises.
+        let words = unsafe { std::slice::from_raw_parts(w0 as *const u64, n) };
+        out[..n].copy_from_slice(words);
+    }
+    out
+}
+
 /// Calls `f` with each box a list's box or node holds: the tree, the
 /// children, or what the elements hold.
 ///
@@ -845,7 +874,8 @@ unsafe extern "C" fn push_entry(
     // SAFETY: as the caller promises.
     unsafe {
         let (heap, types) = worker_of(ctx);
-        push(heap, types, list, &[w0, w1])
+        let words = passed(element(types, list), w0, w1);
+        push(heap, types, list, &words)
     }
 }
 
@@ -895,8 +925,12 @@ mod tests {
     const INT: u64 = 1;
 
     fn types() -> Types {
-        let list = |words, counted| TypeDescriptor::List {
-            element: ElementLayout { words, counted },
+        let list = |words, counted: Vec<CountedField>| TypeDescriptor::List {
+            element: ElementLayout {
+                words,
+                counted: counted.clone(),
+            },
+            cell: ElementLayout { words, counted },
         };
         Types::new([
             (

@@ -436,6 +436,84 @@ fn flat_fields_live_in_their_box() {
 }
 
 #[test]
+fn flat_elements_live_in_their_collections() {
+    // Lists, maps and grids hold flat records and unions in their storage
+    // form, and the prelude's functions on them read and write it.
+    let mut r = session(&[
+        "type Point(x: Int, y: Int)",
+        "type Glyph(code: CodePoint, size: Int, bold: Bool, italic: Bool, at: Point)
+    where size >= 1 and size <= 255",
+        "type Label(text: Str, at: Point)",
+        "type Stock(qty: Int, reserved: Int, onOrder: Bool)",
+        "type Grass",
+        "type Water",
+        "type Terrain = Grass | Water",
+        "type Tile(kind: Terrain, cost: UInt8, seen: Bool)",
+        "fn path(n: Int) -> List[Point] { (1..n).fold([]) { ps, i -> ps.append(Point(x: i, y: i * 2)) } }",
+        "fn walk(n: Int) -> Int {
+  var total = 0
+  for p in path(n) {
+    total = total + p.x + p.y
+  }
+  total
+}",
+        "fn glyphs(n: Int) -> List[Glyph] { (1..n).fold([]) { gs, i -> gs.append(Glyph(code: 'A', size: i, bold: i > 2, italic: False, at: Point(x: i, y: 0))) } }",
+        "fn bold(n: Int) -> Int {
+  let gs = glyphs(n).set(0, Glyph(code: 'B', size: 200, bold: True, italic: True, at: Point(x: 7, y: 8)))
+  gs.fold(0) { t, g -> if g.bold { t + g.size + g.at.x } else { t } } * 10 + gs.drop(1).count()
+}",
+        "fn labels(n: Int) -> List[Label] { (1..n).fold([]) { ls, i -> ls.append(Label(text: \"{i} is a label long enough for a heap buffer\", at: Point(x: i, y: i))) } }",
+        "fn stock() -> Map[Int, Stock] { [1001: Stock(qty: 40, reserved: 5, onOrder: False), 1002: Stock(qty: 0, reserved: 0, onOrder: True)] }",
+        "fn ordered() -> Int { stock().set(1003, Stock(qty: 7, reserved: 1, onOrder: False)).values().fold(0) { t, s -> t + s.qty } }",
+        "fn world(w: Int, h: Int) -> Grid[Tile] { grid(w, h, Tile(kind: Grass, cost: 1, seen: False)).set(1, 2, Tile(kind: Water, cost: 5, seen: True)) }",
+    ]);
+    assert_eq!(eval(&mut r, "walk(100)"), "15150\n");
+    assert_eq!(
+        eval(&mut r, "path(3)"),
+        "[Point(x: 1, y: 2), Point(x: 2, y: 4), Point(x: 3, y: 6)]\n"
+    );
+    assert_eq!(
+        eval(&mut r, "path(40).reverse()[0]"),
+        "Point(x: 40, y: 80)\n"
+    );
+    assert_eq!(eval(&mut r, "bold(5)"), "2314\n");
+    assert_eq!(
+        eval(&mut r, "glyphs(2)"),
+        "[Glyph(code: 'A', size: 1, bold: False, italic: False, at: Point(x: 1, y: 0)), \
+         Glyph(code: 'A', size: 2, bold: False, italic: False, at: Point(x: 2, y: 0))]\n"
+    );
+    assert_eq!(eval(&mut r, "labels(3) == labels(3)"), "True\n");
+    assert_eq!(eval(&mut r, "labels(2) < labels(3)"), "True\n");
+    assert_eq!(
+        eval(&mut r, "labels(2)[1]"),
+        "Label(text: \"2 is a label long enough for a heap buffer\", at: Point(x: 2, y: 2))\n"
+    );
+    assert_eq!(
+        eval(&mut r, "stock()[1001]"),
+        "Stock(qty: 40, reserved: 5, onOrder: False)\n"
+    );
+    assert_eq!(eval(&mut r, "stock()[7]"), "Empty\n");
+    assert_eq!(eval(&mut r, "ordered()"), "47\n");
+    assert_eq!(
+        eval(&mut r, "world(3, 2).column(2)"),
+        "[Tile(kind: Grass, cost: 1, seen: False), Tile(kind: Water, cost: 5, seen: True)]\n"
+    );
+    assert_eq!(
+        eval(&mut r, "world(3, 2).get(1, 2)"),
+        "Tile(kind: Water, cost: 5, seen: True)\n"
+    );
+    assert_eq!(
+        eval(
+            &mut r,
+            "fn maybe() -> List[Option[Point]] { [Point(x: 1, y: 2), Empty] }"
+        ),
+        ""
+    );
+    assert_eq!(eval(&mut r, "maybe()"), "[Point(x: 1, y: 2), Empty]\n");
+    assert_eq!(eval(&mut r, "maybe()[0]"), "Point(x: 1, y: 2)\n");
+}
+
+#[test]
 fn types_marked_flat_must_not_be_boxed() {
     let mut r = session(&["type Point(x: Int, y: Int)\n  is Flat"]);
     // A type too large, or one with a lifecycle, is an error that says

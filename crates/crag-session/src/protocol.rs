@@ -34,7 +34,7 @@ use crag_abi::{
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 28;
+pub const PROTOCOL_VERSION: u32 = 29;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -645,9 +645,10 @@ impl Writer {
                 self.counted(counted);
                 self.u32(dispose.unwrap_or(u32::MAX));
             }
-            TypeDescriptor::List { element } => {
+            TypeDescriptor::List { element, cell } => {
                 self.u8(1);
                 self.element(element);
+                self.element(cell);
             }
             TypeDescriptor::Map {
                 key,
@@ -880,6 +881,7 @@ impl Reader<'_> {
             },
             1 => TypeDescriptor::List {
                 element: self.element()?,
+                cell: self.element()?,
             },
             2 => TypeDescriptor::Map {
                 key: self.element()?,
@@ -991,6 +993,16 @@ mod tests {
                         5,
                         TypeDescriptor::List {
                             element: ElementLayout {
+                                words: 3,
+                                counted: vec![CountedField::Guarded {
+                                    offset: 8,
+                                    guards: vec![FieldGuard::Tag {
+                                        offset: 0,
+                                        tags: vec![1],
+                                    }],
+                                }],
+                            },
+                            cell: ElementLayout {
                                 words: 2,
                                 counted: vec![CountedField::Box(8)],
                             },

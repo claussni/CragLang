@@ -25,7 +25,7 @@
 //! two words in a member box, whose pointer is the payload (`crag_abi`).
 
 use crate::flat;
-use crate::split::flat_layouts;
+use crate::split::{element_storage, flat_layouts};
 use crag_abi::{CountedField, ElementLayout, FieldGuard, HEADER_SIZE, TypeDescriptor};
 use crag_db::Db;
 use crag_db::plumbing::AsId;
@@ -276,8 +276,9 @@ pub fn boxed_indices<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Opt
     Some(out)
 }
 
-/// The words of a value of `ty` in a collection. None for what has no
-/// layout yet.
+/// The words of a value of `ty` where a ref, a lazy value, a stream, a hub
+/// or a signal holds it, a record in its box, as a collection did before
+/// flat layouts (`collection_element`). None for what has no layout yet.
 pub fn element_layout<'db>(
     db: &'db dyn Db,
     program: Program,
@@ -301,6 +302,25 @@ pub fn element_layout<'db>(
         Layout::Pair => (2, vec![CountedField::Box(0)]),
     };
     Some(ElementLayout { words, counted })
+}
+
+/// The words of a value of `ty` in a list, map or grid: a flat record or
+/// union in its storage form (`split::element_storage`), whose pointer map
+/// says where the references are, and anything else as in a cell. None
+/// for what has no layout yet.
+pub fn collection_element<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    ty: Ty<'db>,
+) -> Option<ElementLayout> {
+    let Some((size, _)) = element_storage(db, program, ty) else {
+        return element_layout(db, program, ty);
+    };
+    let l = flat::layout(db, program, ty).as_ref()?;
+    Some(ElementLayout {
+        words: size.div_ceil(8),
+        counted: l.pointers.iter().map(|p| counted_pointer(p, 0)).collect(),
+    })
 }
 
 /// Whether two values of `ty` are equal exactly when their words are, as
@@ -345,7 +365,7 @@ pub fn type_descriptor<'db>(
             return None;
         }
         let value = match value {
-            Some(v) => element_layout(db, program, v)?,
+            Some(v) => collection_element(db, program, v)?,
             None => ElementLayout::default(),
         };
         let key = element_layout(db, program, key)?;
@@ -357,8 +377,10 @@ pub fn type_descriptor<'db>(
     };
     match ty.as_builtin(db) {
         Some((Builtin::List, [element])) => {
-            let element = element_layout(db, program, *element)?;
-            return Some(TypeDescriptor::List { element });
+            return Some(TypeDescriptor::List {
+                element: collection_element(db, program, *element)?,
+                cell: element_layout(db, program, *element)?,
+            });
         }
         Some((Builtin::Map, [key, value])) => return map(*key, Some(*value)),
         Some((Builtin::Set, [key])) => return map(*key, None),
@@ -424,7 +446,11 @@ pub fn type_descriptor<'db>(
     // references are, and when a union's member holds one.
     if flat_layouts() {
         let l = flat::box_layout(db, program, ty).as_ref()?;
-        let counted = l.pointers.iter().map(counted_pointer).collect();
+        let counted = l
+            .pointers
+            .iter()
+            .map(|p| counted_pointer(p, HEADER_SIZE))
+            .collect();
         return Some(TypeDescriptor::Record {
             counted,
             dispose: l.dispose.map(|d| HEADER_SIZE + d),
@@ -455,10 +481,10 @@ pub fn type_descriptor<'db>(
     })
 }
 
-/// A pointer of a box's storage form, after its header, as the runtime
-/// releases it.
-fn counted_pointer(p: &flat::Pointer) -> CountedField {
-    let offset = HEADER_SIZE + p.offset;
+/// A pointer of a storage form that starts at `base`, after a box's
+/// header or at an element's first word, as the runtime releases it.
+fn counted_pointer(p: &flat::Pointer, base: u32) -> CountedField {
+    let offset = base + p.offset;
     if p.guards.is_empty() {
         return CountedField::Box(offset);
     }
@@ -467,17 +493,17 @@ fn counted_pointer(p: &flat::Pointer) -> CountedField {
         .iter()
         .map(|g| match g {
             flat::Guard::Tag { offset, tags } => FieldGuard::Tag {
-                offset: HEADER_SIZE + offset,
+                offset: base + offset,
                 tags: tags.clone(),
             },
             flat::Guard::NotNiche(n) => match n.kind {
                 flat::NicheKind::Value { size, value } => FieldGuard::NotValue {
-                    offset: HEADER_SIZE + n.offset,
+                    offset: base + n.offset,
                     size,
                     value,
                 },
                 flat::NicheKind::Bit(bit) => FieldGuard::BitClear {
-                    offset: HEADER_SIZE + n.offset,
+                    offset: base + n.offset,
                     bit,
                 },
             },

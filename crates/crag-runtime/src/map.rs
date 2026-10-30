@@ -577,6 +577,16 @@ impl<'a> Maps<'a> {
 /// The key and value layouts of a map's type, its type index, and whether
 /// its keys are text.
 ///
+/// The layout of a map's values.
+///
+/// # Safety
+///
+/// `map` points at a live map whose type `types` describes.
+pub unsafe fn value_layout(types: &Types, map: *mut u8) -> &ElementLayout {
+    // SAFETY: as the caller promises.
+    unsafe { layouts(types, map).1 }
+}
+
 /// # Safety
 ///
 /// `map` points at a live map whose type `types` describes.
@@ -1037,7 +1047,8 @@ unsafe extern "C" fn insert_entry(
     // SAFETY: as the caller promises.
     unsafe {
         let (heap, types) = worker_of(ctx);
-        insert(heap, types, map, &[k0, k1], &[v0, v1])
+        let value = crate::list::passed(value_layout(types, map), v0, v1);
+        insert(heap, types, map, &[k0, k1], &value)
     }
 }
 

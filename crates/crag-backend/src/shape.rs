@@ -26,7 +26,7 @@ use crag_types::{Builtin, Ty, TyKind, declared_fields, record_subtypes};
 
 use crate::boxes::{box_form, rebase, select, span, stored_slots};
 use crate::layout::{Layout, layout, type_index};
-use crate::split::{Form, Slot, SlotKind, form};
+use crate::split::{Form, Slot, SlotKind, element_storage, form};
 
 /// The shapes a value of `ty` is printed by, and the index of its own.
 pub fn shapes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> (Shapes, u32) {
@@ -106,9 +106,9 @@ impl<'db> Builder<'db> {
                 words: l.words() as u32,
             },
             (Some(Layout::Box), TyKind::Builtin(b, args)) => match (b, &args[..]) {
-                (Builtin::List, &[element]) => Shape::List(self.shape(element)),
-                (Builtin::Set, &[element]) => Shape::Set(self.shape(element)),
-                (Builtin::Map, &[key, value]) => Shape::Map(self.shape(key), self.shape(value)),
+                (Builtin::List, &[element]) => Shape::List(self.element(element)),
+                (Builtin::Set, &[element]) => Shape::Set(self.element(element)),
+                (Builtin::Map, &[key, value]) => Shape::Map(self.element(key), self.element(value)),
                 _ => opaque(1),
             },
             (Some(Layout::Box), TyKind::Named(..) | TyKind::Record { .. }) => {
@@ -262,15 +262,34 @@ impl<'db> Builder<'db> {
                 shape: self.shape(ty),
             };
         }
-        let form = self.inline(ty, f);
         let slots: Vec<Slot> = slots.iter().map(|s| rebase(s, from)).collect();
+        ShapeField {
+            name: name_text,
+            offset: from,
+            shape: self.stored(ty, f, to - from, &slots),
+        }
+    }
+
+    /// An element of a collection: stored flat (Compiler Architecture
+    /// §A11.4.2–§A11.4.5), or in its layout's words.
+    fn element(&mut self, ty: Ty<'db>) -> u32 {
+        let (db, program) = (self.db, self.program);
+        match (element_storage(db, program, ty), form(db, program, ty)) {
+            (Some((size, slots)), Some(f)) => self.stored(ty, &f, size, &slots),
+            _ => self.shape(ty),
+        }
+    }
+
+    /// A value of `ty` in the form `f` stored in `size` bytes as `slots`
+    /// say, each such shape made once.
+    fn stored(&mut self, ty: Ty<'db>, f: &Form<'db>, size: u32, slots: &[Slot]) -> u32 {
         let stored = Shape::Stored {
-            form,
-            size: to - from,
-            slots: stored_slots(&slots),
+            form: self.inline(ty, f),
+            size,
+            slots: stored_slots(slots),
             words: f.words() as u32,
         };
-        let shape = match self.stored.get(&stored) {
+        match self.stored.get(&stored) {
             Some(&index) => index,
             None => {
                 let index = self.shapes.shapes.len() as u32;
@@ -278,11 +297,6 @@ impl<'db> Builder<'db> {
                 self.stored.insert(stored, index);
                 index
             }
-        };
-        ShapeField {
-            name: name_text,
-            offset: from,
-            shape,
         }
     }
 }

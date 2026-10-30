@@ -44,7 +44,7 @@ use crag_abi::{
 };
 
 use crate::heap::{Heap, alloc_box};
-use crate::print::{field_words, member_words};
+use crate::print::{element_value, field_words, member_words};
 use crate::rc::Types;
 use crate::text::{bytes_of, make_text};
 use crate::{list, map};
@@ -133,7 +133,7 @@ unsafe fn encode(
         }
         &Shape::List(element) => {
             let list = word as *mut u8;
-            let n = shapes.shapes[element as usize].words() as usize;
+            let n = shapes.shapes[element as usize].element_words() as usize;
             // SAFETY: a live list of the element's shape.
             let len = unsafe { list::length(list) };
             out.extend((len as u64).to_le_bytes());
@@ -167,8 +167,13 @@ unsafe fn encode(
         }
         Shape::Function => return Err(NotSolid("a function value".into())),
         Shape::Opaque { name, .. } => return Err(NotSolid(format!("a value of type {name}"))),
-        // Only a field of a box is stored, and `field_words` widens it.
-        Shape::Stored { .. } => return Err(NotSolid("a stored value".into())),
+        // An element of a collection, widened as `field_words` widens a
+        // field.
+        Shape::Stored { .. } => {
+            let (words, form) = element_value(shapes, words, shape);
+            // SAFETY: the words are a live value of the shape.
+            unsafe { encode(&words, shapes, form, types, out)? };
+        }
     }
     Ok(())
 }
@@ -183,8 +188,8 @@ unsafe fn entries(
     types: &Types,
     out: &mut Vec<u8>,
 ) -> Result<(), NotSolid> {
-    let kw = shapes.shapes[key as usize].words() as usize;
-    let vw = value.map_or(0, |v| shapes.shapes[v as usize].words() as usize);
+    let kw = shapes.shapes[key as usize].element_words() as usize;
+    let vw = value.map_or(0, |v| shapes.shapes[v as usize].element_words() as usize);
     let mut encoded = Vec::new();
     // SAFETY: as the caller promises; each entry is its key's words, then
     // its value's.
@@ -398,7 +403,8 @@ impl Decoder<'_> {
             Shape::Opaque { name, .. } => {
                 return Err(DecodeError(format!("a value of type {name}")));
             }
-            Shape::Stored { .. } => return Err(DecodeError("a stored value".into())),
+            // An element of a collection, as its register form.
+            &Shape::Stored { form, .. } => self.check(shapes, form)?,
         }
         Ok(())
     }
@@ -412,7 +418,7 @@ impl Decoder<'_> {
         types: &Types,
     ) -> Vec<u64> {
         let ok = "checked";
-        let words = |s: u32| shapes.shapes[s as usize].words() as usize;
+        let words = |s: u32| shapes.shapes[s as usize].element_words() as usize;
         match &shapes.shapes[shape as usize] {
             Shape::Unit | Shape::Tag(_) => Vec::new(),
             Shape::Number(_) => vec![self.u64().expect(ok)],
@@ -517,9 +523,21 @@ impl Decoder<'_> {
                 let bytes = self.bytes(n).expect(ok);
                 make_text(heap, &[bytes]).to_vec()
             }
-            Shape::Function | Shape::Opaque { .. } | Shape::Stored { .. } => {
-                unreachable!("checked")
+            // An element of a collection, built in its register form and
+            // narrowed into its storage form's words.
+            Shape::Stored {
+                form, size, slots, ..
+            } => {
+                // SAFETY: as the caller promises.
+                let value = unsafe { self.build(shapes, *form, heap, types) };
+                let mut bytes = vec![0u8; size.next_multiple_of(8) as usize];
+                narrow(slots, &value, &mut bytes);
+                bytes
+                    .chunks(8)
+                    .map(|w| u64::from_le_bytes(w.try_into().expect("a word")))
+                    .collect()
             }
+            Shape::Function | Shape::Opaque { .. } => unreachable!("checked"),
         }
     }
 
@@ -545,7 +563,7 @@ impl Decoder<'_> {
                     Some(value) => self.build(shapes, value, heap, types),
                     None => Vec::new(),
                 };
-                v.resize(2, 0);
+                v.resize(v.len().max(2), 0);
                 map = map::insert(heap, types, map, &k, &v);
             }
         }

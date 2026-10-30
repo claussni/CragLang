@@ -190,7 +190,8 @@ pub enum RuntimeFn {
     /// `rt_list_push(ctx, list, w0, w1) -> list`.
     ///
     /// The list with the element appended, whose words are `w0` and `w1`
-    /// as far as its layout has words. It takes the list's reference and the
+    /// as far as its layout has words, or of more than two words at the
+    /// address in `w0` (`ElementLayout`). It takes the list's reference and the
     /// element's, and updates in place what only that reference holds
     /// (Implementation Plan §11.4.13).
     ListPush = 5,
@@ -1574,8 +1575,15 @@ pub enum TypeDescriptor {
         counted: Vec<CountedField>,
         dispose: Option<u32>,
     },
-    /// A list, whose elements each take `element.words` words.
-    List { element: ElementLayout },
+    /// A list, whose elements each take `element.words` words, and how a
+    /// ref, a lazy value, a stream, a hub or a signal whose values are of
+    /// the element type holds one: in `cell`, its layout's words with a
+    /// flat record in its box, where the list may store it flat (Compiler
+    /// Architecture §A11.4).
+    List {
+        element: ElementLayout,
+        cell: ElementLayout,
+    },
     /// A map, or a set when the value has no words. Keys are equal when
     /// their words are, so a key holds no reference and no `Float`, or,
     /// with `text_keys`, each key is a string or bytes, equal to another
@@ -1657,8 +1665,12 @@ impl FieldGuard {
     }
 }
 
-/// The words of a value inside a collection: at most two, with the fields
-/// that hold references at their offsets from the value's first word.
+/// The words of a value inside a collection: at most four, with the fields
+/// that hold references at their offsets from the value's first word. A
+/// flat record or union is there in its storage form (Compiler
+/// Architecture §A11.4), and one of more than two words passes to the
+/// runtime by the address of its words, in the first word of the two it
+/// takes otherwise.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ElementLayout {
     pub words: u32,
@@ -2429,9 +2441,10 @@ pub enum Shape {
         members: Vec<(u32, u32)>,
         words: u32,
     },
-    /// A field of a box stored flat (Compiler Architecture §A11.4): the
-    /// `size` bytes at its offset hold, as `slots` say, the words of a
-    /// value of the shape `form`.
+    /// A field of a box, or an element of a collection, stored flat
+    /// (Compiler Architecture §A11.4): the `size` bytes at its offset, or
+    /// the element's, hold, as `slots` say, the words of a value of the
+    /// shape `form`.
     Stored {
         form: u32,
         size: u32,
@@ -2683,6 +2696,15 @@ impl Shape {
             | Shape::Variant { words, .. }
             | Shape::Stored { words, .. } => *words,
             Shape::Function | Shape::Str | Shape::Bytes => 2,
+        }
+    }
+
+    /// The words a value of the shape takes in a collection: a stored
+    /// one's storage form, which `widen` turns into its `words`.
+    pub fn element_words(&self) -> u32 {
+        match self {
+            Shape::Stored { size, .. } => size.div_ceil(8),
+            shape => shape.words(),
         }
     }
 

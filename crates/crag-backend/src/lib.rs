@@ -56,7 +56,7 @@ use crag_codegen::{CodeObject, CodegenSettings, OptLevel, Target, compile, targe
 use crag_db::Db;
 use crag_hir::{Owner, Program};
 use crag_mir::{Entry, InstanceKey, Tier, mir};
-use crag_types::{Ty, TyKind};
+use crag_types::{Builtin, Ty, TyKind};
 
 pub use boxes::{BoxForm, box_form, field_words};
 pub use layout::{
@@ -285,6 +285,12 @@ fn structure<'db>(
             1u8.hash(&mut hasher);
             format!("{builtin:?}").hash(&mut hasher);
             list(args, open, &mut hasher);
+            // A collection's elements as it stores them (Plan §11.10.10).
+            if let Builtin::List | Builtin::Map | Builtin::Set = builtin {
+                for &t in args {
+                    split::element_storage(db, program, t).hash(&mut hasher);
+                }
+            }
         }
         TyKind::Named(item, args) => {
             2u8.hash(&mut hasher);

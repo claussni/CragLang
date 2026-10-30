@@ -30,7 +30,7 @@ use crag_abi::value_op::{COMPARE, EQUALS, UNORDERED};
 use crag_abi::{Number, Shape, Shapes, TYPE_INDEX_OFFSET};
 
 use crate::fiber::TaskContext;
-use crate::print::{PrintLimits, field_words, member_words, print_value};
+use crate::print::{PrintLimits, element_value, field_words, member_words, print_value};
 use crate::rc::Types;
 use crate::system::worker_of;
 use crate::text::{TextWords, bytes_of, make_text};
@@ -282,7 +282,7 @@ impl Walk<'_> {
                     if len != list::length(lb) {
                         return false;
                     }
-                    let n = self.shape(*element).words() as usize;
+                    let n = self.shape(*element).element_words() as usize;
                     (0..len).all(|i| {
                         let ea = std::slice::from_raw_parts(list::get(self.types, la, i), n);
                         let eb = std::slice::from_raw_parts(list::get(self.types, lb, i), n);
@@ -294,8 +294,8 @@ impl Walk<'_> {
                         Shape::Map(_, v) => Some(*v),
                         _ => None,
                     };
-                    let kw = self.shape(*key).words() as usize;
-                    let vw = value.map_or(0, |v| self.shape(v).words() as usize);
+                    let kw = self.shape(*key).element_words() as usize;
+                    let vw = value.map_or(0, |v| self.shape(v).element_words() as usize);
                     let (ma, mb) = (a[0] as *mut u8, b[0] as *mut u8);
                     if map::length(ma) != map::length(mb) {
                         return false;
@@ -314,7 +314,13 @@ impl Walk<'_> {
                         }
                     })
                 }
-                Shape::Function | Shape::Opaque { .. } | Shape::Stored { .. } => {
+                // An element of a collection, widened.
+                Shape::Stored { .. } => {
+                    let (wa, form) = element_value(self.shapes, a, shape);
+                    let (wb, _) = element_value(self.shapes, b, shape);
+                    self.equals(&wa, &wb, form)
+                }
+                Shape::Function | Shape::Opaque { .. } => {
                     let n = self.shape(shape).words() as usize;
                     a[..n] == b[..n]
                 }
@@ -394,7 +400,7 @@ impl Walk<'_> {
                 Shape::List(element) => {
                     let (la, lb) = (a[0] as *mut u8, b[0] as *mut u8);
                     let (na, nb) = (list::length(la), list::length(lb));
-                    let n = self.shape(*element).words() as usize;
+                    let n = self.shape(*element).element_words() as usize;
                     for i in 0..na.min(nb) {
                         let ea = std::slice::from_raw_parts(list::get(self.types, la, i), n);
                         let eb = std::slice::from_raw_parts(list::get(self.types, lb, i), n);
@@ -405,11 +411,12 @@ impl Walk<'_> {
                     }
                     na.cmp(&nb)
                 }
-                Shape::Set(_)
-                | Shape::Map(..)
-                | Shape::Function
-                | Shape::Opaque { .. }
-                | Shape::Stored { .. } => {
+                Shape::Stored { .. } => {
+                    let (wa, form) = element_value(self.shapes, a, shape);
+                    let (wb, _) = element_value(self.shapes, b, shape);
+                    self.compare(&wa, &wb, form)?
+                }
+                Shape::Set(_) | Shape::Map(..) | Shape::Function | Shape::Opaque { .. } => {
                     return None;
                 }
             })
@@ -463,7 +470,7 @@ impl Walk<'_> {
                     let l = a[0] as *mut u8;
                     let len = list::length(l);
                     h.word(len as u64);
-                    let n = self.shape(*element).words() as usize;
+                    let n = self.shape(*element).element_words() as usize;
                     for i in 0..len {
                         let e = std::slice::from_raw_parts(list::get(self.types, l, i), n);
                         self.hash(e, *element, h);
@@ -474,8 +481,8 @@ impl Walk<'_> {
                         Shape::Map(_, v) => Some(*v),
                         _ => None,
                     };
-                    let kw = self.shape(*key).words() as usize;
-                    let vw = value.map_or(0, |v| self.shape(v).words() as usize);
+                    let kw = self.shape(*key).element_words() as usize;
+                    let vw = value.map_or(0, |v| self.shape(v).element_words() as usize);
                     // The entries in any order hash alike.
                     let mut sum = 0u64;
                     for e in self.entries(a[0], kw, vw) {
@@ -488,7 +495,11 @@ impl Walk<'_> {
                     }
                     h.word(sum);
                 }
-                Shape::Function | Shape::Opaque { .. } | Shape::Stored { .. } => {
+                Shape::Stored { .. } => {
+                    let (words, form) = element_value(self.shapes, a, shape);
+                    self.hash(&words, form, h);
+                }
+                Shape::Function | Shape::Opaque { .. } => {
                     for &w in &a[..self.shape(shape).words() as usize] {
                         h.word(w);
                     }

@@ -159,7 +159,10 @@ unsafe fn types<'a>() -> &'a Types {
 
 extern "C" fn rt_list_push(ctx: *mut u64, list: *mut u8, w0: u64, w1: u64) -> *mut u8 {
     // SAFETY: see above.
-    unsafe { list::push(heap_of(ctx), types(), list, &[w0, w1]) }
+    unsafe {
+        let words = list::passed(list::element(types(), list), w0, w1);
+        list::push(heap_of(ctx), types(), list, &words)
+    }
 }
 
 extern "C" fn rt_list_elem(_ctx: *mut u64, list: *mut u8, index: u64) -> *mut u64 {
@@ -181,7 +184,10 @@ extern "C" fn rt_map_insert(
     v1: u64,
 ) -> *mut u8 {
     // SAFETY: see above.
-    unsafe { map::insert(heap_of(ctx), types(), map, &[k0, k1], &[v0, v1]) }
+    unsafe {
+        let value = list::passed(map::value_layout(types(), map), v0, v1);
+        map::insert(heap_of(ctx), types(), map, &[k0, k1], &value)
+    }
 }
 
 extern "C" fn rt_map_get(_ctx: *mut u64, map: *mut u8, k0: u64, k1: u64) -> *mut u64 {
@@ -1149,6 +1155,99 @@ fn run(a: Int) -> Int { length(line(a)) * 1000 + size(row(a)) }
         m.shown("two"),
         "Row(glyph: Glyph(code: 'A', size: 2, bold: True, italic: False, at: Point(x: 4, \
          y: 20)), next: Point(x: 2, y: 2))"
+    );
+    assert_eq!(m.heap.live_blocks(), 0);
+}
+
+#[test]
+fn flat_elements_are_stored_in_their_collections() {
+    let mut m = Module::new(
+        r#"type Point(x: Int, y: Int)
+type Glyph(code: CodePoint, size: Int, bold: Bool, italic: Bool, at: Point)
+  where 0 < size and size < 256
+type Label(text: Str, at: Point)
+type Stock(qty: Int, reserved: Int, onOrder: Bool)
+
+fn glyph(n: Int) -> Glyph {
+  Glyph(code: 'A', size: n, bold: 2 < n, italic: False, at: Point(x: n, y: 0))
+}
+fn glyphs(n: Int) -> List[Glyph] { [glyph(n), glyph(1), glyph(n + 1)] }
+fn bold(n: Int) -> Int {
+  let gs = glyphs(n)
+  let g = gs[2]
+  let k = case gs {
+    [first, .., last] -> first.size * 100 + last.at.x
+    _ -> 0
+  }
+  if g.bold { k + g.size * 10000 } else { k }
+}
+
+fn labels(n: Int) -> List[Label] {
+  [Label(text: "{n} is a label long enough for a heap buffer", at: Point(x: n, y: n)), Label(text: "short", at: Point(x: 0, y: 7))]
+}
+fn labelled(n: Int) -> Int {
+  let ls = labels(n)
+  if ls[0].text == "{n} is a label long enough for a heap buffer" { ls[0].at.x + ls[1].at.y } else { -1 }
+}
+
+fn stock() -> Map[Int, Stock] {
+  [1001: Stock(qty: 40, reserved: 5, onOrder: False), 1002: Stock(qty: 0, reserved: 0, onOrder: True)]
+}
+fn onHand(key: Int) -> Int {
+  case stock()[key] {
+    Empty -> -1
+    s: Stock -> if s.onOrder { 1000 } else { s.qty - s.reserved }
+  }
+}
+
+fn maybe(n: Int) -> List[Option[Point]] { [Point(x: n, y: 2), Empty] }
+fn firstX(n: Int) -> Int {
+  case maybe(n)[0] {
+    Empty -> -1
+    p: Point -> p.x
+  }
+}
+
+fn points() -> List[Point] { [Point(x: 1, y: 2), Point(x: 3, y: 4), Point(x: 5, y: 6)] }
+fn three() -> List[Glyph] { glyphs(3) }
+fn named() -> List[Label] { labels(2) }
+fn stocked() -> Map[Int, Stock] { stock() }
+fn maybes() -> List[Option[Point]] { maybe(1) }
+"#,
+    );
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    assert_eq!(m.int("bold", &[5]), 60506);
+    assert_eq!(m.int("labelled", &[3]), 10);
+    assert_eq!(m.int("onHand", &[1001]), 35);
+    assert_eq!(m.int("onHand", &[1002]), 1000);
+    assert_eq!(m.int("onHand", &[7]), -1);
+    assert_eq!(m.int("firstX", &[9]), 9);
+    assert_eq!(m.heap.live_blocks(), 0);
+    // The points take no box of their own: the list's box and its leaf.
+    let words = m.call("points", &[]);
+    let boxes = if flat_layouts() { 2 } else { 5 };
+    assert_eq!(m.heap.live_blocks(), boxes);
+    let (shapes, root) = m.result_shapes("points");
+    // SAFETY: the words are the function's result, of the shape.
+    unsafe { release_value(&mut m.heap, &m.types, &words, &shapes, root) };
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(
+        m.shown("three"),
+        "[Glyph(code: 'A', size: 3, bold: True, italic: False, at: Point(x: 3, y: 0)), \
+         Glyph(code: 'A', size: 1, bold: False, italic: False, at: Point(x: 1, y: 0)), \
+         Glyph(code: 'A', size: 4, bold: True, italic: False, at: Point(x: 4, y: 0))]"
+    );
+    assert_eq!(
+        m.shown("stocked"),
+        "[1001: Stock(qty: 40, reserved: 5, onOrder: False), 1002: Stock(qty: 0, reserved: 0, \
+         onOrder: True)]"
+    );
+    assert_eq!(m.shown("maybes"), "[Point(x: 1, y: 2), Empty]");
+    // The labels' strings are released with their list.
+    assert_eq!(
+        m.shown("named"),
+        "[Label(text: \"2 is a label long enough for a heap buffer\", at: Point(x: 2, y: 2)), \
+         Label(text: \"short\", at: Point(x: 0, y: 7))]"
     );
     assert_eq!(m.heap.live_blocks(), 0);
 }
@@ -2193,11 +2292,18 @@ fn alone() -> Option[Str] { "a string made at run time: {2}" }
 fn boxed() -> List[Option[Str] | Bytes] {
   ["a string long enough for a buffer", Empty, "short", b"\x01 bytes long enough for a buffer"]
 }
+// Stored flat in their collections.
+type Flat(a: Int, b: Bool, c: Int)
+fn flats() -> List[Flat] { [Flat(a: 1, b: True, c: 2), Flat(a: -3, b: False, c: 4)] }
+fn spots() -> Map[Int, Option[Flat]] { [1: Flat(a: 5, b: True, c: 6), 2: Empty] }
+fn labels() -> List[(text: Str, n: Int)] {
+  [(text: "a string made at run time: {2}", n: 1), (text: "short", n: 2)]
+}
 "#,
     );
     let names = [
         "deep", "chain", "points", "ages", "set", "maybe", "none", "tags", "mixed", "empty",
-        "nothing", "both", "words", "texts", "boxed", "alone",
+        "nothing", "both", "words", "texts", "boxed", "alone", "flats", "spots", "labels",
     ];
     let limits = PrintLimits::default();
     for name in names {

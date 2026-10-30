@@ -115,14 +115,7 @@ impl Handler {
 /// Gives up an emission's value.
 fn release(heap: &mut Heap, types: &Types, list: u64, mut words: [u64; 2]) {
     // SAFETY: the emission owns the value's references.
-    unsafe {
-        release_value(
-            heap,
-            types,
-            words.as_mut_ptr().cast(),
-            types.element_of(list),
-        )
-    };
+    unsafe { release_value(heap, types, words.as_mut_ptr().cast(), types.cell_of(list)) };
 }
 
 impl Signals {
