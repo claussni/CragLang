@@ -1635,8 +1635,9 @@ pub const LEN_OFFSET: i32 = 16;
 /// and the tree.
 pub const LIST_SIZE: u32 = 40;
 
-/// Bytes of a map's box: the header, the length and the root node.
-pub const MAP_SIZE: u32 = 32;
+/// Bytes of a map's box: the header, the length, the root of its hash
+/// index, the tree of its entries, the tree's height and its slots.
+pub const MAP_SIZE: u32 = 56;
 
 /// Bytes of the largest block the heap allocates from pages of a size class.
 /// A larger box is a mapping of its own, allocated by `rt_alloc` alone.

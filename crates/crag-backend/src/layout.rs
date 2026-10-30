@@ -314,6 +314,13 @@ pub fn equal_by_words<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bo
         })
 }
 
+/// Whether values of `ty` can be keys the runtime compares by their words:
+/// those equal by their words, and a `Float`, whose -0.0 generated code
+/// turns into 0.0 before the runtime sees it (Specification §12.2).
+pub fn word_keys<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
+    equal_by_words(db, program, ty) || matches!(ty.as_builtin(db), Some((Builtin::Float, _)))
+}
+
 /// Whether values of `ty` are strings or bytes, which the runtime compares
 /// as map keys by their bytes.
 pub fn is_text<'db>(db: &'db dyn Db, ty: Ty<'db>) -> bool {
@@ -323,8 +330,8 @@ pub fn is_text<'db>(db: &'db dyn Db, ty: Ty<'db>) -> bool {
 /// The descriptor of a record or collection type: for a record the fields
 /// that hold references, which the runtime releases when it frees a box of
 /// the type, and for a collection the layouts of what it holds. None when
-/// a field or an element has no layout yet, or a map's key is neither equal
-/// by its words nor a string or bytes.
+/// a field or an element has no layout yet, or a map's key is neither one
+/// of `word_keys` nor a string or bytes.
 pub fn type_descriptor<'db>(
     db: &'db dyn Db,
     program: Program,
@@ -332,7 +339,7 @@ pub fn type_descriptor<'db>(
 ) -> Option<TypeDescriptor> {
     let map = |key: Ty<'db>, value: Option<Ty<'db>>| {
         let text_keys = is_text(db, key);
-        if !text_keys && !equal_by_words(db, program, key) {
+        if !text_keys && !word_keys(db, program, key) {
             return None;
         }
         let value = match value {

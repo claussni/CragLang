@@ -156,8 +156,8 @@ unsafe fn encode(
     Ok(())
 }
 
-/// The entries of a map, or of a set without values, in the order of
-/// their keys' bytes.
+/// The entries of a map, or of a set without values, in the map's order
+/// (Specification §12.2).
 unsafe fn entries(
     word: u64,
     shapes: &Shapes,
@@ -183,7 +183,6 @@ unsafe fn entries(
             encoded.push((k, v));
         }
     }
-    encoded.sort();
     out.extend((encoded.len() as u64).to_le_bytes());
     for (k, v) in encoded {
         out.extend(k);

@@ -182,9 +182,10 @@ fn sum(n: Int) -> Int {
     assert_ne!(deep[..4], origin[..4]);
     assert_eq!(deep[4..], words(&[1, 2, 3]));
     assert_eq!(p.bytes("numbers"), words(&[3, 3, 1, 2]));
-    // A map's entries come in the order of their keys, however written.
-    assert_eq!(p.bytes("ages"), words(&[2, 1, 10, 2, 20]));
-    assert_eq!(p.bytes("ages"), p.bytes("same"));
+    // A map's entries come in the order their keys came in, so equal maps
+    // written in other orders encode differently (Specification §12.2).
+    assert_eq!(p.bytes("ages"), words(&[2, 2, 20, 1, 10]));
+    assert_eq!(p.bytes("same"), words(&[2, 1, 10, 2, 20]));
     // A union: the member, then its words.
     let picked = p.bytes("picked");
     let none = p.bytes("none");

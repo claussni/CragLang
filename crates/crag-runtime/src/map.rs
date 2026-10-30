@@ -14,17 +14,25 @@
 // You should have received a copy of the GNU General Public License along with
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
-//! Persistent maps and sets as hash array mapped tries (Plan §11.4.13), in
-//! the compressed form of Steindorfer and Vinju, "Optimizing Hash-Array
-//! Mapped Tries for Fast and Lean Immutable JVM Collections" (CHAMP).
+//! Persistent maps and sets in insertion order (Plan §11.4.13, Compiler
+//! Architecture §A11.4.2).
 //!
-//! A map is a box holding its length and its root node. A node of the trie
-//! is a box with two bitmaps over the 32 values of five bits of the hash:
-//! one marks the entries the node holds inline, the other its children.
-//! Entries come first, then children, each in the order of their bits. A
-//! child always holds at least two entries, so a map has one shape for its
-//! entries whatever the order they came in. Below the depth where the hash
-//! runs out, collision nodes hold entries with equal hashes in a list.
+//! A map is a box holding its length, the root of its hash index and its
+//! entries. The entries are slots in the order their keys came in, each a
+//! key's words and then its value's, in a tree of leaves of 32 slots under
+//! inner nodes of 32 children. Changing the value of a key writes its slot,
+//! a new key is pushed at the end, and removing a key clears its slot to a
+//! hole, so no other slot moves. A leaf marks its live slots in a bitmap.
+//! When holes outnumber the entries, the map is compacted.
+//!
+//! The index is a hash array mapped trie in the compressed form of
+//! Steindorfer and Vinju, "Optimizing Hash-Array Mapped Tries for Fast and
+//! Lean Immutable JVM Collections" (CHAMP), of pairs of a key's hash and
+//! its slot's position. A node has two bitmaps over the 32 values of five
+//! bits of the hash: one marks the pairs the node holds inline, the other
+//! its children. Pairs come first, then children, each in the order of
+//! their bits, and a child always holds at least two pairs. Below the depth
+//! where the hash runs out, collision nodes hold pairs with equal hashes.
 //!
 //! Keys are equal when their words are, or, for strings and bytes, their
 //! bytes (see `crag_abi::TypeDescriptor`).
@@ -44,17 +52,31 @@ use crate::text;
 
 const BITS: u32 = 5;
 
-/// Offset of the root node in the map's box.
+/// Offsets in the map's box: the root of the index, the tree of entries,
+/// its height, and the number of slots in it, holes among them.
 const ROOT: usize = 24;
+const TREE: usize = 32;
+const HEIGHT: usize = 40;
+const SLOTS: usize = 48;
 
-/// The kinds of nodes.
+const _: () = assert!(MAP_SIZE as usize == SLOTS + 8);
+
+/// The kinds of nodes: of the index, and of the tree of entries.
 pub(crate) const BITMAP: u32 = 1;
 pub(crate) const COLLISION: u32 = 2;
+pub(crate) const LEAF: u32 = 3;
+pub(crate) const INNER: u32 = 4;
 
-/// Offsets in a node: the bitmaps, the entry bitmap in the lower half, or
-/// a collision node's number of entries; then the entries and children.
+/// Offsets in a node. The word at `MAPS` holds an index node's bitmaps,
+/// the pairs' in the lower half, or a collision node's number of pairs; a
+/// leaf's bitmap of live slots in the lower half and its slots in use in
+/// the upper; or an inner node's number of children. The pairs and
+/// children, the slots, or the children follow at `BODY`.
 const MAPS: usize = 16;
-const ENTRIES: usize = 24;
+const BODY: usize = 24;
+
+/// A key's hash and the position of its slot.
+type Pair = [u64; 2];
 
 /// The word at `offset` in a box.
 ///
@@ -125,17 +147,28 @@ fn bit(hash: u64, shift: u32) -> u32 {
     1 << ((hash >> shift) & 31)
 }
 
-/// The entries or children before `bit` in a bitmap.
+/// The pairs or children before `bit` in a bitmap.
 fn rank(map: u32, bit: u32) -> usize {
     (map & (bit - 1)).count_ones() as usize
 }
 
-/// What a node holds, taken out of it to build another.
+/// The slots a tree of entries of height `h` holds when full.
+fn capacity(h: usize) -> usize {
+    1 << (BITS as usize * (h + 1))
+}
+
+/// The slots or children a node of the tree of entries has room for when
+/// it uses `n`: room doubles as a node fills, so small maps stay small.
+fn room(n: usize) -> usize {
+    n.max(1).next_power_of_two()
+}
+
+/// What an index node holds, taken out of it to build another.
 struct Contents {
-    entries: u32,
+    pairs_map: u32,
     children: u32,
-    /// The entries' words.
-    words: Vec<u64>,
+    /// The pairs' words.
+    pairs: Vec<u64>,
     nodes: Vec<*mut u8>,
 }
 
@@ -145,7 +178,7 @@ struct Maps<'a> {
     types: &'a Types,
     key: &'a ElementLayout,
     value: &'a ElementLayout,
-    /// Words of a key, and of an entry.
+    /// Words of a key, and of a slot.
     kw: usize,
     ew: usize,
     index: u64,
@@ -175,24 +208,6 @@ impl<'a> Maps<'a> {
     // The safety contract of every method below: the nodes passed are live
     // nodes of this map's type, the keys and values of its layouts.
 
-    unsafe fn entry(&self, node: *mut u8, i: usize) -> *mut u64 {
-        // SAFETY: see above.
-        unsafe { at(node, ENTRIES + 8 * self.ew * i) }
-    }
-
-    /// The slot of child `j` of a bitmap node.
-    unsafe fn slot(&self, node: *mut u8, j: usize) -> *mut *mut u8 {
-        // SAFETY: see above.
-        unsafe {
-            let (entries, _) = bitmaps(node);
-            at(
-                node,
-                ENTRIES + 8 * (self.ew * entries.count_ones() as usize + j),
-            )
-            .cast()
-        }
-    }
-
     unsafe fn retain_entry(&self, entry: *mut u64) {
         // SAFETY: see above.
         unsafe {
@@ -209,62 +224,31 @@ impl<'a> Maps<'a> {
         }
     }
 
-    unsafe fn same_key(&self, entry: *mut u64, key: &[u64]) -> bool {
-        // SAFETY: see above.
-        unsafe {
-            let words = std::slice::from_raw_parts(entry, self.kw);
-            equal_keys(words, &key[..self.kw], self.text)
-        }
-    }
+    // The index.
 
-    /// The hash of a key, whose words are its first.
-    unsafe fn hash(&self, key: &[u64]) -> u64 {
-        // SAFETY: see above.
-        unsafe { hash_key(&key[..self.kw], self.text) }
-    }
-
-    /// The number of entries and children of a node; a collision node has
-    /// no children.
-    unsafe fn counts(&self, node: *mut u8) -> (usize, usize) {
-        // SAFETY: see above.
-        unsafe {
-            if kind(node) == COLLISION {
-                return (at(node, MAPS).read() as usize, 0);
-            }
-            let (entries, children) = bitmaps(node);
-            (
-                entries.count_ones() as usize,
-                children.count_ones() as usize,
-            )
-        }
-    }
-
-    /// The node's contents, with the caller's reference to it: moved out of
-    /// it if the reference is its only one, which frees it, else copied
-    /// with references of their own.
+    /// The index node's contents, with the caller's reference to it: moved
+    /// out of it if the reference is its only one, which frees it, else
+    /// copied with references of their own.
     unsafe fn take(&mut self, node: *mut u8) -> Contents {
         // SAFETY: see above.
         unsafe {
-            let (n, c) = self.counts(node);
-            let (entries, children) = match kind(node) {
+            let (n, c) = counts(node);
+            let (pairs_map, children) = match kind(node) {
                 COLLISION => (0, 0),
                 _ => bitmaps(node),
             };
-            let words = std::slice::from_raw_parts(self.entry(node, 0), n * self.ew).to_vec();
-            let nodes: Vec<*mut u8> = (0..c).map(|j| self.slot(node, j).read()).collect();
+            let pairs = std::slice::from_raw_parts(at(node, BODY), 2 * n).to_vec();
+            let nodes: Vec<*mut u8> = (0..c).map(|j| index_child(node, j).read()).collect();
             if is_unique(node) {
                 self.heap.free(node);
             } else {
-                for i in 0..n {
-                    self.retain_entry(self.entry(node, i));
-                }
                 nodes.iter().for_each(|&child| retain(child));
                 drop_box(self.heap, self.types, node);
             }
             Contents {
-                entries,
+                pairs_map,
                 children,
-                words,
+                pairs,
                 nodes,
             }
         }
@@ -272,37 +256,37 @@ impl<'a> Maps<'a> {
 
     /// A bitmap node of the contents, whose references it takes.
     fn bitmap(&mut self, c: &Contents) -> *mut u8 {
-        let size = ENTRIES + 8 * (c.words.len() + c.nodes.len());
+        let size = BODY + 8 * (c.pairs.len() + c.nodes.len());
         let node = alloc_box(self.heap, size, self.index | u64::from(BITMAP) << 32);
         // SAFETY: the node has room for the contents.
         unsafe {
-            at(node, MAPS).write(u64::from(c.entries) | u64::from(c.children) << 32);
-            let words = at(node, ENTRIES);
-            words.copy_from_nonoverlapping(c.words.as_ptr(), c.words.len());
-            let nodes = words.add(c.words.len()).cast::<*mut u8>();
+            at(node, MAPS).write(u64::from(c.pairs_map) | u64::from(c.children) << 32);
+            let words = at(node, BODY);
+            words.copy_from_nonoverlapping(c.pairs.as_ptr(), c.pairs.len());
+            let nodes = words.add(c.pairs.len()).cast::<*mut u8>();
             nodes.copy_from_nonoverlapping(c.nodes.as_ptr(), c.nodes.len());
         }
         node
     }
 
-    /// A collision node of these entries' words, whose references it takes.
-    fn collision(&mut self, words: &[u64]) -> *mut u8 {
+    /// A collision node of these pairs' words.
+    fn collision(&mut self, pairs: &[u64]) -> *mut u8 {
         let node = alloc_box(
             self.heap,
-            ENTRIES + 8 * words.len(),
+            BODY + 8 * pairs.len(),
             self.index | u64::from(COLLISION) << 32,
         );
-        // SAFETY: the node has room for the entries.
+        // SAFETY: the node has room for the pairs.
         unsafe {
-            at(node, MAPS).write((words.len() / self.ew) as u64);
-            at(node, ENTRIES).copy_from_nonoverlapping(words.as_ptr(), words.len());
+            at(node, MAPS).write((pairs.len() / 2) as u64);
+            at(node, BODY).copy_from_nonoverlapping(pairs.as_ptr(), pairs.len());
         }
         node
     }
 
-    /// The node itself if the caller's reference is its only one, else a
-    /// copy of the same shape with references to what it holds.
-    unsafe fn unique(&mut self, node: *mut u8) -> *mut u8 {
+    /// The index node itself if the caller's reference is its only one,
+    /// else a copy of the same shape with references to its children.
+    unsafe fn unique_index(&mut self, node: *mut u8) -> *mut u8 {
         // SAFETY: see above.
         unsafe {
             if is_unique(node) {
@@ -311,158 +295,287 @@ impl<'a> Maps<'a> {
             let kind = kind(node);
             let c = self.take(node);
             match kind {
-                COLLISION => self.collision(&c.words),
+                COLLISION => self.collision(&c.pairs),
                 _ => self.bitmap(&c),
             }
         }
     }
 
-    /// A node holding two entries whose hashes agree below `shift`.
-    fn pair(&mut self, shift: u32, a: &[u64], b: &[u64]) -> *mut u8 {
+    /// A node holding two pairs whose hashes agree below `shift`.
+    fn pair(&mut self, shift: u32, a: Pair, b: Pair) -> *mut u8 {
         if shift >= 64 {
             return self.collision(&[a, b].concat());
         }
-        // SAFETY: the entries hold keys of the map's type.
-        let (ha, hb) = unsafe { (self.hash(a), self.hash(b)) };
-        let (ba, bb) = (bit(ha, shift), bit(hb, shift));
+        let (ba, bb) = (bit(a[0], shift), bit(b[0], shift));
         let c = if ba == bb {
             Contents {
-                entries: 0,
+                pairs_map: 0,
                 children: ba,
-                words: Vec::new(),
+                pairs: Vec::new(),
                 nodes: vec![self.pair(shift + BITS, a, b)],
             }
         } else {
-            let words = if ba < bb { [a, b] } else { [b, a] }.concat();
+            let pairs = if ba < bb { [a, b] } else { [b, a] }.concat();
             Contents {
-                entries: ba | bb,
+                pairs_map: ba | bb,
                 children: 0,
-                words,
+                pairs,
                 nodes: Vec::new(),
             }
         };
         self.bitmap(&c)
     }
 
-    /// Binds the key in a subtree, whose reference the caller gives; the
-    /// new subtree, and whether the key is new to it. The entry is the key's
-    /// words and then the value's, and the subtree takes their references.
-    unsafe fn insert_node(
-        &mut self,
-        node: *mut u8,
-        h: u64,
-        shift: u32,
-        entry: &[u64],
-    ) -> (*mut u8, bool) {
-        let key = &entry[..self.kw];
+    /// Adds the pair of a key the subtree lacks to it, whose reference the
+    /// caller gives; the new subtree.
+    unsafe fn insert_index(&mut self, node: *mut u8, shift: u32, p: Pair) -> *mut u8 {
         // SAFETY: see above.
         unsafe {
             if kind(node) == COLLISION {
-                let n = at(node, MAPS).read() as usize;
-                if let Some(i) = (0..n).find(|&i| self.same_key(self.entry(node, i), key)) {
-                    return (self.replace(node, i, entry), false);
-                }
                 let mut c = self.take(node);
-                c.words.extend_from_slice(entry);
-                return (self.collision(&c.words), true);
+                c.pairs.extend_from_slice(&p);
+                return self.collision(&c.pairs);
             }
-            let (entries, children) = bitmaps(node);
-            let b = bit(h, shift);
-            if entries & b != 0 {
-                let i = rank(entries, b);
-                if self.same_key(self.entry(node, i), key) {
-                    return (self.replace(node, i, entry), false);
-                }
-                // Two keys share the bits: both go down into a new child.
+            let (pairs_map, children) = bitmaps(node);
+            let b = bit(p[0], shift);
+            if pairs_map & b != 0 {
+                // Two pairs share the bits: both go down into a new child.
                 let mut c = self.take(node);
-                let old: Vec<u64> = c.words.drain(i * self.ew..(i + 1) * self.ew).collect();
-                c.entries ^= b;
+                let i = 2 * rank(pairs_map, b);
+                let old = [c.pairs[i], c.pairs[i + 1]];
+                c.pairs.drain(i..i + 2);
+                c.pairs_map ^= b;
                 c.children |= b;
-                let child = self.pair(shift + BITS, &old, entry);
+                let child = self.pair(shift + BITS, old, p);
                 c.nodes.insert(rank(c.children, b), child);
-                return (self.bitmap(&c), true);
+                return self.bitmap(&c);
             }
             if children & b != 0 {
-                let node = self.unique(node);
-                let slot = self.slot(node, rank(children, b));
-                let (child, added) = self.insert_node(slot.read(), h, shift + BITS, entry);
-                slot.write(child);
-                return (node, added);
+                let node = self.unique_index(node);
+                let slot = index_child(node, rank(children, b));
+                slot.write(self.insert_index(slot.read(), shift + BITS, p));
+                return node;
             }
             let mut c = self.take(node);
-            let i = rank(entries, b) * self.ew;
-            c.words.splice(i..i, entry.iter().copied());
-            c.entries |= b;
-            (self.bitmap(&c), true)
+            let i = 2 * rank(pairs_map, b);
+            c.pairs.splice(i..i, p);
+            c.pairs_map |= b;
+            self.bitmap(&c)
         }
     }
 
-    /// Gives entry `i` of a node the entry's value; the key keeps the one it
-    /// has, and the entry's own key is released.
-    unsafe fn replace(&mut self, node: *mut u8, i: usize, entry: &[u64]) -> *mut u8 {
-        // SAFETY: see above.
-        unsafe {
-            let node = self.unique(node);
-            let at = self.entry(node, i).add(self.kw);
-            release_value(self.heap, self.types, at.cast(), self.value);
-            at.copy_from_nonoverlapping(entry[self.kw..].as_ptr(), self.ew - self.kw);
-            let mut key = entry[..self.kw].to_vec();
-            release_value(self.heap, self.types, key.as_mut_ptr().cast(), self.key);
-            node
-        }
-    }
-
-    /// Removes the key, which the subtree holds, from it; the new subtree,
+    /// Removes the pair, which the subtree holds, from it; the new subtree,
     /// or null for an empty one.
-    unsafe fn remove_node(&mut self, node: *mut u8, h: u64, shift: u32, key: &[u64]) -> *mut u8 {
+    unsafe fn remove_index(&mut self, node: *mut u8, shift: u32, p: Pair) -> *mut u8 {
         // SAFETY: see above.
         unsafe {
             if kind(node) == COLLISION {
-                let n = at(node, MAPS).read() as usize;
-                let i = (0..n)
-                    .find(|&i| self.same_key(self.entry(node, i), key))
-                    .unwrap();
                 let mut c = self.take(node);
-                self.release_entry(c.words[i * self.ew..].as_mut_ptr());
-                c.words.drain(i * self.ew..(i + 1) * self.ew);
-                return self.collision(&c.words);
+                let i = c.pairs.chunks(2).position(|q| q[1] == p[1]).unwrap();
+                c.pairs.drain(2 * i..2 * i + 2);
+                return self.collision(&c.pairs);
             }
-            let (entries, children) = bitmaps(node);
-            let b = bit(h, shift);
-            if entries & b != 0 {
+            let (pairs_map, children) = bitmaps(node);
+            let b = bit(p[0], shift);
+            if pairs_map & b != 0 {
                 let mut c = self.take(node);
-                let i = rank(entries, b) * self.ew;
-                self.release_entry(c.words[i..].as_mut_ptr());
-                c.words.drain(i..i + self.ew);
-                c.entries ^= b;
-                if c.entries == 0 && c.children == 0 {
+                let i = 2 * rank(pairs_map, b);
+                c.pairs.drain(i..i + 2);
+                c.pairs_map ^= b;
+                if c.pairs_map == 0 && c.children == 0 {
                     return std::ptr::null_mut();
                 }
                 return self.bitmap(&c);
             }
-            let node = self.unique(node);
+            let node = self.unique_index(node);
             let j = rank(children, b);
-            let slot = self.slot(node, j);
-            let child = self.remove_node(slot.read(), h, shift + BITS, key);
+            let slot = index_child(node, j);
+            let child = self.remove_index(slot.read(), shift + BITS, p);
             slot.write(child);
-            // A child left with one entry moves up into this node, so every
+            // A child left with one pair moves up into this node, so every
             // child keeps at least two.
-            if self.counts(child) == (1, 0) {
+            if counts(child) == (1, 0) {
                 let moved = self.take(child);
                 let mut c = self.take(node);
                 c.nodes.remove(j);
                 c.children ^= b;
-                let i = rank(c.entries, b) * self.ew;
-                c.words.splice(i..i, moved.words);
-                c.entries |= b;
+                let i = 2 * rank(c.pairs_map, b);
+                c.pairs.splice(i..i, moved.pairs);
+                c.pairs_map |= b;
                 return self.bitmap(&c);
             }
             node
         }
     }
+
+    // The tree of entries.
+
+    /// A node of the tree of entries that the caller's reference alone
+    /// reaches, with room for `n` slots or children: the node itself when
+    /// it is so, else a copy that takes over the caller's reference.
+    unsafe fn own(&mut self, node: *mut u8, n: usize) -> *mut u8 {
+        // SAFETY: see above.
+        unsafe {
+            let kind = kind(node);
+            let (count, unit) = match kind {
+                LEAF => (leaf_used(node), self.ew),
+                _ => (at(node, MAPS).read() as usize, 1),
+            };
+            let unique = is_unique(node);
+            if unique && room(count) >= n {
+                return node;
+            }
+            let size = BODY + 8 * unit * room(n.max(count));
+            let copy = alloc_box(self.heap, size, self.index | u64::from(kind) << 32);
+            at(copy, MAPS).write(at(node, MAPS).read());
+            at(copy, BODY).copy_from_nonoverlapping(at(node, BODY), unit * count);
+            if unique {
+                self.heap.free(node);
+                return copy;
+            }
+            match kind {
+                LEAF => {
+                    let live = leaf_live(node);
+                    for i in (0..count).filter(|i| live & 1 << i != 0) {
+                        self.retain_entry(at(node, BODY + 8 * self.ew * i));
+                    }
+                }
+                _ => (0..count).for_each(|j| retain(tree_child(node, j).read())),
+            }
+            drop_box(self.heap, self.types, node);
+            copy
+        }
+    }
+
+    /// A tree of height `h` holding the entry alone, in its first slot,
+    /// whose references it takes.
+    fn fresh(&mut self, h: usize, entry: &[u64]) -> *mut u8 {
+        let leaf = alloc_box(
+            self.heap,
+            BODY + 8 * self.ew,
+            self.index | u64::from(LEAF) << 32,
+        );
+        // SAFETY: the leaf has room for the slot, and each inner node for
+        // its child.
+        unsafe {
+            at(leaf, MAPS).write(1 | 1 << 32);
+            at(leaf, BODY).copy_from_nonoverlapping(entry.as_ptr(), self.ew);
+            let mut node = leaf;
+            for _ in 0..h {
+                let inner = alloc_box(self.heap, BODY + 8, self.index | u64::from(INNER) << 32);
+                at(inner, MAPS).write(1);
+                tree_child(inner, 0).write(node);
+                node = inner;
+            }
+            node
+        }
+    }
+
+    /// Pushes the entry at `pos`, the end of a subtree of height `h` whose
+    /// reference the caller gives; the new subtree, which has room for it.
+    unsafe fn push_node(&mut self, node: *mut u8, h: usize, pos: usize, entry: &[u64]) -> *mut u8 {
+        // SAFETY: see above.
+        unsafe {
+            if h == 0 {
+                let i = leaf_used(node);
+                let leaf = self.own(node, i + 1);
+                at(leaf, BODY + 8 * self.ew * i).copy_from_nonoverlapping(entry.as_ptr(), self.ew);
+                let live = leaf_live(leaf) | 1 << i;
+                at(leaf, MAPS).write(u64::from(live) | ((i + 1) as u64) << 32);
+                return leaf;
+            }
+            let j = (pos >> (BITS as usize * h)) & 31;
+            let count = at(node, MAPS).read() as usize;
+            if j < count {
+                let node = self.own(node, count);
+                let slot = tree_child(node, j);
+                slot.write(self.push_node(slot.read(), h - 1, pos, entry));
+                return node;
+            }
+            let child = self.fresh(h - 1, entry);
+            let node = self.own(node, count + 1);
+            tree_child(node, count).write(child);
+            at(node, MAPS).write((count + 1) as u64);
+            node
+        }
+    }
+
+    /// The path to slot `pos` of a subtree of height `h`, whose reference
+    /// the caller gives, made the caller's alone: the new subtree, the leaf
+    /// and the slot's place in it.
+    unsafe fn path(&mut self, node: *mut u8, h: usize, pos: usize) -> (*mut u8, *mut u8, usize) {
+        // SAFETY: see above.
+        unsafe {
+            if h == 0 {
+                let leaf = self.own(node, leaf_used(node));
+                return (leaf, leaf, pos & 31);
+            }
+            let node = self.own(node, at(node, MAPS).read() as usize);
+            let slot = tree_child(node, (pos >> (BITS as usize * h)) & 31);
+            let (child, leaf, i) = self.path(slot.read(), h - 1, pos);
+            slot.write(child);
+            (node, leaf, i)
+        }
+    }
+
+    /// Binds a key the map lacks: its entry goes at the end, and its pair
+    /// into the index. The map is the caller's alone, and takes the
+    /// entry's references.
+    unsafe fn append(&mut self, map: *mut u8, h: u64, entry: &[u64]) {
+        // SAFETY: see above.
+        unsafe {
+            let slots = map_slots(map);
+            let (mut tree, mut height) = (tree(map), height(map));
+            if tree.is_null() {
+                tree = self.fresh(0, entry);
+            } else {
+                if slots == capacity(height) {
+                    let root = alloc_box(self.heap, BODY + 16, self.index | u64::from(INNER) << 32);
+                    at(root, MAPS).write(1);
+                    tree_child(root, 0).write(tree);
+                    tree = root;
+                    height += 1;
+                }
+                tree = self.push_node(tree, height, slots, entry);
+            }
+            let p = [h, slots as u64];
+            let root = match root(map) {
+                node if node.is_null() => self.bitmap(&Contents {
+                    pairs_map: bit(h, 0),
+                    children: 0,
+                    pairs: p.to_vec(),
+                    nodes: Vec::new(),
+                }),
+                node => self.insert_index(node, 0, p),
+            };
+            at(map, ROOT).cast::<*mut u8>().write(root);
+            at(map, TREE).cast::<*mut u8>().write(tree);
+            at(map, HEIGHT).write(height as u64);
+            at(map, SLOTS).write(slots as u64 + 1);
+            at(map, LEN_OFFSET as usize).write(length(map) as u64 + 1);
+        }
+    }
+
+    /// The map without holes, its entries in their order; it takes the
+    /// map's reference.
+    unsafe fn compact(&mut self, map: *mut u8) -> *mut u8 {
+        // SAFETY: see above.
+        unsafe {
+            let fresh = empty(self.heap, self.index as u32);
+            for entry in iter(self.types, map) {
+                let entry = entry.cast_mut();
+                self.retain_entry(entry);
+                let entry = std::slice::from_raw_parts(entry, self.ew);
+                self.append(fresh, hash_key(&entry[..self.kw], self.text), entry);
+            }
+            drop_box(self.heap, self.types, map);
+            fresh
+        }
+    }
 }
 
-/// The key and value layouts of a map's type, and its type index.
+/// The key and value layouts of a map's type, its type index, and whether
+/// its keys are text.
 ///
 /// # Safety
 ///
@@ -489,7 +602,7 @@ unsafe fn kind(node: *mut u8) -> u32 {
     unsafe { (header(node) >> 32) as u32 }
 }
 
-/// The entry and child bitmaps of a bitmap node.
+/// The pair and child bitmaps of a bitmap node.
 ///
 /// # Safety
 ///
@@ -498,6 +611,80 @@ unsafe fn bitmaps(node: *mut u8) -> (u32, u32) {
     // SAFETY: as the caller promises.
     let maps = unsafe { at(node, MAPS).read() };
     (maps as u32, (maps >> 32) as u32)
+}
+
+/// The number of pairs and children of an index node; a collision node has
+/// no children.
+///
+/// # Safety
+///
+/// `node` points at a live index node.
+unsafe fn counts(node: *mut u8) -> (usize, usize) {
+    // SAFETY: as the caller promises.
+    unsafe {
+        if kind(node) == COLLISION {
+            return (at(node, MAPS).read() as usize, 0);
+        }
+        let (pairs, children) = bitmaps(node);
+        (pairs.count_ones() as usize, children.count_ones() as usize)
+    }
+}
+
+/// The place of child `j` of a bitmap node.
+///
+/// # Safety
+///
+/// `node` points at a live bitmap node with that child.
+unsafe fn index_child(node: *mut u8, j: usize) -> *mut *mut u8 {
+    // SAFETY: as the caller promises.
+    unsafe {
+        let (pairs, _) = bitmaps(node);
+        at(node, BODY + 8 * (2 * pairs.count_ones() as usize + j)).cast()
+    }
+}
+
+/// The slots in use of a leaf, and its bitmap of live ones.
+///
+/// # Safety
+///
+/// `leaf` points at a live leaf.
+unsafe fn leaf_used(leaf: *mut u8) -> usize {
+    // SAFETY: as the caller promises.
+    unsafe { (at(leaf, MAPS).read() >> 32) as usize }
+}
+
+/// # Safety
+///
+/// `leaf` points at a live leaf.
+unsafe fn leaf_live(leaf: *mut u8) -> u32 {
+    // SAFETY: as the caller promises.
+    unsafe { at(leaf, MAPS).read() as u32 }
+}
+
+/// The place of child `j` of an inner node of the tree of entries.
+///
+/// # Safety
+///
+/// `node` points at a live inner node with room for that child.
+unsafe fn tree_child(node: *mut u8, j: usize) -> *mut *mut u8 {
+    // SAFETY: as the caller promises.
+    unsafe { at(node, BODY + 8 * j).cast() }
+}
+
+/// The leaf holding slot `pos` of a tree of height `h`.
+///
+/// # Safety
+///
+/// `tree` points at a live tree of entries with that slot.
+unsafe fn leaf_of(tree: *mut u8, h: usize, pos: usize) -> *mut u8 {
+    // SAFETY: as the caller promises.
+    unsafe {
+        let mut node = tree;
+        for level in (1..=h).rev() {
+            node = tree_child(node, (pos >> (BITS as usize * level)) & 31).read();
+        }
+        node
+    }
 }
 
 /// # Safety
@@ -510,12 +697,74 @@ unsafe fn root(map: *mut u8) -> *mut u8 {
 
 /// # Safety
 ///
-/// `map` points at a live map whose box only the caller's reference holds.
-unsafe fn set_root(map: *mut u8, node: *mut u8, len: usize) {
+/// `map` points at a live map.
+unsafe fn tree(map: *mut u8) -> *mut u8 {
+    // SAFETY: as the caller promises.
+    unsafe { at(map, TREE).cast::<*mut u8>().read() }
+}
+
+/// # Safety
+///
+/// `map` points at a live map.
+unsafe fn height(map: *mut u8) -> usize {
+    // SAFETY: as the caller promises.
+    unsafe { at(map, HEIGHT).read() as usize }
+}
+
+/// # Safety
+///
+/// `map` points at a live map.
+unsafe fn map_slots(map: *mut u8) -> usize {
+    // SAFETY: as the caller promises.
+    unsafe { at(map, SLOTS).read() as usize }
+}
+
+/// The position of the key's slot and its hash, if the map has the key.
+///
+/// # Safety
+///
+/// `map` points at a live map whose type `types` describes, and `key`
+/// holds a key of its type.
+unsafe fn locate(types: &Types, map: *mut u8, key: &[u64]) -> (u64, Option<usize>) {
     // SAFETY: as the caller promises.
     unsafe {
-        at(map, ROOT).cast::<*mut u8>().write(node);
-        at(map, LEN_OFFSET as usize).write(len as u64);
+        let (k, value, _, text) = layouts(types, map);
+        let (kw, ew) = (k.words as usize, (k.words + value.words) as usize);
+        let key = &key[..kw];
+        let h = hash_key(key, text);
+        let (tree, height) = (tree(map), height(map));
+        let same = |pos: u64| {
+            let pos = pos as usize;
+            let slot = at(leaf_of(tree, height, pos), BODY + 8 * ew * (pos & 31));
+            equal_keys(std::slice::from_raw_parts(slot, kw), key, text)
+        };
+        let mut node = root(map);
+        let mut shift = 0;
+        while !node.is_null() {
+            if kind(node) == COLLISION {
+                let n = at(node, MAPS).read() as usize;
+                let pos = (0..n)
+                    .map(|i| at(node, BODY + 16 * i + 8).read())
+                    .find(|&p| same(p));
+                return (h, pos.map(|p| p as usize));
+            }
+            let (pairs, children) = bitmaps(node);
+            let b = bit(h, shift);
+            if pairs & b != 0 {
+                let i = rank(pairs, b);
+                let (ph, pos) = (
+                    at(node, BODY + 16 * i).read(),
+                    at(node, BODY + 16 * i + 8).read(),
+                );
+                return (h, (ph == h && same(pos)).then_some(pos as usize));
+            }
+            if children & b == 0 {
+                break;
+            }
+            node = index_child(node, rank(children, b)).read();
+            shift += BITS;
+        }
+        (h, None)
     }
 }
 
@@ -524,7 +773,11 @@ unsafe fn set_root(map: *mut u8, node: *mut u8, len: usize) {
 pub fn empty(heap: &mut Heap, index: u32) -> *mut u8 {
     let map = alloc_box(heap, MAP_SIZE as usize, index.into());
     // SAFETY: the box has the words.
-    unsafe { set_root(map, std::ptr::null_mut(), 0) };
+    unsafe {
+        for offset in (LEN_OFFSET as usize..MAP_SIZE as usize).step_by(8) {
+            at(map, offset).write(0);
+        }
+    }
     map
 }
 
@@ -548,46 +801,20 @@ pub unsafe fn length(map: *mut u8) -> usize {
 pub unsafe fn get(types: &Types, map: *mut u8, key: &[u64]) -> *mut u64 {
     // SAFETY: as the caller promises.
     unsafe {
-        let (k, value, _, text) = layouts(types, map);
-        let (kw, ew) = (k.words as usize, (k.words + value.words) as usize);
-        let key = &key[..kw];
-        let found = |entry: *mut u64| equal_keys(std::slice::from_raw_parts(entry, kw), key, text);
-        let entry = |node: *mut u8, i: usize| at(node, ENTRIES + 8 * ew * i);
-        let h = hash_key(key, text);
-        let mut node = root(map);
-        let mut shift = 0;
-        while !node.is_null() {
-            if kind(node) == COLLISION {
-                let n = at(node, MAPS).read() as usize;
-                return match (0..n).map(|i| entry(node, i)).find(|&e| found(e)) {
-                    Some(e) => e.add(kw),
-                    None => std::ptr::null_mut(),
-                };
-            }
-            let (entries, children) = bitmaps(node);
-            let b = bit(h, shift);
-            if entries & b != 0 {
-                let e = entry(node, rank(entries, b));
-                return if found(e) {
-                    e.add(kw)
-                } else {
-                    std::ptr::null_mut()
-                };
-            }
-            if children & b == 0 {
-                break;
-            }
-            let j = entries.count_ones() as usize * ew + rank(children, b);
-            node = at(node, ENTRIES + 8 * j).cast::<*mut u8>().read();
-            shift += BITS;
-        }
-        std::ptr::null_mut()
+        let Some(pos) = locate(types, map, key).1 else {
+            return std::ptr::null_mut();
+        };
+        let (k, value, ..) = layouts(types, map);
+        let ew = (k.words + value.words) as usize;
+        let leaf = leaf_of(tree(map), height(map), pos);
+        at(leaf, BODY + 8 * (ew * (pos & 31) + k.words as usize))
     }
 }
 
 /// The map with the key bound to the value, each given by its first words.
 /// It takes the references of the map, the key and the value. A key the map
-/// has keeps its words, and the one given is released.
+/// has keeps its words and its place, and the one given is released; a new
+/// key goes last.
 ///
 /// # Safety
 ///
@@ -602,23 +829,21 @@ pub unsafe fn insert(
 ) -> *mut u8 {
     // SAFETY: as the caller promises.
     unsafe {
+        let (h, found) = locate(types, map, key);
         let mut m = Maps::new(heap, types, map);
         let entry = [&key[..m.kw], &value[..m.ew - m.kw]].concat();
-        let entry = &entry[..];
         let map = unique_map(&mut m, map);
-        let node = root(map);
-        let len = length(map);
-        if node.is_null() {
-            let c = Contents {
-                entries: bit(m.hash(entry), 0),
-                children: 0,
-                words: entry.to_vec(),
-                nodes: Vec::new(),
-            };
-            set_root(map, m.bitmap(&c), 1);
-        } else {
-            let (node, added) = m.insert_node(node, m.hash(entry), 0, entry);
-            set_root(map, node, len + usize::from(added));
+        match found {
+            Some(pos) => {
+                let (tree, leaf, i) = m.path(tree(map), height(map), pos);
+                at(map, TREE).cast::<*mut u8>().write(tree);
+                let at = at(leaf, BODY + 8 * (m.ew * i + m.kw));
+                release_value(m.heap, m.types, at.cast(), m.value);
+                at.copy_from_nonoverlapping(entry[m.kw..].as_ptr(), m.ew - m.kw);
+                let mut key = entry[..m.kw].to_vec();
+                release_value(m.heap, m.types, key.as_mut_ptr().cast(), m.key);
+            }
+            None => m.append(map, h, &entry),
         }
         map
     }
@@ -632,20 +857,28 @@ pub unsafe fn insert(
 pub unsafe fn remove(heap: &mut Heap, types: &Types, map: *mut u8, key: &[u64]) -> *mut u8 {
     // SAFETY: as the caller promises.
     unsafe {
-        if get(types, map, key).is_null() {
+        let (h, Some(pos)) = locate(types, map, key) else {
             return map;
-        }
+        };
         let mut m = Maps::new(heap, types, map);
-        let key = &key[..m.kw];
         let map = unique_map(&mut m, map);
-        let node = m.remove_node(root(map), m.hash(key), 0, key);
-        set_root(map, node, length(map) - 1);
+        let root = m.remove_index(root(map), 0, [h, pos as u64]);
+        at(map, ROOT).cast::<*mut u8>().write(root);
+        let (tree, leaf, i) = m.path(tree(map), height(map), pos);
+        at(map, TREE).cast::<*mut u8>().write(tree);
+        m.release_entry(at(leaf, BODY + 8 * m.ew * i));
+        at(leaf, MAPS).write(at(leaf, MAPS).read() & !(1 << i));
+        let len = length(map) - 1;
+        at(map, LEN_OFFSET as usize).write(len as u64);
+        if map_slots(map) - len > len {
+            return m.compact(map);
+        }
         map
     }
 }
 
 /// The map's box itself if the caller's reference is its only one, else a
-/// copy holding a reference to the root node.
+/// copy holding references to the index and the entries.
 ///
 /// # Safety
 ///
@@ -656,12 +889,15 @@ unsafe fn unique_map(m: &mut Maps, map: *mut u8) -> *mut u8 {
         if is_unique(map) {
             return map;
         }
-        let copy = empty(m.heap, m.index as u32);
-        let node = root(map);
-        if !node.is_null() {
-            retain(node);
+        let copy = alloc_box(m.heap, MAP_SIZE as usize, m.index);
+        for offset in (LEN_OFFSET as usize..MAP_SIZE as usize).step_by(8) {
+            at(copy, offset).write(at(map, offset).read());
         }
-        set_root(copy, node, length(map));
+        for node in [root(map), tree(map)] {
+            if !node.is_null() {
+                retain(node);
+            }
+        }
         drop_box(m.heap, m.types, map);
         copy
     }
@@ -671,11 +907,15 @@ unsafe fn unique_map(m: &mut Maps, map: *mut u8) -> *mut u8 {
 /// value's follow. Valid while the map is.
 pub struct MapIter {
     ew: usize,
-    /// The nodes left to visit, each with the next of its entries.
-    stack: Vec<(*mut u8, usize)>,
+    tree: *mut u8,
+    height: usize,
+    slots: usize,
+    /// The next slot, and the leaf it is in when it is not a leaf's first.
+    pos: usize,
+    leaf: *mut u8,
 }
 
-/// Iterates a map's entries in an unspecified order.
+/// Iterates a map's entries in the order their keys came in.
 ///
 /// # Safety
 ///
@@ -685,14 +925,13 @@ pub unsafe fn iter(types: &Types, map: *mut u8) -> MapIter {
     // SAFETY: as the caller promises.
     unsafe {
         let (key, value, ..) = layouts(types, map);
-        let node = root(map);
         MapIter {
             ew: (key.words + value.words) as usize,
-            stack: if node.is_null() {
-                Vec::new()
-            } else {
-                vec![(node, 0)]
-            },
+            tree: tree(map),
+            height: height(map),
+            slots: map_slots(map),
+            pos: 0,
+            leaf: std::ptr::null_mut(),
         }
     }
 }
@@ -701,27 +940,16 @@ impl Iterator for MapIter {
     type Item = *const u64;
 
     fn next(&mut self) -> Option<*const u64> {
-        // SAFETY: the map, and so every node on the stack, is live.
+        // SAFETY: the map, and so its tree of entries, is live.
         unsafe {
-            while let Some(&mut (node, ref mut i)) = self.stack.last_mut() {
-                let (entries, children) = match kind(node) {
-                    COLLISION => (at(node, MAPS).read() as usize, 0),
-                    _ => {
-                        let (e, c) = bitmaps(node);
-                        (e.count_ones() as usize, c.count_ones() as usize)
-                    }
-                };
-                let k = *i;
-                *i += 1;
-                if k < entries {
-                    return Some(at(node, ENTRIES + 8 * self.ew * k));
+            while self.pos < self.slots {
+                let (pos, i) = (self.pos, self.pos & 31);
+                self.pos += 1;
+                if i == 0 {
+                    self.leaf = leaf_of(self.tree, self.height, pos);
                 }
-                self.stack.pop();
-                // Children follow the entries, pushed so the first comes
-                // out first.
-                for j in (0..children).rev() {
-                    let slot = at(node, ENTRIES + 8 * (self.ew * entries + j));
-                    self.stack.push((slot.cast::<*mut u8>().read(), 0));
+                if leaf_live(self.leaf) & 1 << i != 0 {
+                    return Some(at(self.leaf, BODY + 8 * self.ew * i));
                 }
             }
             None
@@ -729,8 +957,8 @@ impl Iterator for MapIter {
     }
 }
 
-/// Calls `f` with each box a map's box or node holds: the root, the
-/// children, or what the entries hold.
+/// Calls `f` with each box a map's box or node holds: the index and the
+/// entries, the children, or what the live slots hold.
 ///
 /// # Safety
 ///
@@ -746,29 +974,30 @@ pub(crate) unsafe fn boxes_of(
     let (kw, ew) = (key.words as usize, (key.words + value.words) as usize);
     // SAFETY: as the caller promises.
     unsafe {
-        let (entries, children) = match kind {
+        match kind {
             BITMAP => {
-                let (e, c) = bitmaps(ptr);
-                (e.count_ones() as usize, c.count_ones() as usize)
+                let (_, children) = counts(ptr);
+                (0..children).for_each(|j| f(index_child(ptr, j).read()));
             }
-            COLLISION => (at(ptr, MAPS).read() as usize, 0),
-            _ => {
-                let node = root(ptr);
-                if !node.is_null() {
-                    f(node);
+            COLLISION => {}
+            LEAF => {
+                let live = leaf_live(ptr);
+                for i in (0..leaf_used(ptr)).filter(|i| live & 1 << i != 0) {
+                    let entry = ptr.add(BODY + 8 * ew * i);
+                    boxes_in(entry, &key.counted, &mut *f);
+                    boxes_in(entry.add(8 * kw), &value.counted, &mut *f);
                 }
-                return;
             }
-        };
-        for i in 0..entries {
-            let entry = ptr.add(ENTRIES + 8 * ew * i);
-            boxes_in(entry, &key.counted, &mut *f);
-            boxes_in(entry.add(8 * kw), &value.counted, &mut *f);
-        }
-        for j in 0..children {
-            f(at(ptr, ENTRIES + 8 * (ew * entries + j))
-                .cast::<*mut u8>()
-                .read());
+            INNER => {
+                (0..at(ptr, MAPS).read() as usize).for_each(|j| f(tree_child(ptr, j).read()));
+            }
+            _ => {
+                for node in [root(ptr), tree(ptr)] {
+                    if !node.is_null() {
+                        f(node);
+                    }
+                }
+            }
         }
     }
 }
@@ -833,7 +1062,6 @@ unsafe extern "C" fn get_entry(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::collections::HashMap;
 
     use super::*;
     use crag_abi::CountedField;
@@ -907,69 +1135,97 @@ mod tests {
         }
     }
 
-    /// Checks the shape of a subtree: every child holds two entries or
-    /// more, and every entry sits where its hash says; its entries.
-    unsafe fn check_node(m: &Maps, node: *mut u8, shift: u32, top: bool) -> usize {
-        // SAFETY: the trie is live.
+    /// A map as the entries in their order.
+    type Model = Vec<(u64, u64)>;
+
+    fn bind(model: &mut Model, key: u64, value: u64) {
+        match model.iter_mut().find(|(k, _)| *k == key) {
+            Some(entry) => entry.1 = value,
+            None => model.push((key, value)),
+        }
+    }
+
+    /// The key in slot `pos`, which is live.
+    unsafe fn key_at(m: &Maps, map: *mut u8, pos: usize) -> Vec<u64> {
+        // SAFETY: the map is live and has the slot.
         unsafe {
-            let (n, c) = m.counts(node);
+            let leaf = leaf_of(tree(map), height(map), pos);
+            assert!(leaf_live(leaf) & 1 << (pos & 31) != 0, "a pair of a hole");
+            let slot = at(leaf, BODY + 8 * m.ew * (pos & 31));
+            std::slice::from_raw_parts(slot, m.kw).to_vec()
+        }
+    }
+
+    /// Checks the shape of a subtree of the index: every child holds two
+    /// pairs or more, every pair sits where its hash says, and its hash is
+    /// its key's; its pairs.
+    unsafe fn check_node(m: &Maps, map: *mut u8, node: *mut u8, shift: u32, top: bool) -> usize {
+        // SAFETY: the map is live.
+        unsafe {
+            let (n, c) = counts(node);
             let mut total = n;
+            let pair = |i: usize| {
+                (
+                    at(node, BODY + 16 * i).read(),
+                    at(node, BODY + 16 * i + 8).read(),
+                )
+            };
+            for i in 0..n {
+                let (h, pos) = pair(i);
+                assert_eq!(hash_key(&key_at(m, map, pos as usize), m.text), h);
+            }
             if kind(node) == COLLISION {
                 assert!(shift >= 64);
-                let h = m.hash(std::slice::from_raw_parts(m.entry(node, 0), m.kw));
-                for i in 0..n {
-                    let key = std::slice::from_raw_parts(m.entry(node, i), m.kw);
-                    assert_eq!(m.hash(key), h);
-                }
+                assert!((0..n).all(|i| pair(i).0 == pair(0).0));
             } else {
-                let (entries, children) = bitmaps(node);
-                assert_eq!(entries & children, 0);
-                let mut bits = (0..32).filter(|b| entries & 1 << b != 0);
+                let (pairs, children) = bitmaps(node);
+                assert_eq!(pairs & children, 0);
+                let mut bits = (0..32).filter(|b| pairs & 1 << b != 0);
                 for i in 0..n {
-                    let key = std::slice::from_raw_parts(m.entry(node, i), m.kw);
-                    assert_eq!(bit(m.hash(key), shift), 1 << bits.next().unwrap());
+                    assert_eq!(bit(pair(i).0, shift), 1 << bits.next().unwrap());
                 }
                 for j in 0..c {
-                    total += check_node(m, m.slot(node, j).read(), shift + BITS, false);
+                    total += check_node(m, map, index_child(node, j).read(), shift + BITS, false);
                 }
             }
-            assert!(top || total >= 2, "a child with one entry");
+            assert!(top || total >= 2, "a child with one pair");
             total
         }
     }
 
-    unsafe fn check(heap: &mut Heap, types: &Types, map: *mut u8, model: &HashMap<u64, u64>) {
+    unsafe fn check(heap: &mut Heap, types: &Types, map: *mut u8, model: &Model) {
         // SAFETY: the map is live.
         unsafe {
             assert_eq!(length(map), model.len());
+            assert!(
+                map_slots(map) - length(map) <= length(map),
+                "more holes than entries"
+            );
             let index = header(map) as u32;
             let m = Maps::new(heap, types, map);
-            let node = root(map);
             if model.is_empty() {
-                assert!(node.is_null());
-                return;
+                assert!(root(map).is_null());
+            } else {
+                assert_eq!(check_node(&m, map, root(map), 0, true), model.len());
             }
-            assert_eq!(check_node(&m, node, 0, true), model.len());
             for (k, v) in model {
                 let at = get(types, map, &[*k]);
                 assert!(!at.is_null(), "key {k}");
                 assert_eq!(read(index, at), *v);
             }
-            let mut seen: Vec<u64> = iter(types, map).map(|e| e.read()).collect();
-            seen.sort_unstable();
-            let mut keys: Vec<u64> = model.keys().copied().collect();
-            keys.sort_unstable();
+            let seen: Vec<u64> = iter(types, map).map(|e| e.read()).collect();
+            let keys: Vec<u64> = model.iter().map(|(k, _)| *k).collect();
             assert_eq!(seen, keys);
         }
     }
 
     /// Random inserts, removals and lookups over versions that share
-    /// structure, against hash maps.
+    /// structure, against vectors of entries.
     fn random_operations(index: u32, seed: u64, steps: usize, keys: u64) {
         let mut heap = Heap::new();
         let types = types();
         let mut rng = Rng(seed);
-        let mut pool = vec![(empty(&mut heap, index), HashMap::new())];
+        let mut pool: Vec<(*mut u8, Model)> = vec![(empty(&mut heap, index), Vec::new())];
         let mut next = 0;
         // SAFETY: every map in the pool is live and owned by it.
         unsafe {
@@ -986,17 +1242,17 @@ mod tests {
                     0..=4 => {
                         next += 1;
                         let value = value(&mut heap, index, next);
-                        model.insert(key, if index == SET { 0 } else { next });
+                        bind(&mut model, key, if index == SET { 0 } else { next });
                         insert(&mut heap, &types, map, &[key], &value)
                     }
                     5 | 6 => {
-                        model.remove(&key);
+                        model.retain(|(k, _)| *k != key);
                         remove(&mut heap, &types, map, &[key])
                     }
                     _ => {
                         assert_eq!(
                             get(&types, map, &[key]).is_null(),
-                            !model.contains_key(&key)
+                            !model.iter().any(|(k, _)| *k == key)
                         );
                         map
                     }
@@ -1021,7 +1277,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_of_words_behave_like_hash_maps() {
+    fn maps_of_words_behave_like_ordered_maps() {
         random_operations(INTS, 1, 4000, 3000);
     }
 
@@ -1086,7 +1342,7 @@ mod tests {
             }
             assert_eq!(length(map), 300);
             let m = Maps::new(&mut heap, &types, map);
-            assert_eq!(check_node(&m, root(map), 0, true), 300);
+            assert_eq!(check_node(&m, map, root(map), 0, true), 300);
             let missing = text::make_text(&mut heap, &[b"a longer key, number 301"]);
             assert!(get(&types, map, &missing).is_null());
             drop_box(&mut heap, &types, missing[0] as *mut u8);
@@ -1098,6 +1354,9 @@ mod tests {
                 }
             }
             assert_eq!(length(map), 200);
+            let values: Vec<u64> = iter(&types, map).map(|e| e.add(2).read()).collect();
+            let kept: Vec<u64> = (0..300).filter(|n| n % 3 != 0).map(|n| n + 1).collect();
+            assert_eq!(values, kept);
             drop_box(&mut heap, &types, map);
         }
         assert_eq!(heap.live_blocks(), 0);
@@ -1111,34 +1370,46 @@ mod tests {
     }
 
     #[test]
-    fn the_shape_does_not_depend_on_the_order_of_insertion() {
+    fn entries_keep_the_order_their_keys_came_in() {
         let mut heap = Heap::new();
         let types = types();
-        let mut rng = Rng(5);
-        let keys: Vec<u64> = (0..2000).map(|_| rng.next()).collect();
+        let walk = |m| {
+            unsafe { iter(&types, m) }
+                .map(|e| unsafe { e.read() })
+                .collect::<Vec<_>>()
+        };
         // SAFETY: the maps are live and owned here.
         unsafe {
             let mut a = empty(&mut heap, INTS);
+            for k in [5, 3, 9, 1] {
+                a = insert(&mut heap, &types, a, &[k], &[k]);
+            }
+            // A new value keeps the key's place; a key removed and bound
+            // again goes last.
+            a = insert(&mut heap, &types, a, &[3], &[30]);
+            assert_eq!(walk(a), [5, 3, 9, 1]);
+            a = remove(&mut heap, &types, a, &[5]);
+            a = insert(&mut heap, &types, a, &[5], &[50]);
+            assert_eq!(walk(a), [3, 9, 1, 5]);
+            // Many removals compact the slots and keep the order.
             let mut b = empty(&mut heap, INTS);
-            for &k in &keys {
-                a = insert(&mut heap, &types, a, &[k], &[1]);
+            for k in 0..5000 {
+                b = insert(&mut heap, &types, b, &[k], &[k]);
             }
-            for &k in keys.iter().rev() {
-                b = insert(&mut heap, &types, b, &[k], &[1]);
-            }
-            // Removing half the keys again leaves the shape of the other half.
-            let mut c = empty(&mut heap, INTS);
-            for &k in &keys[..1000] {
-                c = insert(&mut heap, &types, c, &[k], &[1]);
-            }
-            for &k in &keys[1000..] {
-                a = remove(&mut heap, &types, a, &[k]);
+            for k in (0..5000).filter(|k| k % 7 != 0) {
                 b = remove(&mut heap, &types, b, &[k]);
             }
-            let walk = |m| iter(&types, m).map(|e| e.read()).collect::<Vec<_>>();
-            assert_eq!(walk(a), walk(c));
-            assert_eq!(walk(b), walk(c));
-            for m in [a, b, c] {
+            assert!(map_slots(b) <= 2 * length(b));
+            assert_eq!(
+                walk(b),
+                (0..5000).filter(|k| k % 7 == 0).collect::<Vec<_>>()
+            );
+            for k in (0..5000).filter(|k| k % 7 == 0) {
+                b = remove(&mut heap, &types, b, &[k]);
+            }
+            assert_eq!(length(b), 0);
+            assert!(tree(b).is_null() && root(b).is_null());
+            for m in [a, b] {
                 drop_box(&mut heap, &types, m);
             }
         }

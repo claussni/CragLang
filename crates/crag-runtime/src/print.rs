@@ -243,23 +243,16 @@ impl Printer<'_> {
         !self.stop()
     }
 
-    /// The entries of a map, or of a set without values, by their keys.
+    /// The entries of a map, or of a set without values, in the map's order.
     unsafe fn entries(&mut self, word: u64, key: u32, value: Option<u32>, depth: usize) {
         let map = word as *mut u8;
         let kw = self.shape(key).words() as usize;
         let vw = value.map_or(0, |v| self.shape(v).words() as usize);
         // SAFETY: as the caller promises.
-        let mut entries: Vec<&[u64]> = unsafe { map::iter(self.types, map) }
+        let entries: Vec<&[u64]> = unsafe { map::iter(self.types, map) }
             // SAFETY: each entry is its key's words, then its value's.
             .map(|at| unsafe { std::slice::from_raw_parts(at, kw + vw) })
             .collect();
-        match self.shape(key) {
-            // SAFETY: the keys are live strings or bytes.
-            Shape::Str | Shape::Bytes => {
-                entries.sort_by(|a, b| unsafe { bytes_of(&a[..kw]).cmp(bytes_of(&b[..kw])) })
-            }
-            _ => entries.sort_by_key(|e| e[..kw].iter().map(|&w| w as i64).collect::<Vec<_>>()),
-        }
         if entries.is_empty() {
             self.out
                 .push_str(if value.is_some() { "[:]" } else { "[]" });

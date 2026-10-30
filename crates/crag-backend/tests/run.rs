@@ -1017,7 +1017,7 @@ fn copies() -> List[Str] {
         ("ages", r#"["ada": 36, "alan mathison turing": 41]"#),
         ("lookup", "41"),
         ("data", r#"b"\x00\xff and enough bytes for a buffer""#),
-        ("names", r#"["a", "a long name in a set of names", "b"]"#),
+        ("names", r#"["b", "a", "a long name in a set of names"]"#),
         (
             "mottoOf",
             r#""a module-level value that holds a long string""#,
@@ -1933,10 +1933,10 @@ fn adder() -> (Int) -> Int {
     // Entries by their keys.
     assert_eq!(
         shown(&mut m, "ages"),
-        "[1: Point(x: 10, y: 0), 2: Point(x: 20, y: 0)]"
+        "[2: Point(x: 20, y: 0), 1: Point(x: 10, y: 0)]"
     );
     assert_eq!(shown(&mut m, "none"), "[:]");
-    assert_eq!(shown(&mut m, "set"), "[1, 2, 3]");
+    assert_eq!(shown(&mut m, "set"), "[3, 1, 2]");
     assert_eq!(shown(&mut m, "cents"), "12.05");
     assert_eq!(shown(&mut m, "small"), "255");
     assert_eq!(shown(&mut m, "letter"), "'q'");

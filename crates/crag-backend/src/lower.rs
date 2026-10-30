@@ -62,8 +62,8 @@ use crag_mir::{
 use crag_types::{Builtin, CForm, Step, Ty, TyKind, prelude_item, signature};
 
 use crate::layout::{
-    Layout, boxed_indices, deferred, dispose_word, equal_by_words, layout, record_layout,
-    signal_types, subtypes, type_descriptor, type_index,
+    Layout, boxed_indices, deferred, dispose_word, is_text, layout, record_layout, signal_types,
+    subtypes, type_descriptor, type_index, word_keys,
 };
 use crate::slot_key;
 
@@ -982,8 +982,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 };
                 self.describe(map_ty)?;
                 let ptr = word(&self.read(map)?)?;
-                let key = self.operand(key, k)?;
-                let [k0, k1] = self.pad(key);
+                let [k0, k1] = self.key(key, k)?;
                 let at = self.runtime(RuntimeFn::MapGet, vec![ptr, k0, k1]);
                 self.option(at, v, ty, *boxed)
             }
@@ -2108,8 +2107,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 };
                 self.describe(map_ty)?;
                 let map = word(&self.operand(map, map_ty)?)?;
-                let key = self.operand(key, k)?;
-                let [k0, k1] = self.pad(key);
+                let [k0, k1] = self.key(key, k)?;
                 let [v0, v1] = match (value, v) {
                     ([value], Some(v)) => {
                         let value = self.operand(value, v)?;
@@ -2129,8 +2127,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 };
                 self.describe(map_ty)?;
                 let map = word(&self.operand(map, map_ty)?)?;
-                let key = self.operand(key, k)?;
-                let [k0, k1] = self.pad(key);
+                let [k0, k1] = self.key(key, k)?;
                 if intrinsic == Intrinsic::MapRemove {
                     return Ok(vec![self.runtime(RuntimeFn::MapRemove, vec![map, k0, k1])]);
                 }
@@ -2673,7 +2670,7 @@ impl<'a, 'db> Lower<'a, 'db> {
         let Some(descriptor) = type_descriptor(self.db, self.program, ty) else {
             return Err(match ty.as_builtin(self.db) {
                 Some((Builtin::Map | Builtin::Set, [key, ..]))
-                    if !equal_by_words(self.db, self.program, *key) =>
+                    if !word_keys(self.db, self.program, *key) && !is_text(self.db, *key) =>
                 {
                     "maps with keys of this type"
                 }
@@ -2694,6 +2691,18 @@ impl<'a, 'db> Lower<'a, 'db> {
             dsts: vec![dst],
         });
         dst
+    }
+
+    /// The words of a map or set key, padded to two. A `Float` key -0.0
+    /// becomes 0.0, which it equals, so that equal keys have equal words
+    /// (Specification §12.2).
+    fn key(&mut self, key: &Operand<'db>, ty: Ty<'db>) -> Result<[VReg; 2], Unsupported> {
+        let mut words = self.operand(key, ty)?;
+        if matches!(ty.as_builtin(self.db), Some((Builtin::Float, _))) {
+            let zero = self.constant(0);
+            words[0] = self.bin(LirBin::FAdd, words[0], zero);
+        }
+        Ok(self.pad(words))
     }
 
     /// A value's words as the two arguments of a runtime function, zero
@@ -2735,7 +2744,7 @@ impl<'a, 'db> Lower<'a, 'db> {
     ) -> Result<VReg, Unsupported> {
         let mut words = Vec::new();
         for (k, v) in entries {
-            let k = self.operand(k, key)?;
+            let k = self.key(k, key)?;
             let v = match (v, value) {
                 (Some(v), Some(value)) => self.operand(v, value)?,
                 _ => Vec::new(),
@@ -2743,8 +2752,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             words.push((k, v));
         }
         let mut map = self.empty(ty, MAP_SIZE)?;
-        for (k, v) in words {
-            let [k0, k1] = self.pad(k);
+        for ([k0, k1], v) in words {
             let [v0, v1] = self.pad(v);
             map = self.runtime(RuntimeFn::MapInsert, vec![map, k0, k1, v0, v1]);
         }

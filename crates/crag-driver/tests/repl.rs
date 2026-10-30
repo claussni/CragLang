@@ -68,7 +68,7 @@ fn expressions_run_and_show_their_values() {
     assert_eq!(eval(&mut r, "type Point(x: Int, y: Int)"), "");
     assert_eq!(
         eval(&mut r, "[1: Point(x: 1, y: 2), 0: Point(x: 0, y: 0)]"),
-        "[0: Point(x: 0, y: 0), 1: Point(x: 1, y: 2)]\n"
+        "[1: Point(x: 1, y: 2), 0: Point(x: 0, y: 0)]\n"
     );
     assert_eq!(eval(&mut r, "{ n: Int -> n + 1 }"), "<function>\n");
     // A long one is cut short.
