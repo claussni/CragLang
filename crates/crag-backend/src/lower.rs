@@ -69,8 +69,8 @@ use crate::layout::{
 };
 use crate::slot_key;
 use crate::split::{
-    Form, NicheTest, Slot, SlotKind, UnionTag, element_storage, flat_params, flat_result, form,
-    place_form, storage,
+    Form, NicheTest, Slot, SlotKind, UnionTag, element_form, element_storage, flat_params,
+    flat_result, form, place_form, storage,
 };
 
 /// The LIR of a body, with what it could not lower.
@@ -1038,8 +1038,10 @@ impl<'a, 'db> Lower<'a, 'db> {
         }
     }
 
-    /// The `n` registers of a value stored as `slots` in the box at
-    /// `ptr`, from the words that hold it.
+    /// The `n` registers of a value stored as `slots` in the box or the
+    /// collection's slot at `ptr`, from the words that hold it. A slot of
+    /// fewer bytes need not be aligned, and the collection has room for the
+    /// last word read past its end.
     fn load_stored(&mut self, ptr: VReg, slots: &[Slot], n: usize) -> Vec<VReg> {
         let Some((from, to)) = span(slots) else {
             return (0..n).map(|_| self.constant(0)).collect();
@@ -1047,7 +1049,15 @@ impl<'a, 'db> Lower<'a, 'db> {
         let first = from / 8 * 8;
         let words: Vec<VReg> = (first..to)
             .step_by(8)
-            .map(|at| self.load(ptr, at as i32))
+            .map(|at| {
+                let dst = self.reg();
+                self.push(Inst::LoadUnaligned {
+                    dst,
+                    addr: ptr,
+                    offset: at as i32,
+                });
+                dst
+            })
             .collect();
         let slots: Vec<Slot> = slots.iter().map(|s| rebase(s, first)).collect();
         self.unpack(&slots, &words, n)
@@ -3601,11 +3611,12 @@ impl<'a, 'db> Lower<'a, 'db> {
         dst
     }
 
-    /// The words of a map or set key, padded to two. A `Float` key -0.0
+    /// The words of a map or set key, padded to two: as the map stores it,
+    /// packed when it takes fewer bytes than its word. A `Float` key -0.0
     /// becomes 0.0, which it equals, so that equal keys have equal words
     /// (Specification §12.2).
     fn key(&mut self, key: &Operand<'db>, ty: Ty<'db>) -> Result<[VReg; 2], Unsupported> {
-        let mut words = self.operand(key, ty)?;
+        let mut words = self.element_value(key, ty)?;
         if matches!(ty.as_builtin(self.db), Some((Builtin::Float, _))) {
             let zero = self.constant(0);
             words[0] = self.bin(LirBin::FAdd, words[0], zero);
@@ -3631,13 +3642,14 @@ impl<'a, 'db> Lower<'a, 'db> {
     /// storage form (`split::element_storage`), anything else in its
     /// layout's words.
     fn element_value(&mut self, op: &Operand<'db>, ty: Ty<'db>) -> Result<Vec<VReg>, Unsupported> {
-        match element_storage(self.db, self.program, ty) {
-            Some((size, slots)) => {
-                let regs = self.flat_value(op, ty)?;
-                Ok(self.pack(&slots, size, &regs))
-            }
-            None => self.operand(op, ty),
-        }
+        let Some((size, slots)) = element_storage(self.db, self.program, ty) else {
+            return self.operand(op, ty);
+        };
+        let regs = match form(self.db, self.program, ty) {
+            Some(_) => self.flat_value(op, ty)?,
+            None => self.operand(op, ty)?,
+        };
+        Ok(self.pack(&slots, size, &regs))
     }
 
     /// An element's words as the two arguments of a runtime function: as
@@ -3710,7 +3722,11 @@ impl<'a, 'db> Lower<'a, 'db> {
         self.describe(ty)?;
         let at = self.runtime(RuntimeFn::ListElem, vec![list, index]);
         if let Some((_, slots)) = element_storage(db, program, element) {
-            let form = form(db, program, element).ok_or("records of this type")?;
+            let form = element_form(db, program, element).ok_or("values of this type")?;
+            // A number or a tag is loaded at once, as its word.
+            if words_form(&form) {
+                return Ok(Found::Words(self.load_stored(at, &slots, form.words())));
+            }
             return Ok(Found::Stored {
                 ptr: at,
                 form,
@@ -3786,8 +3802,11 @@ impl<'a, 'db> Lower<'a, 'db> {
             let words = self.layout_of(value)?.words();
             return Ok((0..words).map(|k| self.load(at, 8 * k as i32)).collect());
         };
-        let f = form(db, program, value).ok_or("records of this type")?;
+        let f = element_form(db, program, value).ok_or("values of this type")?;
         let regs = self.load_stored(at, &slots, f.words());
+        if words_form(&f) {
+            return Ok(regs);
+        }
         self.fresh = Some(dst);
         self.count_form(&f, value, &regs, Count::Retain)?;
         self.boxed(value, &f, &regs)

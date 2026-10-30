@@ -301,11 +301,11 @@ pub fn element_layout<'db>(
         // inline.
         Layout::Pair => (2, vec![CountedField::Box(0)]),
     };
-    Some(ElementLayout { words, counted })
+    Some(ElementLayout::of_words(words, counted))
 }
 
-/// The words of a value of `ty` in a list, map or grid: a flat record or
-/// union in its storage form (`split::element_storage`), whose pointer map
+/// How a value of `ty` lies in a list, map or grid: in its storage form
+/// where it is stored flat (`split::element_storage`), whose pointer map
 /// says where the references are, and anything else as in a cell. None
 /// for what has no layout yet.
 pub fn collection_element<'db>(
@@ -318,7 +318,8 @@ pub fn collection_element<'db>(
     };
     let l = flat::layout(db, program, ty).as_ref()?;
     Some(ElementLayout {
-        words: size.div_ceil(8),
+        size,
+        align: l.align,
         counted: l.pointers.iter().map(|p| counted_pointer(p, 0)).collect(),
     })
 }

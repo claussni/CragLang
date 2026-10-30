@@ -163,12 +163,9 @@ impl Printer<'_> {
                     None => self.out.push_str(&format!("<a member of type {word}>")),
                 }
             }
-            // An element of a collection: `field_words` widens a field.
-            Shape::Stored { .. } => {
-                let (words, form) = element_value(self.shapes, words, shape);
-                // SAFETY: the words are a live value of the shape.
-                unsafe { self.value(&words, form, depth) }
-            }
+            // Only a field or a collection's slot is stored, and `value_at`
+            // widens it.
+            Shape::Stored { .. } => self.out.push_str("<a stored value>"),
             Shape::Inline { name, fields, .. } => {
                 self.out.push_str(name.as_deref().unwrap_or(""));
                 self.out.push('(');
@@ -191,7 +188,6 @@ impl Printer<'_> {
             }
             Shape::List(element) => {
                 let list = word as *mut u8;
-                let n = self.shape(element).element_words() as usize;
                 // SAFETY: a live list of the element's shape.
                 let len = unsafe { list::length(list) };
                 self.out.push('[');
@@ -202,7 +198,8 @@ impl Printer<'_> {
                     // SAFETY: as above; the index is inside the list.
                     unsafe {
                         let at = list::get(self.types, list, i);
-                        self.value(std::slice::from_raw_parts(at, n), element, depth + 1);
+                        let (words, shape) = value_at(self.shapes, at.cast(), element);
+                        self.value(&words, shape, depth + 1);
                     }
                 }
                 self.out.push(']');
@@ -282,13 +279,8 @@ impl Printer<'_> {
     /// The entries of a map, or of a set without values, in the map's order.
     unsafe fn entries(&mut self, word: u64, key: u32, value: Option<u32>, depth: usize) {
         let map = word as *mut u8;
-        let kw = self.shape(key).element_words() as usize;
-        let vw = value.map_or(0, |v| self.shape(v).element_words() as usize);
         // SAFETY: as the caller promises.
-        let entries: Vec<&[u64]> = unsafe { map::iter(self.types, map) }
-            // SAFETY: each entry is its key's words, then its value's.
-            .map(|at| unsafe { std::slice::from_raw_parts(at, kw + vw) })
-            .collect();
+        let entries: Vec<(*const u8, *const u8)> = unsafe { map::iter(self.types, map) }.collect();
         if entries.is_empty() {
             self.out
                 .push_str(if value.is_some() { "[:]" } else { "[]" });
@@ -300,12 +292,14 @@ impl Printer<'_> {
             if !self.separate(i, len) {
                 break;
             }
-            // SAFETY: the entry's words are a key and a value of the shapes.
+            // SAFETY: the entry holds a key and a value of the shapes.
             unsafe {
-                self.value(&e[..kw], key, depth + 1);
+                let (words, shape) = value_at(self.shapes, e.0, key);
+                self.value(&words, shape, depth + 1);
                 if let Some(value) = value {
                     self.out.push_str(": ");
-                    self.value(&e[kw..], value, depth + 1);
+                    let (words, shape) = value_at(self.shapes, e.1, value);
+                    self.value(&words, shape, depth + 1);
                 }
             }
         }
@@ -355,9 +349,25 @@ pub(crate) unsafe fn field_words<'a>(
     f: &ShapeField,
 ) -> (Cow<'a, [u64]>, u32) {
     // SAFETY: as the caller promises.
+    unsafe { value_at(shapes, ptr.add(f.offset as usize), f.shape) }
+}
+
+/// The words of a value of the shape at `at`, in a box's field or a
+/// collection's slot, and the shape they have: a value stored flat
+/// (Compiler Architecture §A11.4) widened to its register form, of its
+/// shape's `form`, from bytes that need not be aligned.
+///
+/// # Safety
+///
+/// `at` points at a live value of the shape, which outlives the borrow.
+pub(crate) unsafe fn value_at<'a>(
+    shapes: &Shapes,
+    at: *const u8,
+    shape: u32,
+) -> (Cow<'a, [u64]>, u32) {
+    // SAFETY: as the caller promises.
     unsafe {
-        let at = ptr.add(f.offset as usize);
-        match &shapes.shapes[f.shape as usize] {
+        match &shapes.shapes[shape as usize] {
             Shape::Stored {
                 form,
                 size,
@@ -369,36 +379,17 @@ pub(crate) unsafe fn field_words<'a>(
                 widen(slots, bytes, &mut out);
                 (Cow::Owned(out), *form)
             }
-            shape => {
-                let n = shape.words() as usize;
-                let words = std::slice::from_raw_parts(at.cast::<u64>(), n);
-                (Cow::Borrowed(words), f.shape)
+            s if at.cast::<u64>().is_aligned() => {
+                let words = std::slice::from_raw_parts(at.cast::<u64>(), s.words() as usize);
+                (Cow::Borrowed(words), shape)
+            }
+            s => {
+                let words = (0..s.words() as usize)
+                    .map(|k| at.cast::<u64>().add(k).read_unaligned())
+                    .collect();
+                (Cow::Owned(words), shape)
             }
         }
-    }
-}
-
-/// The register form of a value of a collection stored flat, from its
-/// storage words, and its shape there (Compiler Architecture §A11.4); any
-/// other value's words as they are.
-pub(crate) fn element_value<'a>(
-    shapes: &Shapes,
-    words: &'a [u64],
-    shape: u32,
-) -> (Cow<'a, [u64]>, u32) {
-    match &shapes.shapes[shape as usize] {
-        Shape::Stored {
-            form,
-            size,
-            slots,
-            words: n,
-        } => {
-            let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-            let mut out = vec![0; *n as usize];
-            widen(slots, &bytes[..*size as usize], &mut out);
-            (Cow::Owned(out), *form)
-        }
-        _ => (Cow::Borrowed(words), shape),
     }
 }
 

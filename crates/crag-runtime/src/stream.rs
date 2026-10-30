@@ -168,7 +168,7 @@ impl Channel {
     fn hand(&self, waiter: Waiter, value: Value, wakes: &mut Wakes) {
         // SAFETY: the place stays where it is while its fiber waits.
         unsafe {
-            for (i, &word) in value.iter().enumerate().take(self.layout.words as usize) {
+            for (i, &word) in value.iter().enumerate().take(self.layout.words() as usize) {
                 waiter.out.add(i).write(word);
             }
         }
@@ -179,7 +179,7 @@ impl Channel {
     fn give(&self, out: *mut u64, value: Value) {
         // SAFETY: generated code passes a place for the words.
         unsafe {
-            for (i, &word) in value.iter().enumerate().take(self.layout.words as usize) {
+            for (i, &word) in value.iter().enumerate().take(self.layout.words() as usize) {
                 out.add(i).write(word);
             }
         }

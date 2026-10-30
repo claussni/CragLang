@@ -986,6 +986,13 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa, metered: bool) -> (Functio
                     let v = b.ins().load(I64, MemFlagsData::trusted(), p, *offset);
                     b.def_var(vars[dst.0 as usize], v);
                 }
+                Inst::LoadUnaligned { dst, addr, offset } => {
+                    let p = b.use_var(vars[addr.0 as usize]);
+                    let v = b
+                        .ins()
+                        .load(I64, MemFlagsData::new().with_notrap(), p, *offset);
+                    b.def_var(vars[dst.0 as usize], v);
+                }
                 Inst::Store { src, addr, offset } => {
                     let p = b.use_var(vars[addr.0 as usize]);
                     let v = b.use_var(vars[src.0 as usize]);

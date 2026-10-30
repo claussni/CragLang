@@ -284,10 +284,13 @@ pub fn stored_form<'db>(
                     return None;
                 };
                 ty = *element;
-                if element_storage(db, program, ty).is_none() {
-                    continue;
+                match (
+                    element_storage(db, program, ty),
+                    crate::split::form(db, program, ty),
+                ) {
+                    (Some(_), Some(f)) => f,
+                    _ => continue,
                 }
-                crate::split::form(db, program, ty)?
             }
             (None, Step::Slice { .. }) => continue,
             (Some(f), Step::Field(name)) => {

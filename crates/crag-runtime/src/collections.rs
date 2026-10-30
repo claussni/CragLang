@@ -110,17 +110,15 @@ unsafe extern "C" fn list_entry(
             TypeDescriptor::Map { key, value, .. } => (key, value),
             _ => die("keys of a box that is not a map"),
         };
-        let (skip, layout) = match values {
-            1 => (key.words as usize, value),
-            _ => (0, key),
-        };
-        let entries: Vec<*mut u64> = map::iter(types, map).map(|at| at.cast_mut()).collect();
-        for at in entries {
-            let words = at.add(skip);
-            retain_value(words.cast(), layout);
-            let n = layout.words as usize;
+        let entries: Vec<(*const u8, *const u8)> = map::iter(types, map).collect();
+        for (k, v) in entries {
+            let (at, layout) = match values {
+                1 => (v, value),
+                _ => (k, key),
+            };
+            retain_value(at.cast_mut(), layout);
             let mut element = [0u64; 4];
-            element[..n].copy_from_slice(std::slice::from_raw_parts(words, n));
+            at.copy_to_nonoverlapping(element.as_mut_ptr().cast(), layout.size as usize);
             list = list::push(heap, types, list, &element);
         }
         list

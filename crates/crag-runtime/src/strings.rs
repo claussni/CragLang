@@ -402,11 +402,12 @@ unsafe extern "C" fn write_entry(
 
 /// See `measure_entry`.
 unsafe extern "C" fn of_list_entry(ctx: *const TaskContext, list: *mut u8) -> TextWords {
-    // SAFETY: as the caller promises: a live list of `UInt8` words.
+    // SAFETY: as the caller promises: a live list of `UInt8`, whose
+    // elements are a byte, or a word without flat layouts, the byte first.
     let bytes: Vec<u8> = unsafe {
         let (_, types) = worker_of(ctx);
         (0..crate::list::length(list))
-            .map(|i| *crate::list::get(types, list, i) as u8)
+            .map(|i| crate::list::get(types, list, i).cast::<u8>().read())
             .collect()
     };
     text(ctx, &bytes)

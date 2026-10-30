@@ -1665,16 +1665,36 @@ impl FieldGuard {
     }
 }
 
-/// The words of a value inside a collection: at most four, with the fields
-/// that hold references at their offsets from the value's first word. A
-/// flat record or union is there in its storage form (Compiler
-/// Architecture §A11.4), and one of more than two words passes to the
-/// runtime by the address of its words, in the first word of the two it
-/// takes otherwise.
+/// How a value lies inside a collection or a cell: its bytes, at most 32,
+/// aligned to `align`, with the fields that hold references at their
+/// offsets from its first byte. A collection holds a flat record or union,
+/// a sized integer or a union of tags in its storage form (Compiler
+/// Architecture §A11.3, §A11.4), so its bytes may be fewer than a word;
+/// anything else, and every value in a cell, takes the words of its
+/// layout. Generated code passes a value to the runtime in the words its
+/// bytes fill, or, when they are more than two, by the address of those
+/// words, in the first word of the two it takes otherwise.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ElementLayout {
-    pub words: u32,
+    pub size: u32,
+    pub align: u32,
     pub counted: Vec<CountedField>,
+}
+
+impl ElementLayout {
+    /// A value of `words` words, as one not stored flat takes.
+    pub fn of_words(words: u32, counted: Vec<CountedField>) -> ElementLayout {
+        ElementLayout {
+            size: 8 * words,
+            align: if words == 0 { 1 } else { 8 },
+            counted,
+        }
+    }
+
+    /// The words a value's bytes fill, as generated code passes it.
+    pub fn words(&self) -> u32 {
+        self.size.div_ceil(8)
+    }
 }
 
 // A list or a map is a box that generated code allocates inline when it is

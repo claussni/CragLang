@@ -26,7 +26,7 @@ use crag_types::{Builtin, Ty, TyKind, declared_fields, record_subtypes};
 
 use crate::boxes::{box_form, rebase, select, span, stored_slots};
 use crate::layout::{Layout, layout, type_index};
-use crate::split::{Form, Slot, SlotKind, element_storage, form};
+use crate::split::{Form, Slot, SlotKind, element_form, element_storage, form};
 
 /// The shapes a value of `ty` is printed by, and the index of its own.
 pub fn shapes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> (Shapes, u32) {
@@ -274,7 +274,10 @@ impl<'db> Builder<'db> {
     /// §A11.4.2–§A11.4.5), or in its layout's words.
     fn element(&mut self, ty: Ty<'db>) -> u32 {
         let (db, program) = (self.db, self.program);
-        match (element_storage(db, program, ty), form(db, program, ty)) {
+        match (
+            element_storage(db, program, ty),
+            element_form(db, program, ty),
+        ) {
             (Some((size, slots)), Some(f)) => self.stored(ty, &f, size, &slots),
             _ => self.shape(ty),
         }

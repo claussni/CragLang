@@ -34,7 +34,7 @@ use crag_abi::{
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 29;
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -664,7 +664,8 @@ impl Writer {
     }
 
     fn element(&mut self, e: &ElementLayout) {
-        self.u32(e.words);
+        self.u32(e.size);
+        self.u32(e.align);
         self.counted(&e.counted);
     }
 
@@ -898,7 +899,8 @@ impl Reader<'_> {
 
     fn element(&mut self) -> io::Result<ElementLayout> {
         Ok(ElementLayout {
-            words: self.u32()?,
+            size: self.u32()?,
+            align: self.u32()?,
             counted: self.counted()?,
         })
     }
@@ -993,7 +995,8 @@ mod tests {
                         5,
                         TypeDescriptor::List {
                             element: ElementLayout {
-                                words: 3,
+                                size: 24,
+                                align: 8,
                                 counted: vec![CountedField::Guarded {
                                     offset: 8,
                                     guards: vec![FieldGuard::Tag {
@@ -1002,10 +1005,7 @@ mod tests {
                                     }],
                                 }],
                             },
-                            cell: ElementLayout {
-                                words: 2,
-                                counted: vec![CountedField::Box(8)],
-                            },
+                            cell: ElementLayout::of_words(2, vec![CountedField::Box(8)]),
                         },
                     ),
                     (
@@ -1013,7 +1013,8 @@ mod tests {
                         TypeDescriptor::Map {
                             key: ElementLayout::default(),
                             value: ElementLayout {
-                                words: 1,
+                                size: 2,
+                                align: 1,
                                 counted: Vec::new(),
                             },
                             text_keys: false,
@@ -1022,10 +1023,7 @@ mod tests {
                     (
                         7,
                         TypeDescriptor::Map {
-                            key: ElementLayout {
-                                words: 2,
-                                counted: vec![CountedField::Box(0)],
-                            },
+                            key: ElementLayout::of_words(2, vec![CountedField::Box(0)]),
                             value: ElementLayout::default(),
                             text_keys: true,
                         },

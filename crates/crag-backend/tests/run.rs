@@ -1253,6 +1253,67 @@ fn maybes() -> List[Option[Point]] { maybe(1) }
 }
 
 #[test]
+fn collections_pack_values_smaller_than_a_word() {
+    // 300 tiles of two bytes: a leaf takes 256 of them, so the list is its
+    // box, two leaves and the node above them. Boxed, a word each, a leaf
+    // takes 64, and the two tiles are boxes of their own.
+    let tiles = vec!["t"; 299].join(", ");
+    let text = format!(
+        r#"type Grass
+type Rock
+type Terrain = Grass | Rock
+type Tile(kind: Terrain, cost: UInt8, seen: Bool)
+
+fn tiles() -> List[Tile] {{
+  let t = Tile(kind: Grass, cost: 1, seen: False)
+  let r = Tile(kind: Rock, cost: 9, seen: True)
+  [{tiles}, r]
+}}
+fn tileAt(i: Int) -> Int {{
+  let x = tiles()[i]
+  let k = case x.kind {{
+    Grass -> 1
+    Rock -> 2
+  }}
+  if x.seen {{ k * 10 }} else {{ k }}
+}}
+fn signs() -> List[Int8] {{ [-1, 5, -128] }}
+fn sign(i: Int) -> Int8 {{ signs()[i] }}
+fn flags() -> List[Bool] {{ [True, False, True] }}
+fn small() -> Map[Int8, Bool] {{ [-1: True, 3: False] }}
+fn smallAt(k: Int8) -> Int {{
+  case small()[k] {{
+    Empty -> 0
+    True -> 1
+    False -> 2
+  }}
+}}
+"#
+    );
+    let mut m = Module::new(&text);
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    assert_eq!(m.int("tileAt", &[0]), 1);
+    assert_eq!(m.int("tileAt", &[299]), 20);
+    assert_eq!(m.int("sign", &[0]), -1);
+    assert_eq!(m.int("sign", &[2]), -128);
+    assert_eq!(m.int("smallAt", &[-1]), 1);
+    assert_eq!(m.int("smallAt", &[3]), 2);
+    assert_eq!(m.int("smallAt", &[4]), 0);
+    assert_eq!(m.heap.live_blocks(), 0);
+    let words = m.call("tiles", &[]);
+    let boxes = if flat_layouts() { 4 } else { 2 + 1 + 5 + 1 };
+    assert_eq!(m.heap.live_blocks(), boxes);
+    let (shapes, root) = m.result_shapes("tiles");
+    // SAFETY: the words are the function's result, of the shape.
+    unsafe { release_value(&mut m.heap, &m.types, &words, &shapes, root) };
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.shown("signs"), "[-1, 5, -128]");
+    assert_eq!(m.shown("flags"), "[True, False, True]");
+    assert_eq!(m.shown("small"), "[-1: True, 3: False]");
+    assert_eq!(m.heap.live_blocks(), 0);
+}
+
+#[test]
 fn flat_records_are_returned_by_value() {
     let mut m = Module::new(
         r#"type Point(x: Int, y: Int)
@@ -2299,11 +2360,14 @@ fn spots() -> Map[Int, Option[Flat]] { [1: Flat(a: 5, b: True, c: 6), 2: Empty] 
 fn labels() -> List[(text: Str, n: Int)] {
   [(text: "a string made at run time: {2}", n: 1), (text: "short", n: 2)]
 }
+fn narrow() -> List[Int8] { [-1, 7] }
+fn keyed() -> Map[Int8, Flat] { [-3: Flat(a: 1, b: False, c: 2), 4: Flat(a: 3, b: True, c: 4)] }
 "#,
     );
     let names = [
         "deep", "chain", "points", "ages", "set", "maybe", "none", "tags", "mixed", "empty",
         "nothing", "both", "words", "texts", "boxed", "alone", "flats", "spots", "labels",
+        "narrow", "keyed",
     ];
     let limits = PrintLimits::default();
     for name in names {

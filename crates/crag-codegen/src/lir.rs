@@ -243,6 +243,13 @@ pub enum Inst {
         addr: VReg,
         offset: i32,
     },
+    /// Reads the word at `addr + offset`, which need not be aligned: in a
+    /// value a collection stores in fewer bytes than its words.
+    LoadUnaligned {
+        dst: VReg,
+        addr: VReg,
+        offset: i32,
+    },
     /// Writes `src` to the word at `addr + offset`.
     Store {
         src: VReg,
@@ -471,7 +478,7 @@ impl LirFunction {
                         args.iter().chain(dsts).try_for_each(reg)?;
                         handlers.iter().try_for_each(|(_, h)| block(h))?;
                     }
-                    Inst::Load { dst, addr, .. } => {
+                    Inst::Load { dst, addr, .. } | Inst::LoadUnaligned { dst, addr, .. } => {
                         reg(dst)?;
                         reg(addr)?;
                     }

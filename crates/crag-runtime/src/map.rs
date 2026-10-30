@@ -19,8 +19,12 @@
 //!
 //! A map is a box holding its length, the root of its hash index and its
 //! entries. The entries are slots in the order their keys came in, each a
-//! key's words and then its value's, in a tree of leaves of 32 slots under
-//! inner nodes of 32 children. Changing the value of a key writes its slot,
+//! key's bytes and then its value's, in a tree of leaves of 32 slots under
+//! inner nodes of 32 children. A key or a value is there as a collection
+//! stores it (`crag_abi::ElementLayout`): a sized integer narrowed, a flat
+//! record in its storage form, each at its alignment, so an entry of a
+//! `UInt32` key and a `Stock` of 12 bytes takes 16 (Compiler Architecture
+//! §A11.4.2). Changing the value of a key writes its slot,
 //! a new key is pushed at the end, and removing a key clears its slot to a
 //! hole, so no other slot moves. A leaf marks its live slots in a bitmap.
 //! When holes outnumber the entries, the map is compacted.
@@ -34,8 +38,10 @@
 //! their bits, and a child always holds at least two pairs. Below the depth
 //! where the hash runs out, collision nodes hold pairs with equal hashes.
 //!
-//! Keys are equal when their words are, or, for strings and bytes, their
-//! bytes (see `crag_abi::TypeDescriptor`).
+//! Keys are equal when their words are, the bytes a key takes padded with
+//! zeros, or, for strings and bytes, their bytes (see
+//! `crag_abi::TypeDescriptor`). Generated code passes a key in those
+//! words.
 //! Like a list, a map taken by value is updated in place where only its
 //! reference reaches, and a set is a map whose values have no words.
 
@@ -172,15 +178,46 @@ struct Contents {
     nodes: Vec<*mut u8>,
 }
 
+/// Where a slot of a map with these layouts holds its key and its value:
+/// the bytes of the key, the offset of the value, and the bytes of a slot,
+/// each part at its alignment.
+fn slot_layout(key: &ElementLayout, value: &ElementLayout) -> (usize, usize, usize) {
+    let ks = key.size as usize;
+    let vo = ks.next_multiple_of(value.align.max(1) as usize);
+    let align = key.align.max(value.align).max(1) as usize;
+    (ks, vo, (vo + value.size as usize).next_multiple_of(align))
+}
+
+/// The words a key's bytes fill, padded with zeros: the words it is hashed
+/// and compared by.
+///
+/// # Safety
+///
+/// `key` points at `ks` bytes, at most 16.
+unsafe fn key_words(key: *const u8, ks: usize) -> [u64; 2] {
+    let mut out = [0u64; 2];
+    // SAFETY: as the caller promises.
+    unsafe { key.copy_to_nonoverlapping(out.as_mut_ptr().cast(), ks) };
+    out
+}
+
+/// The bytes of a leaf with room for `n` slots of `es` bytes. Code reads
+/// a stored value by the words that cover it, so the leaf has room for a
+/// word read from its last value on.
+fn leaf_bytes(es: usize, n: usize) -> usize {
+    (BODY + es * n + 8).next_multiple_of(8)
+}
+
 /// A map's type and its layouts, with the heap to allocate from.
 struct Maps<'a> {
     heap: &'a mut Heap,
     types: &'a Types,
     key: &'a ElementLayout,
     value: &'a ElementLayout,
-    /// Words of a key, and of a slot.
-    kw: usize,
-    ew: usize,
+    /// Bytes of a key, the offset of a value, and bytes of a slot.
+    ks: usize,
+    vo: usize,
+    es: usize,
     index: u64,
     /// Keys are strings or bytes.
     text: bool,
@@ -193,13 +230,15 @@ impl<'a> Maps<'a> {
     unsafe fn new(heap: &'a mut Heap, types: &'a Types, map: *mut u8) -> Maps<'a> {
         // SAFETY: as the caller promises.
         let (key, value, index, text) = unsafe { layouts(types, map) };
+        let (ks, vo, es) = slot_layout(key, value);
         Maps {
             heap,
             types,
             key,
             value,
-            kw: key.words as usize,
-            ew: (key.words + value.words) as usize,
+            ks,
+            vo,
+            es,
             index,
             text,
         }
@@ -208,20 +247,26 @@ impl<'a> Maps<'a> {
     // The safety contract of every method below: the nodes passed are live
     // nodes of this map's type, the keys and values of its layouts.
 
-    unsafe fn retain_entry(&self, entry: *mut u64) {
+    unsafe fn retain_entry(&self, entry: *mut u8) {
         // SAFETY: see above.
         unsafe {
-            retain_value(entry.cast(), self.key);
-            retain_value(entry.add(self.kw).cast(), self.value);
+            retain_value(entry, self.key);
+            retain_value(entry.add(self.vo), self.value);
         }
     }
 
-    unsafe fn release_entry(&mut self, entry: *mut u64) {
+    unsafe fn release_entry(&mut self, entry: *mut u8) {
         // SAFETY: see above.
         unsafe {
-            release_value(self.heap, self.types, entry.cast(), self.key);
-            release_value(self.heap, self.types, entry.add(self.kw).cast(), self.value);
+            release_value(self.heap, self.types, entry, self.key);
+            release_value(self.heap, self.types, entry.add(self.vo), self.value);
         }
+    }
+
+    /// The slot `i` of a leaf.
+    unsafe fn slot(&self, leaf: *mut u8, i: usize) -> *mut u8 {
+        // SAFETY: see above.
+        unsafe { leaf.add(BODY + self.es * i) }
     }
 
     // The index.
@@ -418,17 +463,21 @@ impl<'a> Maps<'a> {
         unsafe {
             let kind = kind(node);
             let (count, unit) = match kind {
-                LEAF => (leaf_used(node), self.ew),
-                _ => (at(node, MAPS).read() as usize, 1),
+                LEAF => (leaf_used(node), self.es),
+                _ => (at(node, MAPS).read() as usize, 8),
             };
             let unique = is_unique(node);
             if unique && room(count) >= n {
                 return node;
             }
-            let size = BODY + 8 * unit * room(n.max(count));
+            let size = match kind {
+                LEAF => leaf_bytes(self.es, room(n.max(count))),
+                _ => BODY + 8 * room(n.max(count)),
+            };
             let copy = alloc_box(self.heap, size, self.index | u64::from(kind) << 32);
             at(copy, MAPS).write(at(node, MAPS).read());
-            at(copy, BODY).copy_from_nonoverlapping(at(node, BODY), unit * count);
+            let body = node.add(BODY);
+            body.copy_to_nonoverlapping(copy.add(BODY), unit * count);
             if unique {
                 self.heap.free(node);
                 return copy;
@@ -437,7 +486,7 @@ impl<'a> Maps<'a> {
                 LEAF => {
                     let live = leaf_live(node);
                     for i in (0..count).filter(|i| live & 1 << i != 0) {
-                        self.retain_entry(at(node, BODY + 8 * self.ew * i));
+                        self.retain_entry(self.slot(node, i));
                     }
                 }
                 _ => (0..count).for_each(|j| retain(tree_child(node, j).read())),
@@ -449,17 +498,19 @@ impl<'a> Maps<'a> {
 
     /// A tree of height `h` holding the entry alone, in its first slot,
     /// whose references it takes.
-    fn fresh(&mut self, h: usize, entry: &[u64]) -> *mut u8 {
+    fn fresh(&mut self, h: usize, entry: &[u8]) -> *mut u8 {
         let leaf = alloc_box(
             self.heap,
-            BODY + 8 * self.ew,
+            leaf_bytes(self.es, 1),
             self.index | u64::from(LEAF) << 32,
         );
         // SAFETY: the leaf has room for the slot, and each inner node for
         // its child.
         unsafe {
             at(leaf, MAPS).write(1 | 1 << 32);
-            at(leaf, BODY).copy_from_nonoverlapping(entry.as_ptr(), self.ew);
+            entry
+                .as_ptr()
+                .copy_to_nonoverlapping(leaf.add(BODY), self.es);
             let mut node = leaf;
             for _ in 0..h {
                 let inner = alloc_box(self.heap, BODY + 8, self.index | u64::from(INNER) << 32);
@@ -473,13 +524,15 @@ impl<'a> Maps<'a> {
 
     /// Pushes the entry at `pos`, the end of a subtree of height `h` whose
     /// reference the caller gives; the new subtree, which has room for it.
-    unsafe fn push_node(&mut self, node: *mut u8, h: usize, pos: usize, entry: &[u64]) -> *mut u8 {
+    unsafe fn push_node(&mut self, node: *mut u8, h: usize, pos: usize, entry: &[u8]) -> *mut u8 {
         // SAFETY: see above.
         unsafe {
             if h == 0 {
                 let i = leaf_used(node);
                 let leaf = self.own(node, i + 1);
-                at(leaf, BODY + 8 * self.ew * i).copy_from_nonoverlapping(entry.as_ptr(), self.ew);
+                entry
+                    .as_ptr()
+                    .copy_to_nonoverlapping(self.slot(leaf, i), self.es);
                 let live = leaf_live(leaf) | 1 << i;
                 at(leaf, MAPS).write(u64::from(live) | ((i + 1) as u64) << 32);
                 return leaf;
@@ -521,7 +574,7 @@ impl<'a> Maps<'a> {
     /// Binds a key the map lacks: its entry goes at the end, and its pair
     /// into the index. The map is the caller's alone, and takes the
     /// entry's references.
-    unsafe fn append(&mut self, map: *mut u8, h: u64, entry: &[u64]) {
+    unsafe fn append(&mut self, map: *mut u8, h: u64, entry: &[u8]) {
         // SAFETY: see above.
         unsafe {
             let slots = map_slots(map);
@@ -562,11 +615,12 @@ impl<'a> Maps<'a> {
         // SAFETY: see above.
         unsafe {
             let fresh = empty(self.heap, self.index as u32);
-            for entry in iter(self.types, map) {
+            for (entry, _) in iter(self.types, map) {
                 let entry = entry.cast_mut();
                 self.retain_entry(entry);
-                let entry = std::slice::from_raw_parts(entry, self.ew);
-                self.append(fresh, hash_key(&entry[..self.kw], self.text), entry);
+                let key = key_words(entry, self.ks);
+                let h = hash_key(&key[..self.ks.div_ceil(8)], self.text);
+                self.append(fresh, h, std::slice::from_raw_parts(entry, self.es));
             }
             drop_box(self.heap, self.types, map);
             fresh
@@ -739,14 +793,14 @@ unsafe fn locate(types: &Types, map: *mut u8, key: &[u64]) -> (u64, Option<usize
     // SAFETY: as the caller promises.
     unsafe {
         let (k, value, _, text) = layouts(types, map);
-        let (kw, ew) = (k.words as usize, (k.words + value.words) as usize);
-        let key = &key[..kw];
+        let (ks, _, es) = slot_layout(k, value);
+        let key = &key[..ks.div_ceil(8)];
         let h = hash_key(key, text);
         let (tree, height) = (tree(map), height(map));
         let same = |pos: u64| {
             let pos = pos as usize;
-            let slot = at(leaf_of(tree, height, pos), BODY + 8 * ew * (pos & 31));
-            equal_keys(std::slice::from_raw_parts(slot, kw), key, text)
+            let slot = leaf_of(tree, height, pos).add(BODY + es * (pos & 31));
+            equal_keys(&key_words(slot, ks)[..key.len()], key, text)
         };
         let mut node = root(map);
         let mut shift = 0;
@@ -801,8 +855,8 @@ pub unsafe fn length(map: *mut u8) -> usize {
     unsafe { at(map, LEN_OFFSET as usize).read() as usize }
 }
 
-/// The address of the words of the key's value, or null when the map has
-/// none; valid while the map is. The key's words are its first.
+/// The address of the bytes of the key's value, or null when the map has
+/// none; valid while the map is. The key is in the words its bytes fill.
 ///
 /// # Safety
 ///
@@ -815,13 +869,27 @@ pub unsafe fn get(types: &Types, map: *mut u8, key: &[u64]) -> *mut u64 {
             return std::ptr::null_mut();
         };
         let (k, value, ..) = layouts(types, map);
-        let ew = (k.words + value.words) as usize;
+        let (_, vo, es) = slot_layout(k, value);
         let leaf = leaf_of(tree(map), height(map), pos);
-        at(leaf, BODY + 8 * (ew * (pos & 31) + k.words as usize))
+        leaf.add(BODY + es * (pos & 31) + vo).cast()
     }
 }
 
-/// The map with the key bound to the value, each given by its first words.
+/// As [`get`], for the key at `key` in a slot of a map of the same type.
+///
+/// # Safety
+///
+/// As for [`get`], and `key` points at a live key of the map's type.
+pub unsafe fn get_stored(types: &Types, map: *mut u8, key: *const u8) -> *mut u64 {
+    // SAFETY: as the caller promises.
+    unsafe {
+        let key = key_words(key, layouts(types, map).0.size as usize);
+        get(types, map, &key)
+    }
+}
+
+/// The map with the key bound to the value, each given by the first bytes
+/// of its words.
 /// It takes the references of the map, the key and the value. A key the map
 /// has keeps its words and its place, and the one given is released; a new
 /// key goes last.
@@ -841,17 +909,24 @@ pub unsafe fn insert(
     unsafe {
         let (h, found) = locate(types, map, key);
         let mut m = Maps::new(heap, types, map);
-        let entry = [&key[..m.kw], &value[..m.ew - m.kw]].concat();
+        let mut entry = vec![0u8; m.es];
+        let vs = m.value.size as usize;
+        key.as_ptr()
+            .cast::<u8>()
+            .copy_to_nonoverlapping(entry.as_mut_ptr(), m.ks);
+        value
+            .as_ptr()
+            .cast::<u8>()
+            .copy_to_nonoverlapping(entry[m.vo..].as_mut_ptr(), vs);
         let map = unique_map(&mut m, map);
         match found {
             Some(pos) => {
                 let (tree, leaf, i) = m.path(tree(map), height(map), pos);
                 at(map, TREE).cast::<*mut u8>().write(tree);
-                let at = at(leaf, BODY + 8 * (m.ew * i + m.kw));
-                release_value(m.heap, m.types, at.cast(), m.value);
-                at.copy_from_nonoverlapping(entry[m.kw..].as_ptr(), m.ew - m.kw);
-                let mut key = entry[..m.kw].to_vec();
-                release_value(m.heap, m.types, key.as_mut_ptr().cast(), m.key);
+                let at = m.slot(leaf, i).add(m.vo);
+                release_value(m.heap, m.types, at, m.value);
+                entry[m.vo..].as_ptr().copy_to_nonoverlapping(at, vs);
+                release_value(m.heap, m.types, entry.as_mut_ptr(), m.key);
             }
             None => m.append(map, h, &entry),
         }
@@ -876,7 +951,7 @@ pub unsafe fn remove(heap: &mut Heap, types: &Types, map: *mut u8, key: &[u64]) 
         at(map, ROOT).cast::<*mut u8>().write(root);
         let (tree, leaf, i) = m.path(tree(map), height(map), pos);
         at(map, TREE).cast::<*mut u8>().write(tree);
-        m.release_entry(at(leaf, BODY + 8 * m.ew * i));
+        m.release_entry(m.slot(leaf, i));
         at(leaf, MAPS).write(at(leaf, MAPS).read() & !(1 << i));
         let len = length(map) - 1;
         at(map, LEN_OFFSET as usize).write(len as u64);
@@ -913,10 +988,11 @@ unsafe fn unique_map(m: &mut Maps, map: *mut u8) -> *mut u8 {
     }
 }
 
-/// The entries of a map, each the address of its key's words, which its
-/// value's follow. Valid while the map is.
+/// The entries of a map, each the addresses of its key's bytes and its
+/// value's. Valid while the map is.
 pub struct MapIter {
-    ew: usize,
+    vo: usize,
+    es: usize,
     tree: *mut u8,
     height: usize,
     slots: usize,
@@ -935,8 +1011,10 @@ pub unsafe fn iter(types: &Types, map: *mut u8) -> MapIter {
     // SAFETY: as the caller promises.
     unsafe {
         let (key, value, ..) = layouts(types, map);
+        let (_, vo, es) = slot_layout(key, value);
         MapIter {
-            ew: (key.words + value.words) as usize,
+            vo,
+            es,
             tree: tree(map),
             height: height(map),
             slots: map_slots(map),
@@ -947,9 +1025,9 @@ pub unsafe fn iter(types: &Types, map: *mut u8) -> MapIter {
 }
 
 impl Iterator for MapIter {
-    type Item = *const u64;
+    type Item = (*const u8, *const u8);
 
-    fn next(&mut self) -> Option<*const u64> {
+    fn next(&mut self) -> Option<(*const u8, *const u8)> {
         // SAFETY: the map, and so its tree of entries, is live.
         unsafe {
             while self.pos < self.slots {
@@ -959,7 +1037,8 @@ impl Iterator for MapIter {
                     self.leaf = leaf_of(self.tree, self.height, pos);
                 }
                 if leaf_live(self.leaf) & 1 << i != 0 {
-                    return Some(at(self.leaf, BODY + 8 * self.ew * i));
+                    let entry = self.leaf.add(BODY + self.es * i);
+                    return Some((entry, entry.add(self.vo)));
                 }
             }
             None
@@ -981,7 +1060,7 @@ pub(crate) unsafe fn boxes_of(
     value: &ElementLayout,
     f: &mut impl FnMut(*mut u8),
 ) {
-    let (kw, ew) = (key.words as usize, (key.words + value.words) as usize);
+    let (_, vo, es) = slot_layout(key, value);
     // SAFETY: as the caller promises.
     unsafe {
         match kind {
@@ -993,9 +1072,9 @@ pub(crate) unsafe fn boxes_of(
             LEAF => {
                 let live = leaf_live(ptr);
                 for i in (0..leaf_used(ptr)).filter(|i| live & 1 << i != 0) {
-                    let entry = ptr.add(BODY + 8 * ew * i);
+                    let entry = ptr.add(BODY + es * i);
                     boxes_in(entry, &key.counted, &mut *f);
-                    boxes_in(entry.add(8 * kw), &value.counted, &mut *f);
+                    boxes_in(entry.add(vo), &value.counted, &mut *f);
                 }
             }
             INNER => {
@@ -1087,9 +1166,11 @@ mod tests {
     const INTS: u32 = 30;
     const BOXES: u32 = 31;
     const SET: u32 = 32;
+    /// Keys of four bytes and values of twelve, a slot of sixteen.
+    const PACKED: u32 = 34;
 
     fn types() -> Types {
-        let word = |counted| ElementLayout { words: 1, counted };
+        let word = |counted| ElementLayout::of_words(1, counted);
         Types::new([
             (
                 REC,
@@ -1122,6 +1203,22 @@ mod tests {
                     text_keys: false,
                 },
             ),
+            (
+                PACKED,
+                TypeDescriptor::Map {
+                    key: ElementLayout {
+                        size: 4,
+                        align: 4,
+                        counted: vec![],
+                    },
+                    value: ElementLayout {
+                        size: 12,
+                        align: 4,
+                        counted: vec![],
+                    },
+                    text_keys: false,
+                },
+            ),
         ])
     }
 
@@ -1130,6 +1227,7 @@ mod tests {
         match index {
             INTS => vec![v],
             BOXES => vec![boxed(heap, v) as u64],
+            PACKED => vec![v, v ^ 0x5555],
             _ => vec![],
         }
     }
@@ -1141,6 +1239,12 @@ mod tests {
             match index {
                 INTS => ptr.read(),
                 BOXES => unboxed(ptr.read() as *mut u8),
+                PACKED => {
+                    let v = ptr.read_unaligned();
+                    let rest = ptr.add(1).cast::<u32>().read_unaligned();
+                    assert_eq!(rest, (v ^ 0x5555) as u32);
+                    v
+                }
                 _ => 0,
             }
         }
@@ -1162,8 +1266,8 @@ mod tests {
         unsafe {
             let leaf = leaf_of(tree(map), height(map), pos);
             assert!(leaf_live(leaf) & 1 << (pos & 31) != 0, "a pair of a hole");
-            let slot = at(leaf, BODY + 8 * m.ew * (pos & 31));
-            std::slice::from_raw_parts(slot, m.kw).to_vec()
+            let words = key_words(m.slot(leaf, pos & 31), m.ks);
+            words[..m.ks.div_ceil(8)].to_vec()
         }
     }
 
@@ -1224,7 +1328,9 @@ mod tests {
                 assert!(!at.is_null(), "key {k}");
                 assert_eq!(read(index, at), *v);
             }
-            let seen: Vec<u64> = iter(types, map).map(|e| e.read()).collect();
+            let seen: Vec<u64> = iter(types, map)
+                .map(|(k, _)| key_words(k, m.ks)[0])
+                .collect();
             let keys: Vec<u64> = model.iter().map(|(k, _)| *k).collect();
             assert_eq!(seen, keys);
         }
@@ -1293,6 +1399,16 @@ mod tests {
     }
 
     #[test]
+    fn maps_of_packed_entries_behave_like_ordered_maps() {
+        let types = types();
+        let TypeDescriptor::Map { key, value, .. } = types.get(PACKED).unwrap() else {
+            unreachable!("a map");
+        };
+        assert_eq!(slot_layout(key, value), (4, 4, 16));
+        random_operations(PACKED, 8, 3000, 700);
+    }
+
+    #[test]
     fn maps_of_boxes_count_their_values() {
         random_operations(BOXES, 2, 3000, 500);
     }
@@ -1317,14 +1433,8 @@ mod tests {
         let types = Types::new([(
             TEXTS,
             TypeDescriptor::Map {
-                key: ElementLayout {
-                    words: 2,
-                    counted: vec![CountedField::Box(0)],
-                },
-                value: ElementLayout {
-                    words: 1,
-                    counted: vec![],
-                },
+                key: ElementLayout::of_words(2, vec![CountedField::Box(0)]),
+                value: ElementLayout::of_words(1, vec![]),
                 text_keys: true,
             },
         )]);
@@ -1365,7 +1475,9 @@ mod tests {
                 }
             }
             assert_eq!(length(map), 200);
-            let values: Vec<u64> = iter(&types, map).map(|e| e.add(2).read()).collect();
+            let values: Vec<u64> = iter(&types, map)
+                .map(|(_, v)| v.cast::<u64>().read())
+                .collect();
             let kept: Vec<u64> = (0..300).filter(|n| n % 3 != 0).map(|n| n + 1).collect();
             assert_eq!(values, kept);
             drop_box(&mut heap, &types, map);
@@ -1386,7 +1498,7 @@ mod tests {
         let types = types();
         let walk = |m| {
             unsafe { iter(&types, m) }
-                .map(|e| unsafe { e.read() })
+                .map(|(k, _)| unsafe { k.cast::<u64>().read() })
                 .collect::<Vec<_>>()
         };
         // SAFETY: the maps are live and owned here.

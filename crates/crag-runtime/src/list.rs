@@ -18,8 +18,11 @@
 //! "RRB-Trees: Efficient Immutable Vectors").
 //!
 //! A list is a box holding its length, the height of its tree and the tree.
-//! Leaves hold up to 32 elements and inner nodes up to 32 children, so an
-//! index is found in a few steps. A balanced inner node has only complete
+//! Leaves hold their elements back to back in the bytes each takes, a flat
+//! record in its storage form (Compiler Architecture §A11.4.3), and are
+//! sized in bytes: as many elements as fill 512 bytes, a power of two of
+//! them, so small elements give wide leaves. Inner nodes hold up to 32
+//! children, so an index is found in a few steps. A balanced inner node has only complete
 //! children but the last, and is indexed by the bits of the index; a
 //! relaxed one, made by slicing or joining lists, keeps the cumulative sizes
 //! of its children and is searched. Joining rebalances the nodes along the
@@ -29,7 +32,7 @@
 //! half of the index word. A function that takes a list by value updates in
 //! place every node only its reference reaches, and copies the others: a
 //! uniquely held list is updated in place, and a shared one shares all but
-//! the changed path with its new version. Elements of no words, as in a
+//! the changed path with its new version. Elements of no bytes, as in a
 //! `List[Unit]`, need no tree: the length is the whole list.
 
 use crag_abi::{ElementLayout, LEN_OFFSET, LIST_SIZE, TypeDescriptor};
@@ -42,6 +45,9 @@ use crate::system::worker_of;
 
 const BITS: usize = 5;
 const WIDTH: usize = 1 << BITS;
+
+/// The bytes a leaf's elements fill at most.
+const LEAF_BYTES: usize = 512;
 
 /// Offsets in the list's box.
 const HEIGHT: usize = 24;
@@ -71,9 +77,24 @@ unsafe fn at(ptr: *mut u8, offset: usize) -> *mut u64 {
     unsafe { ptr.add(offset).cast() }
 }
 
-/// The elements a complete subtree of height `h` holds.
-fn complete(h: usize) -> usize {
-    1 << (BITS * (h + 1))
+/// The elements a leaf of a list of these elements holds at most: as many
+/// as fill `LEAF_BYTES`, a power of two of them.
+pub fn leaf_width(element: &ElementLayout) -> usize {
+    let n = (LEAF_BYTES / (element.size as usize).max(1)).max(1);
+    1 << n.ilog2()
+}
+
+/// The elements a complete subtree of height `h` holds, of leaves `leaf`
+/// wide.
+fn complete(leaf: usize, h: usize) -> usize {
+    leaf << (BITS * h)
+}
+
+/// The bytes of a leaf `leaf` elements of `size` bytes wide. Code reads a
+/// stored element by the words that cover it, so the leaf has room for a
+/// word read from its last element on.
+fn leaf_bytes(size: usize, leaf: usize) -> usize {
+    (ELEMS + size * leaf + 8).next_multiple_of(8)
 }
 
 /// A list's type and its element layout, with the heap to allocate from.
@@ -81,7 +102,9 @@ struct Lists<'a> {
     heap: &'a mut Heap,
     types: &'a Types,
     element: &'a ElementLayout,
-    words: usize,
+    /// The bytes of an element, and the elements a leaf holds at most.
+    size: usize,
+    leaf: usize,
     /// The type index of the list, which its nodes carry too.
     index: u64,
 }
@@ -100,7 +123,8 @@ impl<'a> Lists<'a> {
             heap,
             types,
             element,
-            words: element.words as usize,
+            size: element.size as usize,
+            leaf: leaf_width(element),
             index,
         }
     }
@@ -146,7 +170,17 @@ impl<'a> Lists<'a> {
 
     unsafe fn elem(&self, leaf: *mut u8, i: usize) -> *mut u8 {
         // SAFETY: see above.
-        unsafe { leaf.add(ELEMS + 8 * self.words * i) }
+        unsafe { leaf.add(ELEMS + self.size * i) }
+    }
+
+    /// The elements a complete subtree of height `h` holds.
+    fn complete(&self, h: usize) -> usize {
+        complete(self.leaf, h)
+    }
+
+    /// The slots a node of height `h` has room for.
+    fn width(&self, h: usize) -> usize {
+        if h == 0 { self.leaf } else { WIDTH }
     }
 
     /// The elements of a subtree, found along its right edge.
@@ -162,7 +196,7 @@ impl<'a> Lists<'a> {
                 if self.relaxed(node, h) {
                     return total + self.cumulative(node, n - 1);
                 }
-                total += (n - 1) * complete(h - 1);
+                total += (n - 1) * self.complete(h - 1);
                 node = self.child(node, n - 1);
                 h -= 1;
             }
@@ -181,9 +215,9 @@ impl<'a> Lists<'a> {
                 };
                 (lo, self.cumulative(node, j))
             } else if j + 1 == self.slots(node) {
-                (j * complete(h - 1), self.size(node, h))
+                (j * self.complete(h - 1), self.size(node, h))
             } else {
-                (j * complete(h - 1), (j + 1) * complete(h - 1))
+                (j * self.complete(h - 1), (j + 1) * self.complete(h - 1))
             }
         }
     }
@@ -192,11 +226,11 @@ impl<'a> Lists<'a> {
     unsafe fn find(&self, node: *mut u8, h: usize, i: usize) -> (usize, usize) {
         // A child holds at most a complete subtree, so the child of a
         // balanced node's index is the first a relaxed one may have.
-        let mut j = i / complete(h - 1);
+        let mut j = i / self.complete(h - 1);
         // SAFETY: see above.
         unsafe {
             if !self.relaxed(node, h) {
-                return (j, i - j * complete(h - 1));
+                return (j, i - j * self.complete(h - 1));
             }
             while self.cumulative(node, j) <= i {
                 j += 1;
@@ -206,7 +240,7 @@ impl<'a> Lists<'a> {
     }
 
     fn new_leaf(&mut self) -> *mut u8 {
-        let size = ELEMS + 8 * self.words * WIDTH;
+        let size = leaf_bytes(self.size, self.leaf);
         let leaf = alloc_box(self.heap, size, self.index | u64::from(LEAF) << 32);
         // SAFETY: the leaf has the word.
         unsafe { self.set_slots(leaf, 0) };
@@ -225,7 +259,7 @@ impl<'a> Lists<'a> {
             for (j, &child) in children.iter().enumerate() {
                 let size = self.size(child, h - 1);
                 balanced &= !self.relaxed(child, h - 1)
-                    && (j + 1 == children.len() || size == complete(h - 1));
+                    && (j + 1 == children.len() || size == self.complete(h - 1));
                 total += size;
                 self.set_child(node, j, child);
                 self.set_cumulative(node, j, total);
@@ -273,7 +307,7 @@ impl<'a> Lists<'a> {
         // SAFETY: see above.
         unsafe {
             let src = self.elem(from, i);
-            src.copy_to_nonoverlapping(self.elem(to, k), 8 * self.words);
+            src.copy_to_nonoverlapping(self.elem(to, k), self.size);
             retain_value(src, self.element);
         }
     }
@@ -305,7 +339,7 @@ impl<'a> Lists<'a> {
         unsafe {
             let n = self.slots(node);
             if h == 0 {
-                if n == WIDTH {
+                if n == self.leaf {
                     let leaf = self.new_leaf();
                     self.write(leaf, 0, value);
                     self.set_slots(leaf, 1);
@@ -341,8 +375,8 @@ impl<'a> Lists<'a> {
     unsafe fn write(&self, leaf: *mut u8, i: usize, value: &[u64]) {
         // SAFETY: see above.
         unsafe {
-            let dst = self.elem(leaf, i).cast::<u64>();
-            dst.copy_from_nonoverlapping(value.as_ptr(), self.words);
+            let src = value.as_ptr().cast::<u8>();
+            src.copy_to_nonoverlapping(self.elem(leaf, i), self.size);
         }
     }
 
@@ -388,7 +422,7 @@ impl<'a> Lists<'a> {
         unsafe {
             if hl == 0 && hr == 0 {
                 let (nl, nr) = (self.slots(l), self.slots(r));
-                if nl + nr > WIDTH {
+                if nl + nr > self.leaf {
                     retain(l);
                     retain(r);
                     return vec![l, r];
@@ -442,15 +476,16 @@ impl<'a> Lists<'a> {
         const EXTRA: usize = 2;
         // SAFETY: see above.
         unsafe {
+            let width = self.width(h - 1);
             let mut plan: Vec<usize> = children.iter().map(|&c| self.slots(c)).collect();
-            let fewest = plan.iter().sum::<usize>().div_ceil(WIDTH);
+            let fewest = plan.iter().sum::<usize>().div_ceil(width);
             while plan.len() > fewest + EXTRA {
                 // Such a node exists, and the nodes after it have room for
                 // its slots, since the slots fit in `fewest` full nodes.
-                let i = plan.iter().position(|&n| n < WIDTH - EXTRA / 2).unwrap();
+                let i = plan.iter().position(|&n| n < width - EXTRA / 2).unwrap();
                 let mut carry = plan.remove(i);
                 for n in &mut plan[i..] {
-                    let take = carry.min(WIDTH - *n);
+                    let take = carry.min(width - *n);
                     *n += take;
                     carry -= take;
                 }
@@ -581,7 +616,7 @@ pub unsafe fn length(list: *mut u8) -> usize {
     unsafe { len(list) }
 }
 
-/// The address of the words of element `i`, valid while the list is.
+/// The address of the bytes of element `i`, valid while the list is.
 ///
 /// # Safety
 ///
@@ -592,11 +627,12 @@ pub unsafe fn get(types: &Types, list: *mut u8, mut i: usize) -> *mut u64 {
     unsafe {
         let element = element(types, list);
         let mut node = tree(list);
-        if element.words == 0 {
+        if element.size == 0 {
             return list.cast();
         }
         let lists = Lookup {
-            words: element.words as usize,
+            size: element.size as usize,
+            leaf: leaf_width(element),
         };
         let mut h = height(list);
         while h > 0 {
@@ -611,7 +647,8 @@ pub unsafe fn get(types: &Types, list: *mut u8, mut i: usize) -> *mut u64 {
 
 /// What a lookup needs: no heap. Mirrors `Lists::find`.
 struct Lookup {
-    words: usize,
+    size: usize,
+    leaf: usize,
 }
 
 impl Lookup {
@@ -619,11 +656,11 @@ impl Lookup {
     ///
     /// `node` is a live inner node of height `h` holding index `i`.
     unsafe fn find(&self, node: *mut u8, h: usize, i: usize) -> (usize, usize) {
-        let mut j = i / complete(h - 1);
+        let mut j = i / complete(self.leaf, h - 1);
         // SAFETY: as the caller promises.
         unsafe {
             if at(node, RELAXED).read() == 0 {
-                return (j, i - j * complete(h - 1));
+                return (j, i - j * complete(self.leaf, h - 1));
             }
             while at(node, SIZES + 8 * j).read() as usize <= i {
                 j += 1;
@@ -642,12 +679,12 @@ impl Lookup {
     /// `leaf` is a live leaf with element `i`.
     unsafe fn elem(&self, leaf: *mut u8, i: usize) -> *mut u8 {
         // SAFETY: as the caller promises.
-        unsafe { leaf.add(ELEMS + 8 * self.words * i) }
+        unsafe { leaf.add(ELEMS + self.size * i) }
     }
 }
 
-/// The list with `value` appended, whose words are its first. It takes the
-/// list's reference and the value's.
+/// The list with `value` appended, whose bytes are its words' first. It
+/// takes the list's reference and the value's.
 ///
 /// # Safety
 ///
@@ -658,7 +695,7 @@ pub unsafe fn push(heap: &mut Heap, types: &Types, list: *mut u8, value: &[u64])
     unsafe {
         let mut l = Lists::new(heap, types, list);
         let list = l.unique_list(list);
-        if l.words > 0 {
+        if l.size > 0 {
             let root = tree(list);
             let h = height(list);
             if root.is_null() {
@@ -696,7 +733,7 @@ pub unsafe fn set(
     unsafe {
         let mut l = Lists::new(heap, types, list);
         let list = l.unique_list(list);
-        if l.words == 0 {
+        if l.size == 0 {
             return list;
         }
         let mut h = height(list);
@@ -737,7 +774,7 @@ pub unsafe fn slice(
         let n = len(list);
         let out = empty(l.heap, l.index as u32);
         at(out, LEN_OFFSET as usize).write((n - front - back) as u64);
-        if l.words == 0 || front + back == n {
+        if l.size == 0 || front + back == n {
             return out;
         }
         let mut h = height(list);
@@ -772,7 +809,7 @@ pub unsafe fn concat(heap: &mut Heap, types: &Types, a: *mut u8, b: *mut u8) -> 
         }
         let out = empty(l.heap, l.index as u32);
         at(out, LEN_OFFSET as usize).write((len(a) + len(b)) as u64);
-        if l.words == 0 {
+        if l.size == 0 {
             return out;
         }
         let h = height(a).max(height(b));
@@ -794,7 +831,7 @@ pub unsafe fn concat(heap: &mut Heap, types: &Types, a: *mut u8, b: *mut u8) -> 
 /// For an element of more than two words, `w0` is the address of its words.
 pub unsafe fn passed(element: &ElementLayout, w0: u64, w1: u64) -> [u64; 4] {
     let mut out = [w0, w1, 0, 0];
-    let n = element.words as usize;
+    let n = element.words() as usize;
     if n > 2 {
         // SAFETY: as the caller promises.
         let words = unsafe { std::slice::from_raw_parts(w0 as *const u64, n) };
@@ -820,9 +857,9 @@ pub(crate) unsafe fn boxes_of(
     unsafe {
         match kind {
             LEAF => {
-                let words = element.words as usize;
+                let size = element.size as usize;
                 for i in 0..at(ptr, SLOTS).read() as usize {
-                    let elem = ptr.add(ELEMS + 8 * words * i);
+                    let elem = ptr.add(ELEMS + size * i);
                     crate::rc::boxes_in(elem, &element.counted, &mut *f);
                 }
             }
@@ -921,16 +958,17 @@ mod tests {
     const BOXES: u32 = 21;
     const UNIONS: u32 = 22;
     const UNITS: u32 = 23;
+    /// Elements of two bytes, and stored records of 24 bytes with a box
+    /// in their second word.
+    const SHORTS: u32 = 24;
+    const STORED: u32 = 25;
     /// The index a union of `UNIONS` carries for an `Int`.
     const INT: u64 = 1;
 
     fn types() -> Types {
         let list = |words, counted: Vec<CountedField>| TypeDescriptor::List {
-            element: ElementLayout {
-                words,
-                counted: counted.clone(),
-            },
-            cell: ElementLayout { words, counted },
+            element: ElementLayout::of_words(words, counted.clone()),
+            cell: ElementLayout::of_words(words, counted),
         };
         Types::new([
             (
@@ -953,6 +991,28 @@ mod tests {
                 ),
             ),
             (UNITS, list(0, vec![])),
+            (
+                SHORTS,
+                TypeDescriptor::List {
+                    element: ElementLayout {
+                        size: 2,
+                        align: 2,
+                        counted: vec![],
+                    },
+                    cell: ElementLayout::of_words(1, vec![]),
+                },
+            ),
+            (
+                STORED,
+                TypeDescriptor::List {
+                    element: ElementLayout {
+                        size: 24,
+                        align: 8,
+                        counted: vec![CountedField::Box(8)],
+                    },
+                    cell: ElementLayout::of_words(1, vec![CountedField::Box(0)]),
+                },
+            ),
         ])
     }
 
@@ -963,7 +1023,18 @@ mod tests {
             BOXES => vec![boxed(heap, v) as u64],
             UNIONS if v.is_multiple_of(2) => vec![INT, v],
             UNIONS => vec![u64::from(REC), boxed(heap, v) as u64],
+            SHORTS => vec![v & 0xffff],
+            STORED => vec![v, boxed(heap, v) as u64, !v],
             _ => vec![],
+        }
+    }
+
+    /// What an element made for `v` stands for: two bytes keep its low
+    /// sixteen bits.
+    fn canon(index: u32, v: u64) -> u64 {
+        match index {
+            SHORTS => v & 0xffff,
+            _ => v,
         }
     }
 
@@ -974,6 +1045,12 @@ mod tests {
             match index {
                 INTS => ptr.read(),
                 BOXES => unboxed(ptr.read() as *mut u8),
+                SHORTS => u64::from(ptr.cast::<u16>().read_unaligned()),
+                STORED => {
+                    let b = unboxed(ptr.add(1).read() as *mut u8);
+                    assert_eq!((ptr.read(), ptr.add(2).read()), (b, !b));
+                    b
+                }
                 UNIONS if ptr.read() == INT => ptr.add(1).read(),
                 UNIONS => unboxed(ptr.add(1).read() as *mut u8),
                 _ => 0,
@@ -987,7 +1064,7 @@ mod tests {
         // SAFETY: the tree is live.
         unsafe {
             let n = l.slots(node);
-            assert!((1..=WIDTH).contains(&n));
+            assert!((1..=l.width(h)).contains(&n));
             assert_eq!(
                 (header(node) >> 32) as u32,
                 if h == 0 { LEAF } else { INNER }
@@ -1000,7 +1077,7 @@ mod tests {
             for j in 0..n {
                 let child = l.child(node, j);
                 let size = check_node(l, child, h - 1);
-                balanced &= !l.relaxed(child, h - 1) && (j + 1 == n || size == complete(h - 1));
+                balanced &= !l.relaxed(child, h - 1) && (j + 1 == n || size == l.complete(h - 1));
                 total += size;
                 if l.relaxed(node, h) {
                     assert_eq!(l.cumulative(node, j), total);
@@ -1029,7 +1106,7 @@ mod tests {
             let index = header(list) as u32;
             let tree = tree(list);
             let l = Lists::new(heap, types, list);
-            if l.words == 0 || model.is_empty() {
+            if l.size == 0 || model.is_empty() {
                 assert!(tree.is_null());
                 return;
             }
@@ -1073,7 +1150,7 @@ mod tests {
                             next += 1;
                             let value = make(&mut heap, index, next);
                             list = push(&mut heap, &types, list, &value);
-                            model.push(next);
+                            model.push(canon(index, next));
                         }
                         pool[k] = (list, model);
                     }
@@ -1083,7 +1160,7 @@ mod tests {
                         let value = make(&mut heap, index, next);
                         let list = set(&mut heap, &types, list, i, &value);
                         let mut model = model;
-                        model[i] = next;
+                        model[i] = canon(index, next);
                         pool[k] = (list, model);
                     }
                     6 | 7 => {
@@ -1133,6 +1210,25 @@ mod tests {
     #[test]
     fn lists_of_unions_count_the_boxes_among_them() {
         random_operations(UNIONS, 3, 800);
+    }
+
+    #[test]
+    fn lists_of_short_elements_pack_their_leaves() {
+        // 256 elements of two bytes fill a leaf of 512 bytes.
+        assert_eq!(
+            leaf_width(&ElementLayout {
+                size: 2,
+                align: 2,
+                counted: vec![]
+            }),
+            256
+        );
+        random_operations(SHORTS, 6, 800);
+    }
+
+    #[test]
+    fn lists_of_stored_records_count_their_pointers() {
+        random_operations(STORED, 7, 600);
     }
 
     #[test]
@@ -1199,13 +1295,13 @@ mod tests {
                 whole = joined;
             }
             check(&mut heap, &types, whole, &model, &mut rng, true);
-            // About 50 000 elements fit in a tree of height 3, and in not
-            // many more leaves than they fill. Without rebalancing the
-            // leaves would be a third more than that.
-            assert_eq!(height(whole), 3);
+            // About 50 000 words fit in a tree of height 2 of leaves of 64,
+            // and in not many more leaves than they fill. Without
+            // rebalancing the leaves would be a third more than that.
+            assert_eq!(height(whole), 2);
             let l = Lists::new(&mut heap, &types, whole);
-            let fewest = model.len().div_ceil(WIDTH);
-            let leaves = leaves(&l, tree(whole), 3);
+            let fewest = model.len().div_ceil(l.leaf);
+            let leaves = leaves(&l, tree(whole), 2);
             assert!(leaves <= fewest + fewest / 10, "{leaves} leaves");
             drop_box(&mut heap, &types, whole);
         }

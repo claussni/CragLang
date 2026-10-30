@@ -44,7 +44,7 @@ use crag_abi::{
 };
 
 use crate::heap::{Heap, alloc_box};
-use crate::print::{element_value, field_words, member_words};
+use crate::print::{field_words, member_words, value_at};
 use crate::rc::Types;
 use crate::text::{bytes_of, make_text};
 use crate::{list, map};
@@ -133,21 +133,15 @@ unsafe fn encode(
         }
         &Shape::List(element) => {
             let list = word as *mut u8;
-            let n = shapes.shapes[element as usize].element_words() as usize;
             // SAFETY: a live list of the element's shape.
             let len = unsafe { list::length(list) };
             out.extend((len as u64).to_le_bytes());
             for i in 0..len {
                 // SAFETY: as above; the index is inside the list.
                 unsafe {
-                    let at = list::get(types, list, i);
-                    encode(
-                        std::slice::from_raw_parts(at, n),
-                        shapes,
-                        element,
-                        types,
-                        out,
-                    )?;
+                    let (words, shape) =
+                        value_at(shapes, list::get(types, list, i).cast(), element);
+                    encode(&words, shapes, shape, types, out)?;
                 }
             }
         }
@@ -167,13 +161,9 @@ unsafe fn encode(
         }
         Shape::Function => return Err(NotSolid("a function value".into())),
         Shape::Opaque { name, .. } => return Err(NotSolid(format!("a value of type {name}"))),
-        // An element of a collection, widened as `field_words` widens a
-        // field.
-        Shape::Stored { .. } => {
-            let (words, form) = element_value(shapes, words, shape);
-            // SAFETY: the words are a live value of the shape.
-            unsafe { encode(&words, shapes, form, types, out)? };
-        }
+        // Only a field or a collection's slot is stored, and `value_at`
+        // widens it.
+        Shape::Stored { .. } => return Err(NotSolid("a stored value".into())),
     }
     Ok(())
 }
@@ -188,19 +178,18 @@ unsafe fn entries(
     types: &Types,
     out: &mut Vec<u8>,
 ) -> Result<(), NotSolid> {
-    let kw = shapes.shapes[key as usize].element_words() as usize;
-    let vw = value.map_or(0, |v| shapes.shapes[v as usize].element_words() as usize);
     let mut encoded = Vec::new();
-    // SAFETY: as the caller promises; each entry is its key's words, then
-    // its value's.
+    // SAFETY: as the caller promises; each entry holds a key and a value of
+    // the shapes.
     unsafe {
-        for at in map::iter(types, word as *mut u8) {
-            let e = std::slice::from_raw_parts(at, kw + vw);
+        for (k_at, v_at) in map::iter(types, word as *mut u8) {
+            let (words, shape) = value_at(shapes, k_at, key);
             let mut k = Vec::new();
-            encode(&e[..kw], shapes, key, types, &mut k)?;
+            encode(&words, shapes, shape, types, &mut k)?;
             let mut v = Vec::new();
             if let Some(value) = value {
-                encode(&e[kw..], shapes, value, types, &mut v)?;
+                let (words, shape) = value_at(shapes, v_at, value);
+                encode(&words, shapes, shape, types, &mut v)?;
             }
             encoded.push((k, v));
         }

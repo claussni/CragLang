@@ -36,7 +36,8 @@
 //! where it must be in a box keeps it boxed. A record read from a box, a
 //! field or an element, is loaded into a split local field by field. A
 //! list, map or grid stores a flat record or union in its storage form
-//! too (`element_storage`): it goes in packed from registers and comes out
+//! too, and a sized integer or a union of tags in its bytes
+//! (`element_storage`): it goes in packed from registers and comes out
 //! loaded into them.
 //!
 //! Splitting makes no more boxes than there are: a local that is boxed
@@ -722,8 +723,10 @@ pub fn storage<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<(u
 }
 
 /// The storage form of a value of `ty` where a list, map or grid stores it
-/// flat (Compiler Architecture §A11.4.2–§A11.4.5): that of a flat record
-/// or union that passes by value. None without flat layouts.
+/// flat, as an element, a key or a value (Compiler Architecture §A11.3,
+/// §A11.4.2–§A11.4.5): that of a flat record or union that passes by
+/// value, or of a sized integer, a code point or a union of tags in fewer
+/// bytes than its word. None without flat layouts.
 pub fn element_storage<'db>(
     db: &'db dyn Db,
     program: Program,
@@ -732,7 +735,31 @@ pub fn element_storage<'db>(
     if !flat_layouts() {
         return None;
     }
-    storage(db, program, ty)
+    if let Some(stored) = storage(db, program, ty) {
+        return Some(stored);
+    }
+    let l = layout::layout(db, program, ty)?;
+    if !matches!(l, Layout::Imm(_) | Layout::Tag) {
+        return None;
+    }
+    let flat = flat::layout(db, program, ty).as_ref()?;
+    if flat.class != LayoutClass::Immediate || flat.size >= 8 {
+        return None;
+    }
+    let leaf = Leaf {
+        size: flat.size,
+        bits: None,
+        narrowed: flat.narrowed,
+    };
+    let mut slots = Vec::new();
+    slots_of(db, program, ty, &Form::Words(l), 0, 0, leaf, &mut slots)?;
+    Some((flat.size, slots))
+}
+
+/// The register form of a value of `ty` that a collection stores flat: a
+/// split value's, or the words of its layout.
+pub fn element_form<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Form<'db>> {
+    form(db, program, ty).or_else(|| layout::layout(db, program, ty).map(Form::Words))
 }
 
 /// How a value is stored where its parent places it: its bytes, its bits

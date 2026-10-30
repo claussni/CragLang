@@ -194,10 +194,7 @@ fn check(config: FiberConfig) {
     let n = 3000u64;
     let mut fiber = image.fiber(0, &[n], config);
     let mut worker = Worker::new();
-    let word = ElementLayout {
-        words: 1,
-        counted: Vec::new(),
-    };
+    let word = ElementLayout::of_words(1, Vec::new());
     worker.set_types(Arc::new(Types::new([
         (
             LIST as u32,
