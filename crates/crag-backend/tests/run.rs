@@ -1053,9 +1053,9 @@ fn run(n: Int) -> Int {
         false => Vec::new(),
     };
     assert_eq!(m.flat("tile"), on(&[true, false]));
-    // A union with a record member keeps its box for now, and so does a
-    // record too large to be flat.
-    assert_eq!(m.flat("spot"), on(&[false]));
+    // A union field with a record member is stored in its place, but a
+    // record too large to be flat keeps its box.
+    assert_eq!(m.flat("spot"), on(&[true]));
     assert_eq!(m.flat("wide"), on(&[false]));
     assert_eq!(m.int("run", &[3]), 2301);
     assert_eq!(m.heap.live_blocks(), 0);
@@ -1077,6 +1077,8 @@ fn walk(l: Line, n: Int) -> Line {
 
 fn origin() -> Point { point(0) }
 
+fn found(a: Int) -> Option[Point] { if a == 0 { Empty } else { point(a) } }
+
 fn viaValue(a: Int) -> Point {
   let f: (Int) -> Point = { b -> Point(x: b, y: b) }
   f(a)
@@ -1087,7 +1089,11 @@ fn run(a: Int) -> Int {
   let l = walk(line(a), 1001)
   let o = origin()
   let v = viaValue(a)
-  p.y * 1000000 + l.from.x * 1000 + l.to.y * 10 + o.y + v.x
+  let f = case found(a) {
+    Empty -> 0
+    q: Point -> q.x
+  }
+  p.y * 1000000 + l.from.x * 1000 + l.to.y * 10 + o.y + v.x + f
 }
 
 fn zeroLine() -> Line { walk(line(1), 2) }
@@ -1100,9 +1106,14 @@ fn zeroLine() -> Line { walk(line(1), 2) }
     let size = |name: &str| m.flat_result(name);
     assert_eq!(size("point"), on(Some(16)));
     assert_eq!(size("line"), on(Some(32)));
+    // A tag byte, then the point.
+    assert_eq!(size("found"), on(Some(24)));
     // The host runs a function without parameters as a root.
     assert_eq!(size("origin"), None);
-    assert_eq!(m.int("run", &[2]), 3 * 1000000 + 20 * 1000 + 3 * 10 + 1 + 2);
+    assert_eq!(
+        m.int("run", &[2]),
+        3 * 1000000 + 20 * 1000 + 3 * 10 + 1 + 2 + 2
+    );
     assert_eq!(
         m.shown("zeroLine"),
         "Line(from: Point(x: 1, y: 2), to: Point(x: 10, y: 11))"

@@ -290,8 +290,9 @@ fn what_has_no_layout() {
 
 #[test]
 fn flat_values_pass_by_value() {
-    // Records pass to the parameters of functions in storage form, with
-    // flat layouts on: narrowed integers, flag bits and tags converted.
+    // Records and unions pass to the parameters of functions and back in
+    // storage form, with flat layouts on: narrowed integers, flag bits,
+    // tags and niches converted.
     let mut r = session(&[
         "type Grass",
         "type Water",
@@ -317,6 +318,15 @@ fn flat_values_pass_by_value() {
         "fn total(p: Point) -> Int { p.x * 10 + p.y }",
         "fn twice(a: Int) -> Int { let p = make(a)\n total(p) + total(p) }",
         "fn wrap(p: Point) -> List[Point] { [p, p] }",
+        "type Spot(at: Option[Point], n: Int16)",
+        r#"fn glyphs(g: Option[Glyph]) -> Str { "{g}" }"#,
+        r#"fn tiles(t: Option[Tile], n: Int) -> Str { "{n} {t}" }"#,
+        r#"fn points(p: Option[Point]) -> Str { "{p}" }"#,
+        r#"fn shorts(n: Option[Int16]) -> Str { "{n}" }"#,
+        r#"fn spots(s: Spot) -> Str { "{s.n} {s.at} {s}" }"#,
+        "fn find(n: Int) -> Option[Point] { if n == 0 { Empty } else { Point(x: n, y: -n) } }",
+        "fn bold(g: Glyph, b: Bool) -> Option[Glyph] { if b { Glyph(code: g.code, size: g.size, bold: True, italic: g.italic, at: g.at) } else { Empty } }",
+        "fn spot(n: Int, k: Int16) -> Spot { Spot(at: find(n), n: k) }",
     ]);
     let cases = [
         (
@@ -352,6 +362,40 @@ fn flat_values_pass_by_value() {
             "wrap(Point(x: 3, y: 4))",
             "[Point(x: 3, y: 4), Point(x: 3, y: 4)]",
         ),
+        (
+            "glyphs(Glyph(code: 'a', size: 1, bold: True, italic: False, at: Point(x: 1, y: 2)))",
+            "Glyph(code: 'a', size: 1, bold: True, italic: False, at: Point(x: 1, y: 2))",
+        ),
+        ("glyphs(Empty)", "Empty"),
+        (
+            "tiles(Tile(kind: Sand, cost: 255, seen: True), 3)",
+            "3 Tile(kind: Sand, cost: 255, seen: True)",
+        ),
+        ("tiles(Empty, 4)", "4 Empty"),
+        ("points(Point(x: -1, y: 1))", "Point(x: -1, y: 1)"),
+        ("points(Empty)", "Empty"),
+        ("shorts(-32768)", "-32768"),
+        ("shorts(Empty)", "Empty"),
+        (
+            "spots(Spot(at: Point(x: 5, y: 6), n: -2))",
+            "-2 Point(x: 5, y: 6) Spot(at: Point(x: 5, y: 6), n: -2)",
+        ),
+        (
+            "spots(Spot(at: Empty, n: 7))",
+            "7 Empty Spot(at: Empty, n: 7)",
+        ),
+        ("find(0)", "Empty"),
+        ("find(9)", "Point(x: 9, y: -9)"),
+        (
+            "bold(Glyph(code: 'z', size: 255, bold: False, italic: True, at: Point(x: 0, y: 0)), True)",
+            "Glyph(code: 'z', size: 255, bold: True, italic: True, at: Point(x: 0, y: 0))",
+        ),
+        (
+            "bold(Glyph(code: 'z', size: 255, bold: False, italic: True, at: Point(x: 0, y: 0)), False)",
+            "Empty",
+        ),
+        ("spot(3, 30)", "Spot(at: Point(x: 3, y: -3), n: 30)"),
+        ("spot(0, -30)", "Spot(at: Empty, n: -30)"),
     ];
     for (input, expected) in cases {
         let shown = eval(&mut r, input);

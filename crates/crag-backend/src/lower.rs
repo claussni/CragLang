@@ -67,7 +67,9 @@ use crate::layout::{
     subtypes, type_descriptor, type_index, word_keys,
 };
 use crate::slot_key;
-use crate::split::{Form, Slot, SlotKind, flat_params, flat_result, form, place_form, storage};
+use crate::split::{
+    Form, NicheTest, Slot, SlotKind, UnionTag, flat_params, flat_result, form, place_form, storage,
+};
 
 /// The LIR of a body, with what it could not lower.
 pub struct Lowered<'db> {
@@ -431,17 +433,24 @@ impl<'a, 'db> Lower<'a, 'db> {
             let regs = self.unpack(slots, words, f.words());
             let values = match self.forms[i] {
                 Some(_) => regs,
-                None => vec![self.box_split(ty, &f, &regs)?],
+                None => self.boxed(ty, &f, &regs)?,
             };
             self.assign(Local(i as u32), values)?;
         }
         Ok(())
     }
 
-    /// The register form of a flat record from the words of its storage
-    /// form (Compiler Architecture §A11.4).
+    /// The register form of a flat record or union from the words of its
+    /// storage form (Compiler Architecture §A11.4).
     fn unpack(&mut self, slots: &[Slot], words: &[VReg], registers: usize) -> Vec<VReg> {
         let mut out: Vec<Option<VReg>> = vec![None; registers];
+        self.unpack_into(slots, words, &mut out);
+        out.into_iter()
+            .map(|r| r.unwrap_or_else(|| self.constant(0)))
+            .collect()
+    }
+
+    fn unpack_into(&mut self, slots: &[Slot], words: &[VReg], out: &mut [Option<VReg>]) {
         for slot in slots {
             let w = (slot.offset / 8) as usize;
             let byte = slot.offset % 8;
@@ -471,32 +480,145 @@ impl<'a, 'db> Lower<'a, 'db> {
                         None => (8 * byte, 8 * slot.size),
                     };
                     let tag = self.field_bits(words[w], shift, width);
-                    let mut index = self.constant(members[0]);
-                    for (k, &m) in members.iter().enumerate().skip(1) {
-                        let k = self.constant(k as i64);
-                        let same = self.cmp(Cond::Eq, tag, k);
-                        let m = self.constant(m);
-                        let dst = self.reg();
-                        self.push(Inst::Select {
-                            dst,
-                            cond: same,
-                            a: m,
-                            b: index,
-                        });
-                        index = dst;
-                    }
+                    out[slot.at] = Some(self.type_of_tag(tag, members));
+                }
+                SlotKind::Union { tag, members } => {
+                    // The member's type index, from its tag or the niche.
+                    let index = match tag {
+                        UnionTag::Bytes { offset, size } => {
+                            let word = words[(offset / 8) as usize];
+                            let tag = self.field_bits(word, 8 * (offset % 8), 8 * size);
+                            let indices: Vec<i64> = members.iter().map(|m| m.0).collect();
+                            self.type_of_tag(tag, &indices)
+                        }
+                        UnionTag::Niche {
+                            empty,
+                            offset,
+                            test,
+                        } => {
+                            let niche = self.niche(words, *offset, *test);
+                            let other = 1 - *empty;
+                            let (e, o) = (
+                                self.constant(members[*empty].0),
+                                self.constant(members[other].0),
+                            );
+                            let dst = self.reg();
+                            self.push(Inst::Select {
+                                dst,
+                                cond: niche,
+                                a: e,
+                                b: o,
+                            });
+                            dst
+                        }
+                    };
                     out[slot.at] = Some(index);
+                    // Each member's registers, where its index is the one.
+                    for (m, member) in members {
+                        let mut own: Vec<Option<VReg>> = vec![None; out.len()];
+                        self.unpack_into(member, words, &mut own);
+                        let m = self.constant(*m);
+                        let same = self.cmp(Cond::Eq, index, m);
+                        for (r, value) in own.into_iter().enumerate() {
+                            let Some(value) = value else { continue };
+                            let other = out[r].unwrap_or_else(|| self.constant(0));
+                            let dst = self.reg();
+                            self.push(Inst::Select {
+                                dst,
+                                cond: same,
+                                a: value,
+                                b: other,
+                            });
+                            out[r] = Some(dst);
+                        }
+                    }
                 }
             }
         }
-        out.into_iter()
-            .map(|r| r.unwrap_or_else(|| self.constant(0)))
+    }
+
+    /// The type index of the member a local tag numbers.
+    fn type_of_tag(&mut self, tag: VReg, members: &[i64]) -> VReg {
+        let mut index = self.constant(members[0]);
+        for (k, &m) in members.iter().enumerate().skip(1) {
+            let k = self.constant(k as i64);
+            let same = self.cmp(Cond::Eq, tag, k);
+            let m = self.constant(m);
+            let dst = self.reg();
+            self.push(Inst::Select {
+                dst,
+                cond: same,
+                a: m,
+                b: index,
+            });
+            index = dst;
+        }
+        index
+    }
+
+    /// The local tag of the member whose type index a register holds.
+    fn tag_of_type(&mut self, index: VReg, members: &[i64]) -> VReg {
+        let mut tag = self.constant(0);
+        for (k, &m) in members.iter().enumerate().skip(1) {
+            let m = self.constant(m);
+            let same = self.cmp(Cond::Eq, index, m);
+            let k = self.constant(k as i64);
+            let dst = self.reg();
+            self.push(Inst::Select {
+                dst,
+                cond: same,
+                a: k,
+                b: tag,
+            });
+            tag = dst;
+        }
+        tag
+    }
+
+    /// Puts the low `width` bits of a value at bit `at` of storage words.
+    fn or_bits(&mut self, words: &mut [Option<VReg>], value: VReg, at: u32, width: u32) {
+        let mut part = value;
+        if width < 64 {
+            let mask = self.constant(((1u64 << width) - 1) as i64);
+            part = self.bin(LirBin::And, part, mask);
+        }
+        if !at.is_multiple_of(64) {
+            let by = self.constant(i64::from(at % 64));
+            part = self.bin(LirBin::Shl, part, by);
+        }
+        let w = (at / 64) as usize;
+        words[w] = Some(match words[w] {
+            Some(before) => self.bin(LirBin::Or, before, part),
+            None => part,
+        });
+    }
+
+    /// Whether storage words hold a niche: 1 or 0.
+    fn niche(&mut self, words: &[VReg], offset: u32, test: NicheTest) -> VReg {
+        let word = words[(offset / 8) as usize];
+        let shift = 8 * (offset % 8);
+        let (bits, value) = match test {
+            NicheTest::Value { size, value } => {
+                (self.field_bits(word, shift, 8 * u32::from(size)), value)
+            }
+            NicheTest::Bit(bit) => (self.field_bits(word, shift + u32::from(bit), 1), 1),
+        };
+        let value = self.constant(value as i64);
+        self.cmp(Cond::Eq, bits, value)
+    }
+
+    /// The words of a flat record's or union's storage form from its
+    /// register form.
+    fn pack(&mut self, slots: &[Slot], size: u32, regs: &[VReg]) -> Vec<VReg> {
+        let mut words: Vec<Option<VReg>> = vec![None; size.div_ceil(8) as usize];
+        self.pack_into(slots, regs, &mut words);
+        words
+            .into_iter()
+            .map(|w| w.unwrap_or_else(|| self.constant(0)))
             .collect()
     }
 
-    /// The words of a flat record's storage form from its register form.
-    fn pack(&mut self, slots: &[Slot], size: u32, regs: &[VReg]) -> Vec<VReg> {
-        let mut words: Vec<Option<VReg>> = vec![None; size.div_ceil(8) as usize];
+    fn pack_into(&mut self, slots: &[Slot], regs: &[VReg], words: &mut [Option<VReg>]) {
         for slot in slots {
             let w = (slot.offset / 8) as usize;
             let byte = slot.offset % 8;
@@ -509,45 +631,69 @@ impl<'a, 'db> Lower<'a, 'db> {
                 }
                 SlotKind::Int { .. } => (regs[slot.at], 8 * byte, 8 * slot.size),
                 SlotKind::Tag(members) => {
-                    // The local tag of the member whose type index it is.
-                    let mut tag = self.constant(0);
-                    for (k, &m) in members.iter().enumerate().skip(1) {
-                        let m = self.constant(m);
-                        let same = self.cmp(Cond::Eq, regs[slot.at], m);
-                        let k = self.constant(k as i64);
-                        let dst = self.reg();
-                        self.push(Inst::Select {
-                            dst,
-                            cond: same,
-                            a: k,
-                            b: tag,
-                        });
-                        tag = dst;
-                    }
+                    let tag = self.tag_of_type(regs[slot.at], members);
                     match slot.bits {
                         Some((bit, width)) => (tag, 8 * byte + u32::from(bit), u32::from(width)),
                         None => (tag, 8 * byte, 8 * slot.size),
                     }
                 }
+                SlotKind::Union { tag, members } => {
+                    // Each member's words with its tag or niche, where its
+                    // index is the one.
+                    let mut chosen: Vec<Option<VReg>> = vec![None; words.len()];
+                    for (k, (m, member)) in members.iter().enumerate() {
+                        let mut own: Vec<Option<VReg>> = vec![None; words.len()];
+                        self.pack_into(member, regs, &mut own);
+                        match tag {
+                            UnionTag::Bytes { offset, size } => {
+                                let k = self.constant(k as i64);
+                                self.or_bits(&mut own, k, 8 * offset, 8 * size);
+                            }
+                            // The member of no words is the other's niche.
+                            UnionTag::Niche {
+                                empty,
+                                offset,
+                                test,
+                            } if *empty == k => {
+                                let (value, at, width) = match *test {
+                                    NicheTest::Value { size, value } => {
+                                        (value as i64, 8 * offset, 8 * u32::from(size))
+                                    }
+                                    NicheTest::Bit(bit) => (1, 8 * offset + u32::from(bit), 1),
+                                };
+                                let value = self.constant(value);
+                                self.or_bits(&mut own, value, at, width);
+                            }
+                            UnionTag::Niche { .. } => {}
+                        }
+                        let m = self.constant(*m);
+                        let same = self.cmp(Cond::Eq, regs[slot.at], m);
+                        for (w, value) in own.into_iter().enumerate() {
+                            let Some(value) = value else { continue };
+                            let other = chosen[w].unwrap_or_else(|| self.constant(0));
+                            let dst = self.reg();
+                            self.push(Inst::Select {
+                                dst,
+                                cond: same,
+                                a: value,
+                                b: other,
+                            });
+                            chosen[w] = Some(dst);
+                        }
+                    }
+                    for (w, value) in chosen.into_iter().enumerate() {
+                        if let Some(value) = value {
+                            words[w] = Some(match words[w] {
+                                Some(before) => self.bin(LirBin::Or, before, value),
+                                None => value,
+                            });
+                        }
+                    }
+                    continue;
+                }
             };
-            let mut part = value;
-            if width < 64 {
-                let mask = self.constant(((1u64 << width) - 1) as i64);
-                part = self.bin(LirBin::And, part, mask);
-            }
-            if shift > 0 {
-                let by = self.constant(i64::from(shift));
-                part = self.bin(LirBin::Shl, part, by);
-            }
-            words[w] = Some(match words[w] {
-                Some(before) => self.bin(LirBin::Or, before, part),
-                None => part,
-            });
+            self.or_bits(words, value, 64 * w as u32 + shift, width);
         }
-        words
-            .into_iter()
-            .map(|w| w.unwrap_or_else(|| self.constant(0)))
-            .collect()
     }
 
     /// The `width` bits of a word from bit `shift` up, zero-extended.
@@ -569,18 +715,32 @@ impl<'a, 'db> Lower<'a, 'db> {
     /// references of their own as the call takes the box's.
     fn flat_argument(&mut self, op: &Operand<'db>, ty: Ty<'db>) -> Result<Vec<VReg>, Unsupported> {
         let (size, slots) = storage(self.db, self.program, ty).ok_or("records of this type")?;
-        let Operand::Local(l) = op else {
-            return Err("this conversion");
-        };
-        let regs = match self.forms[l.index()].clone() {
-            Some(_) => self.locals[l.index()].clone(),
-            None => {
-                let f = form(self.db, self.program, ty).ok_or("records of this type")?;
-                let ptr = word(&self.locals[l.index()].clone())?;
-                self.owned_fields(ty, &f, ptr)?
-            }
-        };
+        let regs = self.flat_value(op, ty)?;
         Ok(self.pack(&slots, size, &regs))
+    }
+
+    /// The registers of a value that passes by value, which takes the
+    /// operand's references: a split local's registers, a boxed value's
+    /// loaded, or a tag's type index.
+    fn flat_value(&mut self, op: &Operand<'db>, ty: Ty<'db>) -> Result<Vec<VReg>, Unsupported> {
+        let f = form(self.db, self.program, ty).ok_or("records of this type")?;
+        match op {
+            Operand::Local(l) if self.forms[l.index()].is_some() => {
+                Ok(self.locals[l.index()].clone())
+            }
+            Operand::Local(l) => {
+                let words = self.locals[l.index()].clone();
+                self.owned_fields(ty, &f, &words)
+            }
+            Operand::Const(Constant::Tag(tag)) => {
+                let mut regs = vec![self.constant(type_index(self.member_of(*tag, ty)))];
+                while regs.len() < f.words() {
+                    regs.push(self.constant(0));
+                }
+                Ok(regs)
+            }
+            Operand::Const(_) => Err("this conversion"),
+        }
     }
 
     fn reg(&mut self) -> VReg {
@@ -3691,7 +3851,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                         let regs = self.unpack(&slots, &words, f.words());
                         let values = match self.forms[dst.index()] {
                             Some(_) => regs,
-                            None => vec![self.box_split(ty, &f, &regs)?],
+                            None => self.boxed(ty, &f, &regs)?,
                         };
                         self.assign(*dst, values)?;
                     }
@@ -3720,13 +3880,12 @@ impl<'a, 'db> Lower<'a, 'db> {
                     Some((size, slots)) => {
                         let words = self.call_flat(*func, args, size, Vec::new());
                         let regs = self.unpack(&slots, &words, f.words());
-                        let ptr = self.box_split(ty, &f, &regs)?;
-                        self.give(vec![ptr], true)?;
+                        let values = self.boxed(ty, &f, &regs)?;
+                        self.give(values, true)?;
                     }
                     None => {
-                        let ptr = self.reg();
-                        self.call(*func, args, vec![ptr], Vec::new());
-                        let regs = self.owned_fields(ty, &f, ptr)?;
+                        let words = self.call_boxed(*func, args, ty)?;
+                        let regs = self.owned_fields(ty, &f, &words)?;
                         self.give_flat(regs)?;
                     }
                 }
@@ -3766,13 +3925,15 @@ impl<'a, 'db> Lower<'a, 'db> {
                 if self.result.is_some() {
                     let ty = self.mir.result;
                     let f = form(self.db, self.program, ty).ok_or("records of this type")?;
-                    let ptr = self.reg();
+                    let words: Vec<VReg> = (0..self.layout_of(ty)?.words())
+                        .map(|_| self.reg())
+                        .collect();
                     self.push(Inst::CallIndirect {
                         callee: code,
                         args,
-                        dsts: vec![ptr],
+                        dsts: words.clone(),
                     });
-                    let regs = self.owned_fields(ty, &f, ptr)?;
+                    let regs = self.owned_fields(ty, &f, &words)?;
                     return self.give_flat(regs);
                 }
                 let term = Term::TailCallIndirect { callee: code, args };
@@ -3780,19 +3941,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             }
             Terminator::Return(op) => {
                 if self.result.is_some() {
-                    let ty = self.mir.result;
-                    let regs = match op {
-                        Operand::Local(l) if self.forms[l.index()].is_some() => {
-                            self.locals[l.index()].clone()
-                        }
-                        Operand::Local(l) => {
-                            let f =
-                                form(self.db, self.program, ty).ok_or("records of this type")?;
-                            let ptr = word(&self.locals[l.index()].clone())?;
-                            self.owned_fields(ty, &f, ptr)?
-                        }
-                        Operand::Const(_) => return Err("this conversion"),
-                    };
+                    let regs = self.flat_value(op, self.mir.result)?;
                     return self.give_flat(regs);
                 }
                 let values = self.operand(op, self.mir.result)?;
@@ -3954,15 +4103,27 @@ impl<'a, 'db> Lower<'a, 'db> {
         &mut self,
         ty: Ty<'db>,
         f: &Form<'db>,
-        ptr: VReg,
+        words: &[VReg],
     ) -> Result<Vec<VReg>, Unsupported> {
-        let regs = self.unbox(ty, f, ptr)?;
+        let regs = self.unboxed(ty, f, words)?;
         self.count_form(f, ty, &regs, Count::Retain)?;
-        match deferred(self.db, self.program, ty) {
-            true => self.release_deferred(ptr),
-            false => self.release(ptr),
-        }
+        let layout = self.layout_of(ty)?;
+        self.count_form(&Form::Words(layout), ty, words, Count::Release)?;
         Ok(regs)
+    }
+
+    /// Calls an instance that gives its result in its layout's words.
+    fn call_boxed(
+        &mut self,
+        func: InstanceKey<'db>,
+        args: Vec<VReg>,
+        ty: Ty<'db>,
+    ) -> Result<Vec<VReg>, Unsupported> {
+        let dsts: Vec<VReg> = (0..self.layout_of(ty)?.words())
+            .map(|_| self.reg())
+            .collect();
+        self.call(func, args, dsts.clone(), Vec::new());
+        Ok(dsts)
     }
 
     fn keep(&mut self, cell: SlotKey, counted: bool, values: &[VReg]) -> Result<(), Unsupported> {

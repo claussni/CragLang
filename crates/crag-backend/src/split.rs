@@ -46,9 +46,12 @@
 //! returns a flat record by value too: in at most two words, or written
 //! to a buffer the caller pushes on its side stack, which a tail call
 //! passes on; a tail call to code that returns otherwise becomes a call.
-//! Records whose register form keeps a member in a box, as a union with a
-//! record member does, still pass in their box, and so do the records of
-//! the code that function values, the runtime and the host call.
+//! A flat union passes the same way: its member's local tag, or for a
+//! `T | Empty` the niche of `T`, and the member's storage form. Values
+//! whose register form keeps a member in a box, as a union with a member
+//! of two words or a cycle's edge does, still pass in their box, and so
+//! do the values of the code that function values, the runtime and the
+//! host call.
 //!
 //! With `CRAG_FLAT=0` in the environment no local is split and every
 //! record passes in its box.
@@ -63,7 +66,7 @@ use crag_mir::{
 };
 use crag_types::{Builtin, Step, Ty, TyKind, TypeDefKind, lifecycle_handler, type_def};
 
-use crate::flat::{self, LayoutClass, TagPlace};
+use crate::flat::{self, LayoutClass, NicheKind, TagPlace};
 use crate::layout::{self, Layout, type_index};
 
 /// Whether flat layouts are on: unless `CRAG_FLAT` is `0`, read once.
@@ -578,9 +581,9 @@ impl<'db> Check<'_, 'db> {
     }
 }
 
-/// Where a value of a flat record's register form is in its storage form
-/// (Compiler Architecture §A11.4): the register it starts at, and how its
-/// bytes or bits hold it.
+/// Where a value of a flat record's or union's register form is in its
+/// storage form (Compiler Architecture §A11.4): the register it starts
+/// at, and how its bytes or bits hold it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
 pub struct Slot {
     pub at: usize,
@@ -603,83 +606,192 @@ pub enum SlotKind {
     /// A union of tags: its local tag, which numbers the members whose
     /// type indices these are.
     Tag(Vec<i64>),
+    /// A union whose register at `at` holds its member's type index: how
+    /// storage tells the member, and each member's type index and slots.
+    Union {
+        tag: UnionTag,
+        members: Vec<(i64, Vec<Slot>)>,
+    },
 }
 
-/// The storage form of a flat record that passes by value, as slots, with
-/// its bytes: none for what is not a flat record, or holds a value its
-/// register form keeps in a box, as a union with a record member does.
+/// How the storage form of a union tells its member.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
+pub enum UnionTag {
+    /// The member's local tag in `size` bytes at `offset`.
+    Bytes { offset: u32, size: u32 },
+    /// The member `empty`, of no words, is the other's niche: `size`
+    /// bytes at `offset` that hold `value`, or a set bit of the flag byte
+    /// there.
+    Niche {
+        empty: usize,
+        offset: u32,
+        test: NicheTest,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
+pub enum NicheTest {
+    Value { size: u8, value: u64 },
+    Bit(u8),
+}
+
+/// The storage form of a flat record or union that passes by value, as
+/// slots, with its bytes: none for what is not one, or holds a value its
+/// register form keeps in a box, as a union with a member of two words
+/// does.
 pub fn storage<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<(u32, Vec<Slot>)> {
     let f = form(db, program, ty)?;
-    let size = flat::layout(db, program, ty).as_ref()?.size;
+    let flat = flat::layout(db, program, ty).as_ref()?;
     let mut slots = Vec::new();
-    slots_into(db, program, ty, &f, 0, 0, &mut slots)?;
-    Some((size, slots))
+    let leaf = Leaf {
+        size: flat.size,
+        bits: None,
+        narrowed: flat.narrowed,
+    };
+    slots_of(db, program, ty, &f, 0, 0, leaf, &mut slots)?;
+    Some((flat.size, slots))
 }
 
-fn slots_into<'db>(
+/// How a value is stored where its parent places it: its bytes, its bits
+/// in a flag byte, and the builtin an integer is narrowed to.
+#[derive(Clone, Copy)]
+struct Leaf {
+    size: u32,
+    bits: Option<(u8, u8)>,
+    narrowed: Option<Builtin>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn slots_of<'db>(
     db: &'db dyn Db,
     program: Program,
     ty: Ty<'db>,
     f: &Form<'db>,
     at: usize,
-    base: u32,
+    offset: u32,
+    leaf: Leaf,
     out: &mut Vec<Slot>,
 ) -> Option<()> {
-    let Form::Fields(fields) = f else {
-        return None;
-    };
-    let flat = flat::layout(db, program, ty).as_ref()?;
-    let mut at = at;
-    for (name, t, inner) in fields {
-        let place = flat.fields.iter().find(|p| p.name == *name)?;
-        let offset = base + place.offset;
-        match inner {
-            Form::Fields(_) => slots_into(db, program, *t, inner, at, offset, out)?,
-            Form::Union(_) => return None,
-            Form::Words(l) => {
-                let kind = match l {
-                    Layout::Zero => None,
-                    Layout::Imm(b) => Some(match place.narrowed.unwrap_or(*b) {
-                        Builtin::Int | Builtin::Int8 | Builtin::Int16 | Builtin::Int32 => {
-                            SlotKind::Int { signed: true }
-                        }
-                        Builtin::UInt8
-                        | Builtin::UInt16
-                        | Builtin::UInt32
-                        | Builtin::UInt64
-                        | Builtin::CodePoint => SlotKind::Int { signed: false },
-                        Builtin::Float | Builtin::Fixed(_) => SlotKind::Words,
-                        _ => return None,
-                    }),
-                    Layout::Box | Layout::Pair | Layout::Closure => Some(SlotKind::Words),
-                    Layout::Tag => {
-                        let union = flat::layout(db, program, *t).as_ref()?.union.as_ref()?;
-                        let TagPlace::Bytes(_) = union.tag else {
-                            return None;
-                        };
-                        let members = union.members.iter().map(|m| type_index(m.ty)).collect();
-                        Some(SlotKind::Tag(members))
-                    }
-                    Layout::Union => return None,
+    match f {
+        Form::Fields(fields) => {
+            let flat = flat::layout(db, program, ty).as_ref()?;
+            let mut at = at;
+            for (name, t, inner) in fields {
+                let place = flat.fields.iter().find(|p| p.name == *name)?;
+                let leaf = Leaf {
+                    size: place.size,
+                    bits: place.bits,
+                    narrowed: place.narrowed,
                 };
-                if let Some(kind) = kind {
-                    let size = match kind {
-                        SlotKind::Words => 8 * l.words() as u32,
-                        _ => place.size,
-                    };
-                    out.push(Slot {
-                        at,
-                        offset,
-                        size,
-                        bits: place.bits,
-                        kind,
-                    });
-                }
+                slots_of(db, program, *t, inner, at, offset + place.offset, leaf, out)?;
+                at += inner.words();
             }
         }
-        at += inner.words();
+        Form::Union(members) => {
+            let forms: Vec<(Ty<'db>, &Form<'db>)> = members.iter().map(|(m, f)| (*m, f)).collect();
+            out.push(union_slot(db, program, ty, &forms, at, offset)?);
+        }
+        Form::Words(l) => {
+            let kind = match l {
+                Layout::Zero => return Some(()),
+                Layout::Imm(b) => match leaf.narrowed.unwrap_or(*b) {
+                    Builtin::Int | Builtin::Int8 | Builtin::Int16 | Builtin::Int32 => {
+                        SlotKind::Int { signed: true }
+                    }
+                    Builtin::UInt8
+                    | Builtin::UInt16
+                    | Builtin::UInt32
+                    | Builtin::UInt64
+                    | Builtin::CodePoint => SlotKind::Int { signed: false },
+                    Builtin::Float | Builtin::Fixed(_) => SlotKind::Words,
+                    _ => return None,
+                },
+                Layout::Box | Layout::Pair | Layout::Closure => SlotKind::Words,
+                // A union of two words keeps a member in a box, or is a
+                // cycle's edge, laid out where its record is.
+                Layout::Union => return None,
+                Layout::Tag => {
+                    let union = flat::layout(db, program, ty).as_ref()?.union.as_ref()?;
+                    let TagPlace::Bytes(_) = union.tag else {
+                        return None;
+                    };
+                    SlotKind::Tag(union.members.iter().map(|m| type_index(m.ty)).collect())
+                }
+            };
+            let size = match kind {
+                SlotKind::Words => 8 * l.words() as u32,
+                _ => leaf.size,
+            };
+            out.push(Slot {
+                at,
+                offset,
+                size,
+                bits: leaf.bits,
+                kind,
+            });
+        }
     }
     Some(())
+}
+
+/// The slot of a union at `offset`, whose type index is register `at`
+/// and whose members' words follow it.
+fn union_slot<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    ty: Ty<'db>,
+    members: &[(Ty<'db>, &Form<'db>)],
+    at: usize,
+    offset: u32,
+) -> Option<Slot> {
+    let flat = flat::layout(db, program, ty).as_ref()?;
+    let union = flat.union.as_ref()?;
+    let tag = match union.tag {
+        TagPlace::Bytes(size) => UnionTag::Bytes { offset, size },
+        TagPlace::Niche(n) => UnionTag::Niche {
+            empty: union
+                .members
+                .iter()
+                .position(|m| matches!(layout::layout(db, program, m.ty), Some(Layout::Zero)))?,
+            offset: offset + n.offset,
+            test: match n.kind {
+                NicheKind::Value { size, value } => NicheTest::Value { size, value },
+                NicheKind::Bit(bit) => NicheTest::Bit(bit),
+            },
+        },
+    };
+    let mut placed = Vec::new();
+    for place in &union.members {
+        let (_, f) = members.iter().find(|(m, _)| *m == place.ty)?;
+        let own = flat::layout(db, program, place.ty).as_ref()?;
+        let leaf = Leaf {
+            size: if place.boxed.is_some() { 8 } else { own.size },
+            bits: None,
+            narrowed: own.narrowed,
+        };
+        let mut slots = Vec::new();
+        slots_of(
+            db,
+            program,
+            place.ty,
+            f,
+            at + 1,
+            offset + place.offset,
+            leaf,
+            &mut slots,
+        )?;
+        placed.push((type_index(place.ty), slots));
+    }
+    Some(Slot {
+        at,
+        offset,
+        size: flat.size,
+        bits: None,
+        kind: SlotKind::Union {
+            tag,
+            members: placed,
+        },
+    })
 }
 
 /// Whether an instance is a function's body, which takes and gives flat
