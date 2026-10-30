@@ -157,6 +157,7 @@ unsafe fn encode(
             let name = name.as_deref().unwrap_or("a record");
             return Err(NotSolid(format!("{name} split into registers")));
         }
+        Shape::Variant { .. } => return Err(NotSolid("a union split into registers".into())),
     }
     Ok(())
 }
@@ -366,6 +367,7 @@ impl Decoder<'_> {
                 return Err(DecodeError(format!("a value of type {name}")));
             }
             Shape::Inline { .. } => return Err(DecodeError("a split record".into())),
+            Shape::Variant { .. } => return Err(DecodeError("a split union".into())),
         }
         Ok(())
     }
@@ -448,7 +450,10 @@ impl Decoder<'_> {
                 let bytes = self.bytes(n).expect(ok);
                 make_text(heap, &[bytes]).to_vec()
             }
-            Shape::Function | Shape::Opaque { .. } | Shape::Inline { .. } => {
+            Shape::Function
+            | Shape::Opaque { .. }
+            | Shape::Inline { .. }
+            | Shape::Variant { .. } => {
                 unreachable!("checked")
             }
         }

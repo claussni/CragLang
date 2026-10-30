@@ -2013,8 +2013,11 @@ impl Shapes {
                         Number::CodePoint => out.push(4),
                     }
                 }
-                Shape::Union { members, words } => {
-                    out.push(3);
+                Shape::Union { members, words } | Shape::Variant { members, words } => {
+                    out.push(match shape {
+                        Shape::Union { .. } => 3,
+                        _ => 13,
+                    });
                     u32(&mut out, members.len() as u32);
                     for &(index, shape) in members {
                         u32(&mut out, index);
@@ -2096,7 +2099,9 @@ impl Shapes {
         let n = shapes.shapes.len() as u32;
         let inside = |i: &u32| *i < n;
         let named = shapes.shapes.iter().all(|s| match s {
-            Shape::Union { members, .. } => members.iter().map(|m| &m.1).all(inside),
+            Shape::Union { members, .. } | Shape::Variant { members, .. } => {
+                members.iter().map(|m| &m.1).all(inside)
+            }
             Shape::Record { fields, .. } | Shape::Inline { fields, .. } => {
                 fields.iter().map(|f| &f.shape).all(inside)
             }
@@ -2164,6 +2169,10 @@ impl ShapeReader<'_> {
                 tag => return Err(format!("a number with the tag {tag}")),
             }),
             3 => Shape::Union {
+                members: self.seq(|r| Ok((r.u32()?, r.u32()?)))?,
+                words: self.u32()?,
+            },
+            13 => Shape::Variant {
                 members: self.seq(|r| Ok((r.u32()?, r.u32()?)))?,
                 words: self.u32()?,
             },
@@ -2255,6 +2264,13 @@ pub enum Shape {
         fields: Vec<ShapeField>,
         words: u32,
     },
+    /// A union split into registers: the type index of the member, then
+    /// the member's own words, a record's inline. Each member by its type
+    /// index.
+    Variant {
+        members: Vec<(u32, u32)>,
+        words: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -2314,7 +2330,8 @@ impl Shape {
             | Shape::Map(..) => 1,
             Shape::Union { words, .. }
             | Shape::Opaque { words, .. }
-            | Shape::Inline { words, .. } => *words,
+            | Shape::Inline { words, .. }
+            | Shape::Variant { words, .. } => *words,
             Shape::Function | Shape::Str | Shape::Bytes => 2,
         }
     }

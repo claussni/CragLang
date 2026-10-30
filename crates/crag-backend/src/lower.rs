@@ -391,15 +391,22 @@ impl<'a, 'db> Lower<'a, 'db> {
             words = words.max(1);
         }
         let form = decl.split.then(|| form(db, program, decl.ty)).flatten();
-        let leaves = match &form {
+        // A union's members are not tracked, as a union's payload is not.
+        let leaves: Vec<(usize, Layout)> = match &form {
             Some(f) => {
                 words = f.words();
                 f.leaves(decl.ty)
+                    .into_iter()
+                    .filter_map(|(at, leaf, _)| match leaf {
+                        Form::Words(l) => Some((at, *l)),
+                        _ => None,
+                    })
+                    .collect()
             }
-            None => layout.map_or(Vec::new(), |l| vec![(0, l, decl.ty)]),
+            None => layout.map_or(Vec::new(), |l| vec![(0, l)]),
         };
         let regs: Vec<VReg> = (0..words).map(|_| self.reg()).collect();
-        for (at, leaf, _) in leaves {
+        for (at, leaf) in leaves {
             match leaf {
                 Layout::Box => self.tracked.push(regs[at]),
                 Layout::Closure => self.tracked.push(regs[at + 1]),
@@ -673,7 +680,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 self.layouts[l.index()].ok_or("values of this type")?;
                 let regs = self.locals[l.index()].clone();
                 match self.forms[l.index()].clone() {
-                    Some(form) => Ok(vec![self.box_split(self.local_ty(*l), &form, &regs)?]),
+                    Some(form) => self.boxed(self.local_ty(*l), &form, &regs),
                     None => Ok(regs),
                 }
             }
@@ -689,6 +696,134 @@ impl<'a, 'db> Lower<'a, 'db> {
                 Ok(self.locals[l.index()].clone())
             }
             _ => self.operand(op, ty),
+        }
+    }
+
+    /// The words of a split value as its layout has them: a record's box,
+    /// a union's two words, or the words as they are.
+    fn boxed(
+        &mut self,
+        ty: Ty<'db>,
+        f: &Form<'db>,
+        regs: &[VReg],
+    ) -> Result<Vec<VReg>, Unsupported> {
+        match f {
+            Form::Words(_) => Ok(regs.to_vec()),
+            Form::Fields(_) => Ok(vec![self.box_split(ty, f, regs)?]),
+            Form::Union(members) => self.box_union(members, regs),
+        }
+    }
+
+    /// The two words of a union split in registers: its type index, and
+    /// its member's word, a record boxed and a member of two words in a
+    /// member box, which take over the member's references.
+    fn box_union(
+        &mut self,
+        members: &[(Ty<'db>, Form<'db>)],
+        regs: &[VReg],
+    ) -> Result<Vec<VReg>, Unsupported> {
+        let payload = self.constant(0);
+        // A trap unwinding the frame releases the box made, as a boxed
+        // local's, when every member's word is a pointer or nothing.
+        let pointers = members
+            .iter()
+            .all(|(_, f)| !matches!(f, Form::Words(Layout::Imm(_))));
+        if pointers {
+            self.tracked.push(payload);
+        }
+        let done = self.new_block();
+        for (m, f) in members {
+            let n = f.words();
+            // A record member is a box, even one of no words.
+            if let Form::Words(Layout::Zero | Layout::Tag) = f {
+                continue;
+            }
+            let (hit, next) = (self.new_block(), self.new_block());
+            let index = self.constant(type_index(*m));
+            let same = self.cmp(Cond::Eq, regs[0], index);
+            let term = Term::Branch {
+                cond: same,
+                then: hit,
+                otherwise: next,
+            };
+            self.end(term, Some(hit));
+            let words = &regs[1..1 + n];
+            let value = match f {
+                Form::Words(Layout::Pair | Layout::Closure) => {
+                    let header = match f {
+                        Form::Words(Layout::Pair) => TEXT_BOX_HEADER,
+                        _ => FUNCTION_BOX_HEADER,
+                    };
+                    let ptr = self.alloc(MEMBER_BOX_SIZE, header as i64);
+                    for (k, &src) in words.iter().enumerate() {
+                        self.push(Inst::Store {
+                            src,
+                            addr: ptr,
+                            offset: (HEADER_SIZE + 8 * k as u32) as i32,
+                        });
+                    }
+                    ptr
+                }
+                _ => word(&self.boxed(*m, f, words)?)?,
+            };
+            self.push(Inst::Move {
+                dst: payload,
+                src: value,
+            });
+            self.end(Term::Jump(done), Some(next));
+        }
+        self.end(Term::Jump(done), Some(done));
+        Ok(vec![regs[0], payload])
+    }
+
+    /// The registers of a split value from the words its layout has, which
+    /// it borrows: a record's fields loaded from its box, a union's member
+    /// from its word.
+    fn unboxed(
+        &mut self,
+        ty: Ty<'db>,
+        f: &Form<'db>,
+        words: &[VReg],
+    ) -> Result<Vec<VReg>, Unsupported> {
+        match f {
+            Form::Words(_) => Ok(words.to_vec()),
+            Form::Fields(_) => self.unbox(ty, f, word(words)?),
+            Form::Union(members) => {
+                let out: Vec<VReg> = (0..f.words()).map(|_| self.constant(0)).collect();
+                self.push(Inst::Move {
+                    dst: out[0],
+                    src: words[0],
+                });
+                let done = self.new_block();
+                for (m, inner) in members {
+                    let n = inner.words();
+                    if n == 0 {
+                        continue;
+                    }
+                    let (hit, next) = (self.new_block(), self.new_block());
+                    let index = self.constant(type_index(*m));
+                    let same = self.cmp(Cond::Eq, words[0], index);
+                    let term = Term::Branch {
+                        cond: same,
+                        then: hit,
+                        otherwise: next,
+                    };
+                    self.end(term, Some(hit));
+                    let values = match inner {
+                        Form::Words(Layout::Pair | Layout::Closure) => self.member_words(words[1]),
+                        _ => self.unboxed(*m, inner, &words[1..2])?,
+                    };
+                    for (k, src) in values.into_iter().enumerate() {
+                        self.push(Inst::Move {
+                            dst: out[1 + k],
+                            src,
+                        });
+                    }
+                    self.end(Term::Jump(done), Some(next));
+                }
+                self.end(Term::Jump(done), Some(done));
+                Ok(out)
+            }
         }
     }
 
@@ -710,10 +845,7 @@ impl<'a, 'db> Lower<'a, 'db> {
         let mut at = 0;
         for (name, t, f) in places {
             let n = f.words();
-            let words = match f {
-                Form::Fields(_) => vec![self.box_split(*t, f, &regs[at..at + n])?],
-                Form::Words(_) => regs[at..at + n].to_vec(),
-            };
+            let words = self.boxed(*t, f, &regs[at..at + n])?;
             let slot = slots
                 .iter()
                 .find(|s| s.name == *name)
@@ -753,17 +885,10 @@ impl<'a, 'db> Lower<'a, 'db> {
                 .iter()
                 .find(|s| s.name == *name)
                 .ok_or("records of this type")?;
-            match f {
-                Form::Fields(_) => {
-                    let inner = self.load(ptr, slot.offset as i32);
-                    out.extend(self.unbox(*t, f, inner)?);
-                }
-                Form::Words(l) => {
-                    for k in 0..l.words() {
-                        out.push(self.load(ptr, (slot.offset + 8 * k as u32) as i32));
-                    }
-                }
-            }
+            let words: Vec<VReg> = (0..slot.layout.words())
+                .map(|k| self.load(ptr, (slot.offset + 8 * k as u32) as i32))
+                .collect();
+            out.extend(self.unboxed(*t, f, &words)?);
         }
         Ok(out)
     }
@@ -844,24 +969,8 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let values = self.rvalue(*local, rvalue)?;
                 self.assign(*local, values)
             }
-            Statement::Retain(local) => self.count(*local, Self::retain),
-            Statement::Release(local) => {
-                // A long chain of boxes is freed between fibers (§13.5).
-                let op = |this: &Self, ty| match deferred(this.db, this.program, ty) {
-                    true => Self::release_deferred,
-                    false => Self::release,
-                };
-                let ty = self.local_ty(*local);
-                let Some(form) = self.forms[local.index()].clone() else {
-                    return self.count(*local, op(self, ty));
-                };
-                let regs = self.locals[local.index()].clone();
-                for (at, leaf, ty) in form.leaves(ty) {
-                    let op = op(self, ty);
-                    self.count_words(Some(leaf), ty, &regs[at..at + leaf.words()], op)?;
-                }
-                Ok(())
-            }
+            Statement::Retain(local) => self.count(*local, Count::Retain),
+            Statement::Release(local) => self.count(*local, Count::Release),
             Statement::Poll => {
                 self.push(Inst::Poll);
                 Ok(())
@@ -897,17 +1006,69 @@ impl<'a, 'db> Lower<'a, 'db> {
     }
 
     /// Retains or releases the box a local holds, if it holds one.
-    fn count(&mut self, local: Local, op: fn(&mut Self, VReg)) -> Result<(), Unsupported> {
+    fn count(&mut self, local: Local, how: Count) -> Result<(), Unsupported> {
         let regs = self.locals[local.index()].clone();
-        let (layout, ty) = (self.layouts[local.index()], self.local_ty(local));
-        let Some(form) = self.forms[local.index()].clone() else {
-            return self.count_words(layout, ty, &regs, op);
+        let ty = self.local_ty(local);
+        let form = match self.forms[local.index()].clone() {
+            Some(form) => form,
+            None => match self.layouts[local.index()] {
+                Some(layout) => Form::Words(layout),
+                None => return Ok(()),
+            },
         };
-        // Each field of a split local that holds a box.
-        for (at, leaf, ty) in form.leaves(ty) {
-            self.count_words(Some(leaf), ty, &regs[at..at + leaf.words()], op)?;
+        self.count_form(&form, ty, &regs, how)
+    }
+
+    /// Retains or releases what the registers of a split value hold: each
+    /// field's, and a union's member's by its type index.
+    fn count_form(
+        &mut self,
+        f: &Form<'db>,
+        ty: Ty<'db>,
+        regs: &[VReg],
+        how: Count,
+    ) -> Result<(), Unsupported> {
+        match f {
+            Form::Words(l) => {
+                let op = match how {
+                    Count::Retain => Self::retain,
+                    // A long chain of boxes is freed between fibers (§13.5).
+                    Count::Release if deferred(self.db, self.program, ty) => Self::release_deferred,
+                    Count::Release => Self::release,
+                };
+                self.count_words(Some(*l), ty, regs, op)
+            }
+            Form::Fields(fields) => {
+                let mut at = 0;
+                for (_, t, inner) in fields {
+                    let n = inner.words();
+                    self.count_form(inner, *t, &regs[at..at + n], how)?;
+                    at += n;
+                }
+                Ok(())
+            }
+            Form::Union(members) => {
+                let done = self.new_block();
+                for (m, inner) in members {
+                    if !counted_form(inner) {
+                        continue;
+                    }
+                    let (hit, next) = (self.new_block(), self.new_block());
+                    let index = self.constant(type_index(*m));
+                    let same = self.cmp(Cond::Eq, regs[0], index);
+                    let term = Term::Branch {
+                        cond: same,
+                        then: hit,
+                        otherwise: next,
+                    };
+                    self.end(term, Some(hit));
+                    self.count_form(inner, *m, &regs[1..1 + inner.words()], how)?;
+                    self.end(Term::Jump(done), Some(next));
+                }
+                self.end(Term::Jump(done), Some(done));
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// Retains or releases the box the words of a value hold, if they hold
@@ -1184,12 +1345,42 @@ impl<'a, 'db> Lower<'a, 'db> {
             Rvalue::Read(place) => {
                 let values = self.read(place)?;
                 match self.forms[dst.index()].clone() {
-                    Some(form) if !self.split_place(place) => self.unbox(ty, &form, word(&values)?),
+                    Some(form) if !self.split_place(place) => self.unboxed(ty, &form, &values),
                     _ => Ok(values),
                 }
             }
             Rvalue::Convert(op) => {
                 let from = self.operand_ty(op, ty);
+                // Into a union split in registers: the member's type index
+                // and words.
+                if let Some(form @ Form::Union(_)) = self.forms[dst.index()].clone() {
+                    if from == ty {
+                        return self.split_operand(op, ty);
+                    }
+                    let member = self.member_of(from, ty);
+                    let f = form.member(member).ok_or("this conversion")?.clone();
+                    let mut values = vec![self.constant(type_index(member))];
+                    values.extend(match f {
+                        Form::Words(_) => self.operand(op, from)?,
+                        _ => self.split_operand(op, from)?,
+                    });
+                    while values.len() < form.words() {
+                        values.push(self.constant(0));
+                    }
+                    return Ok(values);
+                }
+                // Out of a split union, to a member a test established.
+                if let Operand::Local(l) = op
+                    && let Some(form @ Form::Union(_)) = self.forms[l.index()].clone()
+                    && let Some(f) = form.member(ty)
+                {
+                    let regs = self.locals[l.index()].clone();
+                    let payload = regs[1..1 + f.words()].to_vec();
+                    return match self.forms[dst.index()] {
+                        Some(_) => Ok(payload),
+                        None => self.boxed(ty, f, &payload),
+                    };
+                }
                 let values = self.operand(op, from)?;
                 self.convert(values, from, ty)
             }
@@ -1264,8 +1455,8 @@ impl<'a, 'db> Lower<'a, 'db> {
                         .find(|(n, _)| *n == name)
                         .ok_or("records of this type")?;
                     values.extend(match form {
-                        Form::Fields(_) => self.split_operand(op, ty)?,
                         Form::Words(_) => self.operand(op, ty)?,
+                        _ => self.split_operand(op, ty)?,
                     });
                 }
                 Ok(values)
@@ -1363,7 +1554,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let index = word(&self.operand(index, int)?)?;
                 let values = self.element(ptr, list_ty, index)?;
                 match self.forms[dst.index()].clone() {
-                    Some(form) => self.unbox(ty, &form, word(&values)?),
+                    Some(form) => self.unboxed(ty, &form, &values),
                     None => Ok(values),
                 }
             }
@@ -3766,9 +3957,7 @@ impl<'a, 'db> Lower<'a, 'db> {
         ptr: VReg,
     ) -> Result<Vec<VReg>, Unsupported> {
         let regs = self.unbox(ty, f, ptr)?;
-        for (at, leaf, t) in f.leaves(ty) {
-            self.count_words(Some(leaf), t, &regs[at..at + leaf.words()], Self::retain)?;
-        }
+        self.count_form(f, ty, &regs, Count::Retain)?;
         match deferred(self.db, self.program, ty) {
             true => self.release_deferred(ptr),
             false => self.release(ptr),
@@ -3947,7 +4136,7 @@ impl<'a, 'db> Lower<'a, 'db> {
         let values = self.read(place)?;
         let ty = self.place_ty(place)?;
         // A split record is of its own type alone.
-        if self.split_place(place) {
+        if self.split_record(place) {
             let hit = cases
                 .iter()
                 .find(|&&(case, _)| crag_types::tested(db, self.program, ty, case));
@@ -4004,8 +4193,21 @@ impl<'a, 'db> Lower<'a, 'db> {
         Ok(())
     }
 
-    /// Whether the value at a place is a record split in registers.
+    /// Whether the value at a place is a record or a union split in
+    /// registers.
     fn split_place(&self, place: &Place<'db>) -> bool {
+        let Some(form) = &self.forms[place.local.index()] else {
+            return false;
+        };
+        let ty = self.local_ty(place.local);
+        matches!(
+            place_form(form, ty, &place.path),
+            Some((_, _, Form::Fields(_) | Form::Union(_), _))
+        )
+    }
+
+    /// Whether the value at a place is a record split in registers.
+    fn split_record(&self, place: &Place<'db>) -> bool {
         let Some(form) = &self.forms[place.local.index()] else {
             return false;
         };
@@ -4023,6 +4225,22 @@ impl<'a, 'db> Lower<'a, 'db> {
         let indices = subtypes(self.db, self.program, ty);
         self.test_index(index, &indices, hit, miss);
         self.current = (miss.0 as usize, Vec::new());
+    }
+}
+
+/// How `count_form` counts.
+#[derive(Clone, Copy)]
+enum Count {
+    Retain,
+    Release,
+}
+
+/// Whether a split value's registers may hold references.
+fn counted_form(f: &Form<'_>) -> bool {
+    match f {
+        Form::Words(l) => !matches!(l, Layout::Zero | Layout::Imm(_) | Layout::Tag),
+        Form::Fields(fields) => fields.iter().any(|(_, _, f)| counted_form(f)),
+        Form::Union(members) => members.iter().any(|(_, f)| counted_form(f)),
     }
 }
 

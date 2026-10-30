@@ -21,7 +21,11 @@
 //! A split local's register form is its fields' in the order of their
 //! storage form, a field of a flat record type split in turn and any other
 //! field in the words of its layout (`layout::layout`). Building such a
-//! record allocates nothing and reading a field picks its registers.
+//! record allocates nothing and reading a field picks its registers. A
+//! flat union with a member that is a flat record splits too: its
+//! member's type index, then the member's words in its own form, as many
+//! as the widest member's. Where it meets a box, it has its layout's two
+//! words, the member boxed.
 //!
 //! A split local is used in registers by field reads, type tests,
 //! counting, steps, and copies into another split local or a field of
@@ -75,6 +79,10 @@ pub enum Form<'db> {
     Words(Layout),
     /// A flat record's fields, in storage order, each in its own form.
     Fields(Vec<(Name<'db>, Ty<'db>, Form<'db>)>),
+    /// A union with a member that is a flat record: the type index of the
+    /// value's member, then the member's words in its own form, as many as
+    /// the widest member's.
+    Union(Vec<(Ty<'db>, Form<'db>)>),
 }
 
 impl<'db> Form<'db> {
@@ -82,20 +90,26 @@ impl<'db> Form<'db> {
         match self {
             Form::Words(l) => l.words(),
             Form::Fields(fields) => fields.iter().map(|(_, _, f)| f.words()).sum(),
+            Form::Union(members) => 1 + members.iter().map(|(_, f)| f.words()).max().unwrap_or(0),
         }
     }
 
-    /// The values that are not records split further, with their words'
-    /// first index, in order.
-    pub fn leaves(&self, ty: Ty<'db>) -> Vec<(usize, Layout, Ty<'db>)> {
+    /// The values that are not records split further, words or unions,
+    /// with their first word's index, in order.
+    pub fn leaves(&self, ty: Ty<'db>) -> Vec<(usize, &Form<'db>, Ty<'db>)> {
         let mut out = Vec::new();
         self.leaves_into(ty, 0, &mut out);
         out
     }
 
-    fn leaves_into(&self, ty: Ty<'db>, at: usize, out: &mut Vec<(usize, Layout, Ty<'db>)>) {
+    fn leaves_into<'a>(
+        &'a self,
+        ty: Ty<'db>,
+        at: usize,
+        out: &mut Vec<(usize, &'a Form<'db>, Ty<'db>)>,
+    ) {
         match self {
-            Form::Words(l) => out.push((at, *l, ty)),
+            Form::Words(_) | Form::Union(_) => out.push((at, self, ty)),
             Form::Fields(fields) => {
                 let mut at = at;
                 for (_, t, f) in fields {
@@ -104,6 +118,14 @@ impl<'db> Form<'db> {
                 }
             }
         }
+    }
+
+    /// A member's form, whose words start at the second.
+    pub fn member(&self, ty: Ty<'db>) -> Option<&Form<'db>> {
+        let Form::Union(members) = self else {
+            return None;
+        };
+        members.iter().find(|(m, _)| *m == ty).map(|(_, f)| f)
     }
 
     /// A field's first word, type and form.
@@ -123,9 +145,31 @@ impl<'db> Form<'db> {
 }
 
 /// The register form of a split value of `ty`: none unless it is a flat
-/// record. Flat records within it are split too, but a field that is the
-/// edge of a cycle holds a box.
+/// record, or a flat union with a member that is one. Flat records within
+/// it are split too, but a field or a member that is the edge of a cycle
+/// holds a box.
 pub fn form<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Form<'db>> {
+    if let TyKind::Union(_) = ty.kind(db) {
+        let flat = flat::layout(db, program, ty).as_ref()?;
+        if flat.is_boxed() {
+            return None;
+        }
+        let mut members = Vec::new();
+        let mut records = false;
+        for place in &flat.union.as_ref()?.members {
+            let inner = match place.boxed {
+                Some(_) => None,
+                None => form(db, program, place.ty),
+            };
+            records |= inner.is_some();
+            let inner = match inner {
+                Some(f) => f,
+                None => Form::Words(layout::layout(db, program, place.ty)?),
+            };
+            members.push((place.ty, inner));
+        }
+        return records.then_some(Form::Union(members));
+    }
     let record = match ty.kind(db) {
         TyKind::Named(item, _) => {
             matches!(
@@ -179,6 +223,12 @@ pub fn place_form<'a, 'db>(
                 form = f;
             }
             Step::As(t) if *t == ty => {}
+            // A member's words follow the union's type index.
+            Step::As(t) => {
+                form = form.member(*t)?;
+                at += 1;
+                ty = *t;
+            }
             _ => return None,
         }
     }
@@ -313,7 +363,19 @@ impl<'db> Check<'_, 'db> {
         let form = self.forms[place.local.index()].as_ref()?;
         let ty = self.body.locals[place.local.index()].ty;
         let (_, _, form, _) = place_form(form, ty, &place.path)?;
-        Some(matches!(form, Form::Fields(_)))
+        Some(matches!(form, Form::Fields(_) | Form::Union(_)))
+    }
+
+    /// The form of a member of a split union that a value of `from` is.
+    fn member(&self, union: &Form<'db>, from: Ty<'db>, to: Ty<'db>) -> Option<Form<'db>> {
+        let members = to.members(self.db);
+        let member = match members.contains(&from) {
+            true => from,
+            false => members
+                .into_iter()
+                .find(|&m| crag_types::is_subtype(self.db, self.program, from, m))?,
+        };
+        union.member(member).cloned()
     }
 
     /// A place read that must give words, not a split record.
@@ -364,9 +426,11 @@ impl<'db> Check<'_, 'db> {
                 defines = true;
                 let form = self.forms[dst.index()].as_ref();
                 for (name, op) in fields {
-                    // A split record goes into a field split in turn.
+                    // A split record or union goes into a field split in
+                    // turn.
                     let field = form.and_then(|f| f.field(*name));
-                    let split_field = matches!(field, Some((_, _, Form::Fields(_))));
+                    let split_field =
+                        matches!(field, Some((_, _, Form::Fields(_) | Form::Union(_))));
                     match op {
                         Operand::Local(l) if split_field && self.split[l.index()] => {}
                         _ if split_field => {
@@ -377,9 +441,8 @@ impl<'db> Check<'_, 'db> {
                     }
                 }
             }
-            Rvalue::Use(o) | Rvalue::Convert(o) | Rvalue::FnValue { env: o, .. } => {
-                self.consumed(o)
-            }
+            Rvalue::Convert(o) => self.convert(*dst, o, into_split, &mut defines),
+            Rvalue::Use(o) | Rvalue::FnValue { env: o, .. } => self.consumed(o),
             Rvalue::Record { fields, .. } => fields.iter().for_each(|(_, o)| self.consumed(o)),
             Rvalue::List(items) => items.iter().for_each(|o| self.consumed(o)),
             Rvalue::Map(entries) => {
@@ -428,6 +491,52 @@ impl<'db> Check<'_, 'db> {
         if !defines {
             self.keep[dst.index()] = true;
         }
+    }
+
+    /// A conversion into a split union, of a member or the union itself,
+    /// or out of one, to a member a test established.
+    fn convert(
+        &mut self,
+        dst: crag_mir::Local,
+        op: &Operand<'db>,
+        into_split: bool,
+        defines: &mut bool,
+    ) {
+        let to = self.body.locals[dst.index()].ty;
+        let from = match op {
+            Operand::Local(l) => self.body.locals[l.index()].ty,
+            Operand::Const(_) => to,
+        };
+        if into_split && let Some(union @ Form::Union(_)) = self.forms[dst.index()].clone() {
+            match op {
+                // A tag goes in as its type index.
+                Operand::Const(_) => *defines = true,
+                Operand::Local(l) if from == to => {
+                    *defines = self.split[l.index()];
+                }
+                Operand::Local(l) => match self.member(&union, from, to) {
+                    Some(Form::Words(_)) => *defines = true,
+                    Some(_) if self.split[l.index()] => *defines = true,
+                    _ => self.consumed(op),
+                },
+            }
+            return;
+        }
+        if let Operand::Local(l) = op
+            && self.split[l.index()]
+            && let Some(union @ Form::Union(_)) = &self.forms[l.index()]
+            && let Some(member) = union.member(to)
+        {
+            match member {
+                // A member's words, as they are.
+                Form::Words(_) => {}
+                Form::Fields(_) | Form::Union(_) if into_split => *defines = true,
+                // Boxed, which gives the union's references to the box.
+                _ => self.escapes[l.index()] = true,
+            }
+            return;
+        }
+        self.consumed(op);
     }
 
     fn terminator(&mut self, terminator: &Terminator<'db>) {
@@ -526,6 +635,7 @@ fn slots_into<'db>(
         let offset = base + place.offset;
         match inner {
             Form::Fields(_) => slots_into(db, program, *t, inner, at, offset, out)?,
+            Form::Union(_) => return None,
             Form::Words(l) => {
                 let kind = match l {
                     Layout::Zero => None,

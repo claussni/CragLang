@@ -1081,6 +1081,10 @@ mod tests {
                             }],
                             words: 1,
                         },
+                        Shape::Variant {
+                            members: vec![(7, 0), (8, 3)],
+                            words: 3,
+                        },
                     ],
                     records: vec![(7, 0)],
                     boxes: vec![(0, 7, 32), (4, 9, 16), (5, 10, 40)],

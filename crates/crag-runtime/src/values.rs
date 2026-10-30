@@ -271,6 +271,16 @@ impl Walk<'_> {
                         self.equals(field(pa, f.offset, n), field(pb, f.offset, n), f.shape)
                     })
                 }
+                Shape::Variant { members, .. } => {
+                    if a[0] != b[0] {
+                        return false;
+                    }
+                    let Some(&(_, m)) = members.iter().find(|m| u64::from(m.0) == a[0]) else {
+                        return true;
+                    };
+                    let n = self.shape(m).words() as usize;
+                    self.equals(&a[1..1 + n], &b[1..1 + n], m)
+                }
                 Shape::Inline { fields, .. } => fields.iter().all(|f| {
                     let (at, n) = (f.offset as usize, self.shape(f.shape).words() as usize);
                     self.equals(&a[at..at + n], &b[at..at + n], f.shape)
@@ -370,6 +380,16 @@ impl Walk<'_> {
                     }
                     Ordering::Equal
                 }
+                Shape::Variant { members, .. } => {
+                    let position = |w: u64| members.iter().position(|m| u64::from(m.0) == w);
+                    let (ia, ib) = (position(a[0]), position(b[0]));
+                    if ia != ib {
+                        return Some(ia.cmp(&ib));
+                    }
+                    let (_, m) = members[ia?];
+                    let n = self.shape(m).words() as usize;
+                    self.compare(&a[1..1 + n], &b[1..1 + n], m)?
+                }
                 Shape::Inline { fields, .. } => {
                     for f in fields {
                         let (at, n) = (f.offset as usize, self.shape(f.shape).words() as usize);
@@ -429,6 +449,13 @@ impl Walk<'_> {
                     for f in self.record_fields(index, shape) {
                         let n = self.shape(f.shape).words();
                         self.hash(field(ptr, f.offset, n), f.shape, h);
+                    }
+                }
+                Shape::Variant { members, .. } => {
+                    h.word(a[0]);
+                    if let Some(&(_, m)) = members.iter().find(|m| u64::from(m.0) == a[0]) {
+                        let n = self.shape(m).words() as usize;
+                        self.hash(&a[1..1 + n], m, h);
                     }
                 }
                 Shape::Inline { fields, .. } => {

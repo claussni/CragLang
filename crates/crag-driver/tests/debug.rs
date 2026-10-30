@@ -46,11 +46,14 @@ fn answer(n: Int) -> Bytes { if n > 2 { b"many" } else { b"one" } }
 
 type Twice(n: Int, doubled: Int)
 
+fn none(t: Option[Twice]) -> Int { 0 }
+
 fn reply(c: Connection, n: Int) -> () {
   case c.read() {
     bytes: Bytes -> {
       let twice = Twice(n: n, doubled: n * 2)
-      let doubled = twice.doubled
+      let maybe: Option[Twice] = Twice(n: n, doubled: 0)
+      let doubled = twice.doubled + none(maybe)
       let written = c.write(answer(doubled))
     }
     _ -> ()
@@ -184,6 +187,10 @@ fn a_breakpoint_stops_the_task_that_reaches_it() {
     assert!(locals.contains(&("n".into(), "2".into())), "{locals:?}");
     assert!(
         locals.contains(&("twice".into(), "Twice(n: 2, doubled: 4)".into())),
+        "{locals:?}"
+    );
+    assert!(
+        locals.contains(&("maybe".into(), "Twice(n: 2, doubled: 0)".into())),
         "{locals:?}"
     );
     assert!(

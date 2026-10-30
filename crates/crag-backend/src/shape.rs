@@ -141,6 +141,19 @@ impl<'db> Builder<'db> {
     /// record's are.
     fn inline(&mut self, ty: Ty<'db>, f: &Form<'db>) -> u32 {
         let db = self.db;
+        if let Form::Union(members) = f {
+            let index = self.shapes.shapes.len() as u32;
+            self.shapes.shapes.push(Shape::Unit);
+            let members = members
+                .iter()
+                .map(|(m, inner)| (type_index(*m) as u32, self.inline(*m, inner)))
+                .collect();
+            self.shapes.shapes[index as usize] = Shape::Variant {
+                members,
+                words: f.words() as u32,
+            };
+            return index;
+        }
         let Form::Fields(places) = f else {
             return self.shape(ty);
         };

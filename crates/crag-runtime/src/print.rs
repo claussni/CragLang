@@ -153,6 +153,16 @@ impl Printer<'_> {
                 }
                 self.out.push(')');
             }
+            Shape::Variant { members, .. } => {
+                match members.iter().find(|m| u64::from(m.0) == word) {
+                    Some(&(_, m)) => {
+                        let n = self.shape(m).words() as usize;
+                        // SAFETY: the member's words follow its type index.
+                        unsafe { self.value(&words[1..1 + n], m, depth) }
+                    }
+                    None => self.out.push_str(&format!("<a member of type {word}>")),
+                }
+            }
             Shape::Inline { name, fields, .. } => {
                 self.out.push_str(name.as_deref().unwrap_or(""));
                 self.out.push('(');
@@ -365,6 +375,15 @@ pub unsafe fn release_value(
     };
     let ptr = match &shapes.shapes[shape as usize] {
         _ if boxed(shape) => words[0],
+        // A split union's member holds its own.
+        Shape::Variant { members, .. } => {
+            if let Some(&(_, m)) = members.iter().find(|m| u64::from(m.0) == words[0]) {
+                let n = shapes.shapes[m as usize].words() as usize;
+                // SAFETY: as the caller promises, for the member's words.
+                unsafe { release_value(heap, types, &words[1..1 + n], shapes, m) };
+            }
+            0
+        }
         // Each field of a split record holds its own.
         Shape::Inline { fields, .. } => {
             for f in fields {

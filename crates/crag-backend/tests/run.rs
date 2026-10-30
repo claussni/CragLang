@@ -928,8 +928,9 @@ fn escapes(a: Int) -> Point {
     };
     assert_eq!(split("lines"), on(&["p", "q", "l", "r"]));
     assert_eq!(split("label"), on(&["n", "m"]));
-    // `tail` is boxed where it goes into a field that holds a box.
-    assert_eq!(split("node"), on(&["tail", "head"]));
+    // `tail` is boxed where it goes into a field that holds a box, and
+    // `n` loaded from it.
+    assert_eq!(split("node"), on(&["tail", "head", "n"]));
     // A returned record is boxed where it is returned.
     assert_eq!(split("escapes"), on(&["p", "kept"]));
     RELEASED.set(0);
@@ -1106,6 +1107,88 @@ fn zeroLine() -> Line { walk(line(1), 2) }
         m.shown("zeroLine"),
         "Line(from: Point(x: 1, y: 2), to: Point(x: 10, y: 11))"
     );
+    assert_eq!(m.heap.live_blocks(), 0);
+}
+
+#[test]
+fn flat_unions_stay_in_registers() {
+    let mut m = Module::new(
+        r#"type Point(x: Int, y: Int)
+type Spot(at: Option[Point], n: Int)
+type Named(name: Str | Point, n: Int)
+type End
+type Node(value: Int, next: Node | End)
+
+fn pick(a: Int) -> Int {
+  let o: Option[Point] = if 0 < a { Point(x: a, y: 1) } else { Empty }
+  case o {
+    Empty -> -1
+    p: Point -> p.x + p.y
+  }
+}
+
+fn spot(a: Int) -> Int {
+  let s = Spot(at: Point(x: a, y: 2), n: 5)
+  let t = Spot(at: Empty, n: 6)
+  let u = s
+  case u.at {
+    Empty -> t.n
+    p: Point -> p.y * 10 + t.n
+  }
+}
+
+fn named(a: Int) -> Int {
+  let n = Named(name: "a string longer than the inline bytes", n: a)
+  let m = Named(name: Point(x: a, y: a), n: 1)
+  let k = case n.name {
+    s: Str -> 100
+    p: Point -> p.x
+  }
+  let j = case m.name {
+    s: Str -> 100
+    p: Point -> p.x
+  }
+  k + j + n.n
+}
+
+fn kept(a: Int) -> List[Option[Point]] {
+  let o: Option[Point] = Point(x: a, y: a)
+  [o, Empty]
+}
+
+fn chain(k: Int) -> Int {
+  var n: Node | End = End
+  for i in 1..k {
+    n = Node(value: i, next: n)
+  }
+  case n {
+    Node(value:) -> value
+    End -> 0
+  }
+}
+
+fn listed() -> List[Option[Point]] { kept(3) }
+"#,
+    );
+    let split = |name| match flat_layouts() {
+        true => m.split(name),
+        false => Vec::new(),
+    };
+    let on = |names: &[&str]| match flat_layouts() {
+        true => names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+        false => Vec::new(),
+    };
+    assert_eq!(split("pick"), on(&["o", "p"]));
+    assert_eq!(split("spot"), on(&["s", "t", "u", "p"]));
+    assert_eq!(split("named"), on(&["n", "m", "p", "p"]));
+    // Boxed where it goes into the list.
+    assert_eq!(split("kept"), on(&["o"]));
+    assert_eq!(m.int("pick", &[4]), 5);
+    assert_eq!(m.int("pick", &[0]), -1);
+    assert_eq!(m.int("spot", &[3]), 26);
+    assert_eq!(m.int("named", &[7]), 100 + 7 + 7);
+    assert_eq!(m.int("chain", &[1000]), 1000);
+    assert_eq!(m.shown("listed"), "[Point(x: 3, y: 3), Empty]");
     assert_eq!(m.heap.live_blocks(), 0);
 }
 
@@ -1918,7 +2001,9 @@ fn depth(n: Int) -> Int {
     // eight fit 32 KiB, or seven when the loop's range is a box of 32
     // bytes, with flat layouts off, whose refill carves 4 KiB. The node
     // after them goes beyond it; the trap comes at the next step, the
-    // loop's back-edge, which a chain one longer never reaches.
+    // loop's back-edge, which a chain one longer never reaches. With flat
+    // layouts the chain's head is in registers, and a node is boxed when
+    // the next takes it, so the chain holds one more.
     let budget = |memory| Meter {
         steps: u64::MAX,
         memory,
@@ -1929,7 +2014,7 @@ fn depth(n: Int) -> Int {
         assert_eq!(m.worker.heap().live_blocks(), 0);
         result
     };
-    let fit = if flat_layouts() { 8 } else { 7 } * 102;
+    let fit = if flat_layouts() { 8 * 102 + 1 } else { 7 * 102 };
     assert_eq!(fresh(fit), Ok(vec![fit as u64]));
     assert_eq!(fresh(fit + 1), Ok(vec![fit as u64 + 1]));
     let trap = fresh(fit + 2).unwrap_err();
