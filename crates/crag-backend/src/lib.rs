@@ -62,7 +62,7 @@ pub use layout::{
 };
 pub use lower::{Lowered, StepInfo, func_id, lower_to_lir};
 pub use shape::{shapes, split_shapes};
-pub use split::{flat_layouts, scalar_replace};
+pub use split::{flat_layouts, flat_params, scalar_replace};
 
 /// The code of an instance, ready for the loader.
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -231,7 +231,17 @@ fn slot_signature<'db>(db: &'db dyn Db, program: Program, instance: InstanceKey<
             pure: false,
         },
     );
-    let hash = structure(db, program, ty, &mut Vec::new(), &mut HashMap::new());
+    let mut hash = structure(db, program, ty, &mut Vec::new(), &mut HashMap::new());
+    // A parameter that passes by value in storage form (Plan §11.10.10),
+    // as it is stored.
+    for (param, &flat) in body.locals.iter().zip(flat_params(db, program, instance)) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        hash.hash(&mut hasher);
+        flat.then(|| split::storage(db, program, param.ty))
+            .hash(&mut hasher);
+        hash = hasher.finish();
+    }
     // Zero is for what has no signature, and the top bit for steps.
     (((hash >> 32) as u32 ^ hash as u32) & !crag_abi::STEP_CELL).max(1)
 }
@@ -338,12 +348,13 @@ pub fn code<'db>(
     tier: Tier,
 ) -> Option<Result<Code<'db>, String>> {
     let mut body = mir(db, program, instance, tier).as_ref()?.clone();
-    scalar_replace(db, program, &mut body);
+    scalar_replace(db, program, instance, &mut body);
     let owner = *instance.owner(db);
     let value = matches!(owner, Owner::Item(item) if item.kind(db).is_value());
     let cell =
         (value && *instance.entry(db) == Entry::Body).then(|| slot_key(db, program, instance));
-    let lowered = lower_to_lir(db, program, owner, func_id(instance), &body, cell);
+    let flat = flat_params(db, program, instance);
+    let lowered = lower_to_lir(db, program, owner, func_id(instance), &body, cell, flat);
     let settings = CodegenSettings {
         target: host().clone(),
         opt: OptLevel::None,

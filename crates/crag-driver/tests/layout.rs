@@ -287,3 +287,74 @@ fn what_has_no_layout() {
     // The session is as it was.
     assert_eq!(eval(&mut r, "1 + 1"), "2\n");
 }
+
+#[test]
+fn flat_values_pass_by_value() {
+    // Records pass to the parameters of functions in storage form, with
+    // flat layouts on: narrowed integers, flag bits and tags converted.
+    let mut r = session(&[
+        "type Grass",
+        "type Water",
+        "type Rock",
+        "type Sand",
+        "type Terrain = Grass | Water | Rock | Sand",
+        "type Tile(kind: Terrain, cost: UInt8, seen: Bool)",
+        "type Point(x: Int, y: Int)",
+        "type Glyph(code: CodePoint, size: Int, bold: Bool, italic: Bool, at: Point)
+    where size >= 1 and size <= 255",
+        "type Stock(qty: Int32, reserved: Int32, onOrder: Bool)",
+        "type Small(a: Int8, b: Int16, c: UInt8, d: Float)",
+        "type Label(text: Str, at: Point)",
+        r#"fn tile(t: Tile) -> Str { "{t.kind} {t.cost} {t.seen} {t}" }"#,
+        r#"fn glyph(g: Glyph) -> Str { "{g.code} {g.size} {g.bold} {g.italic} {g}" }"#,
+        r#"fn stock(s: Stock) -> Str { "{s.qty - s.reserved} {s.onOrder}" }"#,
+        r#"fn small(s: Small) -> Str { "{s.a} {s.b} {s.c} {s.d} {s}" }"#,
+        r#"fn label(l: Label) -> Str { "{l.text} at {l.at.x}, {l.at.y}" }"#,
+        "fn steps(p: Point, n: Int) -> Int {
+  if n == 0 { p.x } else { steps(Point(x: p.x + p.y, y: p.y), n - 1) }
+}",
+        "fn make(a: Int) -> Point { Point(x: a, y: -a) }",
+        "fn total(p: Point) -> Int { p.x * 10 + p.y }",
+        "fn twice(a: Int) -> Int { let p = make(a)\n total(p) + total(p) }",
+        "fn wrap(p: Point) -> List[Point] { [p, p] }",
+    ]);
+    let cases = [
+        (
+            "tile(Tile(kind: Rock, cost: 200, seen: True))",
+            "Rock 200 True Tile(kind: Rock, cost: 200, seen: True)",
+        ),
+        (
+            "tile(Tile(kind: Water, cost: 0, seen: False))",
+            "Water 0 False Tile(kind: Water, cost: 0, seen: False)",
+        ),
+        (
+            "glyph(Glyph(code: 'é', size: 200, bold: False, italic: True, at: Point(x: -3, y: 4)))",
+            "é 200 False True Glyph(code: 'é', size: 200, bold: False, italic: True, at: Point(x: -3, y: 4))",
+        ),
+        (
+            "stock(Stock(qty: -7, reserved: 2147483000, onOrder: True))",
+            "-2147483007 True",
+        ),
+        (
+            "small(Small(a: -128, b: -300, c: 255, d: 1.5))",
+            "-128 -300 255 1.5 Small(a: -128, b: -300, c: 255, d: 1.5)",
+        ),
+        (
+            r#"label(Label(text: "a string longer than the inline bytes", at: Point(x: 1, y: -2)))"#,
+            "a string longer than the inline bytes at 1, -2",
+        ),
+        // A tail call in a loop of 100000 turns passes its point by value.
+        ("steps(Point(x: 0, y: 3), 100000)", "300000"),
+        // A point a call returned in its box passes twice.
+        ("twice(4)", "72"),
+        // A parameter that escapes twice is boxed once.
+        (
+            "wrap(Point(x: 3, y: 4))",
+            "[Point(x: 3, y: 4), Point(x: 3, y: 4)]",
+        ),
+    ];
+    for (input, expected) in cases {
+        let shown = eval(&mut r, input);
+        assert_eq!(shown.trim_end().trim_matches('"'), expected, "{input}");
+    }
+}

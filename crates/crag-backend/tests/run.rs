@@ -34,7 +34,7 @@ use crag_abi::{
     HEADER_SIZE, HEAP_OFFSET, Number, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, Shapes,
     TrapKind, inline_text,
 };
-use crag_backend::{code, flat_layouts, scalar_replace, shapes, type_index};
+use crag_backend::{code, flat_layouts, flat_params, scalar_replace, shapes, type_index};
 use crag_codegen::{
     CodeObject, CodegenSettings, OptLevel, SlotKey, compile_entry_stub, target_for,
 };
@@ -520,6 +520,17 @@ impl Module {
         shapes(db, program, ty)
     }
 
+    /// Which parameters of a function of the module pass by value.
+    fn flat(&self, name: &str) -> Vec<bool> {
+        let (db, program) = (&self.db, self.program);
+        let module = program.modules(db)[1];
+        let owner = owners(db, module)
+            .into_iter()
+            .find(|o| matches!(o, Owner::Item(i) if i.name(db).text(db) == name))
+            .unwrap();
+        flat_params(db, program, InstanceKey::body(db, owner)).clone()
+    }
+
     /// The named locals of a function of the module that scalar
     /// replacement keeps split.
     fn split(&self, name: &str) -> Vec<String> {
@@ -529,10 +540,11 @@ impl Module {
             .into_iter()
             .find(|o| matches!(o, Owner::Item(i) if i.name(db).text(db) == name))
             .unwrap();
-        let mut body = crag_mir::mir(db, program, InstanceKey::body(db, owner), Tier::Baseline)
+        let key = InstanceKey::body(db, owner);
+        let mut body = crag_mir::mir(db, program, key, Tier::Baseline)
             .clone()
             .unwrap();
-        scalar_replace(db, program, &mut body);
+        scalar_replace(db, program, key, &mut body);
         body.locals
             .iter()
             .filter(|l| l.split)
@@ -992,6 +1004,46 @@ fn zeroNamed() -> List[Int] {
         "Line(from: Point(x: 0, y: 1), to: Point(x: 2, y: 0))"
     );
     assert_eq!(m.shown("zeroNamed"), "[0, 0]");
+    assert_eq!(m.heap.live_blocks(), 0);
+}
+
+#[test]
+fn flat_records_pass_by_value() {
+    let mut m = Module::new(
+        r#"type Grass
+type Rock
+type Terrain = Grass | Rock
+type Tile(kind: Terrain, cost: UInt8, seen: Bool)
+type Point(x: Int, y: Int)
+type Spot(at: Point | Empty[Point], n: Int)
+type Wide(a: Int, b: Int, c: Int, d: Int, e: Int)
+
+fn tile(t: Tile, n: Int) -> Int {
+  let k = case t.kind {
+    Grass -> 1
+    Rock -> 2
+  }
+  if t.seen { k * 10 + n } else { k }
+}
+
+fn spot(s: Spot) -> Int { s.n }
+fn wide(w: Wide) -> Int { w.e }
+
+fn run(n: Int) -> Int {
+  tile(Tile(kind: Rock, cost: 7, seen: True), n) * 100 + tile(Tile(kind: Grass, cost: 0, seen: False), n)
+}
+"#,
+    );
+    let on = |flags: &[bool]| match flat_layouts() {
+        true => flags.to_vec(),
+        false => Vec::new(),
+    };
+    assert_eq!(m.flat("tile"), on(&[true, false]));
+    // A union with a record member keeps its box for now, and so does a
+    // record too large to be flat.
+    assert_eq!(m.flat("spot"), on(&[false]));
+    assert_eq!(m.flat("wide"), on(&[false]));
+    assert_eq!(m.int("run", &[3]), 2301);
     assert_eq!(m.heap.live_blocks(), 0);
 }
 

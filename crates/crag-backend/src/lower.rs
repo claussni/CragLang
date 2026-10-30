@@ -57,7 +57,7 @@ use crag_db::plumbing::AsId;
 use crag_hir::{ItemId, Name, Owner, Program, Threading, hir_body, lower_body};
 use crag_mir::{
     BinOp, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Entry, InstanceKey, Intrinsic,
-    Local, MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,
+    Local, LocalDecl, MirBody, Operand, Place, Rvalue, Statement, Terminator, Tier, TrapKind,
 };
 use crag_types::{Builtin, CForm, Step, Ty, TyKind, prelude_item, signature};
 
@@ -66,7 +66,7 @@ use crate::layout::{
     subtypes, type_descriptor, type_index, word_keys,
 };
 use crate::slot_key;
-use crate::split::{Form, form, place_form};
+use crate::split::{Form, Slot, SlotKind, flat_params, form, place_form, storage};
 
 /// The LIR of a body, with what it could not lower.
 pub struct Lowered<'db> {
@@ -102,9 +102,14 @@ pub fn func_id(instance: InstanceKey<'_>) -> FuncId {
 
 type Unsupported = &'static str;
 
+/// A parameter that passes by value: the words of its storage form, its
+/// bytes and its slots.
+type Incoming = (Vec<VReg>, u32, Vec<Slot>);
+
 /// Lowers the MIR of a body of `owner`, loaded as `func`, whose source map
 /// gives the positions of traps and steps. The code of a module-level
-/// value keeps the value in `cell` (§11.6.2).
+/// value keeps the value in `cell` (§11.6.2). The parameters `flat` names
+/// pass by value in storage form (Plan §11.10.10).
 pub fn lower_to_lir<'db>(
     db: &'db dyn Db,
     program: Program,
@@ -112,6 +117,7 @@ pub fn lower_to_lir<'db>(
     func: FuncId,
     mir: &MirBody<'db>,
     cell: Option<SlotKey>,
+    flat: &[bool],
 ) -> Lowered<'db> {
     let named = |name: &str| {
         prelude_item(db, program, name).map(|i| Ty::new(db, TyKind::Named(i, Vec::new())))
@@ -146,36 +152,33 @@ pub fn lower_to_lir<'db>(
         natives: Vec::new(),
         c_buffer: None,
     };
-    for (i, decl) in mir.locals.iter().enumerate() {
-        let layout = layout(db, program, decl.ty);
-        let mut words = layout.map_or(0, Layout::words);
-        // An environment is passed as a word even when it holds nothing.
-        if i == 0 && mir.env {
-            words = words.max(1);
-        }
-        // A split local's registers are its fields' (Plan §11.10.10).
-        let form = decl.split.then(|| form(db, program, decl.ty)).flatten();
-        let leaves = match &form {
-            Some(f) => {
-                words = f.words();
-                f.leaves(decl.ty)
+    // The parameters' words come first: a parameter that passes by value
+    // has its storage form's, and registers of its own besides.
+    let n = mir.locals.len();
+    l.locals = vec![Vec::new(); n];
+    l.layouts = vec![None; n];
+    l.forms = vec![None; n];
+    let mut incoming: Vec<Option<Incoming>> = vec![None; mir.params];
+    let mut params = 0;
+    for (i, decl) in mir.locals.iter().enumerate().take(mir.params) {
+        match flat.get(i) == Some(&true) {
+            true => {
+                let (size, slots) = storage(db, program, decl.ty).expect("a flat parameter");
+                let words: Vec<VReg> = (0..size.div_ceil(8)).map(|_| l.reg()).collect();
+                params += words.len();
+                incoming[i] = Some((words, size, slots));
             }
-            None => layout.map_or(Vec::new(), |l| vec![(0, l, decl.ty)]),
-        };
-        let regs: Vec<VReg> = (0..words).map(|_| l.reg()).collect();
-        for (at, leaf, _) in leaves {
-            match leaf {
-                Layout::Box => l.tracked.push(regs[at]),
-                Layout::Closure => l.tracked.push(regs[at + 1]),
-                Layout::Pair => l.tracked.push(regs[at]),
-                _ => {}
+            false => {
+                l.local(i, decl);
+                params += l.locals[i].len();
             }
         }
-        l.locals.push(regs);
-        l.layouts.push(layout);
-        l.forms.push(form);
     }
-    let params: usize = l.locals[..mir.params].iter().map(Vec::len).sum();
+    for (i, decl) in mir.locals.iter().enumerate() {
+        if i >= mir.params || incoming[i].is_some() {
+            l.local(i, decl);
+        }
+    }
     let returns = layout(db, program, mir.result).map_or(0, Layout::words);
     let unknown_param = l.layouts[..mir.params].iter().any(Option::is_none);
     for (b, block) in mir.blocks.iter().enumerate() {
@@ -185,10 +188,12 @@ pub fn lower_to_lir<'db>(
             l.unsupported("types of parameters or results");
             continue;
         }
-        let lowered = block
-            .statements
-            .iter()
-            .try_for_each(|s| l.statement(s))
+        let entry = match b {
+            0 => l.receive(&incoming),
+            _ => Ok(()),
+        };
+        let lowered = entry
+            .and_then(|()| block.statements.iter().try_for_each(|s| l.statement(s)))
             .and_then(|()| l.terminator(&block.terminator, returns));
         if let Err(what) = lowered {
             l.unsupported(what);
@@ -340,6 +345,210 @@ struct Lower<'a, 'db> {
 }
 
 impl<'a, 'db> Lower<'a, 'db> {
+    /// Gives local `i` its registers: its layout's words, or a split
+    /// local's fields' (Plan §11.10.10).
+    fn local(&mut self, i: usize, decl: &LocalDecl<'db>) {
+        let (db, program) = (self.db, self.program);
+        let layout = layout(db, program, decl.ty);
+        let mut words = layout.map_or(0, Layout::words);
+        // An environment is passed as a word even when it holds nothing.
+        if i == 0 && self.mir.env {
+            words = words.max(1);
+        }
+        let form = decl.split.then(|| form(db, program, decl.ty)).flatten();
+        let leaves = match &form {
+            Some(f) => {
+                words = f.words();
+                f.leaves(decl.ty)
+            }
+            None => layout.map_or(Vec::new(), |l| vec![(0, l, decl.ty)]),
+        };
+        let regs: Vec<VReg> = (0..words).map(|_| self.reg()).collect();
+        for (at, leaf, _) in leaves {
+            match leaf {
+                Layout::Box => self.tracked.push(regs[at]),
+                Layout::Closure => self.tracked.push(regs[at + 1]),
+                Layout::Pair => self.tracked.push(regs[at]),
+                _ => {}
+            }
+        }
+        self.locals[i] = regs;
+        self.layouts[i] = layout;
+        self.forms[i] = form;
+    }
+
+    /// Takes the parameters that pass by value from their storage form
+    /// into their registers, or into a box when they are not split.
+    fn receive(&mut self, incoming: &[Option<Incoming>]) -> Result<(), Unsupported> {
+        for (i, words) in incoming.iter().enumerate() {
+            let Some((words, _, slots)) = words else {
+                continue;
+            };
+            let ty = self.local_ty(Local(i as u32));
+            let f = form(self.db, self.program, ty).ok_or("records of this type")?;
+            let regs = self.unpack(slots, words, f.words());
+            let values = match self.forms[i] {
+                Some(_) => regs,
+                None => vec![self.box_split(ty, &f, &regs)?],
+            };
+            self.assign(Local(i as u32), values)?;
+        }
+        Ok(())
+    }
+
+    /// The register form of a flat record from the words of its storage
+    /// form (Compiler Architecture §A11.4).
+    fn unpack(&mut self, slots: &[Slot], words: &[VReg], registers: usize) -> Vec<VReg> {
+        let mut out: Vec<Option<VReg>> = vec![None; registers];
+        for slot in slots {
+            let w = (slot.offset / 8) as usize;
+            let byte = slot.offset % 8;
+            match &slot.kind {
+                SlotKind::Words => {
+                    for k in 0..(slot.size / 8) as usize {
+                        out[slot.at + k] = Some(words[w + k]);
+                    }
+                }
+                SlotKind::Int { signed } => {
+                    let bits = 8 * slot.size;
+                    out[slot.at] = Some(match (bits, signed) {
+                        (64, _) => words[w],
+                        // Up to the field, then down with its sign.
+                        (_, true) => {
+                            let up = self.constant(i64::from(64 - 8 * byte - bits));
+                            let raised = self.bin(LirBin::Shl, words[w], up);
+                            let down = self.constant(i64::from(64 - bits));
+                            self.bin(LirBin::SShr, raised, down)
+                        }
+                        (_, false) => self.field_bits(words[w], 8 * byte, bits),
+                    });
+                }
+                SlotKind::Tag(members) => {
+                    let (shift, width) = match slot.bits {
+                        Some((bit, width)) => (8 * byte + u32::from(bit), u32::from(width)),
+                        None => (8 * byte, 8 * slot.size),
+                    };
+                    let tag = self.field_bits(words[w], shift, width);
+                    let mut index = self.constant(members[0]);
+                    for (k, &m) in members.iter().enumerate().skip(1) {
+                        let k = self.constant(k as i64);
+                        let same = self.cmp(Cond::Eq, tag, k);
+                        let m = self.constant(m);
+                        let dst = self.reg();
+                        self.push(Inst::Select {
+                            dst,
+                            cond: same,
+                            a: m,
+                            b: index,
+                        });
+                        index = dst;
+                    }
+                    out[slot.at] = Some(index);
+                }
+            }
+        }
+        out.into_iter()
+            .map(|r| r.unwrap_or_else(|| self.constant(0)))
+            .collect()
+    }
+
+    /// The words of a flat record's storage form from its register form.
+    fn pack(&mut self, slots: &[Slot], size: u32, regs: &[VReg]) -> Vec<VReg> {
+        let mut words: Vec<Option<VReg>> = vec![None; size.div_ceil(8) as usize];
+        for slot in slots {
+            let w = (slot.offset / 8) as usize;
+            let byte = slot.offset % 8;
+            let (value, shift, width) = match &slot.kind {
+                SlotKind::Words => {
+                    for k in 0..(slot.size / 8) as usize {
+                        words[w + k] = Some(regs[slot.at + k]);
+                    }
+                    continue;
+                }
+                SlotKind::Int { .. } => (regs[slot.at], 8 * byte, 8 * slot.size),
+                SlotKind::Tag(members) => {
+                    // The local tag of the member whose type index it is.
+                    let mut tag = self.constant(0);
+                    for (k, &m) in members.iter().enumerate().skip(1) {
+                        let m = self.constant(m);
+                        let same = self.cmp(Cond::Eq, regs[slot.at], m);
+                        let k = self.constant(k as i64);
+                        let dst = self.reg();
+                        self.push(Inst::Select {
+                            dst,
+                            cond: same,
+                            a: k,
+                            b: tag,
+                        });
+                        tag = dst;
+                    }
+                    match slot.bits {
+                        Some((bit, width)) => (tag, 8 * byte + u32::from(bit), u32::from(width)),
+                        None => (tag, 8 * byte, 8 * slot.size),
+                    }
+                }
+            };
+            let mut part = value;
+            if width < 64 {
+                let mask = self.constant(((1u64 << width) - 1) as i64);
+                part = self.bin(LirBin::And, part, mask);
+            }
+            if shift > 0 {
+                let by = self.constant(i64::from(shift));
+                part = self.bin(LirBin::Shl, part, by);
+            }
+            words[w] = Some(match words[w] {
+                Some(before) => self.bin(LirBin::Or, before, part),
+                None => part,
+            });
+        }
+        words
+            .into_iter()
+            .map(|w| w.unwrap_or_else(|| self.constant(0)))
+            .collect()
+    }
+
+    /// The `width` bits of a word from bit `shift` up, zero-extended.
+    fn field_bits(&mut self, word: VReg, shift: u32, width: u32) -> VReg {
+        let mut value = word;
+        if shift > 0 {
+            let by = self.constant(i64::from(shift));
+            value = self.bin(LirBin::UShr, value, by);
+        }
+        if width < 64 {
+            let mask = self.constant(((1u64 << width) - 1) as i64);
+            value = self.bin(LirBin::And, value, mask);
+        }
+        value
+    }
+
+    /// The words of an argument that passes by value: a split local's
+    /// registers packed, or a boxed record's fields loaded, which take
+    /// references of their own as the call takes the box's.
+    fn flat_argument(&mut self, op: &Operand<'db>, ty: Ty<'db>) -> Result<Vec<VReg>, Unsupported> {
+        let (size, slots) = storage(self.db, self.program, ty).ok_or("records of this type")?;
+        let Operand::Local(l) = op else {
+            return Err("this conversion");
+        };
+        let regs = match self.forms[l.index()].clone() {
+            Some(_) => self.locals[l.index()].clone(),
+            None => {
+                let f = form(self.db, self.program, ty).ok_or("records of this type")?;
+                let ptr = word(&self.locals[l.index()].clone())?;
+                let regs = self.unbox(ty, &f, ptr)?;
+                for (at, leaf, t) in f.leaves(ty) {
+                    self.count_words(Some(leaf), t, &regs[at..at + leaf.words()], Self::retain)?;
+                }
+                match deferred(self.db, self.program, ty) {
+                    true => self.release_deferred(ptr),
+                    false => self.release(ptr),
+                }
+                regs
+            }
+        };
+        Ok(self.pack(&slots, size, &regs))
+    }
+
     fn reg(&mut self) -> VReg {
         self.vregs += 1;
         VReg(self.vregs - 1)
@@ -3500,8 +3709,19 @@ impl<'a, 'db> Lower<'a, 'db> {
             true => &[][..],
             false => &signature(db, self.program, item).params[..],
         };
+        // Records pass by value to the parameters of the callee's body
+        // that take them so.
+        let flat = flat_params(db, self.program, func);
+        let body = crag_mir::mir(db, self.program, func, Tier::Baseline);
         let mut words = Vec::new();
-        for (arg, param) in args.iter().zip(params) {
+        for (k, (arg, param)) in args.iter().zip(params).enumerate() {
+            if flat.get(k) == Some(&true)
+                && let Some(body) = body
+            {
+                let ty = body.locals[k].ty;
+                words.extend(self.flat_argument(arg, ty)?);
+                continue;
+            }
             // An instance's parameters have its type arguments in place.
             let ty = match func.args(db).is_empty() {
                 true => param.ty,

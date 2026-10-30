@@ -34,17 +34,30 @@
 //! where it escapes must not be retained, which a second use needs, nor
 //! come out of a box, which it could pass on as it is. A record a call
 //! returns, or that is converted from a union, stays in its box for now.
-//! With `CRAG_FLAT=0` in the environment no local is split.
+//!
+//! A flat record passes to a parameter of a function's body by value, in
+//! its storage form packed into at most four words (Compiler Architecture
+//! §A11.4.6): the parameter is split, and an argument is packed from its
+//! registers or loaded from its box. Records whose register form keeps a
+//! member in a box, as a union with a record member does, still pass in
+//! their box. Results, and the code that function values and the runtime
+//! call, take records in their boxes.
+//!
+//! With `CRAG_FLAT=0` in the environment no local is split and every
+//! record passes in its box.
 
 use std::sync::OnceLock;
 
 use crag_db::Db;
-use crag_hir::{Name, Program};
-use crag_mir::{ClosurePlacement, MirBody, Operand, Place, Rvalue, Statement, Terminator};
-use crag_types::{Step, Ty, TyKind, TypeDefKind, type_def};
+use crag_hir::{ItemKind, Name, Owner, Program, c_function};
+use crag_mir::{
+    ClosurePlacement, Entry, InstanceKey, MirBody, Operand, Place, Rvalue, Statement, Terminator,
+    Tier, mir,
+};
+use crag_types::{Builtin, Step, Ty, TyKind, TypeDefKind, type_def};
 
-use crate::flat::{self, LayoutClass};
-use crate::layout::{self, Layout};
+use crate::flat::{self, LayoutClass, TagPlace};
+use crate::layout::{self, Layout, type_index};
 
 /// Whether flat layouts are on: unless `CRAG_FLAT` is `0`, read once.
 pub fn flat_layouts() -> bool {
@@ -171,16 +184,23 @@ pub fn place_form<'a, 'db>(
 
 /// Marks the locals of a body that code generation keeps split (see the
 /// module's comment).
-pub fn scalar_replace<'db>(db: &'db dyn Db, program: Program, body: &mut MirBody<'db>) {
+pub fn scalar_replace<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    instance: InstanceKey<'db>,
+    body: &mut MirBody<'db>,
+) {
     if !flat_layouts() {
         return;
     }
+    // A parameter is split when it passes by value.
+    let params = flat_params(db, program, instance);
     let first = body.params.max(usize::from(body.env));
     let forms: Vec<Option<Form<'db>>> = body
         .locals
         .iter()
         .enumerate()
-        .map(|(i, l)| match i < first {
+        .map(|(i, l)| match i < first && params.get(i) != Some(&true) {
             true => None,
             false => form(db, program, l.ty),
         })
@@ -199,6 +219,8 @@ pub fn scalar_replace<'db>(db: &'db dyn Db, program: Program, body: &mut MirBody
     loop {
         let n = split.len();
         let mut check = Check {
+            db,
+            program,
             body,
             forms: &forms,
             split: &split,
@@ -240,6 +262,8 @@ pub fn scalar_replace<'db>(db: &'db dyn Db, program: Program, body: &mut MirBody
 
 /// Finds the uses of locals that need them in a box.
 struct Check<'a, 'db> {
+    db: &'db dyn Db,
+    program: Program,
     body: &'a MirBody<'db>,
     forms: &'a [Option<Form<'db>>],
     split: &'a [bool],
@@ -252,6 +276,17 @@ struct Check<'a, 'db> {
 }
 
 impl<'db> Check<'_, 'db> {
+    /// The arguments of a call: one that passes by value takes a split
+    /// local's registers, or is loaded from its box.
+    fn arguments(&mut self, func: InstanceKey<'db>, args: &[Operand<'db>]) {
+        let flat = flat_params(self.db, self.program, func);
+        for (k, o) in args.iter().enumerate() {
+            if flat.get(k) != Some(&true) {
+                self.consumed(o);
+            }
+        }
+    }
+
     /// The use gives the local's value away: a split local is boxed.
     fn consumed(&mut self, op: &Operand<'db>) {
         if let Operand::Local(l) = op {
@@ -397,11 +432,13 @@ impl<'db> Check<'_, 'db> {
                     self.keep[place.local.index()] = true;
                 }
             }
-            Terminator::Call { args, dst, .. } => {
-                args.iter().for_each(|o| self.consumed(o));
+            Terminator::Call {
+                func, args, dst, ..
+            } => {
+                self.arguments(*func, args);
                 self.keep[dst.index()] = true;
             }
-            Terminator::TailCall { args, .. } => args.iter().for_each(|o| self.consumed(o)),
+            Terminator::TailCall { func, args, .. } => self.arguments(*func, args),
             Terminator::CallValue {
                 callee, args, dst, ..
             } => {
@@ -418,4 +455,132 @@ impl<'db> Check<'_, 'db> {
             Terminator::Jump(_) | Terminator::Trap { .. } => {}
         }
     }
+}
+
+/// Where a value of a flat record's register form is in its storage form
+/// (Compiler Architecture §A11.4): the register it starts at, and how its
+/// bytes or bits hold it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Slot {
+    pub at: usize,
+    /// The byte it starts at, and its bytes.
+    pub offset: u32,
+    pub size: u32,
+    /// Its first bit and width in the flag byte at `offset`.
+    pub bits: Option<(u8, u8)>,
+    pub kind: SlotKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SlotKind {
+    /// An integer, stored in `size` bytes and extended to a word with its
+    /// sign or with zeros.
+    Int { signed: bool },
+    /// Words as they are: a `Float`, a box pointer, a string or a
+    /// function value.
+    Words,
+    /// A union of tags: its local tag, which numbers the members whose
+    /// type indices these are.
+    Tag(Vec<i64>),
+}
+
+/// The storage form of a flat record that passes by value, as slots, with
+/// its bytes: none for what is not a flat record, or holds a value its
+/// register form keeps in a box, as a union with a record member does.
+pub fn storage<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<(u32, Vec<Slot>)> {
+    let f = form(db, program, ty)?;
+    let size = flat::layout(db, program, ty).as_ref()?.size;
+    let mut slots = Vec::new();
+    slots_into(db, program, ty, &f, 0, 0, &mut slots)?;
+    Some((size, slots))
+}
+
+fn slots_into<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    ty: Ty<'db>,
+    f: &Form<'db>,
+    at: usize,
+    base: u32,
+    out: &mut Vec<Slot>,
+) -> Option<()> {
+    let Form::Fields(fields) = f else {
+        return None;
+    };
+    let flat = flat::layout(db, program, ty).as_ref()?;
+    let mut at = at;
+    for (name, t, inner) in fields {
+        let place = flat.fields.iter().find(|p| p.name == *name)?;
+        let offset = base + place.offset;
+        match inner {
+            Form::Fields(_) => slots_into(db, program, *t, inner, at, offset, out)?,
+            Form::Words(l) => {
+                let kind = match l {
+                    Layout::Zero => None,
+                    Layout::Imm(b) => Some(match place.narrowed.unwrap_or(*b) {
+                        Builtin::Int | Builtin::Int8 | Builtin::Int16 | Builtin::Int32 => {
+                            SlotKind::Int { signed: true }
+                        }
+                        Builtin::UInt8
+                        | Builtin::UInt16
+                        | Builtin::UInt32
+                        | Builtin::UInt64
+                        | Builtin::CodePoint => SlotKind::Int { signed: false },
+                        Builtin::Float | Builtin::Fixed(_) => SlotKind::Words,
+                        _ => return None,
+                    }),
+                    Layout::Box | Layout::Pair | Layout::Closure => Some(SlotKind::Words),
+                    Layout::Tag => {
+                        let union = flat::layout(db, program, *t).as_ref()?.union.as_ref()?;
+                        let TagPlace::Bytes(_) = union.tag else {
+                            return None;
+                        };
+                        let members = union.members.iter().map(|m| type_index(m.ty)).collect();
+                        Some(SlotKind::Tag(members))
+                    }
+                    Layout::Union => return None,
+                };
+                if let Some(kind) = kind {
+                    let size = match kind {
+                        SlotKind::Words => 8 * l.words() as u32,
+                        _ => place.size,
+                    };
+                    out.push(Slot {
+                        at,
+                        offset,
+                        size,
+                        bits: place.bits,
+                        kind,
+                    });
+                }
+            }
+        }
+        at += inner.words();
+    }
+    Some(())
+}
+
+/// Which parameters of an instance pass by value in storage form: those
+/// of flat record types of a function's body. Other code, which the
+/// runtime or a function value calls, takes every record in its box.
+#[crag_db::tracked(returns(ref))]
+pub fn flat_params<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    instance: InstanceKey<'db>,
+) -> Vec<bool> {
+    let Owner::Item(item) = *instance.owner(db) else {
+        return Vec::new();
+    };
+    let function = *item.kind(db) == ItemKind::Function && c_function(db, item).is_none();
+    if !flat_layouts() || !function || *instance.entry(db) != Entry::Body {
+        return Vec::new();
+    }
+    let Some(body) = mir(db, program, instance, Tier::Baseline) else {
+        return Vec::new();
+    };
+    body.locals[..body.params]
+        .iter()
+        .map(|l| storage(db, program, l.ty).is_some())
+        .collect()
 }
