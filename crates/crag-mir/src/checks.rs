@@ -161,6 +161,7 @@ fn split<'db>(body: &mut MirBody<'db>, b: usize, items: Vec<Item<'db>>) {
                     binding: None,
                     counted: false,
                     split: false,
+                    borrowed: false,
                 });
                 statements.push(Statement::Assign(local, flag));
                 let trap = push(

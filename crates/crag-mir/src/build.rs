@@ -2630,6 +2630,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             binding,
             counted,
             split: false,
+            borrowed: false,
         });
         Local(self.locals.len() as u32 - 1)
     }

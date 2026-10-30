@@ -550,6 +550,17 @@ impl Module {
         flat_params(db, program, InstanceKey::body(db, owner)).clone()
     }
 
+    /// Which parameters of a function of the module are borrowed.
+    fn borrowed(&self, name: &str) -> Vec<bool> {
+        let (db, program) = (&self.db, self.program);
+        let module = program.modules(db)[1];
+        let owner = owners(db, module)
+            .into_iter()
+            .find(|o| matches!(o, Owner::Item(i) if i.name(db).text(db) == name))
+            .unwrap();
+        crag_mir::borrows(db, program, InstanceKey::body(db, owner)).clone()
+    }
+
     /// The named locals of a function of the module that scalar
     /// replacement keeps split.
     fn split(&self, name: &str) -> Vec<String> {
@@ -1976,6 +1987,108 @@ fn bytes() -> Bytes { raw }
     // A handler's error is a compile error; code that gets one traps.
     let trap = m.run("broken", &[]).unwrap_err();
     assert_eq!(trap.kind, TrapKind::Error);
+}
+
+// A function borrows what it only reads (Plan §11.10.1): its caller
+// keeps the value across the call and releases it once, also when a call
+// both gives the value away and lends it, or the callee traps.
+#[test]
+fn borrowed_parameters_are_released_by_their_callers() {
+    let mut m = Module::new(
+        r#"fn total(xs: List[Int]) -> Int {
+  var sum = 0
+  for x in xs {
+    sum = sum + x
+  }
+  sum
+}
+
+fn twice(n: Int) -> Int {
+  let xs = [n, n + 1]
+  total(xs) + total(xs)
+}
+
+fn keep(xs: List[Int], ys: List[Int]) -> List[Int] {
+  if 0 < total(ys) { xs } else { [] }
+}
+
+fn same(n: Int) -> Int {
+  let xs = [n, 2]
+  total(keep(xs, xs))
+}
+
+fn walk(xs: List[Int], acc: Int) -> Int {
+  case xs {
+    [] -> acc
+    [x, ..rest] -> walk(rest, acc + x)
+  }
+}
+
+fn last(xs: List[Int], acc: Int) -> Int {
+  total(xs) + acc
+}
+
+fn lend(n: Int) -> Int {
+  let xs = [n, n, n]
+  case xs {
+    [_, ..rest] -> last(rest, 0)
+    [] -> 0
+  }
+}
+
+fn share(n: Int) -> Int {
+  let xs = [n, 4]
+  last(xs, 1)
+}
+
+fn divide(xs: List[Int], d: Int) -> Int {
+  total(xs) / d
+}
+
+fn trapped(d: Int) -> Int {
+  let xs = [10, 20]
+  divide(xs, d) + total(xs)
+}
+
+fn greet(name: Str) -> Str { "Hello, {name}, from a string long enough" }
+
+fn size(s: Str) -> Int {
+  case s {
+    "" -> 0
+    _ -> 1
+  }
+}
+
+fn greeted(n: Int) -> Int {
+  let s = greet("someone with a long name {n}")
+  size(s) + size(s)
+}
+"#,
+    );
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    assert_eq!(m.borrowed("total"), vec![true]);
+    assert_eq!(m.borrowed("keep"), vec![false, true]);
+    // A tail-recursive loop takes what it passes itself.
+    assert_eq!(m.borrowed("walk"), Vec::<bool>::new());
+    assert_eq!(m.borrowed("last"), vec![true, false]);
+    assert_eq!(m.borrowed("size"), vec![true]);
+    RELEASED.set(0);
+    assert_eq!(m.int("twice", &[5]), 22);
+    assert_eq!(RELEASED.get(), 1);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("same", &[5]), 7);
+    assert_eq!(m.heap.live_blocks(), 0);
+    // The tail call of `last` lends a slice it owns, so it is a call.
+    assert_eq!(m.int("lend", &[3]), 6);
+    assert_eq!(m.int("share", &[3]), 8);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("greeted", &[7]), 2);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.run("trapped", &[2]), Ok(vec![45]));
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+    let trap = m.run("trapped", &[0]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::DivideByZero);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
 }
 
 #[test]

@@ -27,9 +27,12 @@
 //! value is borrowed from it and gets a reference of its own when it lives
 //! on. A closure whose environment is on the side stack borrows what it
 //! captured, so a use of it, or of a copy of it, uses those locals too.
+//! A call borrows the arguments of the parameters its callee borrows
+//! (Implementation Plan §11.10.1), and a borrowed parameter is not counted.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
+use crate::InstanceKey;
 use crate::ir::{
     BlockId, ClosurePlacement, Intrinsic, Local, MirBody, Operand, Place, Rvalue, Statement,
     Terminator,
@@ -37,9 +40,12 @@ use crate::ir::{
 
 pub type LocalSet = BTreeSet<Local>;
 
+/// Which parameters of each callee are borrowed, by `crate::borrows`.
+pub type Lent<'db> = HashMap<InstanceKey<'db>, Vec<bool>>;
+
 /// The counted locals live at the edges of each block.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Liveness {
+pub struct Liveness<'db> {
     /// Live on entry.
     pub live_in: Vec<LocalSet>,
     /// Live after the terminator has used its operands: what a successor
@@ -48,6 +54,8 @@ pub struct Liveness {
     /// The locals each local's value borrows: the captures of a closure on
     /// the side stack, for it and its copies.
     pub holds: Vec<LocalSet>,
+    /// The parameters the callees borrow.
+    pub lent: Lent<'db>,
 }
 
 /// The locals each local borrows through the side-stack closures it may
@@ -94,11 +102,11 @@ fn holds(body: &MirBody<'_>) -> Vec<LocalSet> {
 
 /// How a statement or terminator uses locals.
 #[derive(Default)]
-struct Uses {
-    def: Option<Local>,
+pub(crate) struct Uses {
+    pub(crate) def: Option<Local>,
     /// One entry per consuming use.
-    consumed: Vec<Local>,
-    borrowed: Vec<Local>,
+    pub(crate) consumed: Vec<Local>,
+    pub(crate) borrowed: Vec<Local>,
 }
 
 impl Uses {
@@ -134,7 +142,11 @@ impl Uses {
     }
 }
 
-fn statement_uses(body: &MirBody<'_>, holds: &[LocalSet], statement: &Statement<'_>) -> Uses {
+pub(crate) fn statement_uses(
+    body: &MirBody<'_>,
+    holds: &[LocalSet],
+    statement: &Statement<'_>,
+) -> Uses {
     let mut uses = Uses::default();
     match statement {
         Statement::Assign(dst, rvalue) => {
@@ -201,14 +213,20 @@ fn statement_uses(body: &MirBody<'_>, holds: &[LocalSet], statement: &Statement<
     uses.counted(body, holds)
 }
 
-fn terminator_uses(body: &MirBody<'_>, holds: &[LocalSet], terminator: &Terminator<'_>) -> Uses {
+fn terminator_uses<'db>(
+    body: &MirBody<'db>,
+    holds: &[LocalSet],
+    lent: &Lent<'db>,
+    terminator: &Terminator<'db>,
+) -> Uses {
     let mut uses = Uses::default();
     match terminator {
         Terminator::Branch { cond, .. } => uses.operand(cond, false),
         Terminator::Switch { place, .. } => uses.place(place),
-        Terminator::Call { args, .. } | Terminator::TailCall { args, .. } => {
-            for o in args {
-                uses.operand(o, true);
+        Terminator::Call { func, args, .. } | Terminator::TailCall { func, args, .. } => {
+            let borrowed = lent.get(func).map_or(&[][..], Vec::as_slice);
+            for (k, o) in args.iter().enumerate() {
+                uses.operand(o, !borrowed.get(k).copied().unwrap_or(false));
             }
         }
         Terminator::CallValue { callee, args, .. }
@@ -247,12 +265,13 @@ fn needed(live_in: &[LocalSet], terminator: &Terminator<'_>, successor: BlockId)
     set
 }
 
-pub fn compute_liveness(body: &MirBody<'_>) -> Liveness {
+pub fn compute_liveness<'db>(body: &MirBody<'db>, lent: Lent<'db>) -> Liveness<'db> {
     let n = body.blocks.len();
     let mut live = Liveness {
         live_in: vec![LocalSet::new(); n],
         live_out: vec![LocalSet::new(); n],
         holds: holds(body),
+        lent,
     };
     let holds = live.holds.clone();
     loop {
@@ -264,7 +283,7 @@ pub fn compute_liveness(body: &MirBody<'_>) -> Liveness {
                 out.extend(needed(&live.live_in, &block.terminator, s));
             }
             let mut set = out.clone();
-            set.extend(terminator_uses(body, &holds, &block.terminator).all());
+            set.extend(terminator_uses(body, &holds, &live.lent, &block.terminator).all());
             for statement in block.statements.iter().rev() {
                 let uses = statement_uses(body, &holds, statement);
                 if let Some(def) = uses.def {
@@ -286,14 +305,14 @@ pub fn compute_liveness(body: &MirBody<'_>) -> Liveness {
 
 /// Retains before every consuming use but the last, releases after a last
 /// use that borrows, and retains a part read out of a value that lives on.
-pub fn insert_rc_ops(body: &mut MirBody<'_>, live: &Liveness) {
+pub fn insert_rc_ops<'db>(body: &mut MirBody<'db>, live: &Liveness<'db>) {
     for b in 0..body.blocks.len() {
         let block = &body.blocks[b];
         let mut set = live.live_out[b].clone();
         let mut reversed = Vec::new();
         // A terminator consumes or borrows; those it borrows last die on
         // its edges, which `insert_drops` handles.
-        let uses = terminator_uses(body, &live.holds, &block.terminator);
+        let uses = terminator_uses(body, &live.holds, &live.lent, &block.terminator);
         // What a successor needs after a call, the handler's path too.
         let kept = match &block.terminator {
             Terminator::Call { .. } | Terminator::CallValue { .. } => block
@@ -304,9 +323,13 @@ pub fn insert_rc_ops(body: &mut MirBody<'_>, live: &Liveness) {
                 .collect(),
             _ => set.clone(),
         };
+        // A value the call also borrows lives through it, and dies after.
         for x in distinct(&uses.consumed) {
             let count = uses.consumed.iter().filter(|&&l| l == x).count();
-            let retains = if kept.contains(&x) { count } else { count - 1 };
+            let retains = match kept.contains(&x) || uses.borrowed.contains(&x) {
+                true => count,
+                false => count - 1,
+            };
             reversed.extend(std::iter::repeat_n(Statement::Retain(x), retains));
         }
         set.extend(uses.all());
@@ -362,7 +385,7 @@ pub fn insert_rc_ops(body: &mut MirBody<'_>, live: &Liveness) {
 
 /// Releases what dies unused: a definition no one reads, a parameter, and
 /// what a block holds that a successor does not need, on that edge.
-pub fn insert_drops(body: &mut MirBody<'_>, live: &Liveness) {
+pub fn insert_drops<'db>(body: &mut MirBody<'db>, live: &Liveness<'db>) {
     let n = body.blocks.len();
     let mut incoming = vec![0usize; n];
     for block in &body.blocks {
@@ -374,7 +397,7 @@ pub fn insert_drops(body: &mut MirBody<'_>, live: &Liveness) {
     let mut starts: Vec<Vec<Statement<'_>>> = vec![Vec::new(); n];
     for b in 0..n {
         let block = &body.blocks[b];
-        let term_uses = terminator_uses(body, &live.holds, &block.terminator);
+        let term_uses = terminator_uses(body, &live.holds, &live.lent, &block.terminator);
         let mut set = live.live_out[b].clone();
         let held: LocalSet = set
             .iter()

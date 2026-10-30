@@ -249,6 +249,8 @@ fn slot_signature<'db>(db: &'db dyn Db, program: Program, instance: InstanceKey<
         let mut hasher = std::hash::DefaultHasher::new();
         hash.hash(&mut hasher);
         split::flat_result(db, program, instance).hash(&mut hasher);
+        // Who releases each parameter (Plan §11.10.1).
+        crag_mir::borrows(db, program, instance).hash(&mut hasher);
         hash = hasher.finish();
     }
     // Zero is for what has no signature, and the top bit for steps.

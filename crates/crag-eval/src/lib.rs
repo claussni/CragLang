@@ -347,7 +347,27 @@ impl<'db> Evaluation<'db> {
             args.insert(0, 0);
         }
         let returns = result_shapes.shapes[result_shape as usize].words();
-        let words = self.call(db, &args, returns, meter)?;
+        let called = self.call(db, &args, returns, meter);
+        // A handler that only reads the content borrows it (Plan
+        // §11.10.1), and leaves it to us.
+        if let [true, ..] = crag_mir::borrows(db, program, self.root)[..]
+            && let Some(body) = mir(db, program, self.root, Tier::Baseline)
+        {
+            let (content_shapes, content_shape) =
+                crag_backend::shapes(db, program, body.locals[0].ty);
+            let types = self.worker.types();
+            // SAFETY: the content is ours, and the handler has returned.
+            unsafe {
+                release_value(
+                    self.worker.heap(),
+                    &types,
+                    &args,
+                    &content_shapes,
+                    content_shape,
+                )
+            };
+        }
+        let words = called?;
         let release = |this: &mut Self| {
             let types = this.worker.types();
             // SAFETY: the words are the handler's result, which the fiber

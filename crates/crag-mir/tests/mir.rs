@@ -478,9 +478,8 @@ bb0:
   _1 = Pair(a: _0, b: _0)
   return _1
 ignore
-param _0: Str (s)
+param _0: Str (s) borrowed
 bb0:
-  release _0
   return 1
 first
 param _0: Pair (p)
@@ -547,7 +546,7 @@ fn last(xs: List[Str]) -> Str {
 }
 "#,
         r#"describe
-param _0: Int | Str (v)
+param _0: Int | Str (v) borrowed
 let _1: Int
 let _2: False | True
 let _3: False | True
@@ -558,13 +557,11 @@ bb0:
   switch _0 [Int: bb1] else bb2
 bb1:
   _1 = (_0 as Int)
-  release _0
   _2 = Int.eq(_1, 0)
   branch _2 bb4 bb3
 bb2:
   _5 = (_0 as Str)
   retain _5
-  release _0
   _6 = Str.eq(_5, "a")
   release _5
   branch _6 bb8 bb9
@@ -616,7 +613,7 @@ bb6:
 bb7:
   return _5
 last
-param _0: List[Str] (xs)
+param _0: List[Str] (xs) borrowed
 let _1: Int
 let _2: False | True
 let _3: False | True
@@ -631,19 +628,16 @@ bb1:
   _3 = Int.eq(_1, 1)
   branch _3 bb3 bb4
 bb2:
-  release _0
   return "empty"
 bb3:
   _4 = _0[0]
   retain _4
-  release _0
   jump bb5
 bb4:
   _5 = slice _0[1..-1]
   release _5
   _6 = _0[-1]
   retain _6
-  release _0
   jump bb6
 bb5:
   return _4
@@ -711,7 +705,7 @@ bb3:
   release _2
   return _3
 second
-param _0: List[Int] (xs)
+param _0: List[Int] (xs) borrowed
 let _1: Int
 let _2: False | True
 let _3: False | True
@@ -726,11 +720,9 @@ bb1:
   _3 = Int.eq(_1, 1)
   branch _3 bb3 bb4
 bb2:
-  release _0
   return 0
 bb3:
   _4 = _0[0]
-  release _0
   jump bb5
 bb4:
   _5 = _0[1]
@@ -739,11 +731,9 @@ bb4:
 bb5:
   return _4
 bb6:
-  release _0
   return _5
 bb7:
   _4 = _0[0]
-  release _0
   jump bb5
 "#,
     );
@@ -769,7 +759,7 @@ fn last(r: Range[Int]) -> Int {
 }
 "#,
         r#"sum
-param _0: List[Int] (xs)
+param _0: List[Int] (xs) borrowed
 let _1: Int (total)
 let _2: Int
 let _3: Int
@@ -793,10 +783,8 @@ bb2:
   _9 = overflows Int.add(_1, _6)
   branch _9 bb4 bb5
 bb3:
-  release _0
   return _1
 bb4:
-  release _0
   trap overflow
 bb5:
   _7 = Int.add(_1, _6)
@@ -1008,7 +996,7 @@ param _1: Int (x)
 bb0:
   tail call value _0(_1)
 shift
-param _0: Str (xs)
+param _0: Str (xs) borrowed
 param _1: Int (k)
 let _2: (Int) -> Int is Pure
 let _3: (Int) -> Int
@@ -1019,7 +1007,6 @@ bb0:
   _3 = convert _2
   _4 = call apply(_3, 1) -> bb1
 bb1:
-  release _0
   _5 = _4
   return _5
 shift#11
@@ -1222,7 +1209,7 @@ param _0: Str (s)
 bb0:
   tail call size(_0)
 use
-param _0: List[Str] (xs)
+param _0: List[Str] (xs) borrowed
 let _1: Str
 let _2: Int
 let _3: List[Int]
@@ -1240,6 +1227,7 @@ bb2:
   _3 = [1, 2]
   _4 = call first[Int](_3) -> bb3
 bb3:
+  release _3
   _8 = overflows Int.add(_2, _4)
   branch _8 bb5 bb6
 bb4:
@@ -1256,7 +1244,7 @@ bb8:
   _7 = Int.add(_5, _6)
   return _7
 first[Str]
-param _0: List[Str] (xs)
+param _0: List[Str] (xs) borrowed
 let _1: Int
 let _2: False | True
 let _3: False | True
@@ -1266,21 +1254,18 @@ bb0:
   _2 = Int.lt(0, 0)
   branch _2 bb1 bb2
 bb1:
-  release _0
   trap index
 bb2:
   _3 = Int.ge(0, _1)
   branch _3 bb3 bb4
 bb3:
-  release _0
   trap index
 bb4:
   _4 = _0[0]
   retain _4
-  release _0
   return _4
 first[Int]
-param _0: List[Int] (xs)
+param _0: List[Int] (xs) borrowed
 let _1: Int
 let _2: False | True
 let _3: False | True
@@ -1290,17 +1275,14 @@ bb0:
   _2 = Int.lt(0, 0)
   branch _2 bb1 bb2
 bb1:
-  release _0
   trap index
 bb2:
   _3 = Int.ge(0, _1)
   branch _3 bb3 bb4
 bb3:
-  release _0
   trap index
 bb4:
   _4 = _0[0]
-  release _0
   return _4
 twice[Str] {measure}
 param _0: Str (a)

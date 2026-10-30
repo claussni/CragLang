@@ -75,6 +75,9 @@ pub struct LocalDecl<'db> {
     /// flat record, not as a box: scalar replacement decides it (Plan
     /// §11.10.10).
     pub split: bool,
+    /// Whether it is a parameter whose value the caller keeps (Plan
+    /// §11.10.1): it is not counted here, and no stack map lists it.
+    pub borrowed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -888,7 +891,11 @@ impl<'db> MirBody<'db> {
                 None => String::new(),
             };
             let split = if local.split { " split" } else { "" };
-            out += &format!("{kind} _{i}: {}{name}{split}\n", local.ty.display(db));
+            let borrowed = if local.borrowed { " borrowed" } else { "" };
+            out += &format!(
+                "{kind} _{i}: {}{name}{split}{borrowed}\n",
+                local.ty.display(db)
+            );
         }
         for (i, block) in self.blocks.iter().enumerate() {
             out += &format!("bb{i}:\n");

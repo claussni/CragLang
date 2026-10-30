@@ -409,8 +409,11 @@ impl<'a, 'db> Lower<'a, 'db> {
             None => layout.map_or(Vec::new(), |l| pointer_regs(&Form::Words(l))),
         };
         let regs: Vec<VReg> = (0..words).map(|_| self.reg()).collect();
-        for at in pointers {
-            self.tracked.push(regs[at]);
+        // A borrowed parameter's references are its caller's to release.
+        if !decl.borrowed {
+            for at in pointers {
+                self.tracked.push(regs[at]);
+            }
         }
         self.locals[i] = regs;
         self.layouts[i] = layout;

@@ -23,10 +23,12 @@
 //! the call pops the side stack (§5.6.3); the checks of arithmetic, which
 //! trap on overflow and on a zero divisor (§3.1.1, §3.1.4); and the
 //! reference counts, which follow from a liveness analysis so that a value
-//! is released right after its last use.
+//! is released right after its last use, with the parameters a function
+//! only reads borrowed from its caller (§11.10.1).
 
 extern crate crag_db as salsa;
 
+mod borrow;
 mod build;
 mod checks;
 mod ir;
@@ -39,13 +41,14 @@ use crag_db::Db;
 use crag_hir::{ExprId, Owner, Program};
 use crag_types::{Filling, Handler, HandlerCode, Instance, Ty};
 
+pub use borrow::borrows;
 pub use build::{has_derived_code, place};
 pub use checks::insert_overflow_checks;
 pub use ir::{
     BinOp, Block, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Intrinsic, Local, LocalDecl,
     MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,
 };
-pub use liveness::{Liveness, compute_liveness, insert_drops, insert_rc_ops};
+pub use liveness::{Lent, Liveness, compute_liveness, insert_drops, insert_rc_ops};
 
 /// A function, test or module-level value, or the code of a closure in
 /// one: what code is generated for. A generic function has code only per
@@ -213,12 +216,25 @@ pub fn mir<'db>(
     if tier != Tier::Baseline {
         return mir(db, program, instance, Tier::Baseline).clone();
     }
+    let mut body = built(db, program, instance).clone()?;
+    let lent = borrow::lend(db, program, instance, &mut body);
+    let live = compute_liveness(&body, lent);
+    insert_rc_ops(&mut body, &live);
+    insert_drops(&mut body, &live);
+    Some(body)
+}
+
+/// The MIR of an instance before its reference counts, which depend on
+/// the parameters its callees borrow.
+#[crag_db::tracked(returns(ref))]
+fn built<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    instance: InstanceKey<'db>,
+) -> Option<MirBody<'db>> {
     let mut body = build::build(db, program, instance)?;
     tail::place_tail_closures(&mut body);
     insert_overflow_checks(&mut body);
-    let live = compute_liveness(&body);
-    insert_rc_ops(&mut body, &live);
-    insert_drops(&mut body, &live);
     Some(body)
 }
 
