@@ -40,6 +40,7 @@
 
 extern crate crag_db as salsa;
 
+pub mod flat;
 mod layout;
 mod lower;
 mod shape;

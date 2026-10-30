@@ -191,3 +191,105 @@ fn operator(name: &str, values: &[Known]) -> Option<Known> {
         _ => return None,
     })
 }
+
+/// The intervals the conditions of the type `item` bound integers to:
+/// `this`, by `None`, or a field the type declares, by its name. Only the
+/// comparisons of a name with an integer literal that every condition's
+/// `and`s require count, as `size >= 1 and size <= 255` does; what else a
+/// condition says leaves the interval as wide as it was (Compiler
+/// Architecture §A11.4, range narrowing).
+pub fn int_bounds<'db>(
+    db: &'db dyn crag_db::Db,
+    program: Program,
+    item: ItemId<'db>,
+) -> Vec<(Option<crag_hir::Name<'db>>, i128, i128)> {
+    let body = hir_body(db, program, Owner::Item(item));
+    let Some(decl) = body.type_decl.as_ref() else {
+        return Vec::new();
+    };
+    let types = crate::body_types(db, program, Owner::Item(item));
+    let mut out: Vec<(Option<crag_hir::Name<'db>>, i128, i128)> = Vec::new();
+    let mut atoms = Vec::new();
+    for condition in &decl.conditions {
+        conjuncts(body, condition.value, &mut atoms);
+    }
+    for id in atoms {
+        let Expr::Call {
+            args, fields: None, ..
+        } = body.expr(id)
+        else {
+            continue;
+        };
+        let Some(Callee::Function(f)) = types.callee(id) else {
+            continue;
+        };
+        if f.module(db).path(db) != PRELUDE || args.len() != 2 {
+            continue;
+        }
+        let subject = |e: ExprId| -> Option<Option<crag_hir::Name<'db>>> {
+            match body.expr(e) {
+                Expr::Name { local: Some(b), .. } if Some(*b) == decl.this => Some(None),
+                Expr::Name { local: Some(b), .. } => decl
+                    .field_bindings
+                    .iter()
+                    .find(|(_, f)| f == b)
+                    .map(|(n, _)| Some(*n)),
+                _ => None,
+            }
+        };
+        let int = |e: ExprId| match body.expr(e) {
+            Expr::Literal(literal) => match known(literal, body.is_negative(e)) {
+                Some(Known::Int(n)) => Some(n),
+                _ => None,
+            },
+            _ => None,
+        };
+        // The comparison as `subject op n`, its operands swapped if the
+        // literal is on the left.
+        let (subject, n, op) = match (subject(args[0]), int(args[1]), int(args[0])) {
+            (Some(s), Some(n), _) => (s, n, f.name(db).text(db).as_str()),
+            (None, _, Some(n)) => match subject(args[1]) {
+                Some(s) => (
+                    s,
+                    n,
+                    match f.name(db).text(db).as_str() {
+                        "lessThan" => "greaterThan",
+                        "lessOrEqual" => "greaterOrEqual",
+                        "greaterThan" => "lessThan",
+                        "greaterOrEqual" => "lessOrEqual",
+                        other => other,
+                    },
+                ),
+                None => continue,
+            },
+            _ => continue,
+        };
+        let (lo, hi) = match op {
+            "equals" => (n, n),
+            "lessThan" => (i128::MIN, n - 1),
+            "lessOrEqual" => (i128::MIN, n),
+            "greaterThan" => (n + 1, i128::MAX),
+            "greaterOrEqual" => (n, i128::MAX),
+            _ => continue,
+        };
+        match out.iter_mut().find(|(s, _, _)| *s == subject) {
+            Some((_, l, h)) => {
+                *l = (*l).max(lo);
+                *h = (*h).min(hi);
+            }
+            None => out.push((subject, lo, hi)),
+        }
+    }
+    out
+}
+
+/// The parts of a condition that must all hold: those `and` joins.
+fn conjuncts(body: &crag_hir::Body<'_>, id: ExprId, out: &mut Vec<ExprId>) {
+    match body.expr(id) {
+        Expr::And(a, b) => {
+            conjuncts(body, *a, out);
+            conjuncts(body, *b, out);
+        }
+        _ => out.push(id),
+    }
+}

@@ -73,6 +73,7 @@ pub use infer::{constant as literal_value, is_source, is_text};
 pub use overload::{
     FinalError, Ranked, Specificity, compare_param, final_errors, most_specific, overload_errors,
 };
+pub use refine::int_bounds;
 pub use relate::{
     declared_fields, fields_of, is_subtype, join, normalize, parent, record_subtypes, subst,
     tested, unrefined,

@@ -1,0 +1,289 @@
+// This file is part of Crag.
+//
+// Copyright (C) 2026 Ralf Claussnitzer
+//
+// Crag is free software: you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the Free Software
+// Foundation, either version 3 of the License, or (at your option) any later
+// version.
+//
+// Crag is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+// A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// Crag. If not, see <https://www.gnu.org/licenses/>.
+
+//! Flat layouts as `:layout` shows them (Implementation Plan §11.10.10):
+//! the examples of Compiler Architecture §A11.4.1 to §A11.4.6 have the
+//! sizes stated there.
+
+use crag_driver::{Project, Repl, Scratch};
+use crag_session::ImageCommand;
+
+fn repl() -> Repl {
+    let scratch = Scratch::start(ImageCommand {
+        program: env!("CARGO_BIN_EXE_crag").into(),
+        args: vec!["__image".into()],
+    })
+    .unwrap();
+    Repl::new(Project::bare(), scratch)
+}
+
+fn eval(r: &mut Repl, text: &str) -> String {
+    match r.eval_input(text) {
+        Ok(output) => output.render(),
+        Err(errors) => errors,
+    }
+}
+
+/// A session with the types of the examples.
+fn session(definitions: &[&str]) -> Repl {
+    let mut r = repl();
+    for d in definitions {
+        assert_eq!(eval(&mut r, d), "", "{d}");
+    }
+    r
+}
+
+fn layout(r: &mut Repl, ty: &str) -> String {
+    eval(r, &format!(":layout {ty}"))
+}
+
+#[test]
+fn single_values_and_their_unions() {
+    let mut r = session(&[]);
+    assert_eq!(
+        layout(&mut r, "Int"),
+        "Int: Immediate, 8 bytes, aligned to 8\n"
+    );
+    // A local tag before the payload; the tag past the last is the niche.
+    assert_eq!(
+        layout(&mut r, "Option[Int16]"),
+        "Option[Int16]: Plain, 4 bytes, aligned to 2
+  tag           offset 0, 1 byte
+  Int16         tag 0, offset 2, 2 bytes
+  Empty[Int16]  tag 1
+  niche         2 at offset 0
+"
+    );
+    assert_eq!(
+        layout(&mut r, "Bool"),
+        "Bool: Immediate, 1 byte, aligned to 1
+  tag    offset 0, 1 byte
+  False  tag 0
+  True   tag 1
+  niche  2 at offset 0
+"
+    );
+    assert_eq!(
+        layout(&mut r, "Str | Int"),
+        "Str | Int: Inline, 24 bytes, aligned to 8
+  tag       offset 0, 1 byte
+  Int       tag 0, offset 8, 8 bytes
+  Str       tag 1, offset 8, 16 bytes
+  niche     2 at offset 0
+  pointers  text at 8 if the tag at 0 is 1
+"
+    );
+    assert_eq!(
+        layout(&mut r, "(Int) -> Int"),
+        "(Int) -> Int: Inline, 16 bytes, aligned to 8\n  pointers  environment at 8\n"
+    );
+    assert_eq!(layout(&mut r, "()"), "(): Zero, 0 bytes, aligned to 1\n");
+}
+
+#[test]
+fn map_entries_and_list_elements() {
+    let mut r = session(&[
+        "type Stock(qty: Int32, reserved: Int32, onOrder: Bool)",
+        "type Point(x: Float, y: Float)",
+        "type Label(text: Str, at: Point)",
+    ]);
+    // With its `UInt32` key, an entry takes 16 bytes.
+    assert_eq!(
+        layout(&mut r, "Stock"),
+        "Stock: Plain, 12 bytes, aligned to 4
+  qty: Int32             offset 0, 4 bytes
+  reserved: Int32        offset 4, 4 bytes
+  onOrder: False | True  offset 8, bit 0
+  niche                  bit 1 at offset 8
+"
+    );
+    assert_eq!(
+        layout(&mut r, "Point"),
+        "Point: Plain, 16 bytes, aligned to 8
+  x: Float  offset 0, 8 bytes
+  y: Float  offset 8, 8 bytes
+"
+    );
+    assert_eq!(
+        layout(&mut r, "Label"),
+        "Label: Inline, 32 bytes, aligned to 8
+  at: Point  offset 0, 16 bytes
+  text: Str  offset 16, 16 bytes
+  pointers   text at 16
+"
+    );
+    assert_eq!(
+        layout(&mut r, "Map[UInt32, Stock]"),
+        "Map[UInt32, Stock]: Boxed, a collection, whose size varies\n"
+    );
+    assert_eq!(
+        layout(&mut r, "List[Point]"),
+        "List[Point]: Boxed, a collection, whose size varies\n"
+    );
+}
+
+#[test]
+fn records_inline_narrow_and_pack() {
+    let mut r = session(&[
+        "type Point(x: Float, y: Float)",
+        "type Glyph(code: CodePoint, size: Int, bold: Bool, italic: Bool, at: Point)
+    where size >= 1 and size <= 255",
+        "type Port = Int where this >= 1 and this <= 65535",
+    ]);
+    assert_eq!(
+        layout(&mut r, "Glyph"),
+        "Glyph: Plain, 24 bytes, aligned to 8
+  at: Point             offset 0, 16 bytes
+  code: CodePoint       offset 16, 4 bytes
+  size: Int             offset 20, 1 byte as UInt8
+  bold: False | True    offset 21, bit 0
+  italic: False | True  offset 21, bit 1
+  niche                 0 at offset 20
+"
+    );
+    // `size` is never 0, so 0 is `Empty`.
+    assert_eq!(
+        layout(&mut r, "Option[Glyph]"),
+        "Option[Glyph]: Plain, 24 bytes, aligned to 8
+  Glyph         offset 0, 24 bytes
+  Empty[Glyph]  0 at offset 20
+"
+    );
+    assert_eq!(
+        layout(&mut r, "Port"),
+        "Port: Immediate, 2 bytes, aligned to 2
+  stored as  UInt16
+  niche      0 at offset 0
+"
+    );
+    assert_eq!(
+        layout(&mut r, "Option[Port]"),
+        "Option[Port]: Plain, 2 bytes, aligned to 2
+  Port         offset 0, 2 bytes
+  Empty[Port]  0 at offset 0
+"
+    );
+}
+
+#[test]
+fn grid_cells() {
+    let mut r = session(&[
+        "type Grass",
+        "type Water",
+        "type Rock",
+        "type Sand",
+        "type Terrain = Grass | Water | Rock | Sand",
+        "type Tile(kind: Terrain, cost: UInt8, seen: Bool)",
+    ]);
+    assert_eq!(
+        layout(&mut r, "Tile"),
+        "Tile: Plain, 2 bytes, aligned to 1
+  cost: UInt8                        offset 0, 1 byte
+  kind: Grass | Rock | Sand | Water  offset 1, bits 0–1
+  seen: False | True                 offset 1, bit 2
+  niche                              bit 3 at offset 1
+"
+    );
+    assert_eq!(
+        layout(&mut r, "Grid[Tile]"),
+        "Grid[Tile]: Boxed, a collection, whose size varies\n"
+    );
+}
+
+#[test]
+fn forced_boxes_name_their_reasons() {
+    let mut r = session(&[
+        "type Node(v: Int, next: Option[Node])",
+        "type Triple(a: Str, b: Str, c: Str)",
+        "distinct type Token(n: Int)\n  on Dispose closeToken\nfn closeToken(t: Token) -> () {}",
+        "type Shape(sides: Int)\ntype Square(..Shape, side: Float)",
+        "type Nest[T](inner: Option[Nest[List[T]]])",
+        "type Even(odd: Option[Odd])\ntype Odd(even: Option[Even])",
+        "type Holder(kid: Option[Kid])\ntype Kid(..Holder, age: Int)",
+    ]);
+    // Only the recursive edge is boxed, with null as `Empty`.
+    assert_eq!(
+        layout(&mut r, "Node"),
+        "Node: Inline, 16 bytes, aligned to 8
+  next: Empty[Node] | Node  offset 0, 8 bytes, boxed: it contains itself
+  v: Int                    offset 8, 8 bytes
+  pointers                  box at 0
+"
+    );
+    assert_eq!(
+        layout(&mut r, "Triple"),
+        "Triple: Boxed, flat it would take 48 bytes and 3 managed pointers, more than 32 and 2\n"
+    );
+    assert_eq!(
+        layout(&mut r, "Token"),
+        "Token: Boxed, it has a lifecycle: a Dispose handler, is Secret, a CPtr or a runtime \
+         object\n"
+    );
+    assert_eq!(
+        layout(&mut r, "Ref[Int]"),
+        "Ref[Int]: Boxed, it has a lifecycle: a Dispose handler, is Secret, a CPtr or a runtime \
+         object\n"
+    );
+    assert_eq!(
+        layout(&mut r, "Shape"),
+        "Shape: Boxed, it may hold a subtype\n"
+    );
+    // A subtype lays out its parent's fields first.
+    assert_eq!(
+        layout(&mut r, "Square"),
+        "Square: Plain, 16 bytes, aligned to 8
+  sides: Int   offset 0, 8 bytes
+  side: Float  offset 8, 8 bytes
+"
+    );
+    assert_eq!(
+        layout(&mut r, "Nest[Int]"),
+        "Nest[Int]: Inline, 8 bytes, aligned to 8
+  inner: Empty[Nest[List[Int]]] | Nest[List[Int]]  offset 0, 8 bytes, boxed: its fields unfold \
+         into ever new types
+  pointers                                         box at 0
+"
+    );
+    // Each type of a cycle boxes its edge into it.
+    // A parent's field that holds its subtype.
+    assert_eq!(
+        layout(&mut r, "Kid"),
+        "Kid: Inline, 16 bytes, aligned to 8
+  kid: Empty[Kid] | Kid  offset 0, 8 bytes, boxed: it contains itself
+  age: Int               offset 8, 8 bytes
+  pointers               box at 0
+"
+    );
+    assert_eq!(
+        layout(&mut r, "Even"),
+        "Even: Inline, 8 bytes, aligned to 8
+  odd: Empty[Odd] | Odd  offset 0, 8 bytes, boxed: it contains itself
+  pointers               box at 0
+"
+    );
+}
+
+#[test]
+fn what_has_no_layout() {
+    let mut r = session(&[]);
+    assert_eq!(layout(&mut r, ""), "error: :layout takes a type\n");
+    assert_eq!(
+        layout(&mut r, "Nope"),
+        "error: `Nope` is not a type\n --> input:1:1\n  |\n1 | Nope\n  | ^^^^\n"
+    );
+    // The session is as it was.
+    assert_eq!(eval(&mut r, "1 + 1"), "2\n");
+}

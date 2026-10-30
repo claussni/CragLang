@@ -34,7 +34,7 @@ use crag_hir::{ItemKind, ModuleId, Owner, SourceFile, item_tree, module_scope};
 use crag_mir::{InstanceKey, Tier, mir};
 use crag_session::RunResult;
 use crag_syntax::{TokenKind, lex};
-use crag_types::{CallSite, Ty, written_show};
+use crag_types::{CallSite, Ty, TypeDefKind, type_def, written_show};
 
 use crate::debug::{Pause, Resume};
 use crate::diagnostics::{check, render_at};
@@ -49,6 +49,9 @@ pub const INPUT: &str = "__input";
 /// its type has of its own (§19.11).
 const SHOWN: &str = "__shown";
 
+/// The name of the alias `:layout` gives the type it shows.
+const LAYOUT: &str = "__Layout";
+
 /// The path of the session's module.
 const SESSION: &str = "repl";
 
@@ -58,6 +61,8 @@ Enter a definition to add it to the session, or an expression to run it.
   :start                start the project's app in the app image
   :reload               read changed files and swap their code into the app
   :status               how the app runs, and the files that differ from it
+  :layout <type>        how values of the type are stored: class, size,
+                        alignment, field offsets and any reason for a box
   :stop                 stop the app
   :break [file:line]    stop the app's tasks at a line; alone, list them
   :clear                remove every breakpoint
@@ -88,15 +93,26 @@ pub struct Repl {
     scratch: Scratch,
     /// The expression being run, while it is.
     input: Option<String>,
-    /// Whether its value is written by compiled code: its type's own
-    /// `show`, or the derived one meeting parts with their own.
-    own_show: bool,
+    /// What the input is the text of.
+    wrap: Wrap,
     /// The definition being added, whose errors are shown as the input's.
     fresh: Option<usize>,
     /// The text of each file as the app runs it, while it runs.
     app: Option<Vec<(String, String)>>,
     /// The type of the value the last input showed.
     shown_type: Option<String>,
+}
+
+/// What the session's module makes of the input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wrap {
+    /// An expression to run, whose value the image shows.
+    Value,
+    /// An expression whose value is written by compiled code: its type's
+    /// own `show`, or the derived one meeting parts with their own.
+    OwnShow,
+    /// A type, which `:layout` shows.
+    Type,
 }
 
 /// The session's definitions, as the text of one module.
@@ -122,7 +138,7 @@ struct Placed {
 }
 
 impl SessionModule {
-    fn layout(&self, input: Option<&str>, own_show: bool) -> Placed {
+    fn layout(&self, input: Option<&str>, wrap: Wrap) -> Placed {
         let mut text = String::new();
         let mut starts = Vec::new();
         for entry in &self.entries {
@@ -131,11 +147,18 @@ impl SessionModule {
             text += "\n\n";
         }
         let input = input.map(|input| {
+            if wrap == Wrap::Type {
+                text += &format!("type {LAYOUT} = ");
+                let start = text.len() as u32;
+                text += input;
+                text += "\n";
+                return start;
+            }
             text += &format!("fn {INPUT}() {{\n");
             let start = text.len() as u32;
             text += input;
             text += "\n}\n";
-            if own_show {
+            if wrap == Wrap::OwnShow {
                 text += &format!("fn {SHOWN}() -> Str {{ show({INPUT}()) }}\n");
             }
             start
@@ -290,7 +313,7 @@ impl Repl {
             },
             scratch,
             input: None,
-            own_show: false,
+            wrap: Wrap::Value,
             fresh: None,
             app: None,
             shown_type: None,
@@ -382,6 +405,7 @@ impl Repl {
             "cd" => self.change_dir(rest.trim()),
             "reload" => self.reload(),
             "status" => self.status(),
+            "layout" => self.show_layout(rest.trim()),
             "break" => self.breakpoint(rest.trim()),
             "clear" => {
                 self.scratch
@@ -824,13 +848,55 @@ impl Repl {
         Ok(names)
     }
 
+    /// Shows how values of a type are stored (Compiler Architecture
+    /// §A11.4.6): the type is the target of an alias of the session's own
+    /// while it is laid out.
+    fn show_layout(&mut self, text: &str) -> Result<EvalOutput, String> {
+        if text.is_empty() {
+            return Err("error: :layout takes a type\n".into());
+        }
+        self.input = Some(text.into());
+        self.wrap = Wrap::Type;
+        self.apply();
+        let result = self.describe_layout();
+        self.input = None;
+        self.wrap = Wrap::Value;
+        self.apply();
+        result
+    }
+
+    fn describe_layout(&self) -> Result<EvalOutput, String> {
+        let errors = self.errors();
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let (db, program) = (&self.project.db, self.project.program);
+        let item = item_tree(db, self.session.module)
+            .items
+            .iter()
+            .map(|i| i.id)
+            .find(|id| *id.kind(db) == ItemKind::Type && id.name(db).text(db) == LAYOUT)
+            .expect("the alias of :layout");
+        let TypeDefKind::Alias(ty) = type_def(db, program, item).kind else {
+            return Err("error: :layout takes a type\n".into());
+        };
+        let written = self.input.as_deref().expect("the type of :layout");
+        match crag_backend::flat::describe(db, program, ty) {
+            Some(text) => Ok(EvalOutput::Text(format!("{written}: {text}"))),
+            None => Err(format!(
+                "error: {} has no layout of its own\n",
+                ty.display(db)
+            )),
+        }
+    }
+
     /// Runs an expression in the scratch image.
     fn evaluate(&mut self, text: &str) -> Result<EvalOutput, String> {
         self.input = Some(text.into());
         self.apply();
         let result = self.run_input();
         self.input = None;
-        self.own_show = false;
+        self.wrap = Wrap::Value;
         self.apply();
         result
     }
@@ -852,7 +918,7 @@ impl Repl {
         let ran = if ty == Ty::unit(db) {
             self.scratch.execute(&self.project, key)
         } else if written_show(db, self.project.program, ty, at).is_some() {
-            self.own_show = true;
+            self.wrap = Wrap::OwnShow;
             self.apply();
             let (key, text) = root(&self.project, self.session.module, SHOWN);
             self.scratch.show(&self.project, key, text, true)
@@ -869,10 +935,7 @@ impl Repl {
 
     /// Gives the session's module its text.
     fn apply(&mut self) {
-        let text = self
-            .session
-            .layout(self.input.as_deref(), self.own_show)
-            .text;
+        let text = self.session.layout(self.input.as_deref(), self.wrap).text;
         let file = self.session.module.file(&self.project.db);
         file.set_text(&mut self.project.db).to(text);
         self.project.read_resources();
@@ -924,7 +987,7 @@ impl Sources for Repl {
         if module != self.session.module {
             return self.project.locate(module, position);
         }
-        let layout = self.session.layout(self.input.as_deref(), self.own_show);
+        let layout = self.session.layout(self.input.as_deref(), self.wrap);
         if let (Some(start), Some(input)) = (layout.input, &self.input)
             && position >= start
         {
