@@ -22,10 +22,12 @@
 //! its fields, `Bool`s and tag-only unions as bits of a flag byte after the
 //! other fields, integers a `where` condition bounds narrowed, a union's
 //! local tag, the niche a `T | Empty` can use instead of a tag, and the
-//! pointer map. It depends on the type alone. So far only locals use it
-//! (see `split`): a local of a flat record type may be kept in registers,
-//! but every record in memory is still boxed as `layout::record_layout`
-//! places it. The REPL's `:layout` shows what flattening does.
+//! pointer map. It depends on the type alone. Locals, parameters and
+//! results use it (see `split`): a flat record or union is kept in
+//! registers and passes between functions in its storage form, but every
+//! record in memory is still boxed as `layout::record_layout` places it.
+//! The REPL's `:layout` shows what flattening does, and `check_flat`
+//! holds a type marked `is Flat` to it.
 //!
 //! A field that would contain its own type is the recursive edge, and
 //! holds a box: a field's member is boxed when it reaches the record it is
@@ -35,10 +37,10 @@
 //! `MAX_UNFOLD` types.
 
 use crag_db::Db;
-use crag_hir::{Name, Owner, Program, hir_body, type_identity};
+use crag_hir::{ItemId, ItemKind, Name, Owner, Program, hir_body, item_tree, type_identity};
 use crag_types::{
     Builtin, Ty, TyKind, TypeDefKind, dispose_handler, fields_of, int_bounds, parent, prelude_item,
-    record_subtypes, subst, type_def,
+    record_subtypes, signature, subst, type_def,
 };
 
 /// The most bytes a flat value takes (§A11.4).
@@ -909,4 +911,124 @@ fn pointer_text(p: &Pointer) -> String {
         };
     }
     out
+}
+
+/// The errors of a type marked `is Flat` (Compiler Architecture
+/// §A11.4.6): it must not be boxed, and an error names why it is. A
+/// generic type is checked at each instance the program's signatures and
+/// records name with concrete type arguments.
+pub fn check_flat<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> Vec<String> {
+    if *item.kind(db) != ItemKind::Type {
+        return Vec::new();
+    }
+    let body = hir_body(db, program, Owner::Item(item));
+    let marked = body.type_decl.as_ref().is_some_and(|d| {
+        d.markers
+            .iter()
+            .any(|(m, negated)| !negated && m.text(db) == "Flat")
+    });
+    if !marked {
+        return Vec::new();
+    }
+    let instances = match body.type_params.is_empty() {
+        true => vec![Ty::new(db, TyKind::Named(item, Vec::new()))],
+        false => instances(db, program, item),
+    };
+    let mut out = Vec::new();
+    for ty in instances {
+        if let Some(Layout {
+            class: LayoutClass::Boxed(reason),
+            ..
+        }) = layout(db, program, ty)
+        {
+            out.push(format!(
+                "`{}` is marked `is Flat` but is boxed: {}",
+                ty.display(db),
+                reason_text(*reason)
+            ));
+        }
+    }
+    out
+}
+
+/// The instances of a generic type with concrete type arguments that the
+/// signatures of the program's functions and the fields of its records
+/// name.
+fn instances<'db>(db: &'db dyn Db, program: Program, generic: ItemId<'db>) -> Vec<Ty<'db>> {
+    let mut out = Vec::new();
+    let mut seen = Vec::new();
+    for &module in program.modules(db) {
+        for entry in &item_tree(db, module).items {
+            let item = entry.id;
+            let mut types = Vec::new();
+            match item.kind(db) {
+                ItemKind::Function => {
+                    let s = signature(db, program, item);
+                    types.extend(s.params.iter().map(|p| p.ty));
+                    types.extend(s.result);
+                }
+                ItemKind::Type
+                    if hir_body(db, program, Owner::Item(item))
+                        .type_params
+                        .is_empty() =>
+                {
+                    let ty = Ty::new(db, TyKind::Named(item, Vec::new()));
+                    types.extend(
+                        fields_of(db, program, ty)
+                            .into_iter()
+                            .flatten()
+                            .map(|(_, t)| t),
+                    );
+                }
+                _ => {}
+            }
+            for ty in types {
+                named(db, ty, generic, &mut seen, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Gathers the instances of a generic type within a type.
+fn named<'db>(
+    db: &'db dyn Db,
+    ty: Ty<'db>,
+    generic: ItemId<'db>,
+    seen: &mut Vec<Ty<'db>>,
+    out: &mut Vec<Ty<'db>>,
+) {
+    if seen.contains(&ty) {
+        return;
+    }
+    seen.push(ty);
+    let parts: Vec<Ty<'db>> = match ty.kind(db) {
+        TyKind::Named(item, args) => {
+            if *item == generic && args.iter().all(|a| concrete(db, *a)) {
+                out.push(ty);
+            }
+            args.clone()
+        }
+        TyKind::Builtin(_, args) => args.clone(),
+        TyKind::Union(members) => members.clone(),
+        TyKind::Record { fields, .. } => fields.iter().map(|(_, t)| *t).collect(),
+        TyKind::Fn { params, result, .. } => params.iter().copied().chain([*result]).collect(),
+        TyKind::Error | TyKind::Param(..) => Vec::new(),
+    };
+    for part in parts {
+        named(db, part, generic, seen, out);
+    }
+}
+
+/// Whether a type has no type parameters in it.
+fn concrete<'db>(db: &'db dyn Db, ty: Ty<'db>) -> bool {
+    match ty.kind(db) {
+        TyKind::Param(..) | TyKind::Error => false,
+        TyKind::Named(_, args) | TyKind::Builtin(_, args) => args.iter().all(|a| concrete(db, *a)),
+        TyKind::Union(members) => members.iter().all(|m| concrete(db, *m)),
+        TyKind::Record { fields, .. } => fields.iter().all(|(_, t)| concrete(db, *t)),
+        TyKind::Fn { params, result, .. } => {
+            params.iter().all(|p| concrete(db, *p)) && concrete(db, *result)
+        }
+    }
 }

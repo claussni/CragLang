@@ -402,3 +402,37 @@ fn flat_values_pass_by_value() {
         assert_eq!(shown.trim_end().trim_matches('"'), expected, "{input}");
     }
 }
+
+#[test]
+fn types_marked_flat_must_not_be_boxed() {
+    let mut r = session(&["type Point(x: Int, y: Int)\n  is Flat"]);
+    // A type too large, or one with a lifecycle, is an error that says
+    // why.
+    let big = eval(
+        &mut r,
+        "type Big(a: Int, b: Int, c: Int, d: Int, e: Int)\n  is Flat",
+    );
+    assert!(
+        big.contains(
+            "`Big` is marked `is Flat` but is boxed: flat it would take 40 bytes and 0 managed \
+             pointers, more than 32 and 2"
+        ),
+        "{big}"
+    );
+    let key = eval(&mut r, "type Key(k: Int)\n  is Secret\n  is Flat");
+    assert!(
+        key.contains("`Key` is marked `is Flat` but is boxed: it has a lifecycle"),
+        "{key}"
+    );
+    // A record that holds a list's box is flat itself.
+    assert_eq!(eval(&mut r, "type Listed(items: List[Int])\n  is Flat"), "");
+    // A generic type is checked at the instances the program names.
+    assert_eq!(eval(&mut r, "type Pair[T](a: T, b: T)\n  is Flat"), "");
+    assert_eq!(eval(&mut r, "fn small(p: Pair[Int]) -> Int { p.a }"), "");
+    assert_eq!(eval(&mut r, "type Wide(a: Int, b: Int, c: Int)"), "");
+    let wide = eval(&mut r, "fn wide(p: Pair[Wide]) -> Int { 0 }");
+    assert!(
+        wide.contains("`Pair[Wide]` is marked `is Flat` but is boxed: flat it would take 48 bytes"),
+        "{wide}"
+    );
+}

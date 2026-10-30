@@ -111,6 +111,13 @@ pub fn module_diagnostics(db: &dyn Db, program: Program, module: ModuleId) -> Ve
         };
         out.push(at(range, error.error.kind.message(db)));
     }
+    // A type marked `is Flat` must not be boxed (Compiler Architecture
+    // §A11.4.6).
+    for item in &crag_hir::item_tree(db, module).items {
+        for message in crag_backend::flat::check_flat(db, program, item.id) {
+            out.push(at(decl_range(db, module, item.decl), message));
+        }
+    }
     // Constants are evaluated at compile time (Specification §18.4),
     // and an evaluation that fails is an error at the value.
     for (item, error) in crag_eval::eval_errors(db, program, module) {
