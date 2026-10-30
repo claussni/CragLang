@@ -69,11 +69,20 @@ impl Types {
     }
 
     /// How a cell holds a value of the elements of list type `list`, which
-    /// a ref, a lazy value, a stream, a hub or a signal gives for the
-    /// layout of its values.
+    /// a lazy value, a stream, a hub or a signal gives for the layout of
+    /// its values.
     pub(crate) fn cell_of(&self, list: u64) -> &ElementLayout {
         match u32::try_from(list).ok().and_then(|i| self.get(i)) {
             Some(TypeDescriptor::List { cell, .. }) => cell,
+            _ => die(&format!("values of type {list}, which is not a list type")),
+        }
+    }
+
+    /// How a ref cell holds a value of the elements of list type `list`,
+    /// which a ref gives for the layout of its values.
+    pub(crate) fn ref_cell_of(&self, list: u64) -> &ElementLayout {
+        match u32::try_from(list).ok().and_then(|i| self.get(i)) {
+            Some(TypeDescriptor::List { ref_cell, .. }) => ref_cell,
             _ => die(&format!("values of type {list}, which is not a list type")),
         }
     }

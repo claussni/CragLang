@@ -179,7 +179,8 @@ fn self_reader() -> LirFunction {
 fn types() -> Arc<Types> {
     let list = |counted: Vec<CountedField>| TypeDescriptor::List {
         element: ElementLayout::of_words(1, counted.clone()),
-        cell: ElementLayout::of_words(1, counted),
+        cell: ElementLayout::of_words(1, counted.clone()),
+        ref_cell: ElementLayout::of_words(1, counted),
     };
     Arc::new(Types::new([
         (INTS as u32, list(vec![])),

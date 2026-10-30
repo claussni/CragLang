@@ -201,6 +201,7 @@ fn check(config: FiberConfig) {
             TypeDescriptor::List {
                 element: word.clone(),
                 cell: word.clone(),
+                ref_cell: word.clone(),
             },
         ),
         (

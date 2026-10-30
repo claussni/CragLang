@@ -19,7 +19,9 @@
 //!
 //! A cell is a version word and the value's two words, on the side stack
 //! of the task that binds the ref; the tasks that use it end before it
-//! does (§10.1). The lowest bit of the version is a lock, which a write
+//! does (§10.1). A flat record or union of at most 16 bytes lies in those
+//! words in its storage form (Compiler Architecture §A11.4.1), so an
+//! update writes no box; anything larger is a box the words point to. The lowest bit of the version is a lock, which a write
 //! holds only while it stores the value. A reader loads the version, the
 //! value and the version again, and tries again when they differ or the
 //! lock was held, as a seqlock reader does.
@@ -290,7 +292,14 @@ unsafe extern "C" fn commit_entry(
         if !unsafe { log.write(cell, words, list) } {
             // SAFETY: the cell or the log holds a reference besides the
             // caller's.
-            unsafe { release_value(heap, types, words.as_mut_ptr().cast(), types.cell_of(list)) };
+            unsafe {
+                release_value(
+                    heap,
+                    types,
+                    words.as_mut_ptr().cast(),
+                    types.ref_cell_of(list),
+                )
+            };
         }
         return crag_abi::REF_COMMITTED;
     }
@@ -299,7 +308,12 @@ unsafe extern "C" fn commit_entry(
         // still holds a reference besides the caller's.
         // SAFETY: as the caller promises.
         unsafe {
-            release_value(heap, types, words.as_mut_ptr().cast(), types.cell_of(list));
+            release_value(
+                heap,
+                types,
+                words.as_mut_ptr().cast(),
+                types.ref_cell_of(list),
+            );
         }
         crag_abi::REF_COMMITTED
     } else {
@@ -308,7 +322,12 @@ unsafe extern "C" fn commit_entry(
                 // The update reruns with a value of its own.
                 // SAFETY: as the caller promises.
                 unsafe {
-                    release_value(heap, types, words.as_mut_ptr().cast(), types.cell_of(list));
+                    release_value(
+                        heap,
+                        types,
+                        words.as_mut_ptr().cast(),
+                        types.ref_cell_of(list),
+                    );
                 }
                 break crag_abi::REF_CONFLICT;
             }
@@ -382,15 +401,27 @@ unsafe extern "C" fn swap_entry(
         let Some(mut old) = (unsafe { log.read(cell) }) else {
             conflicted(unsafe { &*ctx });
             // SAFETY: the caller's references to the new value.
-            unsafe { release_value(heap, types, new.as_mut_ptr().cast(), types.cell_of(list)) };
+            unsafe {
+                release_value(
+                    heap,
+                    types,
+                    new.as_mut_ptr().cast(),
+                    types.ref_cell_of(list),
+                )
+            };
             return Words(0, 0);
         };
         // SAFETY: the cell or the log holds the old value until the
         // attempt ends, and the caller gets references of its own.
         unsafe {
-            retain_value(old.as_mut_ptr().cast(), types.cell_of(list));
+            retain_value(old.as_mut_ptr().cast(), types.ref_cell_of(list));
             if !log.write(cell, new, list) {
-                release_value(heap, types, new.as_mut_ptr().cast(), types.cell_of(list));
+                release_value(
+                    heap,
+                    types,
+                    new.as_mut_ptr().cast(),
+                    types.ref_cell_of(list),
+                );
             }
         }
         return Words(old[0], old[1]);
@@ -405,7 +436,7 @@ unsafe extern "C" fn swap_entry(
     // The caller gets references of its own: the cell's go when no
     // borrowed read can still hold the value.
     // SAFETY: the cell's reference keeps the value alive until retired.
-    unsafe { retain_value(old.as_mut_ptr().cast(), types.cell_of(list)) };
+    unsafe { retain_value(old.as_mut_ptr().cast(), types.ref_cell_of(list)) };
     retire(heap, types, old, list);
     Words(old[0], old[1])
 }

@@ -468,8 +468,8 @@ pub enum RuntimeFn {
     ///
     /// Ends an update begun by `RefRead`: [`REF_COMMITTED`] when the cell
     /// still holds `version`, else [`REF_CONFLICT`] and the update must
-    /// rerun. The value is laid out as the elements of the list type with
-    /// index `list`. A committed value's references go to the cell; one
+    /// rerun. The value is laid out as the `ref_cell` of the list type
+    /// with index `list` says (`TypeDescriptor::List`). A committed value's references go to the cell; one
     /// identical to the value read is not written and its references are
     /// given up (Specification §9.3), and so are those of a value that
     /// conflicted. Unpins the task.
@@ -1112,7 +1112,8 @@ pub const HUB_BROADCAST: u64 = 1;
 
 /// The size of a ref cell, which generated code places on the side stack:
 /// a version word at offset 0, whose lowest bit is the lock, and the two
-/// words of the value at offsets 8 and 16. A new cell has version 0.
+/// words of the value at offsets 8 and 16, a value stored flat there in
+/// its storage form with zeros past its bytes. A new cell has version 0.
 pub const REF_CELL_SIZE: u64 = 24;
 
 /// A status of `rt_ref_commit`: the value was written, or was the one read.
@@ -1576,13 +1577,16 @@ pub enum TypeDescriptor {
         dispose: Option<u32>,
     },
     /// A list, whose elements each take `element.words` words, and how a
-    /// ref, a lazy value, a stream, a hub or a signal whose values are of
-    /// the element type holds one: in `cell`, its layout's words with a
-    /// flat record in its box, where the list may store it flat (Compiler
-    /// Architecture §A11.4).
+    /// lazy value, a stream, a hub or a signal whose values are of the
+    /// element type holds one: in `cell`, its layout's words with a flat
+    /// record in its box, where the list may store it flat (Compiler
+    /// Architecture §A11.4). A ref holds one as `ref_cell` says: a flat
+    /// record or union of at most 16 bytes in its storage form, anything
+    /// else as in `cell`.
     List {
         element: ElementLayout,
         cell: ElementLayout,
+        ref_cell: ElementLayout,
     },
     /// A map, or a set when the value has no words. Keys are equal when
     /// their words are, so a key holds no reference and no `Float`, or,
@@ -1669,9 +1673,9 @@ impl FieldGuard {
 /// aligned to `align`, with the fields that hold references at their
 /// offsets from its first byte. A collection holds a flat record or union,
 /// a sized integer or a union of tags in its storage form (Compiler
-/// Architecture §A11.3, §A11.4), so its bytes may be fewer than a word;
-/// anything else, and every value in a cell, takes the words of its
-/// layout. Generated code passes a value to the runtime in the words its
+/// Architecture §A11.3, §A11.4), so its bytes may be fewer than a word,
+/// and a ref cell a flat record or union of at most 16 bytes; anything
+/// else, and every value in another cell, takes the words of its layout. Generated code passes a value to the runtime in the words its
 /// bytes fill, or, when they are more than two, by the address of those
 /// words, in the first word of the two it takes otherwise.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]

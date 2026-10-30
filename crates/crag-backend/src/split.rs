@@ -65,8 +65,8 @@ use std::sync::OnceLock;
 use crag_db::Db;
 use crag_hir::{ItemKind, Name, Owner, Program, c_function};
 use crag_mir::{
-    ClosurePlacement, Entry, InstanceKey, MirBody, Operand, Place, Rvalue, Statement, Terminator,
-    Tier, mir,
+    ClosurePlacement, Entry, InstanceKey, Intrinsic, MirBody, Operand, Place, Rvalue, Statement,
+    Terminator, Tier, mir,
 };
 use crag_types::{Builtin, Step, Ty, TyKind, TypeDefKind, lifecycle_handler, type_def};
 
@@ -494,6 +494,12 @@ impl<'db> Check<'_, 'db> {
                         element_storage(self.db, self.program, ty).is_none();
                 }
             }
+            // A ref's value is loaded as an element is.
+            Rvalue::Intrinsic(Intrinsic::RefValue, _) if into_split => {
+                defines = true;
+                let ty = self.body.locals[dst.index()].ty;
+                self.from_box[dst.index()] = ref_storage(self.db, self.program, ty).is_none();
+            }
             Rvalue::Record {
                 fields,
                 dispose: None,
@@ -754,6 +760,22 @@ pub fn element_storage<'db>(
     let mut slots = Vec::new();
     slots_of(db, program, ty, &Form::Words(l), 0, 0, leaf, &mut slots)?;
     Some((flat.size, slots))
+}
+
+/// The storage form of a value of `ty` where a ref cell stores it flat,
+/// beside its version (Compiler Architecture §A11.4.1, §A11.4.6): that of
+/// a flat record or union that passes by value and takes at most the
+/// cell's two words. An integer keeps its word, which `RefApply` works
+/// on. None without flat layouts.
+pub fn ref_storage<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    ty: Ty<'db>,
+) -> Option<(u32, Vec<Slot>)> {
+    if !flat_layouts() {
+        return None;
+    }
+    storage(db, program, ty).filter(|&(size, _)| size <= 16)
 }
 
 /// The register form of a value of `ty` that a collection stores flat: a

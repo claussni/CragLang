@@ -3143,6 +3143,70 @@ fn refs_count_what_they_empty() {
 }
 
 #[test]
+fn refs_hold_flat_values_in_their_cells() {
+    let mut m = Module::new(
+        r#"type Small(a: Int, lit: Bool)
+type Named(text: Str)
+
+fn smalls(n: Int) -> Int {
+  ref s = Small(a: 1, lit: False)
+  for k in 1..n {
+    s.update { v -> Small(a: v.a + k, lit: if v.lit { False } else { True }) }
+  }
+  let v = s.use()
+  if v.lit { v.a * 10 + 1 } else { v.a * 10 }
+}
+
+fn names(n: Int) -> Int {
+  ref name = Named(text: "a name long enough for a heap buffer")
+  name.update { v -> Named(text: "{v.text} and {n}") }
+  let old = name.swap(Named(text: "short"))
+  let now = name.use()
+  if old.text == "a name long enough for a heap buffer and {n}" and now.text == "short" { n } else { -1 }
+}
+
+fn maybe(n: Int) -> Int {
+  ref m: Option[Small] = Small(a: n, lit: True)
+  let before = case m.use() {
+    s: Small -> s.a
+    _ -> 0
+  }
+  let old = m.swap(Empty)
+  let after = case m.use() {
+    s: Small -> s.a
+    _ -> -1
+  }
+  let was = case old {
+    s: Small -> s.a
+    _ -> 0
+  }
+  before * 100 + was * 10 + after
+}
+
+fn maybeNamed(n: Int) -> Int {
+  ref m: Option[Named] = Named(text: "another name long enough for the heap")
+  let first = m.swap(Named(text: "another name long enough for the heap, {n}"))
+  let old = m.swap(Empty)
+  case old {
+    s: Named -> if s.text == "another name long enough for the heap, {n}" { n } else { -1 }
+    _ -> 0
+  }
+}
+"#,
+    );
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    // The runtime's ref functions need a fiber's task context.
+    assert_eq!(m.run("smalls", &[5]).unwrap(), [161]);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+    assert_eq!(m.run("names", &[7]).unwrap(), [7]);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+    assert_eq!(m.run("maybe", &[4]).unwrap(), [4 * 100 + 4 * 10 - 1]);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+    assert_eq!(m.run("maybeNamed", &[3]).unwrap(), [3]);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+}
+
+#[test]
 fn exts_count_what_they_hold() {
     let mut m = Module::new(
         r#"type Point(x: Int, y: Int)

@@ -70,7 +70,7 @@ use crate::layout::{
 use crate::slot_key;
 use crate::split::{
     Form, NicheTest, Slot, SlotKind, UnionTag, element_form, element_storage, flat_params,
-    flat_result, form, place_form, storage,
+    flat_result, form, place_form, ref_storage, storage,
 };
 
 /// The LIR of a body, with what it could not lower.
@@ -1933,6 +1933,22 @@ impl<'a, 'db> Lower<'a, 'db> {
                 };
                 Ok(vec![addr, word(&env)?])
             }
+            // The value read from a ref cell, borrowed: found as an element
+            // is, stored flat or in its layout's words.
+            Rvalue::Intrinsic(Intrinsic::RefValue, _) => {
+                let ptr = self.scratch();
+                let found = match ref_storage(self.db, self.program, ty) {
+                    Some((_, slots)) => {
+                        let form = form(self.db, self.program, ty).ok_or("records of this type")?;
+                        Found::Stored { ptr, form, slots }
+                    }
+                    None => {
+                        let words = self.layout_of(ty)?.words();
+                        Found::Words((0..words).map(|k| self.load(ptr, 8 * k as i32)).collect())
+                    }
+                };
+                self.take(dst, found, None)
+            }
             Rvalue::Intrinsic(intrinsic, args) => self.intrinsic(*intrinsic, args, ty),
         }
     }
@@ -2326,7 +2342,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             (Intrinsic::RefNew, [value]) => {
                 let value_ty = self.cell_value_ty(ty)?;
                 self.describe(ty)?;
-                let words = self.operand(value, value_ty)?;
+                let words = self.ref_value(value, value_ty)?;
                 let ptr = self.alloc(HEADER_SIZE + REF_CELL_SIZE as u32, type_index(ty));
                 let zero = self.constant(0);
                 let header = HEADER_SIZE as i32;
@@ -2349,13 +2365,6 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let out = self.scratch();
                 Ok(vec![self.runtime(RuntimeFn::RefRead, vec![cell, out])])
             }
-            (Intrinsic::RefValue, []) => {
-                let out = self.scratch();
-                let words = layout(self.db, self.program, ty)
-                    .ok_or("values of this type")?
-                    .words();
-                Ok((0..words).map(|k| self.load(out, 8 * k as i32)).collect())
-            }
             (Intrinsic::RefDone, []) => {
                 self.push(Inst::CallRuntime {
                     func: RuntimeFn::RefDone,
@@ -2370,7 +2379,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let list = self.cell_list(value_ty)?;
                 let cell = self.cell_addr(cell)?;
                 let version = word(&self.operand(version, int)?)?;
-                let words = self.operand(value, value_ty)?;
+                let words = self.ref_value(value, value_ty)?;
                 let [w0, w1] = self.pad(words);
                 Ok(vec![self.runtime(
                     RuntimeFn::RefCommit,
@@ -3270,9 +3279,24 @@ impl<'a, 'db> Lower<'a, 'db> {
             (Intrinsic::RefSwap, [cell, value]) => {
                 let list = self.cell_list(ty)?;
                 let cell = self.cell_addr(cell)?;
-                let words = self.operand(value, ty)?;
+                let words = self.ref_value(value, ty)?;
                 let [w0, w1] = self.pad(words);
                 let old = self.runtime2(RuntimeFn::RefSwap, vec![cell, list, w0, w1]);
+                // The old value stored flat, with references of its own,
+                // goes into a box that takes them.
+                if let Some((_, slots)) = ref_storage(self.db, self.program, ty) {
+                    let f = form(self.db, self.program, ty).ok_or("records of this type")?;
+                    let out = self.scratch();
+                    for (k, &src) in old.iter().enumerate() {
+                        self.push(Inst::Store {
+                            src,
+                            addr: out,
+                            offset: 8 * k as i32,
+                        });
+                    }
+                    let regs = self.load_stored(out, &slots, f.words());
+                    return self.boxed(ty, &f, &regs);
+                }
                 let words = layout(self.db, self.program, ty)
                     .ok_or("values of this type")?
                     .words();
@@ -3650,6 +3674,20 @@ impl<'a, 'db> Lower<'a, 'db> {
             None => self.operand(op, ty)?,
         };
         Ok(self.pack(&slots, size, &regs))
+    }
+
+    /// The words of a value that goes into a ref cell, which take the
+    /// operand's references: a value stored flat there packed into its
+    /// storage form (`split::ref_storage`), anything else in its layout's
+    /// words.
+    fn ref_value(&mut self, op: &Operand<'db>, ty: Ty<'db>) -> Result<Vec<VReg>, Unsupported> {
+        match ref_storage(self.db, self.program, ty) {
+            Some((size, slots)) => {
+                let regs = self.flat_value(op, ty)?;
+                Ok(self.pack(&slots, size, &regs))
+            }
+            None => self.operand(op, ty),
+        }
     }
 
     /// An element's words as the two arguments of a runtime function: as

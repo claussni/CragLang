@@ -25,7 +25,7 @@
 //! two words in a member box, whose pointer is the payload (`crag_abi`).
 
 use crate::flat;
-use crate::split::{element_storage, flat_layouts};
+use crate::split::{element_storage, flat_layouts, ref_storage};
 use crag_abi::{CountedField, ElementLayout, FieldGuard, HEADER_SIZE, TypeDescriptor};
 use crag_db::Db;
 use crag_db::plumbing::AsId;
@@ -324,6 +324,21 @@ pub fn collection_element<'db>(
     })
 }
 
+/// How a ref cell holds a value of `ty`: in its storage form where it
+/// stores it flat (`split::ref_storage`), anything else as other cells
+/// do. None for what has no layout yet.
+pub fn ref_cell<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<ElementLayout> {
+    let Some((size, _)) = ref_storage(db, program, ty) else {
+        return element_layout(db, program, ty);
+    };
+    let l = flat::layout(db, program, ty).as_ref()?;
+    Some(ElementLayout {
+        size,
+        align: l.align,
+        counted: l.pointers.iter().map(|p| counted_pointer(p, 0)).collect(),
+    })
+}
+
 /// Whether two values of `ty` are equal exactly when their words are, as
 /// the runtime compares map keys unless they are strings or bytes:
 /// numbers but `Float`, code points, tags, and unions of these.
@@ -381,6 +396,7 @@ pub fn type_descriptor<'db>(
             return Some(TypeDescriptor::List {
                 element: collection_element(db, program, *element)?,
                 cell: element_layout(db, program, *element)?,
+                ref_cell: ref_cell(db, program, *element)?,
             });
         }
         Some((Builtin::Map, [key, value])) => return map(*key, Some(*value)),
@@ -415,11 +431,22 @@ pub fn type_descriptor<'db>(
                 dispose: None,
             });
         }
-        // A ref cell's box: the cell's version word, then the value laid
-        // out as in a collection (`crag_abi::REF_CELL_SIZE`); an `ext`'s:
-        // the lock, then the value.
+        // A ref cell's box: the cell's version word, then the value as
+        // `ref_cell` lays it out (`crag_abi::REF_CELL_SIZE`); an `ext`'s:
+        // the lock, then the value as other cells hold it.
         Some((b @ (Builtin::Ref | Builtin::Ext), [value])) => {
             let base = HEADER_SIZE + 8;
+            if b == Builtin::Ref && ref_storage(db, program, *value).is_some() {
+                let l = flat::layout(db, program, *value).as_ref()?;
+                return Some(TypeDescriptor::Record {
+                    counted: l
+                        .pointers
+                        .iter()
+                        .map(|p| counted_pointer(p, base))
+                        .collect(),
+                    dispose: None,
+                });
+            }
             let mut counted: Vec<CountedField> = element_layout(db, program, *value)?
                 .counted
                 .into_iter()

@@ -968,7 +968,8 @@ mod tests {
     fn types() -> Types {
         let list = |words, counted: Vec<CountedField>| TypeDescriptor::List {
             element: ElementLayout::of_words(words, counted.clone()),
-            cell: ElementLayout::of_words(words, counted),
+            cell: ElementLayout::of_words(words, counted.clone()),
+            ref_cell: ElementLayout::of_words(words, counted),
         };
         Types::new([
             (
@@ -1000,6 +1001,7 @@ mod tests {
                         counted: vec![],
                     },
                     cell: ElementLayout::of_words(1, vec![]),
+                    ref_cell: ElementLayout::of_words(1, vec![]),
                 },
             ),
             (
@@ -1011,6 +1013,7 @@ mod tests {
                         counted: vec![CountedField::Box(8)],
                     },
                     cell: ElementLayout::of_words(1, vec![CountedField::Box(0)]),
+                    ref_cell: ElementLayout::of_words(1, vec![CountedField::Box(0)]),
                 },
             ),
         ])

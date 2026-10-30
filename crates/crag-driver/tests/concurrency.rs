@@ -286,6 +286,42 @@ fn main() -> ExitCode {
 }
 
 #[test]
+fn refs_of_flat_values_keep_every_update_under_contention() {
+    let (code, out) = run(
+        "flat-refs",
+        r#"import std.task
+
+type Tally(sum: Int, odd: Bool)
+type Named(text: Str)
+
+fn main() -> ExitCode {
+  ref p = Tally(sum: 0, odd: False)
+  ref name = Named(text: "a name long enough for a heap buffer ")
+  all(limit: 8) { g ->
+    for i in 1..40 {
+      g.start { ->
+        p.update { v -> Tally(sum: v.sum + i, odd: if v.odd { False } else { True }) }
+        name.update { v -> Named(text: "{v.text}x") }
+      }
+    }
+    0
+  }
+  atomic {
+    p.update { v -> Tally(sum: v.sum + 1, odd: if v.odd { False } else { True }) }
+    name.update { v -> Named(text: "{v.text}!") }
+  }
+  let v = p.use()
+  let tally = if v.sum == 821 and v.odd { 0 } else { 1 }
+  let names = if name.use().text == "a name long enough for a heap buffer xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx!" { 0 } else { 2 }
+  ExitCode(code: tally + names)
+}
+"#,
+    );
+    // 1 + 2 + ... + 40 = 820, and 41 flips of `odd`.
+    assert_eq!(code, 0, "{out}");
+}
+
+#[test]
 fn first_result_takes_the_first_value_a_task_gives() {
     let (code, out) = run(
         "first-result",
