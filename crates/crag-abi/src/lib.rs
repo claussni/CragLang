@@ -1597,6 +1597,13 @@ pub enum CountedField {
     /// A union at this offset: its type index, then its payload, which is a
     /// box pointer when the index is one of `boxed`, sorted.
     Union { offset: u32, boxed: Vec<u32> },
+    /// A word at this offset as `Box` has it, there only when each guard
+    /// holds: in a union stored flat, the member it belongs to is the one
+    /// (Compiler Architecture §A11.4).
+    Guarded {
+        offset: u32,
+        guards: Vec<FieldGuard>,
+    },
     /// The lock of an `ext` binding at this offset, from `ExtNew`, which
     /// the runtime frees with the box (Implementation Plan §11.7.14). No
     /// reference: it is never counted.
@@ -1613,6 +1620,41 @@ pub enum CountedField {
     /// A socket's file descriptor at this offset, which the runtime closes
     /// with the box.
     Socket(u32),
+}
+
+/// What must hold for a guarded field to be there.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FieldGuard {
+    /// The byte at `offset`, a union's local tag, is one of `tags`.
+    Tag { offset: u32, tags: Vec<u8> },
+    /// The `size` bytes at `offset`, little-endian, do not hold `value`,
+    /// the niche that stands for the union's other member.
+    NotValue { offset: u32, size: u8, value: u64 },
+    /// The bit of the byte at `offset` is clear.
+    BitClear { offset: u32, bit: u8 },
+}
+
+impl FieldGuard {
+    /// The end of the bytes the guard reads.
+    pub fn end(&self) -> u32 {
+        match self {
+            FieldGuard::Tag { offset, .. } | FieldGuard::BitClear { offset, .. } => offset + 1,
+            FieldGuard::NotValue { offset, size, .. } => offset + u32::from(*size),
+        }
+    }
+
+    /// Whether the guard holds for the bytes of a box.
+    pub fn holds(&self, bytes: &[u8]) -> bool {
+        match self {
+            FieldGuard::Tag { offset, tags } => tags.contains(&bytes[*offset as usize]),
+            FieldGuard::NotValue {
+                offset,
+                size,
+                value,
+            } => read_le(bytes, *offset, u32::from(*size)) != *value,
+            FieldGuard::BitClear { offset, bit } => bytes[*offset as usize] >> bit & 1 == 0,
+        }
+    }
 }
 
 /// The words of a value inside a collection: at most two, with the fields
@@ -2068,6 +2110,18 @@ impl Shapes {
                 }
                 Shape::Str => out.push(10),
                 Shape::Bytes => out.push(11),
+                Shape::Stored {
+                    form,
+                    size,
+                    slots,
+                    words,
+                } => {
+                    out.push(14);
+                    u32(&mut out, *form);
+                    u32(&mut out, *size);
+                    stored_slots(&mut out, slots);
+                    u32(&mut out, *words);
+                }
             }
         }
         u32(&mut out, self.records.len() as u32);
@@ -2105,7 +2159,7 @@ impl Shapes {
             Shape::Record { fields, .. } | Shape::Inline { fields, .. } => {
                 fields.iter().map(|f| &f.shape).all(inside)
             }
-            Shape::List(e) | Shape::Set(e) => inside(e),
+            Shape::List(e) | Shape::Set(e) | Shape::Stored { form: e, .. } => inside(e),
             Shape::Map(k, v) => inside(k) && inside(v),
             _ => true,
         });
@@ -2215,8 +2269,112 @@ impl ShapeReader<'_> {
                 })?,
                 words: self.u32()?,
             },
+            14 => Shape::Stored {
+                form: self.u32()?,
+                size: self.u32()?,
+                slots: self.slots()?,
+                words: self.u32()?,
+            },
             tag => return Err(format!("a shape with the tag {tag}")),
         })
+    }
+
+    fn slots(&mut self) -> Result<Vec<StoredSlot>, String> {
+        self.seq(|r| {
+            Ok(StoredSlot {
+                at: r.u32()?,
+                offset: r.u32()?,
+                size: r.u32()?,
+                bits: match r.u8()? {
+                    0 => None,
+                    _ => Some((r.u8()?, r.u8()?)),
+                },
+                kind: match r.u8()? {
+                    0 => StoredKind::Int {
+                        signed: r.u8()? != 0,
+                    },
+                    1 => StoredKind::Words,
+                    2 => StoredKind::Tag(r.seq(ShapeReader::u32)?),
+                    3 => StoredKind::Union {
+                        tag: match r.u8()? {
+                            0 => StoredTag::Bytes {
+                                offset: r.u32()?,
+                                size: r.u32()?,
+                            },
+                            1 => StoredTag::Niche {
+                                empty: r.u32()?,
+                                offset: r.u32()?,
+                                size: r.u8()?,
+                                value: r.u64()?,
+                            },
+                            tag => return Err(format!("a union tag with the tag {tag}")),
+                        },
+                        members: r.seq(|r| Ok((r.u32()?, r.slots()?)))?,
+                    },
+                    tag => return Err(format!("a stored slot with the tag {tag}")),
+                },
+            })
+        })
+    }
+
+    fn u64(&mut self) -> Result<u64, String> {
+        let end = self.at + 8;
+        let b = self.bytes.get(self.at..end).ok_or("the shapes end early")?;
+        self.at = end;
+        Ok(u64::from_le_bytes(b.try_into().expect("eight bytes")))
+    }
+}
+
+/// Writes the slots of a stored shape, as `ShapeReader::slots` reads them.
+fn stored_slots(out: &mut Vec<u8>, slots: &[StoredSlot]) {
+    let u32 = |out: &mut Vec<u8>, n: u32| out.extend_from_slice(&n.to_le_bytes());
+    u32(out, slots.len() as u32);
+    for slot in slots {
+        u32(out, slot.at);
+        u32(out, slot.offset);
+        u32(out, slot.size);
+        match slot.bits {
+            None => out.push(0),
+            Some((bit, width)) => out.extend([1, bit, width]),
+        }
+        match &slot.kind {
+            StoredKind::Int { signed } => out.extend([0, u8::from(*signed)]),
+            StoredKind::Words => out.push(1),
+            StoredKind::Tag(members) => {
+                out.push(2);
+                u32(out, members.len() as u32);
+                for &m in members {
+                    u32(out, m);
+                }
+            }
+            StoredKind::Union { tag, members } => {
+                out.push(3);
+                match *tag {
+                    StoredTag::Bytes { offset, size } => {
+                        out.push(0);
+                        u32(out, offset);
+                        u32(out, size);
+                    }
+                    StoredTag::Niche {
+                        empty,
+                        offset,
+                        size,
+                        value,
+                    } => {
+                        out.push(1);
+                        u32(out, empty);
+                        u32(out, offset);
+                        out.push(size);
+                        out.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+                u32(out, members.len() as u32);
+                for (index, member) in members {
+                    u32(out, *index);
+                    stored_slots(out, member);
+                }
+            }
+        }
     }
 }
 
@@ -2271,6 +2429,197 @@ pub enum Shape {
         members: Vec<(u32, u32)>,
         words: u32,
     },
+    /// A field of a box stored flat (Compiler Architecture §A11.4): the
+    /// `size` bytes at its offset hold, as `slots` say, the words of a
+    /// value of the shape `form`.
+    Stored {
+        form: u32,
+        size: u32,
+        slots: Vec<StoredSlot>,
+        words: u32,
+    },
+}
+
+/// Where a value of a register form is in a storage form (Compiler
+/// Architecture §A11.4): the word it starts at, and how bytes or bits hold
+/// it from `offset` on.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StoredSlot {
+    pub at: u32,
+    pub offset: u32,
+    pub size: u32,
+    /// Its first bit and width in the byte at `offset`.
+    pub bits: Option<(u8, u8)>,
+    pub kind: StoredKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum StoredKind {
+    /// An integer of `size` bytes, extended with its sign or with zeros.
+    Int { signed: bool },
+    /// Words as they are.
+    Words,
+    /// A union of tags: its local tag, which numbers the members whose
+    /// type indices these are.
+    Tag(Vec<u32>),
+    /// A union whose word at `at` holds its member's type index: how
+    /// storage tells the member, and each member's type index and slots.
+    Union {
+        tag: StoredTag,
+        members: Vec<(u32, Vec<StoredSlot>)>,
+    },
+}
+
+/// How the storage form of a union tells its member.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum StoredTag {
+    /// The member's local tag in `size` bytes at `offset`.
+    Bytes { offset: u32, size: u32 },
+    /// The member `empty`, of no words, is the other's niche: `size` bytes
+    /// at `offset` that hold `value`, or with `size` zero, the bit `value`
+    /// of the byte there set.
+    Niche {
+        empty: u32,
+        offset: u32,
+        size: u8,
+        value: u64,
+    },
+}
+
+/// The `size` bytes at `offset`, little-endian.
+fn read_le(bytes: &[u8], offset: u32, size: u32) -> u64 {
+    let mut out = [0u8; 8];
+    let (from, n) = (offset as usize, size as usize);
+    out[..n].copy_from_slice(&bytes[from..from + n]);
+    u64::from_le_bytes(out)
+}
+
+/// The low `width` bits of `value` put at bit `bit` of the bytes from
+/// `offset` on, which hold zeros there.
+fn or_le(bytes: &mut [u8], offset: u32, bit: u32, width: u32, value: u64) {
+    let value = match width {
+        64 => value,
+        w => value & ((1u64 << w) - 1),
+    };
+    let wide = u128::from(value) << bit;
+    let n = (bit + width).div_ceil(8) as usize;
+    for (k, b) in wide.to_le_bytes()[..n].iter().enumerate() {
+        bytes[offset as usize + k] |= b;
+    }
+}
+
+impl StoredTag {
+    /// The index of the member the bytes hold.
+    fn member(&self, bytes: &[u8]) -> usize {
+        match *self {
+            StoredTag::Bytes { offset, size } => read_le(bytes, offset, size) as usize,
+            StoredTag::Niche {
+                empty,
+                offset,
+                size,
+                value,
+            } => {
+                let niche = match size {
+                    0 => u64::from(bytes[offset as usize] >> value & 1) == 1,
+                    size => read_le(bytes, offset, u32::from(size)) == value,
+                };
+                match niche {
+                    true => empty as usize,
+                    false => 1 - empty as usize,
+                }
+            }
+        }
+    }
+}
+
+/// Puts the register form of a value stored as `slots` in `bytes` into
+/// `out`, as generated code loads it.
+pub fn widen(slots: &[StoredSlot], bytes: &[u8], out: &mut [u64]) {
+    for slot in slots {
+        let at = slot.at as usize;
+        match &slot.kind {
+            StoredKind::Words => {
+                for k in 0..(slot.size / 8) {
+                    out[at + k as usize] = read_le(bytes, slot.offset + 8 * k, 8);
+                }
+            }
+            StoredKind::Int { signed } => {
+                let raw = read_le(bytes, slot.offset, slot.size);
+                let unused = 64 - 8 * slot.size;
+                out[at] = match (signed, unused) {
+                    (_, 0) | (false, _) => raw,
+                    (true, _) => ((raw << unused) as i64 >> unused) as u64,
+                };
+            }
+            StoredKind::Tag(members) => {
+                let tag = match slot.bits {
+                    Some((bit, width)) => {
+                        u64::from(bytes[slot.offset as usize] >> bit) & ((1 << width) - 1)
+                    }
+                    None => read_le(bytes, slot.offset, slot.size),
+                };
+                out[at] = members.get(tag as usize).copied().map_or(0, u64::from);
+            }
+            StoredKind::Union { tag, members } => {
+                let Some((index, member)) = members.get(tag.member(bytes)) else {
+                    continue;
+                };
+                out[at] = u64::from(*index);
+                widen(member, bytes, out);
+            }
+        }
+    }
+}
+
+/// Puts the register form of a value in `words` into `bytes` as `slots`
+/// store it, as generated code stores it. The bytes the slots take hold
+/// zeros before.
+pub fn narrow(slots: &[StoredSlot], words: &[u64], bytes: &mut [u8]) {
+    for slot in slots {
+        let at = slot.at as usize;
+        match &slot.kind {
+            StoredKind::Words => {
+                for k in 0..(slot.size / 8) {
+                    or_le(bytes, slot.offset + 8 * k, 0, 64, words[at + k as usize]);
+                }
+            }
+            StoredKind::Int { .. } => or_le(bytes, slot.offset, 0, 8 * slot.size, words[at]),
+            StoredKind::Tag(members) => {
+                let tag = members
+                    .iter()
+                    .position(|&m| u64::from(m) == words[at])
+                    .unwrap_or(0) as u64;
+                match slot.bits {
+                    Some((bit, width)) => or_le(bytes, slot.offset, bit.into(), width.into(), tag),
+                    None => or_le(bytes, slot.offset, 0, 8 * slot.size, tag),
+                }
+            }
+            StoredKind::Union { tag, members } => {
+                let Some(k) = members.iter().position(|m| u64::from(m.0) == words[at]) else {
+                    continue;
+                };
+                match *tag {
+                    StoredTag::Bytes { offset, size } => {
+                        or_le(bytes, offset, 0, 8 * size, k as u64)
+                    }
+                    StoredTag::Niche {
+                        empty,
+                        offset,
+                        size: 0,
+                        value,
+                    } if empty as usize == k => or_le(bytes, offset, value as u32, 1, 1),
+                    StoredTag::Niche {
+                        empty,
+                        offset,
+                        size,
+                        value,
+                    } if empty as usize == k => or_le(bytes, offset, 0, 8 * u32::from(size), value),
+                    StoredTag::Niche { .. } => {}
+                }
+                narrow(&members[k].1, words, bytes);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -2331,7 +2680,8 @@ impl Shape {
             Shape::Union { words, .. }
             | Shape::Opaque { words, .. }
             | Shape::Inline { words, .. }
-            | Shape::Variant { words, .. } => *words,
+            | Shape::Variant { words, .. }
+            | Shape::Stored { words, .. } => *words,
             Shape::Function | Shape::Str | Shape::Bytes => 2,
         }
     }
@@ -2371,6 +2721,94 @@ mod tests {
             Number::from_code(Number::Fixed(3).code()),
             Some(Number::Fixed(3))
         );
+    }
+
+    #[test]
+    fn stored_values_widen_to_what_they_narrowed_from() {
+        let slot = |at, offset, size, bits, kind| StoredSlot {
+            at,
+            offset,
+            size,
+            bits,
+            kind,
+        };
+        let slots = vec![
+            slot(0, 0, 1, None, StoredKind::Int { signed: false }),
+            slot(1, 1, 1, Some((0, 1)), StoredKind::Tag(vec![7, 8])),
+            slot(2, 1, 1, Some((1, 2)), StoredKind::Tag(vec![9, 10, 11])),
+            slot(3, 2, 2, None, StoredKind::Int { signed: true }),
+            slot(
+                4,
+                4,
+                12,
+                None,
+                StoredKind::Union {
+                    tag: StoredTag::Bytes { offset: 4, size: 1 },
+                    members: vec![
+                        (20, vec![slot(5, 8, 8, None, StoredKind::Words)]),
+                        (21, vec![]),
+                    ],
+                },
+            ),
+            slot(
+                6,
+                16,
+                2,
+                None,
+                StoredKind::Union {
+                    tag: StoredTag::Niche {
+                        empty: 1,
+                        offset: 16,
+                        size: 2,
+                        value: 0,
+                    },
+                    members: vec![
+                        (
+                            30,
+                            vec![slot(7, 16, 2, None, StoredKind::Int { signed: true })],
+                        ),
+                        (31, vec![]),
+                    ],
+                },
+            ),
+        ];
+        for words in [
+            [
+                200,
+                8,
+                11,
+                -5i64 as u64,
+                20,
+                0xdead_beef,
+                30,
+                -1234i64 as u64,
+            ],
+            [0, 7, 9, 5, 21, 0, 31, 0],
+        ] {
+            let mut bytes = [0u8; 24];
+            narrow(&slots, &words, &mut bytes);
+            let mut out = [0u64; 8];
+            widen(&slots, &bytes, &mut out);
+            assert_eq!(out, words);
+        }
+        let mut bytes = [0u8; 24];
+        narrow(&slots, &[0, 7, 9, 0, 20, 0, 31, 0], &mut bytes);
+        assert!(
+            FieldGuard::Tag {
+                offset: 4,
+                tags: vec![0]
+            }
+            .holds(&bytes)
+        );
+        assert!(
+            !FieldGuard::NotValue {
+                offset: 16,
+                size: 2,
+                value: 0
+            }
+            .holds(&bytes)
+        );
+        assert!(FieldGuard::BitClear { offset: 1, bit: 0 }.holds(&bytes));
     }
 
     #[test]

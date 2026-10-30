@@ -197,6 +197,19 @@ pub(crate) unsafe fn boxes_in(base: *mut u8, fields: &[CountedField], mut f: imp
                         f(at.add(1).cast::<*mut u8>().read());
                     }
                 }
+                CountedField::Guarded { offset, guards } => {
+                    let end = guards.iter().map(|g| g.end()).max().unwrap_or(0);
+                    let bytes = std::slice::from_raw_parts(base, end as usize);
+                    if guards.iter().all(|g| g.holds(bytes)) {
+                        let ptr = base
+                            .add(*offset as usize)
+                            .cast::<*mut u8>()
+                            .read_unaligned();
+                        if holds_box(ptr) {
+                            f(ptr);
+                        }
+                    }
+                }
                 CountedField::Ext(_)
                 | CountedField::Lazy(_)
                 | CountedField::Stream(_)

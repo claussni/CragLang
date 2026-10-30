@@ -27,14 +27,14 @@
 use std::io::{self, Read, Write};
 
 use crag_abi::{
-    CallHandler, CodeObject, CountedField, ElementLayout, FuncId, HandlerKind, NativeSymbol, Reloc,
-    RelocKind, RelocTarget, RuntimeFn, Shapes, SlotKey, StackCheck, StackMap, TrapKind, TrapOrigin,
-    TypeDescriptor,
+    CallHandler, CodeObject, CountedField, ElementLayout, FieldGuard, FuncId, HandlerKind,
+    NativeSymbol, Reloc, RelocKind, RelocTarget, RuntimeFn, Shapes, SlotKey, StackCheck, StackMap,
+    TrapKind, TrapOrigin, TypeDescriptor,
 };
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 27;
+pub const PROTOCOL_VERSION: u32 = 28;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -698,6 +698,32 @@ impl Writer {
                 w.u8(6);
                 w.u32(*offset);
             }
+            CountedField::Guarded { offset, guards } => {
+                w.u8(7);
+                w.u32(*offset);
+                w.seq(guards, |w, g| match g {
+                    FieldGuard::Tag { offset, tags } => {
+                        w.u8(0);
+                        w.u32(*offset);
+                        w.seq(tags, |w, t| w.u8(*t));
+                    }
+                    FieldGuard::NotValue {
+                        offset,
+                        size,
+                        value,
+                    } => {
+                        w.u8(1);
+                        w.u32(*offset);
+                        w.u8(*size);
+                        w.u64(*value);
+                    }
+                    FieldGuard::BitClear { offset, bit } => {
+                        w.u8(2);
+                        w.u32(*offset);
+                        w.u8(*bit);
+                    }
+                });
+            }
         });
     }
 }
@@ -888,6 +914,29 @@ impl Reader<'_> {
                 4 => CountedField::Stream(r.u32()?),
                 5 => CountedField::Hub(r.u32()?),
                 6 => CountedField::Socket(r.u32()?),
+                7 => CountedField::Guarded {
+                    offset: r.u32()?,
+                    guards: r.seq(|r| {
+                        Ok(match r.u8()? {
+                            0 => FieldGuard::Tag {
+                                offset: r.u32()?,
+                                tags: r.seq(Reader::u8)?,
+                            },
+                            1 => FieldGuard::NotValue {
+                                offset: r.u32()?,
+                                size: r.u8()?,
+                                value: r.u64()?,
+                            },
+                            2 => FieldGuard::BitClear {
+                                offset: r.u32()?,
+                                bit: r.u8()?,
+                            },
+                            tag => {
+                                return Err(invalid(format!("a field guard with the tag {tag}")));
+                            }
+                        })
+                    })?,
+                },
                 tag => return Err(invalid(format!("a counted field with the tag {tag}"))),
             })
         })
@@ -897,7 +946,7 @@ impl Reader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crag_abi::{Number, Shape, ShapeField};
+    use crag_abi::{Number, Shape, ShapeField, StoredKind, StoredSlot, StoredTag};
 
     fn all() -> Vec<Message> {
         vec![
@@ -918,6 +967,21 @@ mod tests {
                                 CountedField::Union {
                                     offset: 24,
                                     boxed: vec![3, 5],
+                                },
+                                CountedField::Guarded {
+                                    offset: 48,
+                                    guards: vec![
+                                        FieldGuard::Tag {
+                                            offset: 40,
+                                            tags: vec![0, 2],
+                                        },
+                                        FieldGuard::NotValue {
+                                            offset: 44,
+                                            size: 2,
+                                            value: 7,
+                                        },
+                                        FieldGuard::BitClear { offset: 46, bit: 3 },
+                                    ],
                                 },
                             ],
                             dispose: Some(40),
@@ -1083,6 +1147,38 @@ mod tests {
                         },
                         Shape::Variant {
                             members: vec![(7, 0), (8, 3)],
+                            words: 3,
+                        },
+                        Shape::Stored {
+                            form: 3,
+                            size: 16,
+                            slots: vec![StoredSlot {
+                                at: 0,
+                                offset: 0,
+                                size: 16,
+                                bits: Some((1, 2)),
+                                kind: StoredKind::Union {
+                                    tag: StoredTag::Niche {
+                                        empty: 1,
+                                        offset: 4,
+                                        size: 0,
+                                        value: 3,
+                                    },
+                                    members: vec![
+                                        (
+                                            7,
+                                            vec![StoredSlot {
+                                                at: 1,
+                                                offset: 8,
+                                                size: 2,
+                                                bits: None,
+                                                kind: StoredKind::Int { signed: true },
+                                            }],
+                                        ),
+                                        (8, Vec::new()),
+                                    ],
+                                },
+                            }],
                             words: 3,
                         },
                     ],

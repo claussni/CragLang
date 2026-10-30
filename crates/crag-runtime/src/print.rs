@@ -23,7 +23,9 @@
 //! with escapes and doubled braces, bytes as a byte literal. Limits cut
 //! deep, long and large values short with `…`.
 
-use crag_abi::{HEADER_SIZE, Number, Shape, Shapes, TYPE_INDEX_OFFSET};
+use std::borrow::Cow;
+
+use crag_abi::{HEADER_SIZE, Number, Shape, ShapeField, Shapes, TYPE_INDEX_OFFSET, widen};
 
 use crate::heap::Heap;
 use crate::rc::{Types, drop_box};
@@ -140,12 +142,10 @@ impl Printer<'_> {
                     }
                     self.out.push_str(&f.name);
                     self.out.push_str(": ");
-                    let n = self.shape(f.shape).words() as usize;
-                    // SAFETY: the field's words are at its offset.
+                    // SAFETY: the box has the field.
                     unsafe {
-                        let at = ptr.add(f.offset as usize).cast::<u64>();
-                        let words = std::slice::from_raw_parts(at, n);
-                        self.value(words, f.shape, depth + 1);
+                        let (words, shape) = field_words(self.shapes, ptr, f);
+                        self.value(&words, shape, depth + 1);
                     }
                     if self.full {
                         return;
@@ -163,6 +163,8 @@ impl Printer<'_> {
                     None => self.out.push_str(&format!("<a member of type {word}>")),
                 }
             }
+            // Only a field of a box is stored, and `field_words` widens it.
+            Shape::Stored { .. } => self.out.push_str("<a stored value>"),
             Shape::Inline { name, fields, .. } => {
                 self.out.push_str(name.as_deref().unwrap_or(""));
                 self.out.push('(');
@@ -337,6 +339,43 @@ pub(crate) fn number(n: Number, word: u64) -> String {
 
 /// Gives up the references a value's words hold, freeing what only they
 /// held.
+/// The words of a field of a record's box, and the shape they have: a
+/// field stored flat (Compiler Architecture §A11.4) widened to its
+/// register form, of its shape's `form`.
+///
+/// # Safety
+///
+/// `ptr` points at a live box that has the field, which outlives the
+/// borrow.
+pub(crate) unsafe fn field_words<'a>(
+    shapes: &Shapes,
+    ptr: *const u8,
+    f: &ShapeField,
+) -> (Cow<'a, [u64]>, u32) {
+    // SAFETY: as the caller promises.
+    unsafe {
+        let at = ptr.add(f.offset as usize);
+        match &shapes.shapes[f.shape as usize] {
+            Shape::Stored {
+                form,
+                size,
+                slots,
+                words,
+            } => {
+                let bytes = std::slice::from_raw_parts(at, *size as usize);
+                let mut out = vec![0; *words as usize];
+                widen(slots, bytes, &mut out);
+                (Cow::Owned(out), *form)
+            }
+            shape => {
+                let n = shape.words() as usize;
+                let words = std::slice::from_raw_parts(at.cast::<u64>(), n);
+                (Cow::Borrowed(words), f.shape)
+            }
+        }
+    }
+}
+
 ///
 /// The words of a union's member, from its payload: the payload itself, or
 /// for a member of two words the words of the member box it points at.

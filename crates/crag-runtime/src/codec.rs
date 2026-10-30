@@ -39,10 +39,12 @@
 //! and then builds the value, so bytes that do not fit leave no boxes
 //! behind. The boxes get the type indices and sizes the shapes give them.
 
-use crag_abi::{HEADER_SIZE, MEMBER_BOX_SIZE, Shape, ShapeField, Shapes, TYPE_INDEX_OFFSET};
+use crag_abi::{
+    HEADER_SIZE, MEMBER_BOX_SIZE, Shape, ShapeField, Shapes, TYPE_INDEX_OFFSET, narrow,
+};
 
 use crate::heap::{Heap, alloc_box};
-use crate::print::member_words;
+use crate::print::{field_words, member_words};
 use crate::rc::Types;
 use crate::text::{bytes_of, make_text};
 use crate::{list, map};
@@ -102,19 +104,32 @@ unsafe fn encode(
             };
             out.extend(own.to_le_bytes());
             for f in fields {
-                let n = shapes.shapes[f.shape as usize].words() as usize;
-                // SAFETY: the field's words are at its offset.
+                // SAFETY: the box has the field.
                 unsafe {
-                    let at = ptr.add(f.offset as usize).cast::<u64>();
-                    encode(
-                        std::slice::from_raw_parts(at, n),
-                        shapes,
-                        f.shape,
-                        types,
-                        out,
-                    )?;
+                    let (words, shape) = field_words(shapes, ptr, f);
+                    encode(&words, shapes, shape, types, out)?;
                 }
             }
+        }
+        // A field stored flat, widened: its fields in order, or its
+        // member's place and the member, as a union's.
+        Shape::Inline { fields, .. } => {
+            for f in fields {
+                let n = shapes.shapes[f.shape as usize].words() as usize;
+                let at = f.offset as usize;
+                // SAFETY: the field's words are the value's from its offset.
+                unsafe { encode(&words[at..at + n], shapes, f.shape, types, out)? };
+            }
+        }
+        Shape::Variant { members, .. } => {
+            let Some(at) = members.iter().position(|m| u64::from(m.0) == word) else {
+                return Err(NotSolid(format!("a member of type {word}")));
+            };
+            out.extend((at as u32).to_le_bytes());
+            let member = members[at].1;
+            let n = shapes.shapes[member as usize].words() as usize;
+            // SAFETY: the member's words follow its type index.
+            unsafe { encode(&words[1..1 + n], shapes, member, types, out)? };
         }
         &Shape::List(element) => {
             let list = word as *mut u8;
@@ -152,12 +167,8 @@ unsafe fn encode(
         }
         Shape::Function => return Err(NotSolid("a function value".into())),
         Shape::Opaque { name, .. } => return Err(NotSolid(format!("a value of type {name}"))),
-        // Values cross into the runtime boxed.
-        Shape::Inline { name, .. } => {
-            let name = name.as_deref().unwrap_or("a record");
-            return Err(NotSolid(format!("{name} split into registers")));
-        }
-        Shape::Variant { .. } => return Err(NotSolid("a union split into registers".into())),
+        // Only a field of a box is stored, and `field_words` widens it.
+        Shape::Stored { .. } => return Err(NotSolid("a stored value".into())),
     }
     Ok(())
 }
@@ -332,12 +343,33 @@ impl Decoder<'_> {
                 }
                 let (_, size) = boxed(own)?;
                 for f in fields {
-                    let end = f.offset as u64 + 8 * u64::from(shape_of(f.shape)?.words());
-                    if f.offset < crag_abi::HEADER_SIZE || f.offset % 8 != 0 || end > size.into() {
+                    let (end, aligned, shape) = match shape_of(f.shape)? {
+                        &Shape::Stored { form, size, .. } => (f.offset + size, true, form),
+                        s => (f.offset + 8 * s.words(), f.offset % 8 == 0, f.shape),
+                    };
+                    if f.offset < crag_abi::HEADER_SIZE || !aligned || end > size {
                         return Err(DecodeError(format!("field {} is outside its box", f.name)));
+                    }
+                    self.check(shapes, shape)?;
+                }
+            }
+            Shape::Inline { fields, words, .. } => {
+                for f in fields {
+                    if f.offset + shape_of(f.shape)?.words() > *words {
+                        return Err(DecodeError(format!("field {} does not fit", f.name)));
                     }
                     self.check(shapes, f.shape)?;
                 }
+            }
+            Shape::Variant { members, words } => {
+                let at = self.u32()? as usize;
+                let Some(&(_, member)) = members.get(at) else {
+                    return Err(DecodeError(format!("no member {at}")));
+                };
+                if 1 + shape_of(member)?.words() > *words {
+                    return Err(DecodeError(format!("member {at} does not fit")));
+                }
+                self.check(shapes, member)?;
             }
             &Shape::List(element) | &Shape::Set(element) => {
                 boxed(shape)?;
@@ -366,8 +398,7 @@ impl Decoder<'_> {
             Shape::Opaque { name, .. } => {
                 return Err(DecodeError(format!("a value of type {name}")));
             }
-            Shape::Inline { .. } => return Err(DecodeError("a split record".into())),
-            Shape::Variant { .. } => return Err(DecodeError("a split union".into())),
+            Shape::Stored { .. } => return Err(DecodeError("a stored value".into())),
         }
         Ok(())
     }
@@ -412,16 +443,52 @@ impl Decoder<'_> {
                 };
                 let (index, size) = shapes.boxed(own).expect(ok);
                 let ptr = alloc_box(heap, size as usize, u64::from(index));
+                let header = HEADER_SIZE as usize;
+                // SAFETY: the box is ours; the fields stored flat are put
+                // into zeros.
+                unsafe { ptr.add(header).write_bytes(0, size as usize - header) };
                 for f in fields {
                     // SAFETY: as the caller promises; the field lies inside
                     // the box, as checked.
                     unsafe {
-                        let value = self.build(shapes, f.shape, heap, types);
-                        let at = ptr.add(f.offset as usize).cast::<u64>();
-                        std::ptr::copy_nonoverlapping(value.as_ptr(), at, value.len());
+                        let at = ptr.add(f.offset as usize);
+                        match &shapes.shapes[f.shape as usize] {
+                            Shape::Stored {
+                                form, size, slots, ..
+                            } => {
+                                let value = self.build(shapes, *form, heap, types);
+                                let bytes = std::slice::from_raw_parts_mut(at, *size as usize);
+                                narrow(slots, &value, bytes);
+                            }
+                            _ => {
+                                let value = self.build(shapes, f.shape, heap, types);
+                                let at = at.cast::<u64>();
+                                std::ptr::copy_nonoverlapping(value.as_ptr(), at, value.len());
+                            }
+                        }
                     }
                 }
                 vec![ptr as u64]
+            }
+            Shape::Inline {
+                fields, words: n, ..
+            } => {
+                let mut out = vec![0; *n as usize];
+                for f in fields {
+                    // SAFETY: as the caller promises.
+                    let value = unsafe { self.build(shapes, f.shape, heap, types) };
+                    let at = f.offset as usize;
+                    out[at..at + value.len()].copy_from_slice(&value);
+                }
+                out
+            }
+            Shape::Variant { members, words: n } => {
+                let (index, member) = members[self.u32().expect(ok) as usize];
+                let mut out = vec![u64::from(index)];
+                // SAFETY: as the caller promises.
+                out.extend(unsafe { self.build(shapes, member, heap, types) });
+                out.resize(*n as usize, 0);
+                out
             }
             &Shape::List(element) => {
                 let (index, _) = shapes.boxed(shape).expect(ok);
@@ -450,10 +517,7 @@ impl Decoder<'_> {
                 let bytes = self.bytes(n).expect(ok);
                 make_text(heap, &[bytes]).to_vec()
             }
-            Shape::Function
-            | Shape::Opaque { .. }
-            | Shape::Inline { .. }
-            | Shape::Variant { .. } => {
+            Shape::Function | Shape::Opaque { .. } | Shape::Stored { .. } => {
                 unreachable!("checked")
             }
         }

@@ -30,7 +30,7 @@ use crag_abi::value_op::{COMPARE, EQUALS, UNORDERED};
 use crag_abi::{Number, Shape, Shapes, TYPE_INDEX_OFFSET};
 
 use crate::fiber::TaskContext;
-use crate::print::{PrintLimits, member_words, print_value};
+use crate::print::{PrintLimits, field_words, member_words, print_value};
 use crate::rc::Types;
 use crate::system::worker_of;
 use crate::text::{TextWords, bytes_of, make_text};
@@ -186,16 +186,6 @@ struct Walk<'a> {
     types: &'a Types,
 }
 
-/// The words of a record's field.
-///
-/// # Safety
-///
-/// `ptr` is a live box with the field at its offset.
-unsafe fn field<'a>(ptr: *const u8, offset: u32, words: u32) -> &'a [u64] {
-    // SAFETY: as the caller promises.
-    unsafe { std::slice::from_raw_parts(ptr.add(offset as usize).cast::<u64>(), words as usize) }
-}
-
 /// The type index in a box's header.
 ///
 /// # Safety
@@ -267,8 +257,9 @@ impl Walk<'_> {
                         return false;
                     }
                     self.record_fields(index, shape).iter().all(|f| {
-                        let n = self.shape(f.shape).words();
-                        self.equals(field(pa, f.offset, n), field(pb, f.offset, n), f.shape)
+                        let (wa, s) = field_words(self.shapes, pa, f);
+                        let (wb, _) = field_words(self.shapes, pb, f);
+                        self.equals(&wa, &wb, s)
                     })
                 }
                 Shape::Variant { members, .. } => {
@@ -323,7 +314,7 @@ impl Walk<'_> {
                         }
                     })
                 }
-                Shape::Function | Shape::Opaque { .. } => {
+                Shape::Function | Shape::Opaque { .. } | Shape::Stored { .. } => {
                     let n = self.shape(shape).words() as usize;
                     a[..n] == b[..n]
                 }
@@ -371,9 +362,9 @@ impl Walk<'_> {
                         return Some(ia.cmp(&ib));
                     }
                     for f in self.record_fields(ia, shape) {
-                        let n = self.shape(f.shape).words();
-                        let o =
-                            self.compare(field(pa, f.offset, n), field(pb, f.offset, n), f.shape)?;
+                        let (wa, s) = field_words(self.shapes, pa, f);
+                        let (wb, _) = field_words(self.shapes, pb, f);
+                        let o = self.compare(&wa, &wb, s)?;
                         if o != Ordering::Equal {
                             return Some(o);
                         }
@@ -414,7 +405,11 @@ impl Walk<'_> {
                     }
                     na.cmp(&nb)
                 }
-                Shape::Set(_) | Shape::Map(..) | Shape::Function | Shape::Opaque { .. } => {
+                Shape::Set(_)
+                | Shape::Map(..)
+                | Shape::Function
+                | Shape::Opaque { .. }
+                | Shape::Stored { .. } => {
                     return None;
                 }
             })
@@ -447,8 +442,8 @@ impl Walk<'_> {
                     let index = box_index(ptr);
                     h.word(u64::from(index));
                     for f in self.record_fields(index, shape) {
-                        let n = self.shape(f.shape).words();
-                        self.hash(field(ptr, f.offset, n), f.shape, h);
+                        let (words, s) = field_words(self.shapes, ptr, f);
+                        self.hash(&words, s, h);
                     }
                 }
                 Shape::Variant { members, .. } => {
@@ -493,7 +488,7 @@ impl Walk<'_> {
                     }
                     h.word(sum);
                 }
-                Shape::Function | Shape::Opaque { .. } => {
+                Shape::Function | Shape::Opaque { .. } | Shape::Stored { .. } => {
                     for &w in &a[..self.shape(shape).words() as usize] {
                         h.word(w);
                     }
