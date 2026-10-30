@@ -59,6 +59,11 @@ tests pass either way:
 
     CRAG_FLAT=0 ./cargo test
 
+`CRAG_OPT=1` compiles in the optimizing tier, with the MIR optimizer's
+passes and Cranelift's speed setting:
+
+    CRAG_OPT=1 ./cargo test
+
 The `crag` command works on the project in the current directory, a
 directory with a `package.crag` naming the package and its `main` module:
 

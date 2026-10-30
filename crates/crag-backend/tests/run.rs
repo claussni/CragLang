@@ -249,12 +249,12 @@ struct Module {
 
 impl Module {
     fn new(text: &str) -> Module {
-        Module::compiled(text, Tier::Baseline)
+        Module::compiled(text, Tier::compiled())
     }
 
     /// A module whose `embed`s may name the resources.
     fn with_resources(text: &str, resources: &[(&str, &[u8])]) -> Module {
-        Module::compiled_with(text, Tier::Baseline, resources)
+        Module::compiled_with(text, Tier::compiled(), resources)
     }
 
     fn metered(text: &str) -> Module {

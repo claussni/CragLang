@@ -373,7 +373,10 @@ pub fn code<'db>(
     let lowered = lower_to_lir(db, program, instance, &body, cell);
     let settings = CodegenSettings {
         target: host().clone(),
-        opt: OptLevel::None,
+        opt: match tier {
+            Tier::Optimizing => OptLevel::Speed,
+            Tier::Baseline | Tier::Metered => OptLevel::None,
+        },
         metered: tier == Tier::Metered,
     };
     Some(compile_cached(&lowered.lir, &settings).map(|mut object| {

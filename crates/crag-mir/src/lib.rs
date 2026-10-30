@@ -174,15 +174,31 @@ pub fn handler_code<'db>(db: &'db dyn Db, handler: &Handler<'db>) -> InstanceKey
     }
 }
 
-/// How code is compiled (Compiler Architecture §5). The optimizing tier
-/// arrives with its milestone.
+/// How code is compiled (Compiler Architecture §5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
 pub enum Tier {
     Baseline,
+    /// The MIR optimizer's passes and Cranelift's speed setting
+    /// (Implementation Plan §11.10.1, §11.10.2), still behind slots.
+    Optimizing,
     /// The baseline tier with fuel checks (Implementation Plan §11.6.6),
     /// for code run at compile time or received from elsewhere. Its MIR is
     /// the baseline tier's.
     Metered,
+}
+
+impl Tier {
+    /// The tier `crag run`, `crag test` and the images compile in: the
+    /// baseline, or the optimizing tier with `CRAG_OPT=1` in the
+    /// environment, so that a whole test run goes through the MIR
+    /// optimizer. Read once.
+    pub fn compiled() -> Tier {
+        static OPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        match *OPT.get_or_init(|| std::env::var("CRAG_OPT").is_ok_and(|v| v == "1")) {
+            true => Tier::Optimizing,
+            false => Tier::Baseline,
+        }
+    }
 }
 
 /// The MIR of an instance; none for what has no body, such as a builtin
@@ -194,7 +210,7 @@ pub fn mir<'db>(
     instance: InstanceKey<'db>,
     tier: Tier,
 ) -> Option<MirBody<'db>> {
-    if tier == Tier::Metered {
+    if tier != Tier::Baseline {
         return mir(db, program, instance, Tier::Baseline).clone();
     }
     let mut body = build::build(db, program, instance)?;

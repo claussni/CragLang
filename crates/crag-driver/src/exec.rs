@@ -136,7 +136,8 @@ pub fn compile<'a>(
     };
     // Steps name the same types again and again.
     let mut shaped: HashMap<(crag_types::Ty, bool), (std::sync::Arc<Shapes>, u32)> = HashMap::new();
-    for instance in collect_instances(db, program, roots, Tier::Baseline) {
+    let tier = Tier::compiled();
+    for instance in collect_instances(db, program, roots, tier) {
         let owner = *instance.owner(db);
         let name = match instance.entry(db) {
             Entry::Body | Entry::Part => owner_name(project, owner),
@@ -151,12 +152,12 @@ pub fn compile<'a>(
         // `CRAG_MIR=1` shows the MIR of what is compiled and what code
         // generation does not support, for debugging the compiler.
         if std::env::var_os("CRAG_MIR").is_some()
-            && let Some(body) = mir(db, program, instance, Tier::Baseline)
+            && let Some(body) = mir(db, program, instance, tier)
         {
             eprintln!("{name}\n{}", body.pretty(db));
         }
         let value = matches!(owner, Owner::Item(item) if item.kind(db).is_value());
-        let code = match code(db, program, instance, Tier::Baseline) {
+        let code = match code(db, program, instance, tier) {
             Some(Ok(code)) => code,
             Some(Err(e)) => return Err(format!("cannot compile {name}: {e}")),
             None => return Err(format!("{name} has no body to compile")),
