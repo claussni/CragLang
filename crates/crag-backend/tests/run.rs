@@ -2362,12 +2362,20 @@ fn labels() -> List[(text: Str, n: Int)] {
 }
 fn narrow() -> List[Int8] { [-1, 7] }
 fn keyed() -> Map[Int8, Flat] { [-3: Flat(a: 1, b: False, c: 2), 4: Flat(a: 3, b: True, c: 4)] }
+// Plain types, written in their storage form.
+type Tile(x: UInt8, y: Int8, lit: Bool)
+fn flat() -> Flat { Flat(a: 1, b: True, c: -2) }
+fn tile() -> Option[Tile] { Tile(x: 200, y: -3, lit: True) }
+fn noTile() -> Option[Tile] { Empty }
+fn placed() -> (name: Str, at: Tile, tiles: List[Tile]) {
+  (name: "a", at: Tile(x: 1, y: 2, lit: False), tiles: [Tile(x: 3, y: 4, lit: True)])
+}
 "#,
     );
     let names = [
         "deep", "chain", "points", "ages", "set", "maybe", "none", "tags", "mixed", "empty",
         "nothing", "both", "words", "texts", "boxed", "alone", "flats", "spots", "labels",
-        "narrow", "keyed",
+        "narrow", "keyed", "flat", "tile", "noTile", "placed",
     ];
     let limits = PrintLimits::default();
     for name in names {
@@ -2395,6 +2403,48 @@ fn keyed() -> Map[Int8, Flat] { [-3: Flat(a: 1, b: False, c: 2), 4: Flat(a: 3, b
         }
         assert_eq!(m.heap.live_blocks(), 0, "{name}");
     }
+
+    // A Plain value is its storage form: `Flat` as `a`, `c` and a flag
+    // byte, padded to 24 bytes, and `Option[Tile]` in the three bytes of a
+    // `Tile`, `Empty` in the niche of `lit`'s flag byte. Bytes the value
+    // they read does not give back are refused: a bit no field holds,
+    // padding, or a payload beside the niche.
+    let plain = |m: &mut Module, name: &str| {
+        let words = m.call(name, &[]);
+        let (shapes, root) = m.result_shapes(name);
+        // SAFETY: as above.
+        unsafe {
+            let bytes = encode_value(&words, &shapes, root, &m.types).unwrap();
+            release_value(&mut m.heap, &m.types, &words, &shapes, root);
+            (bytes, shapes, root)
+        }
+    };
+    let (flat, flat_shapes, flat_root) = plain(&mut m, "flat");
+    let mut expected = [0u8; 24];
+    expected[..8].copy_from_slice(&1i64.to_le_bytes());
+    expected[8..16].copy_from_slice(&(-2i64).to_le_bytes());
+    expected[16] = 1;
+    assert_eq!(flat, expected);
+    let (tile, tile_shapes, tile_root) = plain(&mut m, "tile");
+    assert_eq!(tile, [200, 253, 1]);
+    assert_eq!(plain(&mut m, "noTile").0, [0, 0, 2]);
+    let broken = [
+        (
+            &flat_shapes,
+            flat_root,
+            [&flat[..16], &[3], &flat[17..]].concat(),
+        ),
+        (&flat_shapes, flat_root, [&flat[..23], &[1]].concat()),
+        (&tile_shapes, tile_root, vec![200, 253, 5]),
+        (&tile_shapes, tile_root, vec![1, 0, 2]),
+        (&tile_shapes, tile_root, vec![200, 253]),
+    ];
+    for (i, (shapes, root, b)) in broken.iter().enumerate() {
+        // SAFETY: as above.
+        let result = unsafe { decode_value(b, shapes, *root, &mut m.heap, &m.types) };
+        assert!(result.is_err(), "plain {i}");
+    }
+    assert_eq!(m.heap.live_blocks(), 0);
 
     // Bytes that do not fit the shape are refused, and nothing is left.
     let words = m.call("points", &[]);

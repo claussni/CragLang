@@ -34,7 +34,7 @@ use crag_abi::{
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 31;
+pub const PROTOCOL_VERSION: u32 = 32;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -1074,6 +1074,7 @@ mod tests {
                         shapes: vec![Shape::List(1), Shape::Number(Number::Signed)],
                         records: Vec::new(),
                         boxes: vec![(0, 5, 40)],
+                        plain: Vec::new(),
                     },
                     root: 0,
                     bytes: vec![1, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0],
@@ -1205,6 +1206,7 @@ mod tests {
                     ],
                     records: vec![(7, 0)],
                     boxes: vec![(0, 7, 32), (4, 9, 16), (5, 10, 40)],
+                    plain: vec![(18, 19)],
                 },
                 root: 2,
                 text: false,
@@ -1383,23 +1385,34 @@ mod tests {
                 shapes: vec![Shape::List(1)],
                 records: Vec::new(),
                 boxes: Vec::new(),
+                plain: Vec::new(),
             },
             Shapes {
                 shapes: vec![Shape::Unit],
                 records: vec![(3, 1)],
                 boxes: Vec::new(),
+                plain: Vec::new(),
             },
             // A box's shape.
             Shapes {
                 shapes: vec![Shape::Unit],
                 records: Vec::new(),
                 boxes: vec![(1, 3, 16)],
+                plain: Vec::new(),
+            },
+            // A storage form that is no stored shape.
+            Shapes {
+                shapes: vec![Shape::Unit],
+                records: Vec::new(),
+                boxes: Vec::new(),
+                plain: vec![(0, 0)],
             },
             // The root, too.
             Shapes {
                 shapes: Vec::new(),
                 records: Vec::new(),
                 boxes: Vec::new(),
+                plain: Vec::new(),
             },
         ] {
             let show = Message::Show {

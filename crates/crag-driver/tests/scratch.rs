@@ -333,8 +333,8 @@ fn constants_arrive_in_their_cells() {
         .unwrap()
         .result;
     let (shapes, root) = shapes(db, program, ty);
-    let mut bytes = root.to_le_bytes().to_vec();
-    bytes.extend([1u64, 1].iter().flat_map(|w| w.to_le_bytes()));
+    // A Plain record, so its storage form: its fields, no shape index.
+    let bytes = [1u64, 1].iter().flat_map(|w| w.to_le_bytes()).collect();
     let fill = Fill {
         cell: slot_key(db, program, corner),
         shapes,

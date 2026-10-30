@@ -171,10 +171,12 @@ fn sum(n: Int) -> Int {
     assert_eq!(answer.bytes, words(&[42]));
     assert_eq!(answer.hash, *blake3::hash(&answer.bytes).as_bytes());
     assert_eq!(p.bytes("looped"), words(&[55]));
-    // Defaults run at compile time like any code.
-    assert_eq!(p.bytes("defaulted")[4..], words(&[1, 2, 8]));
+    // Defaults run at compile time like any code. `Point3` is Plain, so
+    // its storage form is its encoding, with no shape before it.
+    assert_eq!(p.bytes("defaulted"), words(&[1, 2, 8]));
     assert_eq!(p.bytes("scaled"), words(&[12]));
-    // A record: the shape of its box's type, then its fields.
+    // A record that may hold a subtype: the shape of its box's type, then
+    // its fields.
     let origin = p.bytes("origin");
     assert_eq!(origin[4..], words(&[1, 2]));
     // A subtype's box has a shape of its own and keeps its fields.

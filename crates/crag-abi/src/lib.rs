@@ -2045,6 +2045,10 @@ pub struct Shapes {
     /// shape, the type index in the box's header and the box's bytes, so
     /// a value can be built from its encoding (§11.6.8).
     pub boxes: Vec<(u32, u32, u32)>,
+    /// For each shape of a Plain type, in a box or split, the `Stored`
+    /// shape of its storage form, which the codec writes it in (Compiler
+    /// Architecture §A11.4).
+    pub plain: Vec<(u32, u32)>,
 }
 
 impl Shapes {
@@ -2059,6 +2063,12 @@ impl Shapes {
             .iter()
             .find(|b| b.0 == shape)
             .map(|&(_, index, size)| (index, size))
+    }
+
+    /// The `Stored` shape of the storage form of a shape of a Plain type,
+    /// if it is one.
+    pub fn plain(&self, shape: u32) -> Option<u32> {
+        self.plain.iter().find(|p| p.0 == shape).map(|p| p.1)
     }
 
     /// The table as bytes, as the session protocol sends it and generated
@@ -2171,6 +2181,11 @@ impl Shapes {
             u32(&mut out, index);
             u32(&mut out, size);
         }
+        u32(&mut out, self.plain.len() as u32);
+        for &(shape, stored) in &self.plain {
+            u32(&mut out, shape);
+            u32(&mut out, stored);
+        }
         out
     }
 
@@ -2182,6 +2197,7 @@ impl Shapes {
             shapes: r.seq(ShapeReader::shape)?,
             records: r.seq(|r| Ok((r.u32()?, r.u32()?)))?,
             boxes: r.seq(|r| Ok((r.u32()?, r.u32()?, r.u32()?)))?,
+            plain: r.seq(|r| Ok((r.u32()?, r.u32()?)))?,
         };
         if r.at != bytes.len() {
             return Err("bytes after the shapes".into());
@@ -2202,6 +2218,10 @@ impl Shapes {
         if !named
             || !shapes.records.iter().map(|r| &r.1).all(inside)
             || !shapes.boxes.iter().map(|b| &b.0).all(inside)
+            || !shapes.plain.iter().all(|p| {
+                inside(&p.0)
+                    && matches!(shapes.shapes.get(p.1 as usize), Some(Shape::Stored { .. }))
+            })
         {
             return Err("a shape that names no shape of its table".into());
         }

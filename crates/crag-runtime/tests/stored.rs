@@ -97,6 +97,7 @@ fn shapes() -> Shapes {
         ],
         records: vec![(LABEL, 7)],
         boxes: vec![(7, LABEL, 48)],
+        plain: Vec::new(),
     }
 }
 

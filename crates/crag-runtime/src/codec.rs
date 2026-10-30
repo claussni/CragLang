@@ -31,6 +31,12 @@
 //!   keys' bytes, each the key and then the value.
 //! - A string or bytes: its length, eight bytes, then its bytes. A string
 //!   decodes only from valid UTF-8.
+//! - A value of a Plain type, a flat record or union with no pointers: its
+//!   storage form (Compiler Architecture §A11.4), little-endian with zeroed
+//!   padding, in place of all of the above. A record of a Plain type has
+//!   no subtypes, so no shape index goes before it. Decoding takes only the
+//!   bytes that the value it reads gives back, so each value has one
+//!   encoding. This makes the packing rules of the storage form a format.
 //!
 //! A function value or what the shape cannot show is not encoded: it holds
 //! code addresses, or words whose meaning the shape does not know.
@@ -40,7 +46,7 @@
 //! behind. The boxes get the type indices and sizes the shapes give them.
 
 use crag_abi::{
-    HEADER_SIZE, MEMBER_BOX_SIZE, Shape, ShapeField, Shapes, TYPE_INDEX_OFFSET, narrow,
+    HEADER_SIZE, MEMBER_BOX_SIZE, Shape, ShapeField, Shapes, TYPE_INDEX_OFFSET, narrow, widen,
 };
 
 use crate::heap::{Heap, alloc_box};
@@ -78,6 +84,21 @@ unsafe fn encode(
     types: &Types,
     out: &mut Vec<u8>,
 ) -> Result<(), NotSolid> {
+    if let Some(stored) = shapes.plain(shape) {
+        let Shape::Stored {
+            form, size, slots, ..
+        } = &shapes.shapes[stored as usize]
+        else {
+            return Err(NotSolid(format!("shape {stored} is no storage form")));
+        };
+        let mut register = vec![0; shapes.shapes[*form as usize].words() as usize];
+        // SAFETY: as the caller promises.
+        unsafe { to_form(words, shapes, shape, *form, &mut register) };
+        let at = out.len();
+        out.resize(at + *size as usize, 0);
+        narrow(slots, &register, &mut out[at..]);
+        return Ok(());
+    }
     let word = words.first().copied().unwrap_or(0);
     match &shapes.shapes[shape as usize] {
         Shape::Unit | Shape::Tag(_) => {}
@@ -166,6 +187,172 @@ unsafe fn encode(
         Shape::Stored { .. } => return Err(NotSolid("a stored value".into())),
     }
     Ok(())
+}
+
+/// Puts the words of a value of the shape `from` into `out` in the
+/// register form `to` of a value of the same Plain type: a record's
+/// fields out of its box, or out of a split record, by name, and a union's
+/// member by its type index.
+///
+/// # Safety
+///
+/// The words are a live value of the shape `from`.
+unsafe fn to_form(words: &[u64], shapes: &Shapes, from: u32, to: u32, out: &mut [u64]) {
+    let field = |have: &[ShapeField], name: &str| {
+        have.iter()
+            .find(|h| h.name == name)
+            .cloned()
+            .expect("a field of the same type")
+    };
+    match (&shapes.shapes[from as usize], &shapes.shapes[to as usize]) {
+        _ if from == to => out.copy_from_slice(&words[..out.len()]),
+        (Shape::Record { fields: have, .. }, Shape::Inline { fields: want, .. }) => {
+            for f in want {
+                let n = shapes.shapes[f.shape as usize].words() as usize;
+                let at = f.offset as usize;
+                // SAFETY: the word points at a live box with the field.
+                unsafe {
+                    let (value, shape) =
+                        field_words(shapes, words[0] as *const u8, &field(have, &f.name));
+                    to_form(&value, shapes, shape, f.shape, &mut out[at..at + n]);
+                }
+            }
+        }
+        (Shape::Inline { fields: have, .. }, Shape::Inline { fields: want, .. }) => {
+            for f in want {
+                let h = field(have, &f.name);
+                let (n, m) = (
+                    shapes.shapes[f.shape as usize].words() as usize,
+                    shapes.shapes[h.shape as usize].words() as usize,
+                );
+                let (at, from_at) = (f.offset as usize, h.offset as usize);
+                // SAFETY: the field's words are the value's from its offset.
+                unsafe {
+                    to_form(
+                        &words[from_at..from_at + m],
+                        shapes,
+                        h.shape,
+                        f.shape,
+                        &mut out[at..at + n],
+                    )
+                };
+            }
+        }
+        (
+            Shape::Union { members: have, .. } | Shape::Variant { members: have, .. },
+            Shape::Variant { members: want, .. },
+        ) => {
+            out[0] = words[0];
+            let member = |members: &[(u32, u32)]| {
+                members
+                    .iter()
+                    .find(|m| u64::from(m.0) == words[0])
+                    .map(|m| m.1)
+            };
+            let (Some(h), Some(w)) = (member(have), member(want)) else {
+                return;
+            };
+            let (n, m) = (
+                shapes.shapes[w as usize].words() as usize,
+                shapes.shapes[h as usize].words() as usize,
+            );
+            // SAFETY: a member of a Plain type is in the payload.
+            unsafe { to_form(&words[1..1 + m], shapes, h, w, &mut out[1..1 + n]) };
+        }
+        _ => out.copy_from_slice(&words[..out.len()]),
+    }
+}
+
+/// The words of a value of the shape `to` built from the words `words` of
+/// its register form `from`, the reverse of `to_form`: a record of a box
+/// gets its box, and its fields stored flat are narrowed into it.
+fn from_form(words: &[u64], shapes: &Shapes, from: u32, to: u32, heap: &mut Heap) -> Vec<u64> {
+    let field = |have: &[ShapeField], name: &str| {
+        have.iter()
+            .find(|h| h.name == name)
+            .cloned()
+            .expect("a field of the same type")
+    };
+    let part = |f: &ShapeField| {
+        let n = shapes.shapes[f.shape as usize].words() as usize;
+        &words[f.offset as usize..f.offset as usize + n]
+    };
+    match (&shapes.shapes[from as usize], &shapes.shapes[to as usize]) {
+        _ if from == to => words.to_vec(),
+        (Shape::Inline { fields: have, .. }, Shape::Record { fields: want, .. }) => {
+            let (index, size) = shapes.boxed(to).expect("a record's box");
+            let ptr = alloc_box(heap, size as usize, u64::from(index));
+            let header = HEADER_SIZE as usize;
+            // SAFETY: the box is ours; the fields stored flat are put into
+            // zeros.
+            unsafe { ptr.add(header).write_bytes(0, size as usize - header) };
+            for f in want {
+                let h = field(have, &f.name);
+                // SAFETY: the field lies inside the box, as the shapes say.
+                unsafe {
+                    let at = ptr.add(f.offset as usize);
+                    match &shapes.shapes[f.shape as usize] {
+                        Shape::Stored {
+                            form, size, slots, ..
+                        } => {
+                            let value = from_form(part(&h), shapes, h.shape, *form, heap);
+                            let bytes = std::slice::from_raw_parts_mut(at, *size as usize);
+                            narrow(slots, &value, bytes);
+                        }
+                        _ => {
+                            let value = from_form(part(&h), shapes, h.shape, f.shape, heap);
+                            let at = at.cast::<u64>();
+                            std::ptr::copy_nonoverlapping(value.as_ptr(), at, value.len());
+                        }
+                    }
+                }
+            }
+            vec![ptr as u64]
+        }
+        (
+            Shape::Inline { fields: have, .. },
+            Shape::Inline {
+                fields: want,
+                words: n,
+                ..
+            },
+        ) => {
+            let mut out = vec![0; *n as usize];
+            for f in want {
+                let h = field(have, &f.name);
+                let value = from_form(part(&h), shapes, h.shape, f.shape, heap);
+                let at = f.offset as usize;
+                out[at..at + value.len()].copy_from_slice(&value);
+            }
+            out
+        }
+        (
+            Shape::Variant { members: have, .. },
+            Shape::Union {
+                members: want,
+                words: n,
+            }
+            | Shape::Variant {
+                members: want,
+                words: n,
+            },
+        ) => {
+            let mut out = vec![words[0]];
+            let member = |members: &[(u32, u32)]| {
+                members
+                    .iter()
+                    .find(|m| u64::from(m.0) == words[0])
+                    .map(|m| m.1)
+            };
+            if let (Some(h), Some(w)) = (member(have), member(want)) {
+                let m = shapes.shapes[h as usize].words() as usize;
+                out.extend(from_form(&words[1..1 + m], shapes, h, w, heap));
+            }
+            out.resize(*n as usize, 0);
+            out
+        }
+        (_, s) => words[..s.words() as usize].to_vec(),
+    }
 }
 
 /// The entries of a map, or of a set without values, in the map's order
@@ -293,6 +480,25 @@ impl Decoder<'_> {
                 .boxed(s)
                 .ok_or_else(|| DecodeError(format!("shape {s} has no box")))
         };
+        if let Some(stored) = shapes.plain(shape) {
+            let Shape::Stored {
+                form, size, slots, ..
+            } = shape_of(stored)?
+            else {
+                return Err(DecodeError(format!("shape {stored} is no storage form")));
+            };
+            let bytes = self.bytes(*size as usize)?;
+            let mut register = vec![0; shape_of(*form)?.words() as usize];
+            widen(slots, bytes, &mut register);
+            let mut again = vec![0; bytes.len()];
+            narrow(slots, &register, &mut again);
+            if again != bytes {
+                return Err(DecodeError(format!(
+                    "bytes that are no value of shape {shape}"
+                )));
+            }
+            return Ok(());
+        }
         match shape_of(shape)? {
             Shape::Unit | Shape::Tag(_) => {}
             Shape::Number(_) => {
@@ -408,6 +614,18 @@ impl Decoder<'_> {
     ) -> Vec<u64> {
         let ok = "checked";
         let words = |s: u32| shapes.shapes[s as usize].element_words() as usize;
+        if let Some(stored) = shapes.plain(shape) {
+            let Shape::Stored {
+                form, size, slots, ..
+            } = &shapes.shapes[stored as usize]
+            else {
+                unreachable!("checked");
+            };
+            let bytes = self.bytes(*size as usize).expect(ok);
+            let mut register = vec![0; shapes.shapes[*form as usize].words() as usize];
+            widen(slots, bytes, &mut register);
+            return from_form(&register, shapes, *form, shape, heap);
+        }
         match &shapes.shapes[shape as usize] {
             Shape::Unit | Shape::Tag(_) => Vec::new(),
             Shape::Number(_) => vec![self.u64().expect(ok)],

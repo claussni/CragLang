@@ -25,8 +25,9 @@ use crag_hir::{Name, Program};
 use crag_types::{Builtin, Ty, TyKind, declared_fields, record_subtypes};
 
 use crate::boxes::{box_form, rebase, select, span, stored_slots};
+use crate::flat::{self, LayoutClass};
 use crate::layout::{Layout, layout, type_index};
-use crate::split::{Form, Slot, SlotKind, element_form, element_storage, form};
+use crate::split::{Form, Slot, SlotKind, element_form, element_storage, form, storage};
 
 /// The shapes a value of `ty` is printed by, and the index of its own.
 pub fn shapes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> (Shapes, u32) {
@@ -143,7 +144,39 @@ impl<'db> Builder<'db> {
                 self.shape(sub);
             }
         }
+        if matches!(
+            self.shapes.shapes[index as usize],
+            Shape::Record { .. } | Shape::Union { .. }
+        ) {
+            self.plain(ty, index);
+        }
         index
+    }
+
+    /// Names the storage form of a Plain type for its shape `index`, and
+    /// for the shape of its register form, so that the codec writes its
+    /// values in it (Compiler Architecture §A11.4).
+    fn plain(&mut self, ty: Ty<'db>, index: u32) {
+        let (db, program) = (self.db, self.program);
+        let plain = flat::layout(db, program, ty)
+            .as_ref()
+            .is_some_and(|l| l.class == LayoutClass::Plain);
+        if !plain || self.shapes.plain(index).is_some() {
+            return;
+        }
+        let (Some(f), Some((size, slots))) = (form(db, program, ty), storage(db, program, ty))
+        else {
+            return;
+        };
+        let stored = self.stored(ty, &f, size, &slots);
+        let Shape::Stored { form, .. } = self.shapes.shapes[stored as usize] else {
+            unreachable!("a stored shape");
+        };
+        for shape in [index, form] {
+            if self.shapes.plain(shape).is_none() {
+                self.shapes.plain.push((shape, stored));
+            }
+        }
     }
 
     /// A split record: its fields' words in its register form, shown as a
@@ -157,6 +190,7 @@ impl<'db> Builder<'db> {
         }
         let index = self.split(ty, f);
         self.inlined.push((ty, f.clone(), index));
+        self.plain(ty, index);
         index
     }
 
