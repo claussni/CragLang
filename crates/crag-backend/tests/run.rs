@@ -903,14 +903,95 @@ fn escapes(a: Int) -> Point {
     };
     assert_eq!(split("lines"), on(&["p", "q", "l", "r"]));
     assert_eq!(split("label"), on(&["n", "m"]));
-    // `tail` goes into a field that holds a box.
-    assert_eq!(split("node"), on(&["head"]));
-    // A returned record keeps its box.
-    assert_eq!(split("escapes"), on(&["p"]));
+    // `tail` is boxed where it goes into a field that holds a box.
+    assert_eq!(split("node"), on(&["tail", "head"]));
+    // A returned record is boxed where it is returned.
+    assert_eq!(split("escapes"), on(&["p", "kept"]));
     RELEASED.set(0);
     assert_eq!(m.int("lines", &[3, 4]), 3443);
     assert_eq!(m.int("node", &[5]), 6);
     assert_eq!(m.shown("label"), "[1, 2]");
+    assert_eq!(m.heap.live_blocks(), 0);
+}
+
+#[test]
+fn flat_locals_are_boxed_where_they_escape() {
+    let mut m = Module::new(
+        r#"type Point(x: Int, y: Int)
+type Line(from: Point, to: Point)
+type Named(items: List[Int], at: Point)
+
+fn line(a: Int) -> Line {
+  let p = Point(x: a, y: 1)
+  let l = Line(from: p, to: Point(x: 2, y: a))
+  l
+}
+
+fn ends(a: Int) -> Int {
+  let l = line(a)
+  let from = l.from
+  let to = l.to
+  from.x * 100 + to.y * 10 + from.y
+}
+
+fn listed(a: Int) -> List[Point] {
+  let p = Point(x: a, y: a)
+  [p, p]
+}
+
+fn first(a: Int) -> Int {
+  let ps = listed(a)
+  let p = ps[0]
+  p.x + p.y
+}
+
+fn passed(a: Int) -> Int {
+  let l = line(a)
+  let from = l.from
+  ends(from.x)
+}
+
+fn named(a: Int) -> List[Int] {
+  let n = Named(items: [a, a], at: Point(x: 1, y: 2))
+  let m = Named(items: n.items, at: n.at)
+  m.items
+}
+
+fn zeroLine() -> Line {
+  line(0)
+}
+
+fn zeroNamed() -> List[Int] {
+  named(0)
+}
+"#,
+    );
+    let split = |name| match flat_layouts() {
+        true => m.split(name),
+        false => Vec::new(),
+    };
+    let on = |names: &[&str]| match flat_layouts() {
+        true => names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+        false => Vec::new(),
+    };
+    // Boxed where it is returned, the points within it too.
+    assert_eq!(split("line"), on(&["p", "l"]));
+    // Loaded from the box a call returned.
+    assert_eq!(split("ends"), on(&["from", "to"]));
+    // Used twice where it must be in a box: one box, shared.
+    assert_eq!(split("listed"), on(&[]));
+    // An element is loaded from its list.
+    assert_eq!(split("first"), on(&["p"]));
+    assert_eq!(split("passed"), on(&["from"]));
+    assert_eq!(split("named"), on(&["n", "m"]));
+    assert_eq!(m.int("ends", &[7]), 7 * 100 + 7 * 10 + 1);
+    assert_eq!(m.int("first", &[4]), 8);
+    assert_eq!(m.int("passed", &[3]), 3 * 100 + 3 * 10 + 1);
+    assert_eq!(
+        m.shown("zeroLine"),
+        "Line(from: Point(x: 0, y: 1), to: Point(x: 2, y: 0))"
+    );
+    assert_eq!(m.shown("zeroNamed"), "[0, 0]");
     assert_eq!(m.heap.live_blocks(), 0);
 }
 

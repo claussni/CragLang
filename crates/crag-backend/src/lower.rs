@@ -429,14 +429,107 @@ impl<'a, 'db> Lower<'a, 'db> {
     }
 
     /// The words of an operand that goes where a `ty` is expected.
+    /// A split local goes where a value must be in a box: it is boxed
+    /// there, and the box takes its references.
     fn operand(&mut self, op: &Operand<'db>, ty: Ty<'db>) -> Result<Vec<VReg>, Unsupported> {
         match op {
             Operand::Local(l) => {
                 self.layouts[l.index()].ok_or("values of this type")?;
-                Ok(self.locals[l.index()].clone())
+                let regs = self.locals[l.index()].clone();
+                match self.forms[l.index()].clone() {
+                    Some(form) => Ok(vec![self.box_split(self.local_ty(*l), &form, &regs)?]),
+                    None => Ok(regs),
+                }
             }
             Operand::Const(c) => self.constant_words(c, ty),
         }
+    }
+
+    /// The words of an operand that goes where a split record is
+    /// expected: a split local's registers as they are.
+    fn split_operand(&mut self, op: &Operand<'db>, ty: Ty<'db>) -> Result<Vec<VReg>, Unsupported> {
+        match op {
+            Operand::Local(l) if self.forms[l.index()].is_some() => {
+                Ok(self.locals[l.index()].clone())
+            }
+            _ => self.operand(op, ty),
+        }
+    }
+
+    /// A box holding the words of a split record, nested split records
+    /// boxed in turn.
+    fn box_split(
+        &mut self,
+        ty: Ty<'db>,
+        form: &Form<'db>,
+        regs: &[VReg],
+    ) -> Result<VReg, Unsupported> {
+        let Form::Fields(places) = form else {
+            return word(regs);
+        };
+        let (slots, size) =
+            record_layout(self.db, self.program, ty).ok_or("records of this type")?;
+        self.describe(ty)?;
+        let mut stores = Vec::new();
+        let mut at = 0;
+        for (name, t, f) in places {
+            let n = f.words();
+            let words = match f {
+                Form::Fields(_) => vec![self.box_split(*t, f, &regs[at..at + n])?],
+                Form::Words(_) => regs[at..at + n].to_vec(),
+            };
+            let slot = slots
+                .iter()
+                .find(|s| s.name == *name)
+                .ok_or("records of this type")?;
+            stores.push((slot.offset, words));
+            at += n;
+        }
+        let ptr = self.alloc(size, type_index(ty));
+        // A trap unwinding the frame releases it, as a boxed local's.
+        self.tracked.push(ptr);
+        for (offset, words) in stores {
+            for (k, src) in words.into_iter().enumerate() {
+                self.push(Inst::Store {
+                    src,
+                    addr: ptr,
+                    offset: (offset + 8 * k as u32) as i32,
+                });
+            }
+        }
+        Ok(ptr)
+    }
+
+    /// The words of a split record loaded from its box, borrowed from it.
+    fn unbox(
+        &mut self,
+        ty: Ty<'db>,
+        form: &Form<'db>,
+        ptr: VReg,
+    ) -> Result<Vec<VReg>, Unsupported> {
+        let Form::Fields(places) = form else {
+            return Ok(vec![ptr]);
+        };
+        let (slots, _) = record_layout(self.db, self.program, ty).ok_or("records of this type")?;
+        let mut out = Vec::new();
+        for (name, t, f) in places {
+            let slot = slots
+                .iter()
+                .find(|s| s.name == *name)
+                .ok_or("records of this type")?;
+            match f {
+                Form::Fields(_) => {
+                    let inner = self.load(ptr, slot.offset as i32);
+                    out.extend(self.unbox(*t, f, inner)?);
+                }
+                Form::Words(l) => {
+                    for k in 0..l.words() {
+                        out.push(self.load(ptr, (slot.offset + 8 * k as u32) as i32));
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn constant_words(&mut self, c: &Constant<'db>, ty: Ty<'db>) -> Result<Vec<VReg>, Unsupported> {
@@ -849,8 +942,16 @@ impl<'a, 'db> Lower<'a, 'db> {
     fn rvalue(&mut self, dst: Local, rvalue: &Rvalue<'db>) -> Result<Vec<VReg>, Unsupported> {
         let ty = self.local_ty(dst);
         match rvalue {
+            Rvalue::Use(op) if self.forms[dst.index()].is_some() => self.split_operand(op, ty),
             Rvalue::Use(op) => self.operand(op, ty),
-            Rvalue::Read(place) => self.read(place),
+            // A record read from its box into a split local is loaded.
+            Rvalue::Read(place) => {
+                let values = self.read(place)?;
+                match self.forms[dst.index()].clone() {
+                    Some(form) if !self.split_place(place) => self.unbox(ty, &form, word(&values)?),
+                    _ => Ok(values),
+                }
+            }
             Rvalue::Convert(op) => {
                 let from = self.operand_ty(op, ty);
                 let values = self.operand(op, from)?;
@@ -921,12 +1022,15 @@ impl<'a, 'db> Lower<'a, 'db> {
                     return Err("records of this type");
                 };
                 let mut values = Vec::new();
-                for (name, ty, _) in places {
+                for (name, ty, form) in places {
                     let (_, op) = fields
                         .iter()
                         .find(|(n, _)| *n == name)
                         .ok_or("records of this type")?;
-                    values.extend(self.operand(op, ty)?);
+                    values.extend(match form {
+                        Form::Fields(_) => self.split_operand(op, ty)?,
+                        Form::Words(_) => self.operand(op, ty)?,
+                    });
                 }
                 Ok(values)
             }
@@ -1021,7 +1125,11 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let ptr = word(&self.read(list)?)?;
                 let int = Ty::builtin(self.db, Builtin::Int);
                 let index = word(&self.operand(index, int)?)?;
-                self.element(ptr, list_ty, index)
+                let values = self.element(ptr, list_ty, index)?;
+                match self.forms[dst.index()].clone() {
+                    Some(form) => self.unbox(ty, &form, word(&values)?),
+                    None => Ok(values),
+                }
             }
             Rvalue::MapGet { map, key, boxed } => {
                 let map_ty = self.place_ty(map)?;
@@ -2640,7 +2748,7 @@ impl<'a, 'db> Lower<'a, 'db> {
     fn read(&mut self, place: &Place<'db>) -> Result<Vec<VReg>, Unsupported> {
         let db = self.db;
         let mut ty = self.local_ty(place.local);
-        let mut values = self.operand(&Operand::Local(place.local), ty)?;
+        let mut values = self.split_operand(&Operand::Local(place.local), ty)?;
         let mut path = &place.path[..];
         // A split local's fields are its registers.
         if let Some(form) = &self.forms[place.local.index()] {
@@ -3288,8 +3396,11 @@ impl<'a, 'db> Lower<'a, 'db> {
             let offset = CELL_VALUE_OFFSET + 8 * i as i32;
             self.push(Inst::Store { src, addr, offset });
         }
-        if let Operand::Local(local) = op {
-            self.count(*local, Self::retain)?;
+        // The words returned, a split local boxed among them.
+        if let Operand::Local(_) = op {
+            let ty = self.mir.result;
+            let layout = self.layout_of(ty)?;
+            self.count_words(Some(layout), ty, values, Self::retain)?;
         }
         let full = self.constant(CELL_FULL as i64);
         self.push(Inst::Store {

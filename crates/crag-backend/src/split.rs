@@ -23,17 +23,24 @@
 //! field in the words of its layout (`layout::layout`). Building such a
 //! record allocates nothing and reading a field picks its registers.
 //!
-//! For now a local is split only when every use of it takes the register
-//! form: a field read, a type test, counting, a step, or a copy into
-//! another split local or a field of one. Anything else, a call, a return
-//! or a store into a box, keeps it boxed. With `CRAG_FLAT=0` in the
-//! environment no local is split.
+//! A split local is used in registers by field reads, type tests,
+//! counting, steps, and copies into another split local or a field of
+//! one. A use that gives it away to a call, a return or a box boxes it
+//! there, which takes its fields' references; a use that only borrows it
+//! where it must be in a box keeps it boxed. A record read from a box, a
+//! field or an element, is loaded into a split local field by field.
+//!
+//! Splitting makes no more boxes than there are: a local that is boxed
+//! where it escapes must not be retained, which a second use needs, nor
+//! come out of a box, which it could pass on as it is. A record a call
+//! returns, or that is converted from a union, stays in its box for now.
+//! With `CRAG_FLAT=0` in the environment no local is split.
 
 use std::sync::OnceLock;
 
 use crag_db::Db;
 use crag_hir::{Name, Program};
-use crag_mir::{MirBody, Operand, Place, Rvalue, Statement, Terminator};
+use crag_mir::{ClosurePlacement, MirBody, Operand, Place, Rvalue, Statement, Terminator};
 use crag_types::{Step, Ty, TyKind, TypeDefKind, type_def};
 
 use crate::flat::{self, LayoutClass};
@@ -179,15 +186,25 @@ pub fn scalar_replace<'db>(db: &'db dyn Db, program: Program, body: &mut MirBody
         })
         .collect();
     let mut split: Vec<bool> = forms.iter().map(Option::is_some).collect();
+    let mut retained = vec![false; split.len()];
+    for block in &body.blocks {
+        for statement in &block.statements {
+            if let Statement::Retain(l) = statement {
+                retained[l.index()] = true;
+            }
+        }
+    }
     // Keeping one local boxed may keep others boxed: those it is copied
     // from or into.
     loop {
-        let mut keep = vec![false; split.len()];
+        let n = split.len();
         let mut check = Check {
             body,
             forms: &forms,
             split: &split,
-            keep: &mut keep,
+            keep: vec![false; n],
+            escapes: vec![false; n],
+            from_box: vec![false; n],
         };
         for block in &body.blocks {
             for statement in &block.statements {
@@ -195,9 +212,19 @@ pub fn scalar_replace<'db>(db: &'db dyn Db, program: Program, body: &mut MirBody
             }
             check.terminator(&block.terminator);
         }
+        let Check {
+            keep,
+            escapes,
+            from_box,
+            ..
+        } = check;
         let mut changed = false;
-        for (s, k) in split.iter_mut().zip(keep) {
-            if *s && k {
+        for (i, s) in split.iter_mut().enumerate() {
+            // A local boxed where it escapes must not be boxed twice: not
+            // when it is retained to be used again, and not when its value
+            // came out of a box, which it could pass on as it is.
+            let twice = escapes[i] && (retained[i] || from_box[i]);
+            if *s && (keep[i] || twice) {
                 *s = false;
                 changed = true;
             }
@@ -211,17 +238,29 @@ pub fn scalar_replace<'db>(db: &'db dyn Db, program: Program, body: &mut MirBody
     }
 }
 
-/// Finds the uses that need a local in a box.
+/// Finds the uses of locals that need them in a box.
 struct Check<'a, 'db> {
     body: &'a MirBody<'db>,
     forms: &'a [Option<Form<'db>>],
     split: &'a [bool],
-    keep: &'a mut [bool],
+    /// Locals that must stay boxed.
+    keep: Vec<bool>,
+    /// Locals a use gives away into a box, which code generation makes.
+    escapes: Vec<bool>,
+    /// Locals assigned a record borrowed from a box, read from it.
+    from_box: Vec<bool>,
 }
 
 impl<'db> Check<'_, 'db> {
-    /// The local is used where its value must be in a box.
-    fn boxed_use(&mut self, op: &Operand<'db>) {
+    /// The use gives the local's value away: a split local is boxed.
+    fn consumed(&mut self, op: &Operand<'db>) {
+        if let Operand::Local(l) = op {
+            self.escapes[l.index()] = true;
+        }
+    }
+
+    /// The use borrows the local's value where it must be in a box.
+    fn borrowed(&mut self, op: &Operand<'db>) {
         if let Operand::Local(l) = op {
             self.keep[l.index()] = true;
         }
@@ -238,7 +277,7 @@ impl<'db> Check<'_, 'db> {
 
     /// A place read that must give words, not a split record.
     fn place_words(&mut self, place: &Place<'db>) {
-        if self.place(place) != Some(false) {
+        if self.forms[place.local.index()].is_some() && self.place(place) != Some(false) {
             self.keep[place.local.index()] = true;
         }
     }
@@ -253,12 +292,29 @@ impl<'db> Check<'_, 'db> {
             Rvalue::Use(Operand::Local(src)) if into_split && self.split[src.index()] => {
                 defines = true;
             }
-            Rvalue::Read(place) => match self.place(place) {
-                // A split record goes into a split local.
-                Some(true) if into_split && self.split[place.local.index()] => defines = true,
-                Some(false) => {}
-                _ => self.keep[place.local.index()] = true,
-            },
+            Rvalue::Read(place) => {
+                let source = place.local.index();
+                match (self.split[source], self.place(place)) {
+                    // A split record goes into a split local.
+                    (true, Some(true)) if into_split && self.split[source] => defines = true,
+                    // Words, or a record read from its box.
+                    (false, _) | (true, Some(false)) => {
+                        if into_split {
+                            defines = true;
+                            self.from_box[dst.index()] = true;
+                        }
+                    }
+                    _ => self.keep[source] = true,
+                }
+            }
+            Rvalue::Index { list, index } => {
+                self.place_words(list);
+                self.borrowed(index);
+                if into_split {
+                    defines = true;
+                    self.from_box[dst.index()] = true;
+                }
+            }
             Rvalue::Record {
                 fields,
                 dispose: None,
@@ -273,24 +329,55 @@ impl<'db> Check<'_, 'db> {
                     match op {
                         Operand::Local(l) if split_field && self.split[l.index()] => {}
                         _ if split_field => {
-                            self.boxed_use(op);
+                            self.consumed(op);
                             self.keep[dst.index()] = true;
                         }
-                        _ => self.boxed_use(op),
+                        _ => self.consumed(op),
+                    }
+                }
+            }
+            Rvalue::Use(o) | Rvalue::Convert(o) | Rvalue::FnValue { env: o, .. } => {
+                self.consumed(o)
+            }
+            Rvalue::Record { fields, .. } => fields.iter().for_each(|(_, o)| self.consumed(o)),
+            Rvalue::List(items) => items.iter().for_each(|o| self.consumed(o)),
+            Rvalue::Map(entries) => {
+                for (k, v) in entries {
+                    self.consumed(k);
+                    self.consumed(v);
+                }
+            }
+            Rvalue::Intrinsic(intrinsic, args) => {
+                for (k, o) in args.iter().enumerate() {
+                    match intrinsic.consumes(k) {
+                        true => self.consumed(o),
+                        false => self.borrowed(o),
+                    }
+                }
+            }
+            Rvalue::Closure {
+                captures,
+                placement,
+                ..
+            } => {
+                for o in captures {
+                    match placement {
+                        ClosurePlacement::Heap => self.consumed(o),
+                        ClosurePlacement::SideStack => self.borrowed(o),
                     }
                 }
             }
             Rvalue::Len(place) | Rvalue::Slice { list: place, .. } => self.place_words(place),
-            Rvalue::Index { list, index } => {
-                self.place_words(list);
-                self.boxed_use(index);
-            }
             Rvalue::MapGet { map, key, .. } => {
                 self.place_words(map);
-                self.boxed_use(key);
+                self.borrowed(key);
             }
             Rvalue::FloatOverflow(_) => {}
-            _ => {
+            Rvalue::Binary { .. }
+            | Rvalue::Overflows { .. }
+            | Rvalue::Compare { .. }
+            | Rvalue::Cast { .. }
+            | Rvalue::Concat(_) => {
                 let mut rvalue = rvalue.clone();
                 for l in rvalue.locals_mut() {
                     self.keep[l.index()] = true;
@@ -306,17 +393,29 @@ impl<'db> Check<'_, 'db> {
         match terminator {
             Terminator::Switch { place, .. } => {
                 // A test of a split record is decided by its type.
-                if self.place(place).is_none() {
+                if self.forms[place.local.index()].is_some() && self.place(place).is_none() {
                     self.keep[place.local.index()] = true;
                 }
             }
-            Terminator::Jump(_) | Terminator::Trap { .. } => {}
-            _ => {
-                let mut terminator = terminator.clone();
-                for l in terminator.locals_mut() {
-                    self.keep[l.index()] = true;
-                }
+            Terminator::Call { args, dst, .. } => {
+                args.iter().for_each(|o| self.consumed(o));
+                self.keep[dst.index()] = true;
             }
+            Terminator::TailCall { args, .. } => args.iter().for_each(|o| self.consumed(o)),
+            Terminator::CallValue {
+                callee, args, dst, ..
+            } => {
+                self.consumed(callee);
+                args.iter().for_each(|o| self.consumed(o));
+                self.keep[dst.index()] = true;
+            }
+            Terminator::TailCallValue { callee, args, .. } => {
+                self.consumed(callee);
+                args.iter().for_each(|o| self.consumed(o));
+            }
+            Terminator::Return(o) => self.consumed(o),
+            Terminator::Branch { cond, .. } => self.borrowed(cond),
+            Terminator::Jump(_) | Terminator::Trap { .. } => {}
         }
     }
 }
