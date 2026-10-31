@@ -26,7 +26,7 @@
 
 use std::io::{self, Read, Write};
 
-use crag_abi::{
+use crate::{
     CallHandler, CodeObject, CountedField, ElementLayout, FieldGuard, Frame, FuncId, HandlerKind,
     InlinedCode, InlinedRange, NativeSymbol, Reloc, RelocKind, RelocTarget, RuntimeFn, Shapes,
     SlotKey, StackCheck, StackMap, TrapKind, TrapOrigin, TypeDescriptor,
@@ -447,7 +447,7 @@ impl Message {
                     return Err(invalid(format!("the shape {root} of a shorter table")));
                 }
                 let text = r.u8()? != 0;
-                if text && !matches!(shapes.shapes[root as usize], crag_abi::Shape::Str) {
+                if text && !matches!(shapes.shapes[root as usize], crate::Shape::Str) {
                     return Err(invalid("text shown of another shape than a string".into()));
                 }
                 Message::Show {
@@ -567,6 +567,27 @@ pub fn decode_object(bytes: &[u8]) -> io::Result<CodeObject> {
     match r.0.is_empty() {
         true => Ok(object),
         false => Err(invalid("bytes after a code object".into())),
+    }
+}
+
+/// Type descriptors by their indices, as the messages carry them, for
+/// release objects (Implementation Plan §11.10.3).
+pub fn encode_types(types: &[(u32, TypeDescriptor)]) -> Vec<u8> {
+    let mut w = Writer(Vec::new());
+    w.seq(types, |w, (index, d)| {
+        w.u32(*index);
+        w.descriptor(d);
+    });
+    w.0
+}
+
+/// The type descriptors `encode_types` gave the bytes of.
+pub fn decode_types(bytes: &[u8]) -> io::Result<Vec<(u32, TypeDescriptor)>> {
+    let mut r = Reader(bytes);
+    let types = r.seq(|r| Ok((r.u32()?, r.descriptor()?)))?;
+    match r.0.is_empty() {
+        true => Ok(types),
+        false => Err(invalid("bytes after the type descriptors".into())),
     }
 }
 
@@ -1046,7 +1067,7 @@ impl Reader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crag_abi::{Number, Shape, ShapeField, StoredKind, StoredSlot, StoredTag};
+    use crate::{Number, Shape, ShapeField, StoredKind, StoredSlot, StoredTag};
 
     fn all() -> Vec<Message> {
         vec![
@@ -1385,7 +1406,7 @@ mod tests {
                     offset: 7,
                 },
                 TrapOrigin {
-                    position: crag_abi::INLINED_POSITION | 1,
+                    position: crate::INLINED_POSITION | 1,
                     line: 5,
                     column: 9,
                     inlined: 1,

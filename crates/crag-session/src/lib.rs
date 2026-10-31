@@ -23,7 +23,7 @@
 
 pub mod host;
 pub mod image;
-pub mod protocol;
+pub use crag_abi::protocol;
 
 pub use host::{
     AppStatus, ImageCommand, ImageExit, ImageHandle, ImageKind, ImageState, Optimized,

@@ -97,7 +97,7 @@ pub use env::set_program_args;
 pub use fiber::{Fiber, FiberConfig, FiberState, TaskContext, Worker};
 pub use heap::{Heap, alloc_box};
 pub use meter::Meter;
-pub use print::{PrintLimits, print_value, release_value};
+pub use print::{PrintLimits, print_value, record_field, release_value};
 pub use rc::{Disposal, Types, next_disposal, release_box};
 pub use sched::{FiberRef, Scheduler, SchedulerConfig, WaitReason, WorkerStats, wake};
 pub use sentinel::{StopHandle, StopReason, request_stop};

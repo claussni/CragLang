@@ -1,0 +1,21 @@
+[package]
+name = "crag-rt"
+description = "Crag runtime archive: the runtime and the start of a release executable, as a static library"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# The archive defines the C `main`, which a test harness would define too.
+[lib]
+crate-type = ["staticlib"]
+test = false
+doctest = false
+
+[dependencies]
+crag-abi = { path = "../crag-abi" }
+crag-runtime = { path = "../crag-runtime" }

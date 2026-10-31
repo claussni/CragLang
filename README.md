@@ -15,7 +15,7 @@ The documents live as Claude Docs documents and are edited there.
 | Crate | Components |
 | --- | --- |
 | `crates/crag-runtime` | Fiber runtime, stack growth, side stack, sentinel, stress harness, allocator, reference counting and the queue of disposals, lists and maps, the scheduler, the I/O poller and timers, scopes and cancellation, streams and hubs, refs, transactions, ext locks, signals of blocks, lazy cells and deferred teardown, strings and bytes, traps |
-| `crates/crag-abi` | Constants shared by generated code and the runtime |
+| `crates/crag-abi` | Constants shared by generated code and the runtime, the messages between host and images, and the table a release executable starts from |
 | `crates/crag-codegen` | Cranelift facade |
 | `crates/crag-loader` | Code loader |
 | `crates/crag-db` | Salsa facade |
@@ -25,9 +25,10 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-types` | Types and core inference (M1) |
 | `crates/crag-mir` | MIR builder (M1) |
 | `crates/crag-backend` | Code generation from MIR (M1) |
-| `crates/crag-aot` | The AOT object writer: release code in an ELF object file (M7) |
+| `crates/crag-aot` | Release builds: the AOT object writer, which puts release code in an ELF object file, finding the runtime archive, and linking with lld (M7) |
+| `crates/crag-rt` | The runtime archive: the runtime and the start of a release executable, as a static library for musl (M7) |
 | `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1); the UI with the built-in editor, the app image, hot reload, the debugger, the language server `crag lsp` and the debug adapter `crag dap` (M5) |
-| `crates/crag-session` | Session manager: image processes, their protocol and supervision (M3) |
+| `crates/crag-session` | Session manager: image processes and their supervision (M3) |
 | `crates/crag-eval` | Compile-time evaluation of constants, `embed`s among them, in the metered tier (M3) |
 | `crates/crag-fmt` | The formatter: the canonical layout of source files (M5) |
 | `crates/crag-package` | Packages: manifests, versions, folder registries, resolution and the SBOM (M6) |
@@ -72,6 +73,13 @@ it counted 10,000 calls and loop iterations; a breakpoint sends it back.
 runs for more than a few milliseconds, and `CRAG_HOT=0` never optimizes:
 
     CRAG_HOT=1 ./cargo test
+
+Release executables link the program's object with the runtime archive,
+`crag-rt` built for `x86_64-unknown-linux-musl`, statically and with the
+Rust toolchain's lld. The tests of `crag-aot` build the archive first;
+by hand:
+
+    ./cargo build -p crag-rt --release --target x86_64-unknown-linux-musl
 
 The `crag` command works on the project in the current directory, a
 directory with a `package.crag` naming the package and its `main` module:

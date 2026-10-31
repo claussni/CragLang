@@ -15,14 +15,13 @@
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
 //! Release code written into an object file, read back as it was written,
-//! the same for the same sources, and taken by the linker.
+//! and the same for the same sources.
 
 use std::collections::HashMap;
 use std::fs;
-use std::process::Command;
 
-use crag_abi::{CodeObject, FuncId, RelocTarget, RuntimeFn};
-use crag_aot::{emit_object, read_object};
+use crag_abi::{CodeObject, FuncId, RelocTarget};
+use crag_aot::{MAIN, emit_object, read_object, read_table};
 use crag_backend::{code, func_id};
 use crag_driver::{Project, main_instance};
 use crag_mir::Tier;
@@ -76,7 +75,7 @@ fn project(name: &str) -> Project {
 
 fn emit(project: &Project) -> crag_aot::Emitted<'_> {
     let main = main_instance(project).unwrap();
-    emit_object(&project.db, project.program, &[(main, "main")]).unwrap()
+    emit_object(&project.db, project.program, &[(main, MAIN)]).unwrap()
 }
 
 #[test]
@@ -129,6 +128,12 @@ fn release_code_reads_back_as_it_was_written() {
     // The program has cells, static data and calls of the runtime.
     assert!(cells > 0 && locals > 0 && runtime > 0);
     assert!(read.iter().any(|f| f.name == "main"));
+    // The table holds the types the code uses and the root.
+    let table = read_table(&emitted.bytes).unwrap();
+    assert!(!table.types.is_empty());
+    assert_eq!(table.roots.len(), 1);
+    assert_eq!(table.roots[0].name, MAIN);
+    assert_eq!(table.functions[table.roots[0].place as usize].name, "main");
 }
 
 #[test]
@@ -140,33 +145,4 @@ fn the_same_sources_give_the_same_bytes() {
     let root = std::env::temp_dir();
     let root = root.to_string_lossy();
     assert!(!bytes.windows(root.len()).any(|w| w == root.as_bytes()));
-}
-
-#[test]
-fn the_linker_takes_the_object() {
-    let p = project("link");
-    let bytes = emit(&p).bytes;
-    let dir = std::env::temp_dir().join(format!("crag-aot-ld-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("app.o");
-    fs::write(&path, &bytes).unwrap();
-    // Until the runtime archive (Plan §11.10.4) defines them, the runtime's
-    // functions are addresses of no code.
-    let mut ld = Command::new("ld");
-    ld.arg("-static")
-        .arg("-e")
-        .arg("main")
-        .arg("-o")
-        .arg(dir.join("app"));
-    for func in RuntimeFn::ALL {
-        ld.arg(format!("--defsym={}=0x1000", func.symbol()));
-    }
-    let out = ld.arg(&path).output().expect("ld runs");
-    let _ = fs::remove_dir_all(&dir);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 }

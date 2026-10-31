@@ -137,6 +137,7 @@ const _: () = assert!(SAVE_BYTES <= RUNTIME_RESERVE as usize);
 /// Only generated code may call this, on a fiber stack, with the fiber's
 /// task context.
 #[unsafe(naked)]
+#[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn rt_side_grow(ctx: *const TaskContext, size: usize, align: usize) {
     std::arch::naked_asm!(
         save_registers!(),

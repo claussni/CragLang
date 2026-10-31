@@ -39,6 +39,7 @@ macro_rules! system_stack_fn {
         /// Only generated code may call this, on a fiber stack, with the
         /// fiber's task context.
         #[unsafe(naked)]
+        #[unsafe(no_mangle)]
         pub(crate) unsafe extern "C" fn $name($($arg: $ty),*) $(-> $ret)? {
             std::arch::naked_asm!(
                 "push rbx",
@@ -81,6 +82,7 @@ macro_rules! suspending_fn {
         /// Only generated code may call this, on a fiber stack, with the
         /// fiber's task context.
         #[unsafe(naked)]
+        #[unsafe(no_mangle)]
         pub(crate) unsafe extern "C" fn $name($($arg: $ty),*) $(-> $ret)? {
             std::arch::naked_asm!(
                 "push rbx",

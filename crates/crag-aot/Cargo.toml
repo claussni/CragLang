@@ -1,6 +1,6 @@
 [package]
 name = "crag-aot"
-description = "Crag AOT object writer: release code in an object file for the linker"
+description = "Crag release builds: the AOT object writer, runtime archives and linking"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,10 +13,10 @@ workspace = true
 [dependencies]
 crag-abi = { path = "../crag-abi" }
 crag-backend = { path = "../crag-backend" }
+crag-codegen = { path = "../crag-codegen" }
 crag-db = { path = "../crag-db" }
 crag-hir = { path = "../crag-hir" }
 crag-mir = { path = "../crag-mir" }
-crag-session = { path = "../crag-session" }
 object = { version = "0.37", default-features = false, features = ["std", "elf", "read_core", "write_core"] }
 
 [dev-dependencies]

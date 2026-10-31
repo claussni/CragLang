@@ -352,6 +352,40 @@ pub(crate) unsafe fn field_words<'a>(
     unsafe { value_at(shapes, ptr.add(f.offset as usize), f.shape) }
 }
 
+/// The words of the field `name` of a record, its words of the shape
+/// `shape` of `shapes`, in its register form: read out of the record's
+/// box, or out of its words when it is split into registers. None for a
+/// value that is no record or has no such field.
+///
+/// # Safety
+///
+/// The words are a live value of the shape.
+pub unsafe fn record_field(
+    shapes: &Shapes,
+    shape: u32,
+    words: &[u64],
+    name: &str,
+) -> Option<Vec<u64>> {
+    let named = |fields: &[ShapeField]| fields.iter().find(|f| f.name == name).cloned();
+    match shapes.shapes.get(shape as usize)? {
+        Shape::Record { fields, .. } => {
+            let f = named(fields)?;
+            // SAFETY: the word points at the live box of the record, which
+            // holds the field at its offset.
+            let (words, _) = unsafe { field_words(shapes, *words.first()? as *const u8, &f) };
+            Some(words.into_owned())
+        }
+        Shape::Inline { fields, .. } => {
+            let f = named(fields)?;
+            let n = shapes.shapes.get(f.shape as usize)?.words() as usize;
+            words
+                .get(f.offset as usize..f.offset as usize + n)
+                .map(<[u64]>::to_vec)
+        }
+        _ => None,
+    }
+}
+
 /// The words of a value of the shape at `at`, in a box's field or a
 /// collection's slot, and the shape they have: a value stored flat
 /// (Compiler Architecture §A11.4) widened to its register form, of its

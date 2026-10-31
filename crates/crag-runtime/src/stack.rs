@@ -188,6 +188,7 @@ const OVERFLOW: usize = 3;
 /// Only generated code may call this, on a fiber stack, with the fiber's
 /// task context.
 #[unsafe(naked)]
+#[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn rt_morestack(ctx: *const TaskContext, needed: usize) {
     std::arch::naked_asm!(
         save_registers!(),

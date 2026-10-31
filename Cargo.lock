@@ -133,11 +133,11 @@ version = "0.0.0"
 dependencies = [
  "crag-abi",
  "crag-backend",
+ "crag-codegen",
  "crag-db",
  "crag-driver",
  "crag-hir",
  "crag-mir",
- "crag-session",
  "object",
 ]
 
@@ -255,6 +255,14 @@ dependencies = [
  "blake3",
  "crag-hir",
  "crag-syntax",
+]
+
+[[package]]
+name = "crag-rt"
+version = "0.0.0"
+dependencies = [
+ "crag-abi",
+ "crag-runtime",
 ]
 
 [[package]]

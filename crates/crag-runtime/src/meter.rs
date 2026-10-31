@@ -90,6 +90,7 @@ impl Metering {
 /// Only generated code may call this, on a fiber stack, with the fiber's
 /// task context.
 #[unsafe(naked)]
+#[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn rt_refuel(ctx: *const TaskContext) {
     std::arch::naked_asm!(
         save_registers!(),

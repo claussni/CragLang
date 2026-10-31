@@ -20,7 +20,8 @@
 //! The code generator bakes these values into machine code and the runtime
 //! lays out its memory to match, so neither crate depends on the other. The
 //! code object, which the host compiles and an image loads, is defined here
-//! for the same reason.
+//! for the same reason, with the messages that carry it ([`protocol`]) and
+//! the tables a release executable starts from ([`release`]).
 //!
 //! # The stack check
 //!
@@ -80,6 +81,9 @@
 //!
 //! A function that pushes saves both fields on entry and stores them back
 //! before it returns or tail-calls, which frees everything it pushed.
+
+pub mod protocol;
+pub mod release;
 
 /// Offset of `stack_limit` in the task context, in bytes. It is the first
 /// field, so the check loads it with no displacement.

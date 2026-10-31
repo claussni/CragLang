@@ -20,7 +20,10 @@
 set -eu
 root=$(cd "$(dirname "$0")" && pwd)
 image=crag-dev
-docker image inspect "$image" >/dev/null 2>&1 || docker build -q -t "$image" "$root" >/dev/null
+# The image is built again when the Dockerfile changed since.
+sum=$(sha256sum "$root/Dockerfile" | cut -c1-16)
+built=$(docker image inspect -f '{{index .Config.Labels "crag.dockerfile"}}' "$image" 2>/dev/null || true)
+[ "$built" = "$sum" ] || docker build -q --label "crag.dockerfile=$sum" -t "$image" "$root" >/dev/null
 mkdir -p "$root/.cargo-home"
 tty=; [ -t 0 ] && [ -t 1 ] && tty=-it
 # Podman runs rootless: keep-id maps the host user into the container so

@@ -256,6 +256,7 @@ pub struct Trap {
 /// Only generated code may call this, on a fiber stack, with the fiber's
 /// task context.
 #[unsafe(naked)]
+#[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn rt_trap(ctx: *const TaskContext, kind: u64, position: u64) -> ! {
     std::arch::naked_asm!(
         "mov rcx, rsp",
@@ -427,6 +428,7 @@ pub(crate) unsafe fn callers(code: &CodeMap, mut fp: usize) -> Vec<Frame> {
 /// Only generated code may call this, on a fiber stack, with the fiber's
 /// task context, from code a call with a handler is below.
 #[unsafe(naked)]
+#[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn rt_tx_throw(ctx: *const TaskContext) -> ! {
     std::arch::naked_asm!(
         "mov rsi, rsp",
@@ -488,6 +490,7 @@ unsafe extern "C" fn throw_entry(
 ///
 /// Only generated code may call this, with the fiber's task context.
 #[unsafe(naked)]
+#[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn rt_trap_catch(ctx: *const TaskContext, kind: u64, position: u64) {
     std::arch::naked_asm!(
         "mov [rdi + {kind}], rsi",
@@ -508,6 +511,7 @@ pub(crate) unsafe extern "C" fn rt_trap_catch(ctx: *const TaskContext, kind: u64
 ///
 /// As for `rt_trap`.
 #[unsafe(naked)]
+#[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn rt_trap_rethrow(ctx: *const TaskContext) -> ! {
     std::arch::naked_asm!(
         "mov rsi, [rdi + {kind}]",
