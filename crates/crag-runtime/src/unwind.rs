@@ -42,7 +42,9 @@ use std::sync::atomic::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crag_abi::{CodeObject, FuncId, HandlerKind, NO_POSITION, TrapKind, TrapOrigin};
+use crag_abi::{
+    CodeObject, Frame, FuncId, HandlerKind, InlinedCode, NO_POSITION, TrapKind, TrapOrigin,
+};
 
 use crate::die;
 use crate::fiber::{STATUS_TRAPPED, TaskContext, Worker};
@@ -63,6 +65,9 @@ pub struct CodeMap {
     handlers: Vec<(usize, usize, u32, HandlerKind)>,
     /// Where the traps of each function's code lie in its module.
     origins: HashMap<FuncId, Arc<Origins>>,
+    /// Where the code of inlined calls lies, sorted, with the functions
+    /// whose code it is, innermost first (Implementation Plan §11.10.1).
+    inlined: Vec<(usize, usize, Arc<[FuncId]>)>,
     /// The entry stubs a task of a scope starts in, which call a function
     /// value's code with its environment: by the code's number of results.
     task_entries: Option<[usize; 3]>,
@@ -98,9 +103,46 @@ impl CodeMap {
                 module: object.module.clone(),
                 origins: object.origins.clone(),
                 details: object.details.clone(),
+                inlined: object.inlined.clone(),
             }),
         );
         self.handlers.sort_unstable_by_key(|h| h.0);
+        let frames: Vec<Arc<[FuncId]>> = object
+            .inlined
+            .iter()
+            .map(|call| call.frames.clone().into())
+            .collect();
+        for range in &object.inlined_at {
+            if let Some(frames) = (range.inlined as usize)
+                .checked_sub(1)
+                .and_then(|k| frames.get(k))
+            {
+                let (start, end) = (base + range.start as usize, base + range.end as usize);
+                self.inlined.push((start, end, frames.clone()));
+            }
+        }
+        self.inlined.sort_unstable_by_key(|r| r.0);
+    }
+
+    /// The frames of the function whose code holds the return address
+    /// `ret`, innermost first: the inlined calls whose code holds it, and
+    /// the function.
+    pub fn frames_at(&self, ret: usize, out: &mut Vec<Frame>) {
+        let Some(func) = self.function_at(ret) else {
+            return;
+        };
+        // The call ends where it returns to.
+        let at = ret - 1;
+        let i = self.inlined.partition_point(|r| r.0 <= at);
+        if let Some((_, end, frames)) = i.checked_sub(1).map(|i| &self.inlined[i])
+            && at < *end
+        {
+            out.extend(frames.iter().map(|&func| Frame {
+                func,
+                inlined: true,
+            }));
+        }
+        out.push(Frame::of(func));
     }
 
     /// The handler of the kind of the call returning to `ret` and the
@@ -118,15 +160,23 @@ impl CodeMap {
     /// and what the position word's upper half names.
     pub fn origin(&self, func: FuncId, position: u64) -> Option<(String, u32, u32, String)> {
         let origins = self.origins.get(&func)?;
-        let offset = position as u32;
-        let i = origins.origins.partition_point(|o| o.position <= offset);
-        let at = origins.origins.get(i.checked_sub(1)?)?;
+        let at = origins.at(position)?;
         let detail = (position >> 32) as usize;
         let detail = detail
             .checked_sub(1)
             .and_then(|d| origins.details.get(d).cloned())
             .unwrap_or_default();
-        Some((origins.module.clone(), at.line, at.column, detail))
+        let module = match (at.inlined as usize).checked_sub(1) {
+            Some(k) => origins.inlined.get(k)?.module.clone(),
+            None => origins.module.clone(),
+        };
+        Some((module, at.line, at.column, detail))
+    }
+
+    /// The byte offset in its module's source of a position in the code
+    /// of `func`, which differs from the position in inlined code.
+    pub fn offset(&self, func: FuncId, position: u64) -> Option<u32> {
+        Some(self.origins.get(&func)?.at(position)?.offset)
     }
 
     /// Gives the entry stubs of tasks: from `compile_entry_stub` with one
@@ -166,18 +216,30 @@ struct Origins {
     module: String,
     origins: Vec<TrapOrigin>,
     details: Vec<String>,
+    inlined: Vec<InlinedCode>,
+}
+
+impl Origins {
+    /// The origin of a position word.
+    fn at(&self, position: u64) -> Option<&TrapOrigin> {
+        let offset = position as u32;
+        let i = self.origins.partition_point(|o| o.position <= offset);
+        self.origins.get(i.checked_sub(1)?)
+    }
 }
 
 /// Why and where a fiber stopped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Trap {
     pub kind: TrapKind,
-    /// The byte offset of the expression that trapped in its module's
-    /// source, if code generation knew it.
+    /// The byte offset of the expression that trapped in the source of
+    /// the module of the stack's first function, if code generation knew
+    /// it.
     pub position: Option<u32>,
     /// The function that trapped, then the functions of the frames below it
-    /// in turn, as far as the code map holds them.
-    pub stack: Vec<FuncId>,
+    /// in turn, as far as the code map holds them. Inlined code tells the
+    /// function it came from as a frame of its own.
+    pub stack: Vec<Frame>,
     /// What the trap names beyond its kind, such as the condition that
     /// failed or the error `!!` met.
     pub detail: Option<String>,
@@ -239,7 +301,7 @@ unsafe extern "C" fn trap_entry(
             Vec::new()
         };
         let mut stack = earlier;
-        let land_at = |fp_at: usize, handler: usize, offset: u32, unwound: Vec<FuncId>| {
+        let land_at = |fp_at: usize, handler: usize, offset: u32, unwound: Vec<Frame>| {
             // The handler's frame and those below it stay.
             (*fiber).caught_stack = unwound;
             if !again {
@@ -250,14 +312,18 @@ unsafe extern "C" fn trap_entry(
             land(fp_at - offset as usize, fp_at, handler)
         };
         unwind(worker, ret, fp, trap_kind.catchable(), land_at, &mut stack);
-        let detail = stack
-            .first()
-            .and_then(|&f| Worker::code(worker).origin(f, position))
+        // The trapping frame is the first of the function that trapped,
+        // whose code holds the position.
+        let code = Worker::code(worker);
+        let own = stack.iter().find(|f| !f.inlined).map(|f| f.func);
+        let detail = own
+            .and_then(|f| code.origin(f, position))
             .map(|(_, _, _, detail)| detail)
             .filter(|d| !d.is_empty());
+        let offset = own.and_then(|f| code.offset(f, position));
         let trap = Trap {
             kind: trap_kind,
-            position: (position != NO_POSITION).then_some(position as u32),
+            position: (position != NO_POSITION).then(|| offset.unwrap_or(position as u32)),
             stack,
             detail,
         };
@@ -284,8 +350,8 @@ unsafe fn unwind(
     mut ret: *const usize,
     mut fp: usize,
     catch: bool,
-    land: impl Fn(usize, usize, u32, Vec<FuncId>),
-    stack: &mut Vec<FuncId>,
+    land: impl Fn(usize, usize, u32, Vec<Frame>),
+    stack: &mut Vec<Frame>,
 ) {
     // SAFETY: as the caller promises. Each frame's stack pointer at its call
     // lies just above the return address; the frame pointer of the frame
@@ -301,7 +367,7 @@ unsafe fn unwind(
                 die("a trap handler was left");
             }
             let sp = ret as usize + 8;
-            stack.extend(code.function_at(at));
+            code.frames_at(at, stack);
             for &offset in code.slots(at) {
                 // A function value's environment may be null, and the
                 // first word of an inline string no pointer.
@@ -330,17 +396,17 @@ const RETHROWN: u64 = 1 << 32;
 ///
 /// `fp` is the frame pointer of a frame of a fiber's stack whose frames
 /// are suspended at calls.
-pub(crate) unsafe fn callers(code: &CodeMap, mut fp: usize) -> Vec<FuncId> {
+pub(crate) unsafe fn callers(code: &CodeMap, mut fp: usize) -> Vec<Frame> {
     let mut out = Vec::new();
     // SAFETY: as the caller promises, the chain of frame pointers ends at
     // the fiber's first frame, whose saved frame pointer is zero.
     unsafe {
         while fp != 0 {
             let ret = ((fp + 8) as *const usize).read();
-            let Some(func) = code.function_at(ret) else {
+            if code.function_at(ret).is_none() {
                 break;
-            };
-            out.push(func);
+            }
+            code.frames_at(ret, &mut out);
             fp = (fp as *const usize).read();
         }
     }

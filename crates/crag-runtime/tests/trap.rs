@@ -21,7 +21,7 @@ mod common;
 
 use std::sync::Arc;
 
-use crag_abi::{FuncId, RuntimeFn, TrapKind, TypeDescriptor};
+use crag_abi::{Frame, FuncId, RuntimeFn, TrapKind, TypeDescriptor};
 use crag_codegen::{BinOp, Block, BlockId, Cond, Inst, LirFunction, Term};
 use crag_runtime::{FiberConfig, FiberState, Trap, Types, Worker};
 
@@ -123,7 +123,7 @@ fn check(config: FiberConfig) {
     let trap = Trap {
         kind: TrapKind::Overflow,
         position: Some(42),
-        stack: vec![FuncId(0); 5001],
+        stack: vec![Frame::of(FuncId(0)); 5001],
         detail: None,
     };
     assert_eq!(fiber.trap(), Some(&trap));

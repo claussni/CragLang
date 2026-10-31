@@ -24,13 +24,15 @@
 //! trap on overflow and on a zero divisor (§3.1.1, §3.1.4); and the
 //! reference counts, which follow from a liveness analysis so that a value
 //! is released right after its last use, with the parameters a function
-//! only reads borrowed from its caller (§11.10.1).
+//! only reads borrowed from its caller (§11.10.1). In the optimizing tier,
+//! small callees are inlined before the counts are placed.
 
 extern crate crag_db as salsa;
 
 mod borrow;
 mod build;
 mod checks;
+mod inline;
 mod ir;
 mod liveness;
 mod tail;
@@ -44,9 +46,10 @@ use crag_types::{Filling, Handler, HandlerCode, Instance, Ty};
 pub use borrow::borrows;
 pub use build::{has_derived_code, place};
 pub use checks::insert_overflow_checks;
+pub use inline::{InlineCost, inline_call, should_inline};
 pub use ir::{
-    BinOp, Block, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Intrinsic, Local, LocalDecl,
-    MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,
+    BinOp, Block, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Inlined, Intrinsic, Local,
+    LocalDecl, MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,
 };
 pub use liveness::{Lent, Liveness, compute_liveness, insert_drops, insert_rc_ops};
 
@@ -213,10 +216,13 @@ pub fn mir<'db>(
     instance: InstanceKey<'db>,
     tier: Tier,
 ) -> Option<MirBody<'db>> {
-    if tier != Tier::Baseline {
+    if tier == Tier::Metered {
         return mir(db, program, instance, Tier::Baseline).clone();
     }
     let mut body = built(db, program, instance).clone()?;
+    if tier == Tier::Optimizing {
+        inline::inline_calls(db, program, instance, &mut body);
+    }
     let lent = borrow::lend(db, program, instance, &mut body);
     let live = compute_liveness(&body, lent);
     insert_rc_ops(&mut body, &live);
@@ -260,6 +266,8 @@ pub fn collect_instances<'db>(
         };
         out.push(instance);
         pending.extend(body.callees().into_iter().rev());
+        // Inlined callees are compiled too, so that reports know them.
+        pending.extend(body.inlined.iter().rev().map(|call| call.func));
     }
     out
 }

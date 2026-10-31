@@ -71,8 +71,8 @@ pub struct Paused {
     /// The words of the step's locals, in order.
     pub words: Vec<u64>,
     /// The functions of the frames that called it, innermost first, as far
-    /// as the code map holds them.
-    pub callers: Vec<FuncId>,
+    /// as the code map holds them, with those inlined into them.
+    pub callers: Vec<crag_abi::Frame>,
 }
 
 struct Stopped {
@@ -139,9 +139,9 @@ pub fn release_all() {
 }
 
 suspending_fn! {
-    /// `rt_step(ctx, cell, words, count, fp)`: see
+    /// `rt_step(ctx, cell, words, count, fp, inlined)`: see
     /// `crag_abi::RuntimeFn::Step`.
-    fn rt_step(ctx: *const TaskContext, cell: *const u64, words: *const u64, count: u64, fp: u64) => step_entry
+    fn rt_step(ctx: *const TaskContext, cell: *const u64, words: *const u64, count: u64, fp: u64, inlined: u64) => step_entry
 }
 
 /// The Rust half of `rt_step`: stops the task if it is to.
@@ -157,6 +157,7 @@ unsafe extern "C" fn step_entry(
     words: *const u64,
     count: u64,
     fp: u64,
+    inlined: u64,
 ) {
     // SAFETY: as the caller promises.
     let ctx_ref = unsafe { &*ctx };
@@ -170,7 +171,9 @@ unsafe extern "C" fn step_entry(
             .stack
             .top()
     };
-    let depth = top.saturating_sub(fp as usize);
+    // Code inlined into the frame is deeper than the frame's own: frames
+    // lie at least 16 bytes apart, and inlined calls nest less deeply.
+    let depth = top.saturating_sub(fp as usize) + inlined as usize;
     let mut state = state();
     let stop = state.breaks.contains(&(func, step))
         || match state.stepping.get(&task) {

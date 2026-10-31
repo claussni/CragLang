@@ -248,7 +248,7 @@ fn solve<'db>(db: &'db dyn Db, program: Program, group: &[InstanceKey<'db>]) -> 
 }
 
 /// Whether the body assigns the local anywhere.
-fn assigned(body: &MirBody<'_>, local: Local) -> bool {
+pub(crate) fn assigned(body: &MirBody<'_>, local: Local) -> bool {
     body.blocks.iter().any(|block| {
         let assigns = block
             .statements
@@ -307,6 +307,7 @@ pub(crate) fn lend<'db>(
             statements: Vec::new(),
             terminator: Terminator::Return(Operand::Local(dst)),
             catch,
+            inlined: body.blocks[b].inlined,
         });
         let target = BlockId(body.blocks.len() as u32 - 1);
         body.blocks[b].terminator = Terminator::Call {

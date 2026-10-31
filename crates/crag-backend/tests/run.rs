@@ -31,10 +31,10 @@ use std::cell::Cell;
 use std::collections::HashMap;
 
 use crag_abi::{
-    HEADER_SIZE, HEAP_OFFSET, Number, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, Shapes,
-    TrapKind, inline_text,
+    Frame, FuncId, HEADER_SIZE, HEAP_OFFSET, Number, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET,
+    Shapes, TrapKind, inline_text,
 };
-use crag_backend::{code, flat_layouts, flat_params, scalar_replace, shapes, type_index};
+use crag_backend::{code, flat_layouts, flat_params, func_id, scalar_replace, shapes, type_index};
 use crag_codegen::{
     CodeObject, CodegenSettings, OptLevel, SlotKey, compile_entry_stub, target_for,
 };
@@ -265,7 +265,17 @@ impl Module {
         Module::compiled_with(text, tier, &[])
     }
 
+    /// A module, in the optimizing tier, that may import the module `lib`
+    /// with the library's text.
+    fn with_library(text: &str, library: &str) -> Module {
+        Module::build(text, Tier::Optimizing, &[], Some(library))
+    }
+
     fn compiled_with(text: &str, tier: Tier, resources: &[(&str, &[u8])]) -> Module {
+        Module::build(text, tier, resources, None)
+    }
+
+    fn build(text: &str, tier: Tier, resources: &[(&str, &[u8])], library: Option<&str>) -> Module {
         let db = RootDatabase::new();
         let core = ModuleId::new(
             &db,
@@ -284,7 +294,12 @@ impl Module {
                 (module, source.to_string(), Resource::new(&db, content))
             })
             .collect();
-        let program = Program::new(&db, vec![core, module], resources);
+        let mut modules = vec![core, module];
+        if let Some(library) = library {
+            let file = SourceFile::new(&db, library.to_string());
+            modules.push(ModuleId::new(&db, "lib".to_string(), file));
+        }
+        let program = Program::new(&db, modules, resources);
         let syntax = &crag_hir::parse(&db, *module.file(&db)).errors;
         assert!(syntax.is_empty(), "{syntax:?}");
         let lowering: Vec<_> = owners(&db, module)
@@ -551,6 +566,18 @@ impl Module {
     }
 
     /// Which parameters of a function of the module are borrowed.
+    /// The function a function of the module, or of its library, is
+    /// loaded as.
+    fn func(&self, name: &str) -> FuncId {
+        let (db, program) = (&self.db, self.program);
+        let owner = program.modules(db)[1..]
+            .iter()
+            .flat_map(|&module| owners(db, module))
+            .find(|o| matches!(o, Owner::Item(i) if i.name(db).text(db) == name))
+            .unwrap();
+        func_id(InstanceKey::body(db, owner))
+    }
+
     fn borrowed(&self, name: &str) -> Vec<bool> {
         let (db, program) = (&self.db, self.program);
         let module = program.modules(db)[1];
@@ -1680,8 +1707,13 @@ fn copies() -> List[Str] {
     }
     // Only strings in buffers of the same length that differ in their
     // words are compared by the runtime: a buffer made at run time and a
-    // literal's, or the literals of two functions.
-    assert_eq!(TEXT_COMPARES.get(), 3);
+    // literal's, or the literals of two functions. Inlined, `kind` shares
+    // its literal's buffer with `kinds`.
+    let compares = match Tier::compiled() {
+        Tier::Optimizing => 2,
+        _ => 3,
+    };
+    assert_eq!(TEXT_COMPARES.get(), compares);
     // Short strings are inline, long ones point at their buffer.
     let words = m.call("hello", &[]);
     assert_eq!(words, inline_text(b"Hello, Ada!"));
@@ -3405,5 +3437,57 @@ fn lazy_values_count_what_they_hold() {
     assert_eq!(m.unsupported, Vec::<String>::new());
     // Lazy cells need a fiber's task context.
     assert_eq!(m.run("twice", &[5]).unwrap(), [5]);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+}
+
+/// In the optimizing tier, a small callee's code is copied in place of its
+/// call, from its own module too. A trap in the copy is reported where the
+/// callee's code is, with the callee as a frame of its own, marked as
+/// inlined (Plan §11.10.1).
+#[test]
+fn traps_in_inlined_code_tell_their_callee() {
+    let library = "pub fn inc(n: Int) -> Int {\n  n + 2\n}\n";
+    let text = r#"import lib
+
+fn double(n: Int) -> Int {
+  n * 2
+}
+
+fn twice(n: Int) -> Int {
+  inc(double(n)) + 2
+}
+"#;
+    let mut m = Module::with_library(text, library);
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    let (db, program) = (&m.db, m.program);
+    let twice = owners(db, program.modules(db)[1])
+        .into_iter()
+        .find(|o| matches!(o, Owner::Item(i) if i.name(db).text(db) == "twice"))
+        .unwrap();
+    let body = crag_mir::mir(db, program, InstanceKey::body(db, twice), Tier::Optimizing);
+    assert_eq!(body.as_ref().unwrap().inlined.len(), 2);
+    assert_eq!(m.run("twice", &[20]), Ok(vec![44]));
+    let (twice, double, inc) = (m.func("twice"), m.func("double"), m.func("inc"));
+    let inlined = |func| Frame {
+        func,
+        inlined: true,
+    };
+    // In the function's own module.
+    let trap = m.run("twice", &[i64::MAX]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::Overflow);
+    assert_eq!(trap.position, Some(text.find("n * 2").unwrap() as u32));
+    assert_eq!(trap.stack, vec![inlined(double), Frame::of(twice)]);
+    // In the library's.
+    let trap = m.run("twice", &[(i64::MAX - 1) / 2]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::Overflow);
+    assert_eq!(trap.position, Some(library.find("n + 2").unwrap() as u32));
+    assert_eq!(trap.stack, vec![inlined(inc), Frame::of(twice)]);
+    // In the function's own code after them.
+    let trap = m.run("twice", &[(i64::MAX - 3) / 2]).unwrap_err();
+    assert_eq!(
+        trap.position,
+        Some(text.find("inc(double(n)) + 2").unwrap() as u32)
+    );
+    assert_eq!(trap.stack, vec![Frame::of(twice)]);
     assert_eq!(m.worker.heap().live_blocks(), 0);
 }

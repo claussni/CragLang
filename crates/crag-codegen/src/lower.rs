@@ -20,8 +20,8 @@
 use std::collections::HashMap;
 
 use crag_abi::{
-    CELL_STATE_OFFSET, FRAME_BUDGET, FUEL_OFFSET, HandlerKind, NO_POSITION, RuntimeFn,
-    SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET,
+    CELL_STATE_OFFSET, FRAME_BUDGET, FUEL_OFFSET, HandlerKind, InlinedRange, NO_POSITION,
+    RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET,
 };
 use cranelift_codegen::binemit::Reloc as ClifReloc;
 use cranelift_codegen::control::ControlPlane;
@@ -31,7 +31,7 @@ use cranelift_codegen::ir::types::{F64, I64};
 use cranelift_codegen::ir::{
     AbiParam, AtomicRmwOp, BlockArg, ExceptionTableData, ExceptionTableItem, ExceptionTag,
     ExtFuncData, ExternalName, FuncRef, Function, GlobalValue, GlobalValueData, InstBuilder,
-    MemFlagsData, Signature, StackSlotData, StackSlotKind, TrapCode, UserExternalName,
+    MemFlagsData, Signature, SourceLoc, StackSlotData, StackSlotKind, TrapCode, UserExternalName,
     UserFuncName, Value,
 };
 use cranelift_codegen::isa::{self, CallConv, OwnedTargetIsa, TargetIsa};
@@ -149,6 +149,8 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
             handlers: body.handlers,
             module: String::new(),
             origins: Vec::new(),
+            inlined: Vec::new(),
+            inlined_at: body.inlined_at,
             details: Vec::new(),
             natives: lir.natives.clone(),
         });
@@ -201,6 +203,15 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
             ..h
         })
         .collect();
+    let inlined_at = body
+        .inlined_at
+        .into_iter()
+        .map(|r| InlinedRange {
+            start: r.start + body_offset,
+            end: r.end + body_offset,
+            ..r
+        })
+        .collect();
 
     Ok(CodeObject {
         code,
@@ -213,6 +224,8 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
         handlers,
         module: String::new(),
         origins: Vec::new(),
+        inlined: Vec::new(),
+        inlined_at,
         details: Vec::new(),
         natives: lir.natives.clone(),
     })
@@ -309,6 +322,8 @@ pub fn compile_entry_stub(
         handlers: stub.handlers,
         module: String::new(),
         origins: Vec::new(),
+        inlined: Vec::new(),
+        inlined_at: Vec::new(),
         details: Vec::new(),
         natives: Vec::new(),
     })
@@ -563,8 +578,7 @@ fn emit_step(
     imports: &mut Imports,
     ctx: Value,
     conv: CallConv,
-    func: FuncId,
-    step: u32,
+    (func, step, inlined): (FuncId, u32, u32),
     values: &[Value],
 ) {
     let cell = imports.symbol(b, NS_CELL, crag_abi::step_cell(func, step));
@@ -585,9 +599,11 @@ fn emit_step(
     }
     let words = b.ins().stack_addr(I64, slot, 0);
     let fp = b.ins().get_frame_pointer(I64);
-    let callee = imports.runtime(b, conv, RuntimeFn::Step, 4, 0);
+    let callee = imports.runtime(b, conv, RuntimeFn::Step, 5, 0);
     let count = b.ins().iconst(I64, values.len() as i64);
-    b.ins().call(callee, &[ctx, cell, words, count, fp]);
+    let inlined = b.ins().iconst(I64, i64::from(inlined));
+    b.ins()
+        .call(callee, &[ctx, cell, words, count, fp, inlined]);
     b.ins().jump(done, &[]);
 
     b.switch_to_block(done);
@@ -1024,8 +1040,14 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa, metered: bool) -> (Functio
                         emit_fuel_check(&mut b, &mut imports, ctx);
                     }
                 }
+                Inst::Inlined(k) => b.set_srcloc(SourceLoc::new(*k)),
                 Inst::Step { .. } if metered => {}
-                Inst::Step { func, step, values } => {
+                Inst::Step {
+                    func,
+                    step,
+                    values,
+                    inlined,
+                } => {
                     let values: Vec<Value> = values
                         .iter()
                         .map(|r| b.use_var(vars[r.0 as usize]))
@@ -1035,8 +1057,7 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa, metered: bool) -> (Functio
                         &mut imports,
                         ctx,
                         isa.default_call_conv(),
-                        *func,
-                        *step,
+                        (*func, *step, *inlined),
                         &values,
                     );
                 }
@@ -1231,6 +1252,7 @@ struct Compiled {
     data_relocs: Vec<(usize, u32)>,
     stack_maps: Vec<StackMap>,
     handlers: Vec<CallHandler>,
+    inlined_at: Vec<InlinedRange>,
     /// Distance from the frame pointer down to the stack pointer.
     frame_below_fp: u32,
 }
@@ -1300,6 +1322,22 @@ fn run_backend(
         .collect();
     stack_maps.sort_by_key(|m| m.return_offset);
 
+    // `Inst::Inlined` numbers the code of inlined calls from one.
+    let mut inlined_at: Vec<InlinedRange> = Vec::new();
+    for s in buffer.get_srclocs_sorted() {
+        if s.loc.is_default() || s.loc.bits() == 0 || s.start == s.end {
+            continue;
+        }
+        match inlined_at.last_mut() {
+            Some(last) if last.end == s.start && last.inlined == s.loc.bits() => last.end = s.end,
+            _ => inlined_at.push(InlinedRange {
+                start: s.start,
+                end: s.end,
+                inlined: s.loc.bits(),
+            }),
+        }
+    }
+
     let mut handlers = Vec::new();
     for site in buffer.call_sites() {
         for handler in site.exception_handlers {
@@ -1332,6 +1370,7 @@ fn run_backend(
         data_relocs,
         stack_maps,
         handlers,
+        inlined_at,
         frame_below_fp: frame.frame_to_fp_offset,
     })
 }

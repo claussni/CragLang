@@ -654,7 +654,7 @@ impl<'db> Check<'_, 'db> {
             Terminator::Return(_) if self.gives_flat => {}
             Terminator::Return(o) => self.consumed(o),
             Terminator::Branch { cond, .. } => self.borrowed(cond),
-            Terminator::Jump(_) | Terminator::Trap { .. } => {}
+            Terminator::Jump(_) | Terminator::Trap { .. } | Terminator::Guard { .. } => {}
         }
     }
 }

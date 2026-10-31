@@ -2531,6 +2531,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 statements,
                 terminator,
                 catch,
+                inlined: None,
             });
         }
         let mut used = vec![false; self.locals.len()];
@@ -2571,6 +2572,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             result: self.result,
             bool_ty: self.bool_ty,
             unsupported: self.unsupported,
+            inlined: Vec::new(),
         }
     }
 

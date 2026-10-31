@@ -279,12 +279,19 @@ pub enum Inst {
     /// The start of a statement (Implementation Plan §11.8.6): while the
     /// first word of the cell `crag_abi::step_cell(func, step)` is not
     /// zero, the code copies `values` to its frame and calls `rt_step` with
-    /// them. Metered code has no steps.
+    /// them, and how many inlined calls deep the step is. Metered code
+    /// has no steps.
     Step {
         func: FuncId,
         step: u32,
         values: Vec<VReg>,
+        inlined: u32,
     },
+    /// The code from here on, until the next mark, is that of an inlined
+    /// call, by its number from one in `CodeObject::inlined`, or the
+    /// function's own, with zero (Implementation Plan §11.10.1). The code
+    /// object's `inlined_at` tells where it lies.
+    Inlined(u32),
 }
 
 #[derive(Clone, Debug)]
@@ -497,7 +504,7 @@ impl LirFunction {
                             return Err(format!("side-stack alignment {align}"));
                         }
                     }
-                    Inst::Poll => {}
+                    Inst::Poll | Inst::Inlined(_) => {}
                 }
             }
             match &b.term {

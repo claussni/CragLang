@@ -436,6 +436,12 @@ fn main() -> () {
 }
 "#;
 
+/// Whether the tests compile in the optimizing tier, which inlines small
+/// functions and reports them as inlined frames.
+fn optimizing() -> bool {
+    crag_mir::Tier::compiled() == crag_mir::Tier::Optimizing
+}
+
 #[test]
 fn a_breakpoint_takes_the_ui_to_the_stopped_line() {
     use std::io::{Read, Write};
@@ -483,11 +489,16 @@ fn a_breakpoint_takes_the_ui_to_the_stopped_line() {
     let s = screen(&mut ui, 120, 40);
     assert!(shows(&s, "Debug: 1 paused"), "{}", s.join("\n"));
     assert!(shows(&s, " Tasks "), "{}", s.join("\n"));
-    assert!(
-        shows(&s, &format!("⏸ reply app.crag:{}", line + 1)),
-        "{}",
-        s.join("\n")
-    );
+    // Inlined, the name says so, and the line no longer fits.
+    let reply = match optimizing() {
+        true => "reply (inlined)",
+        false => "reply",
+    };
+    let stopped = match optimizing() {
+        true => "⏸ reply (inlined) app.crag".to_string(),
+        false => format!("⏸ reply app.crag:{}", line + 1),
+    };
+    assert!(shows(&s, &stopped), "{}", s.join("\n"));
     assert!(shows(&s, "n = 1"), "{}", s.join("\n"));
     assert!(
         shows(&s, &format!("▶{:>2} │", line + 1)),
@@ -495,7 +506,7 @@ fn a_breakpoint_takes_the_ui_to_the_stopped_line() {
         s.join("\n")
     );
     assert!(
-        shows(&s, &format!("scratch [reply app.crag:{}]> ", line + 1)),
+        shows(&s, &format!("scratch [{reply} app.crag:{}]> ", line + 1)),
         "{}",
         s.join("\n")
     );

@@ -48,6 +48,8 @@ fn object(code: Vec<u8>, relocs: Vec<Reloc>) -> CodeObject {
         handlers: vec![],
         module: String::new(),
         origins: vec![],
+        inlined: vec![],
+        inlined_at: vec![],
         details: vec![],
         natives: vec![],
     }

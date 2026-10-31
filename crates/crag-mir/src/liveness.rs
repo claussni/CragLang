@@ -237,7 +237,7 @@ fn terminator_uses<'db>(
             }
         }
         Terminator::Return(o) => uses.operand(o, true),
-        Terminator::Jump(_) | Terminator::Trap { .. } => {}
+        Terminator::Jump(_) | Terminator::Trap { .. } | Terminator::Guard { .. } => {}
     }
     uses.counted(body, holds)
 }
@@ -456,6 +456,7 @@ pub fn insert_drops<'db>(body: &mut MirBody<'db>, live: &Liveness<'db>) {
                 statements: releases.collect(),
                 terminator: Terminator::Jump(s),
                 catch: None,
+                inlined: body.blocks[b].inlined,
             });
             let edge = BlockId(body.blocks.len() as u32 - 1);
             *body.blocks[b].terminator.successors_mut()[k] = edge;

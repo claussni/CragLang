@@ -240,6 +240,12 @@ fn printing_and_transforms_that_print_are_not_pure() {
     assert!(out.contains(" --> app.crag:8:3"), "{out}");
 }
 
+/// Whether the tests compile in the optimizing tier, which inlines small
+/// functions and reports them as inlined frames.
+fn optimizing() -> bool {
+    crag_mir::Tier::compiled() == crag_mir::Tier::Optimizing
+}
+
 #[test]
 fn a_trap_in_main_is_reported_with_its_stack() {
     let root = project(
@@ -254,9 +260,16 @@ fn a_trap_in_main_is_reported_with_its_stack() {
     );
     let mut out = Vec::new();
     assert_eq!(crag_run(&root, &mut out), EXIT_TRAP);
+    // Inlined, the first call of `down` is part of `main`.
+    let frames = match optimizing() {
+        true => "  in down, 3 frames\n  in down (inlined)\n  in main\n",
+        false => "  in down, 4 frames\n  in main\n",
+    };
     assert_eq!(
         text(out),
-        "trap: division by zero\n --> app.crag:2:15\n  |\n2 |   if n == 0 { 1 / n } else { down(n - 1) + 1 }\n  |               ^\n  in down, 4 frames\n  in main\n"
+        format!(
+            "trap: division by zero\n --> app.crag:2:15\n  |\n2 |   if n == 0 {{ 1 / n }} else {{ down(n - 1) + 1 }}\n  |               ^\n{frames}"
+        )
     );
 }
 
@@ -331,10 +344,17 @@ test "overflows in a closure" {
     let report = crag_test(&root, None, &mut out);
     let out = text(out);
     assert_eq!(report.failed.len(), 1, "{out}");
-    // `apply` calls the closure in tail position, so its frame is gone.
+    // `apply` calls the closure in tail position, so its frame is gone,
+    // unless it is inlined into the test.
+    let apply = match optimizing() {
+        true => "  in apply (inlined)\n",
+        false => "",
+    };
     assert_eq!(
         report.failed[0].1,
-        "trap: arithmetic overflow\n  --> app.crag:16:24\n   |\n16 |   let y = apply({ n -> n * big }, 2)\n   |                        ^\n  in a closure in test \"overflows in a closure\"\n  in test \"overflows in a closure\"\n"
+        format!(
+            "trap: arithmetic overflow\n  --> app.crag:16:24\n   |\n16 |   let y = apply({{ n -> n * big }}, 2)\n   |                        ^\n  in a closure in test \"overflows in a closure\"\n{apply}  in test \"overflows in a closure\"\n"
+        )
     );
 }
 

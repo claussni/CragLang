@@ -150,14 +150,27 @@ fn shipped_code_runs_in_the_scratch_image() {
     assert_eq!(s.run(&p, function(&p, "total")).unwrap(), Ok(vec![14]));
 }
 
+/// Whether the tests compile in the optimizing tier, which inlines small
+/// functions and reports them as inlined frames.
+fn optimizing() -> bool {
+    crag_mir::Tier::compiled() == crag_mir::Tier::Optimizing
+}
+
 #[test]
 fn a_trap_in_the_image_is_reported_by_the_host() {
     let p = project("trap", APP);
     let mut s = scratch();
     assert_eq!(
         s.run(&p, function(&p, "boom")).unwrap(),
-        // `boom` tail-calls `down`, so its frame is gone.
-        Err("trap: division by zero\n  --> app.crag:33:15\n   |\n33 |   if n == 0 { 1 / n } else { down(n - 1) + 1 }\n   |               ^\n  in down, 4 frames\n".into())
+        // `boom` tail-calls `down`, so its frame is gone, unless the first
+        // call is inlined into it.
+        Err(format!(
+            "trap: division by zero\n  --> app.crag:33:15\n   |\n33 |   if n == 0 {{ 1 / n }} else {{ down(n - 1) + 1 }}\n   |               ^\n{}",
+            match optimizing() {
+                true => "  in down, 3 frames\n  in down (inlined)\n  in boom\n",
+                false => "  in down, 4 frames\n",
+            }
+        ))
     );
     // The image runs on.
     assert_eq!(s.run(&p, function(&p, "answer")).unwrap(), Ok(vec![42]));
@@ -182,9 +195,11 @@ fn a_changed_definition_replaces_the_old_code() {
     assert_eq!(s.run(&p, function(&p, "answer")).unwrap(), Ok(vec![42]));
     let module = p.module("demo.app").unwrap();
 
-    // `answer` calls `two` through its slot, so only `two` is sent again.
+    // `answer` calls `two` through its slot, so only `two` is sent again,
+    // or `answer` too when it has a copy of `two`.
     p.set_source(module, APP.replace("  2\n", "  3\n"));
-    assert_eq!(s.ship(&p, &[function(&p, "answer")]).unwrap(), 1);
+    let sent = if optimizing() { 2 } else { 1 };
+    assert_eq!(s.ship(&p, &[function(&p, "answer")]).unwrap(), sent);
     assert_eq!(s.run(&p, function(&p, "answer")).unwrap(), Ok(vec![43]));
     assert_eq!(s.run(&p, function(&p, "two")).unwrap(), Ok(vec![3]));
     assert_eq!(s.run(&p, function(&p, "twice")).unwrap(), Ok(vec![46]));
@@ -242,9 +257,10 @@ fn a_value_is_computed_again_once_its_code_changed() {
     );
 
     // `corner` calls `two`, whose new code computes it anew; only `two`
-    // is sent.
+    // is sent, or `corner` too when it has a copy of `two`.
     p.set_source(module, APP.replace("  2\n", "  3\n"));
-    assert_eq!(s.ship(&p, &[function(&p, "cornered")]).unwrap(), 1);
+    let sent = if optimizing() { 2 } else { 1 };
+    assert_eq!(s.ship(&p, &[function(&p, "cornered")]).unwrap(), sent);
     assert_eq!(s.run(&p, function(&p, "cornered")).unwrap(), Ok(vec![43]));
     let again = s.run(&p, function(&p, "theCorner")).unwrap().unwrap();
     assert_ne!(again, corner);

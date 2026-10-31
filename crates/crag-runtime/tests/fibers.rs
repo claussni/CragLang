@@ -24,7 +24,7 @@ use std::time::Duration;
 mod common;
 
 use common::{Image, finish, r};
-use crag_abi::{FuncId, StackCheck, TrapKind};
+use crag_abi::{Frame, FuncId, StackCheck, TrapKind};
 use crag_codegen::{BinOp, Block, BlockId, Cond, Inst, LirFunction, Term, compile};
 use crag_runtime::meter::REFUEL;
 use crag_runtime::stress::run_tortured;
@@ -340,7 +340,7 @@ fn a_stack_that_would_pass_its_maximum_traps() {
         let trap = fiber.trap().unwrap();
         assert_eq!(trap.kind, TrapKind::StackOverflow);
         assert!(trap.stack.len() > 1000, "{} frames", trap.stack.len());
-        assert!(trap.stack.iter().all(|&f| f == FuncId(0)));
+        assert!(trap.stack.iter().all(|&f| f == Frame::of(FuncId(0))));
         assert!(fiber.stack_size() <= 1 << 20);
     }
 }
@@ -445,7 +445,7 @@ fn metered(
         let trap = fiber.trap().unwrap();
         assert_eq!(trap.kind, TrapKind::OutOfSteps);
         assert_eq!(trap.position, None);
-        assert_eq!(trap.stack.first(), Some(&FuncId(func as u32)));
+        assert_eq!(trap.stack.first(), Some(&Frame::of(FuncId(func as u32))));
     }
     (state, fiber.steps_left().unwrap())
 }
@@ -496,7 +496,7 @@ fn metered_code_takes_a_step_per_entry_and_back_edge() {
             memory: usize::MAX,
         });
         assert_eq!(w.resume(&mut fiber), Trapped);
-        assert_eq!(fiber.trap().unwrap().stack, vec![FuncId(1); 101]);
+        assert_eq!(fiber.trap().unwrap().stack, vec![Frame::of(FuncId(1)); 101]);
 
         // Without a meter, metered code does not run out.
         let mut fiber = image.fiber(0, &[n], config);

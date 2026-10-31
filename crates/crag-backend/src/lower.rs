@@ -41,12 +41,12 @@ use std::ops::Range;
 
 use crag_abi::{
     BUFFER_HEADER, CELL_FULL, CELL_STATE_OFFSET, CELL_VALUE_OFFSET, COUNT_OFFSET,
-    FUNCTION_BOX_HEADER, HEADER_SIZE, HEAP_OFFSET, HandlerKind, INLINE_TEXT_MAX, LEN_OFFSET,
-    LIST_SIZE, MAP_SIZE, MEMBER_BOX_SIZE, NO_POSITION, NativeSymbol, PAGE_FREE_OFFSET,
-    PAGE_USED_OFFSET, REF_ADD, REF_CELL_SIZE, REF_MUL, REF_SUB, REF_UNSIGNED, SCOPE_DONE,
-    SIDE_END_OFFSET, SIDE_PTR_OFFSET, SIGNAL_NONE, START_EXEMPT, STATIC_COUNT, TEXT_BOX_HEADER,
-    TEXT_LEN_MAX, TX_CONFLICT_OFFSET, TYPE_INDEX_OFFSET, TrapKind as AbiTrap, TrapOrigin,
-    TypeDescriptor, c_kind, inline_text, size_class, threading,
+    FUNCTION_BOX_HEADER, HEADER_SIZE, HEAP_OFFSET, HandlerKind, INLINE_TEXT_MAX, INLINED_POSITION,
+    InlinedCode, LEN_OFFSET, LIST_SIZE, MAP_SIZE, MEMBER_BOX_SIZE, NO_POSITION, NativeSymbol,
+    PAGE_FREE_OFFSET, PAGE_USED_OFFSET, REF_ADD, REF_CELL_SIZE, REF_MUL, REF_SUB, REF_UNSIGNED,
+    SCOPE_DONE, SIDE_END_OFFSET, SIDE_PTR_OFFSET, SIGNAL_NONE, START_EXEMPT, STATIC_COUNT,
+    TEXT_BOX_HEADER, TEXT_LEN_MAX, TX_CONFLICT_OFFSET, TYPE_INDEX_OFFSET, TrapKind as AbiTrap,
+    TrapOrigin, TypeDescriptor, c_kind, inline_text, size_class, threading,
 };
 use crag_codegen::{
     BinOp as LirBin, Block as LirBlock, BlockId as LirBlockId, CallTarget, Cond, FuncId, Inst,
@@ -54,7 +54,7 @@ use crag_codegen::{
 };
 use crag_db::Db;
 use crag_db::plumbing::AsId;
-use crag_hir::{ItemId, Name, Owner, Program, Threading, hir_body, lower_body};
+use crag_hir::{ExprId, ItemId, Name, Owner, Program, Threading, hir_body, lower_body};
 use crag_mir::{
     BinOp, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Entry, InstanceKey, Intrinsic,
     Local, LocalDecl, MirBody, Operand, Place, Rvalue, Statement, Terminator, Tier, TrapKind,
@@ -89,13 +89,19 @@ pub struct Lowered<'db> {
     pub module: String,
     pub origins: Vec<TrapOrigin>,
     pub details: Vec<String>,
+    /// The calls inlined into it (Implementation Plan §11.10.1).
+    pub inlined: Vec<InlinedCode>,
 }
 
 /// A statement's step, for the debugger: where the statement starts and
 /// the named locals whose words `rt_step` gets, in order.
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
 pub struct StepInfo<'db> {
+    /// In the module of the innermost of `inlined`, else of the function.
     pub position: Option<u32>,
+    /// The functions whose code was inlined where the step is, innermost
+    /// first.
+    pub inlined: Vec<InstanceKey<'db>>,
     /// The named locals whose words it passes, and whether each is split.
     pub locals: Vec<(Name<'db>, Ty<'db>, bool)>,
 }
@@ -156,6 +162,22 @@ pub fn lower_to_lir<'db>(
         source: owner.module(db).file(db).text(db),
         origins: Vec::new(),
         details: Vec::new(),
+        scopes: mir
+            .inlined
+            .iter()
+            .map(|call| {
+                let owner = *call.func.owner(db);
+                let lowered = lower_body(db, program, owner);
+                Scope {
+                    positions: &lowered.source_map.exprs,
+                    name_at: lowered.source_map.name.start,
+                    source: owner.module(db).file(db).text(db),
+                }
+            })
+            .collect(),
+        scope: None,
+        block_scopes: vec![0; mir.blocks.len()],
+        inlined_origins: 0,
         natives: Vec::new(),
         c_buffer: None,
         result: result.cloned(),
@@ -208,6 +230,7 @@ pub fn lower_to_lir<'db>(
         l.current = (b, Vec::new());
         l.fresh = None;
         l.catch = block.catch;
+        l.scope = block.inlined;
         if unknown_param || returns > 2 {
             l.unsupported("types of parameters or results");
             continue;
@@ -262,7 +285,7 @@ pub fn lower_to_lir<'db>(
         l.cell_entry(cell, returns);
     }
     // A block a failed lowering left unfinished is never reached.
-    let blocks = l
+    let mut blocks: Vec<LirBlock> = l
         .blocks
         .into_iter()
         .map(|b| {
@@ -273,6 +296,28 @@ pub fn lower_to_lir<'db>(
                     position: None,
                 },
             })
+        })
+        .collect();
+    // Each block of code with inlined calls tells whose code it is.
+    if !mir.inlined.is_empty() {
+        for (block, scope) in blocks.iter_mut().zip(&l.block_scopes) {
+            block.insts.insert(0, Inst::Inlined(*scope));
+        }
+    }
+    let inlined = mir
+        .inlined
+        .iter()
+        .map(|call| {
+            let mut frames = vec![func_id(call.func)];
+            let mut parent = call.parent;
+            while let Some(p) = parent {
+                frames.push(func_id(mir.inlined[p as usize].func));
+                parent = mir.inlined[p as usize].parent;
+            }
+            InlinedCode {
+                frames,
+                module: call.func.owner(db).module(db).path(db).clone(),
+            }
         })
         .collect();
     Lowered {
@@ -297,6 +342,7 @@ pub fn lower_to_lir<'db>(
             origins
         },
         details: l.details,
+        inlined,
     }
 }
 
@@ -328,6 +374,14 @@ fn handlers(unwind: &Option<BlockId>, catch: &Option<BlockId>) -> Vec<(HandlerKi
         .map(|b| (HandlerKind::Transaction, block(b)))
         .chain(catch.iter().map(|b| (HandlerKind::Trap, block(b))))
         .collect()
+}
+
+/// Where the expressions of an inlined call's code lie: the positions and
+/// source of the callee's owner.
+struct Scope<'db> {
+    positions: &'db [Range<u32>],
+    name_at: u32,
+    source: &'db str,
 }
 
 struct Lower<'a, 'db> {
@@ -365,6 +419,14 @@ struct Lower<'a, 'db> {
     source: &'db str,
     origins: Vec<TrapOrigin>,
     details: Vec<String>,
+    /// Where the expressions of each inlined call's code lie.
+    scopes: Vec<Scope<'db>>,
+    /// The inlined call whose code the MIR block being lowered is.
+    scope: Option<u32>,
+    /// The inlined call of each LIR block's code, from one, or zero.
+    block_scopes: Vec<u32>,
+    /// The positions of traps in inlined code numbered so far.
+    inlined_origins: u32,
     /// Three words on the side stack that the runtime's reads put what they
     /// read in, pushed at the entry once the code reads anything.
     scratch: Option<VReg>,
@@ -751,22 +813,53 @@ impl<'a, 'db> Lower<'a, 'db> {
         self.current.1.push(inst);
     }
 
-    /// The line and column, from one, of a byte offset in the module, the
-    /// column counted in characters.
-    fn origin(&self, at: u32) -> TrapOrigin {
-        let before = &self.source[..(at as usize).min(self.source.len())];
+    /// Where the expressions of the code being lowered lie, where the
+    /// name of its declaration starts, and its module's source.
+    fn scope(&self) -> (&'db [Range<u32>], u32, &'db str) {
+        match self.scope {
+            None => (self.positions, self.name_at, self.source),
+            Some(k) => {
+                let scope = &self.scopes[k as usize];
+                (scope.positions, scope.name_at, scope.source)
+            }
+        }
+    }
+
+    /// The byte offset of an expression of the code being lowered in its
+    /// module's source.
+    fn position(&self, e: ExprId) -> Option<u32> {
+        self.scope().0.get(e.index()).map(|r| r.start)
+    }
+
+    /// The position a trap at a byte offset of the code being lowered
+    /// names, with its origin: the line and column, from one, the column
+    /// counted in characters.
+    fn origin(&mut self, at: u32) -> u32 {
+        let source = self.scope().2;
+        let before = &source[..(at as usize).min(source.len())];
         let line = before.matches('\n').count() as u32 + 1;
         let start = before.rfind('\n').map_or(0, |i| i + 1);
         let column = before[start..].chars().count() as u32 + 1;
-        TrapOrigin {
-            position: at,
+        let (position, inlined) = match self.scope {
+            None => (at, 0),
+            Some(k) => {
+                self.inlined_origins += 1;
+                (INLINED_POSITION | self.inlined_origins, k + 1)
+            }
+        };
+        self.origins.push(TrapOrigin {
+            position,
             line,
             column,
-        }
+            inlined,
+            offset: at,
+        });
+        position
     }
 
     fn new_block(&mut self) -> LirBlockId {
         self.blocks.push(None);
+        self.block_scopes.push(0);
         LirBlockId(self.blocks.len() as u32 - 1)
     }
 
@@ -774,6 +867,7 @@ impl<'a, 'db> Lower<'a, 'db> {
     fn end(&mut self, term: Term, next: Option<LirBlockId>) {
         let (b, insts) = std::mem::take(&mut self.current);
         self.blocks[b] = Some(LirBlock { insts, term });
+        self.block_scopes[b] = self.scope.map_or(0, |k| k + 1);
         if let Some(next) = next {
             self.current = (next.0 as usize, Vec::new());
         }
@@ -1227,9 +1321,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             }
             Statement::Step { at, locals } => {
                 let step = self.steps.len() as u32;
-                let position = at
-                    .and_then(|e| self.positions.get(e.index()))
-                    .map(|r| r.start);
+                let position = at.and_then(|e| self.position(e));
                 let mut values = Vec::new();
                 let mut named = Vec::new();
                 for &local in locals {
@@ -1241,14 +1333,22 @@ impl<'a, 'db> Lower<'a, 'db> {
                         named.push((name, decl.ty, decl.split));
                     }
                 }
+                let mut inlined = Vec::new();
+                let mut scope = self.scope;
+                while let Some(k) = scope {
+                    inlined.push(self.mir.inlined[k as usize].func);
+                    scope = self.mir.inlined[k as usize].parent;
+                }
                 self.steps.push(StepInfo {
                     position,
+                    inlined,
                     locals: named,
                 });
                 self.push(Inst::Step {
                     func: self.func,
                     step,
                     values,
+                    inlined: self.steps[step as usize].inlined.len() as u32,
                 });
                 Ok(())
             }
@@ -2893,10 +2993,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 Ok(Vec::new())
             }
             (Intrinsic::Site(expr), []) => {
-                let at = self
-                    .positions
-                    .get(expr.index())
-                    .map_or(NO_POSITION as i64, |r| i64::from(r.start));
+                let at = self.position(expr).map_or(NO_POSITION as i64, i64::from);
                 Ok(vec![self.constant(at)])
             }
             (Intrinsic::BytesRead, [bytes, packed, at]) => {
@@ -4090,6 +4187,37 @@ impl<'a, 'db> Lower<'a, 'db> {
         }
         match term {
             Terminator::Jump(b) => self.end(Term::Jump(block(*b)), None),
+            Terminator::Guard {
+                func,
+                inlined,
+                fallback,
+            } => {
+                // The code the slot holds now, and the code loaded with
+                // this function, which the copy was made from.
+                if !self.calls.contains(func) {
+                    self.calls.push(*func);
+                }
+                let (now, loaded) = (self.reg(), self.reg());
+                self.push(Inst::FuncAddr {
+                    dst: now,
+                    func: self.slot(*func),
+                    params: 0,
+                    returns: 0,
+                });
+                self.push(Inst::FuncAddr {
+                    dst: loaded,
+                    func: CallTarget::Direct(func_id(*func)),
+                    params: 0,
+                    returns: 0,
+                });
+                let same = self.cmp(Cond::Eq, now, loaded);
+                let term = Term::Branch {
+                    cond: same,
+                    then: block(*inlined),
+                    otherwise: block(*fallback),
+                };
+                self.end(term, None);
+            }
             Terminator::Branch {
                 cond,
                 then,
@@ -4268,13 +4396,10 @@ impl<'a, 'db> Lower<'a, 'db> {
                 // The byte offset of the expression in the module's source,
                 // with the detail it names in the upper half.
                 let position = match site {
-                    Some(e) => self.positions.get(e.index()).map(|r| r.start),
-                    None => detail.as_ref().map(|_| self.name_at),
+                    Some(e) => self.position(*e),
+                    None => detail.as_ref().map(|_| self.scope().1),
                 };
-                if let Some(at) = position {
-                    let origin = self.origin(at);
-                    self.origins.push(origin);
-                }
+                let position = position.map(|at| self.origin(at));
                 let word = |this: &mut Self| -> u64 {
                     let Some(at) = position else {
                         return NO_POSITION;

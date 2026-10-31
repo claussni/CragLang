@@ -27,14 +27,14 @@
 use std::io::{self, Read, Write};
 
 use crag_abi::{
-    CallHandler, CodeObject, CountedField, ElementLayout, FieldGuard, FuncId, HandlerKind,
-    NativeSymbol, Reloc, RelocKind, RelocTarget, RuntimeFn, Shapes, SlotKey, StackCheck, StackMap,
-    TrapKind, TrapOrigin, TypeDescriptor,
+    CallHandler, CodeObject, CountedField, ElementLayout, FieldGuard, Frame, FuncId, HandlerKind,
+    InlinedCode, InlinedRange, NativeSymbol, Reloc, RelocKind, RelocTarget, RuntimeFn, Shapes,
+    SlotKey, StackCheck, StackMap, TrapKind, TrapOrigin, TypeDescriptor,
 };
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 32;
+pub const PROTOCOL_VERSION: u32 = 33;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -74,7 +74,8 @@ pub enum Message {
     Trapped {
         kind: TrapKind,
         position: Option<u32>,
-        stack: Vec<FuncId>,
+        /// Innermost first, with the functions inlined into each frame.
+        stack: Vec<Frame>,
         detail: Option<String>,
     },
     /// From the image: it could not do what the host asked, and why; it
@@ -133,13 +134,14 @@ pub enum Message {
 }
 
 /// A task stopped at a step: the task, the function and step, and the
-/// functions of the frames that called it, innermost first.
+/// functions of the frames that called it, innermost first, with the
+/// functions inlined into them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PausedTask {
     pub task: u64,
     pub func: FuncId,
     pub step: u32,
-    pub callers: Vec<FuncId>,
+    pub callers: Vec<Frame>,
 }
 
 /// A function's code, shipped to an image.
@@ -270,7 +272,7 @@ impl Message {
                         w.u32(*p);
                     }
                 }
-                w.seq(stack, |w, f| w.u32(f.0));
+                w.seq(stack, |w, f| w.frame(f));
                 w.text(detail.as_deref().unwrap_or(""));
             }
             Message::Failed(why) => {
@@ -318,7 +320,7 @@ impl Message {
                     w.u64(t.task);
                     w.u32(t.func.0);
                     w.u32(t.step);
-                    w.seq(&t.callers, |w, f| w.u32(f.0));
+                    w.seq(&t.callers, |w, f| w.frame(f));
                 });
             }
             Message::Resume { task, how } => {
@@ -393,7 +395,7 @@ impl Message {
                     1 => Some(r.u32()?),
                     tag => return Err(invalid(format!("an option with the tag {tag}"))),
                 },
-                stack: r.seq(|r| Ok(FuncId(r.u32()?)))?,
+                stack: r.seq(Reader::frame)?,
                 detail: Some(r.text()?).filter(|d| !d.is_empty()),
             },
             FAILED => Message::Failed(r.text()?),
@@ -429,7 +431,7 @@ impl Message {
                     task: r.u64()?,
                     func: FuncId(r.u32()?),
                     step: r.u32()?,
-                    callers: r.seq(|r| Ok(FuncId(r.u32()?)))?,
+                    callers: r.seq(Reader::frame)?,
                 })
             })?),
             RESUME => Message::Resume {
@@ -621,6 +623,17 @@ impl Writer {
             w.u32(o.position);
             w.u32(o.line);
             w.u32(o.column);
+            w.u32(o.inlined);
+            w.u32(o.offset);
+        });
+        self.seq(&o.inlined, |w, call| {
+            w.seq(&call.frames, |w, f| w.u32(f.0));
+            w.text(&call.module);
+        });
+        self.seq(&o.inlined_at, |w, range| {
+            w.u32(range.start);
+            w.u32(range.end);
+            w.u32(range.inlined);
         });
         self.seq(&o.details, |w, d| w.text(d));
         self.seq(&o.natives, |w, n| {
@@ -632,6 +645,11 @@ impl Writer {
 
     fn text(&mut self, text: &str) {
         self.seq(text.as_bytes(), |w, b| w.u8(*b));
+    }
+
+    fn frame(&mut self, frame: &Frame) {
+        self.u32(frame.func.0);
+        self.u8(u8::from(frame.inlined));
     }
 
     fn shapes(&mut self, shapes: &Shapes) {
@@ -857,6 +875,21 @@ impl Reader<'_> {
                     position: r.u32()?,
                     line: r.u32()?,
                     column: r.u32()?,
+                    inlined: r.u32()?,
+                    offset: r.u32()?,
+                })
+            })?,
+            inlined: self.seq(|r| {
+                Ok(InlinedCode {
+                    frames: r.seq(|r| Ok(FuncId(r.u32()?)))?,
+                    module: r.text()?,
+                })
+            })?,
+            inlined_at: self.seq(|r| {
+                Ok(InlinedRange {
+                    start: r.u32()?,
+                    end: r.u32()?,
+                    inlined: r.u32()?,
                 })
             })?,
             details: self.seq(Reader::text)?,
@@ -867,6 +900,13 @@ impl Reader<'_> {
                     threading: r.u8()?,
                 })
             })?,
+        })
+    }
+
+    fn frame(&mut self) -> io::Result<Frame> {
+        Ok(Frame {
+            func: FuncId(self.u32()?),
+            inlined: self.u8()? != 0,
         })
     }
 
@@ -1095,7 +1135,13 @@ mod tests {
                 task: 0x7f00_1234,
                 func: FuncId(3),
                 step: 2,
-                callers: vec![FuncId(4), FuncId(9)],
+                callers: vec![
+                    Frame {
+                        func: FuncId(4),
+                        inlined: true,
+                    },
+                    Frame::of(FuncId(9)),
+                ],
             }]),
             Message::Resume { task: 7, how: 2 },
             Message::Texts(vec!["1".into(), "Point(x: 1)".into()]),
@@ -1103,7 +1149,13 @@ mod tests {
             Message::Trapped {
                 kind: TrapKind::Overflow,
                 position: Some(17),
-                stack: vec![FuncId(9), FuncId(10)],
+                stack: vec![
+                    Frame {
+                        func: FuncId(9),
+                        inlined: true,
+                    },
+                    Frame::of(FuncId(10)),
+                ],
                 detail: None,
             },
             Message::Trapped {
@@ -1267,10 +1319,30 @@ mod tests {
                 kind: HandlerKind::Trap,
             }],
             module: "app".into(),
-            origins: vec![TrapOrigin {
-                position: 7,
-                line: 2,
-                column: 3,
+            origins: vec![
+                TrapOrigin {
+                    position: 7,
+                    line: 2,
+                    column: 3,
+                    inlined: 0,
+                    offset: 7,
+                },
+                TrapOrigin {
+                    position: crag_abi::INLINED_POSITION | 1,
+                    line: 5,
+                    column: 9,
+                    inlined: 1,
+                    offset: 40,
+                },
+            ],
+            inlined: vec![InlinedCode {
+                frames: vec![FuncId(12), FuncId(11)],
+                module: "lib".into(),
+            }],
+            inlined_at: vec![InlinedRange {
+                start: 2,
+                end: 6,
+                inlined: 1,
             }],
             details: vec!["NotFound".into()],
             natives: vec![NativeSymbol {

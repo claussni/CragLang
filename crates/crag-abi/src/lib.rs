@@ -722,15 +722,17 @@ pub enum RuntimeFn {
     /// its type to standard error.
     SignalDefault = 76,
 
-    /// `rt_step(ctx, cell, words, count, fp)`.
+    /// `rt_step(ctx, cell, words, count, fp, inlined)`.
     ///
     /// A statement's step, called while its flag is set (Implementation
     /// Plan §11.8.6): `cell` is the step's cell, whose second word names
     /// it (`step_cell_word`), so code holds no function id outside its
     /// relocations and can be kept across programs; the `count` words at
-    /// `words` are those of its locals, and `fp` is the frame pointer of
-    /// the calling frame. The debugger may stop the task here; it returns
-    /// once the task is resumed.
+    /// `words` are those of its locals, `fp` is the frame pointer of the
+    /// calling frame, and `inlined` how many inlined calls deep in the
+    /// frame's code the step is (Implementation Plan §11.10.1). The
+    /// debugger may stop the task here; it returns once the task is
+    /// resumed.
     Step = 77,
 
     /// `rt_io_print(ctx, w0, w1, newline) -> errno`.
@@ -1849,6 +1851,25 @@ pub const PAGE_USED_OFFSET: i32 = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FuncId(pub u32);
 
+/// A frame of a stack as traps and the debugger report it: a function,
+/// and whether its code was inlined into the frame after it, so that it
+/// had no frame of its own (Implementation Plan §11.10.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Frame {
+    pub func: FuncId,
+    pub inlined: bool,
+}
+
+impl Frame {
+    /// A function's own frame.
+    pub fn of(func: FuncId) -> Frame {
+        Frame {
+            func,
+            inlined: false,
+        }
+    }
+}
+
 /// A slot of the slot table that development images call through
 /// (Implementation Plan §11.6.4): a function with one signature. The host
 /// numbers signatures; code compiled against one signature only reaches
@@ -1926,6 +1947,13 @@ pub struct CodeObject {
     /// Where each position a trap of this code may name lies, ordered by
     /// position.
     pub origins: Vec<TrapOrigin>,
+    /// The calls whose callee's code the optimizer copied into this code
+    /// (Implementation Plan §11.10.1), which origins and `inlined_at`
+    /// index from one.
+    pub inlined: Vec<InlinedCode>,
+    /// Where the code of inlined calls lies, ordered by offset, so that a
+    /// return address in it is known to be in the callee.
+    pub inlined_at: Vec<InlinedRange>,
     /// What traps of this code name beyond their kind, such as the type of
     /// the error `!!` met: the upper half of a trap's position word, from
     /// one, indexes it.
@@ -1935,12 +1963,43 @@ pub struct CodeObject {
     pub natives: Vec<NativeSymbol>,
 }
 
-/// The line and column, from one, of a byte offset in a module's source.
+/// The line and column, from one, of a position a trap of the code names:
+/// the byte offset in the source of the code's module, or, in the code of
+/// an inlined call, [`INLINED_POSITION`] with a number of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TrapOrigin {
     pub position: u32,
     pub line: u32,
     pub column: u32,
+    /// The inlined call whose code it is in, from one; zero for the
+    /// code's own.
+    pub inlined: u32,
+    /// The byte offset in the source of the module the position is in.
+    pub offset: u32,
+}
+
+/// The bit of a trap's position that marks it as one in the code of an
+/// inlined call: source offsets stay below it.
+pub const INLINED_POSITION: u32 = 1 << 31;
+
+/// A call whose callee's code is part of another function's code.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct InlinedCode {
+    /// The callee, then the inlined calls whose code made the call in
+    /// turn, innermost first; the function the code belongs to is not
+    /// among them.
+    pub frames: Vec<FuncId>,
+    /// The callee's module, where the positions of its code lie.
+    pub module: String,
+}
+
+/// A run of an inlined call's code, as offsets in `CodeObject::code`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InlinedRange {
+    pub start: u32,
+    pub end: u32,
+    /// The call, from one, in `CodeObject::inlined`.
+    pub inlined: u32,
 }
 
 /// What a call's handler takes over from.

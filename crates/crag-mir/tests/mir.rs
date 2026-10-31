@@ -53,6 +53,11 @@ pub fn update[T, R](r: Ref[T], f: (T) -> R) -> () | Errs[R]
 /// The type errors of the module, then the MIR of every function, test
 /// and value of the module after a line with its name.
 fn mir_of(text: &str, steps: bool) -> String {
+    mir_in(text, steps, Tier::Baseline)
+}
+
+/// As `mir_of`, in a tier.
+fn mir_in(text: &str, steps: bool, tier: Tier) -> String {
     let db = RootDatabase::new();
     let core = ModuleId::new(
         &db,
@@ -81,12 +86,7 @@ fn mir_of(text: &str, steps: bool) -> String {
         }
         // The body, then the instances and closure code it reaches that
         // are not bodies of the module's functions, each once.
-        for key in collect_instances(
-            &db,
-            program,
-            &[InstanceKey::body(&db, owner)],
-            Tier::Baseline,
-        ) {
+        for key in collect_instances(&db, program, &[InstanceKey::body(&db, owner)], tier) {
             let own = key.args(&db).is_empty() && *key.entry(&db) == Entry::Body;
             if (own && *key.owner(&db) != owner) || !printed.insert(key) {
                 continue;
@@ -95,7 +95,7 @@ fn mir_of(text: &str, steps: bool) -> String {
                 true => name.clone(),
                 false => key_name(&db, key),
             };
-            let body = mir(&db, program, key, Tier::Baseline).as_ref().unwrap();
+            let body = mir(&db, program, key, tier).as_ref().unwrap();
             let pretty = body.pretty(&db);
             // The tests of other things leave the debugger's steps out.
             let pretty: String = pretty
@@ -1420,4 +1420,150 @@ fn steps_show_the_named_locals_that_hold_values() {
         ],
         "{found}"
     );
+}
+
+/// In the optimizing tier, a call of a small function becomes a copy of
+/// its code, whose blocks name the call; their reference counts follow
+/// the values through the copy. A guard falls back to the call once the
+/// function's slot holds other code. A recursive call stays a call.
+#[test]
+fn small_calls_are_inlined() {
+    let text = r#"fn inc(n: Int) -> Int {
+  n + 1
+}
+
+fn twice(n: Int) -> Int {
+  inc(inc(n))
+}
+
+fn keep(s: Str) -> Str {
+  s
+}
+
+fn shown(s: Str) -> Int {
+  size(keep(s)) + 1
+}
+
+fn count(n: Int) -> Int {
+  if n == 0 { 0 } else { 1 + count(n - 1) }
+}
+"#;
+    let found = mir_in(text, true, Tier::Optimizing);
+    let expected = r#"inc
+param _0: Int (n)
+let _1: Int
+let _2: False | True
+bb0:
+  step e3 [_0]
+  _2 = overflows Int.add(_0, 1)
+  branch _2 bb1 bb2
+bb1:
+  trap overflow
+bb2:
+  _1 = Int.add(_0, 1)
+  return _1
+twice
+param _0: Int (n)
+let _1: Int
+let _2: Int
+let _3: False | True
+let _4: Int
+let _5: False | True
+inlined i0: inc at e3
+inlined i1: inc at e4
+bb0:
+  step e4 [_0]
+  guard inc bb3 else bb2
+bb1:
+  guard inc bb7 else bb6
+bb2:
+  _1 = call inc(_0) -> bb1
+bb3 (i0):
+  step e3 [_0]
+  _3 = overflows Int.add(_0, 1)
+  branch _3 bb4 bb5
+bb4 (i0):
+  trap overflow
+bb5 (i0):
+  _2 = Int.add(_0, 1)
+  _1 = _2
+  jump bb1
+bb6:
+  tail call inc(_1)
+bb7 (i1):
+  step e3 [_1]
+  _5 = overflows Int.add(_1, 1)
+  branch _5 bb8 bb9
+bb8 (i1):
+  trap overflow
+bb9 (i1):
+  _4 = Int.add(_1, 1)
+  return _4
+keep
+param _0: Str (s)
+bb0:
+  step e0 [_0]
+  return _0
+shown
+param _0: Str (s)
+let _1: Str
+let _2: Int
+let _3: Int
+let _4: False | True
+inlined i0: keep at e3
+bb0:
+  step e7 [_0]
+  guard keep bb6 else bb5
+bb1:
+  _2 = call size(_1) -> bb2
+bb2:
+  _4 = overflows Int.add(_2, 1)
+  branch _4 bb3 bb4
+bb3:
+  trap overflow
+bb4:
+  _3 = Int.add(_2, 1)
+  return _3
+bb5:
+  _1 = call keep(_0) -> bb1
+bb6 (i0):
+  step e0 [_0]
+  _1 = _0
+  jump bb1
+count
+param _0: Int (n)
+let _1: False | True
+let _2: Int
+let _3: Int
+let _4: Int
+let _5: False | True
+let _6: False | True
+bb0:
+  step e16 [_0]
+  _1 = Int.eq(_0, 0)
+  branch _1 bb1 bb2
+bb1:
+  step e4 [_0]
+  return 0
+bb2:
+  step e14 [_0]
+  _5 = overflows Int.sub(_0, 1)
+  branch _5 bb4 bb5
+bb3:
+  _6 = overflows Int.add(1, _3)
+  branch _6 bb6 bb7
+bb4:
+  trap overflow
+bb5:
+  _2 = Int.sub(_0, 1)
+  _3 = call count(_2) -> bb3
+bb6:
+  trap overflow
+bb7:
+  _4 = Int.add(1, _3)
+  return _4
+"#;
+    if found != expected {
+        panic!("MIR differs; found:\n{found}");
+    }
 }

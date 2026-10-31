@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crag_abi::{CELL_FULL, FuncId, RuntimeFn, Shapes, SlotKey, TrapKind, TypeDescriptor};
+use crag_abi::{CELL_FULL, Frame, FuncId, RuntimeFn, Shapes, SlotKey, TrapKind, TypeDescriptor};
 use crag_backend::{code, func_id, shapes};
 use crag_codegen::{CodeObject, CodegenSettings, OptLevel, compile_entry_stub, target_for};
 use crag_eval::{EvalSite, const_eval};
@@ -70,11 +70,17 @@ pub struct Function {
     pub steps: Vec<StepView>,
 }
 
-/// A statement's step: where it starts in the module, and the locals whose
+/// A statement's step: where it starts in its module, and the locals whose
 /// words a stopped task has there, in order.
 #[derive(Clone, Debug)]
 pub struct StepView {
     pub position: Option<u32>,
+    /// The module the statement is in: the function's, or that of the
+    /// innermost function inlined where it is.
+    pub module: ModuleId,
+    /// The functions whose code was inlined where it is, innermost first
+    /// (Implementation Plan §11.10.1).
+    pub inlined: Vec<FuncId>,
     pub locals: Vec<LocalView>,
 }
 
@@ -194,6 +200,12 @@ pub fn compile<'a>(
                     .iter()
                     .map(|step| StepView {
                         position: step.position,
+                        module: step
+                            .inlined
+                            .first()
+                            .map_or(owner, |i| *i.owner(db))
+                            .module(db),
+                        inlined: step.inlined.iter().map(|&i| func_id(i)).collect(),
                         locals: step
                             .locals
                             .iter()
@@ -262,7 +274,7 @@ pub fn report(sources: &dyn Sources, functions: &HashMap<FuncId, Function>, trap
         None => trap_message(trap.kind).to_string(),
     };
     let what = what.as_str();
-    let first = trap.stack.first().map(|f| &functions[f]);
+    let first = trap.stack.first().map(|f| &functions[&f.func]);
     let mut out = match (first, trap.position) {
         (Some(f), Some(position)) => {
             let (file, source, position) = sources.locate(f.module, position);
@@ -273,9 +285,9 @@ pub fn report(sources: &dyn Sources, functions: &HashMap<FuncId, Function>, trap
     // Runs of one function, as recursion makes them, are told once.
     let mut k = 0;
     while k < trap.stack.len() {
-        let func = trap.stack[k];
-        let run = trap.stack[k..].iter().take_while(|&&f| f == func).count();
-        let name = &functions[&func].name;
+        let frame = trap.stack[k];
+        let run = trap.stack[k..].iter().take_while(|&&f| f == frame).count();
+        let name = frame_name(functions, frame);
         out += &match run {
             1 => format!("  in {name}\n"),
             n => format!("  in {name}, {n} frames\n"),
@@ -283,6 +295,18 @@ pub fn report(sources: &dyn Sources, functions: &HashMap<FuncId, Function>, trap
         k += run;
     }
     out
+}
+
+/// The name of a frame for reports: its function's, marked when its code
+/// was inlined into the frame after it.
+pub fn frame_name(functions: &HashMap<FuncId, Function>, frame: Frame) -> String {
+    let name = functions
+        .get(&frame.func)
+        .map_or_else(|| format!("function {}", frame.func.0), |f| f.name.clone());
+    match frame.inlined {
+        true => format!("{name} (inlined)"),
+        false => name,
+    }
 }
 
 /// The name of a body for reports: a function's, or a test's label.

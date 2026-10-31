@@ -384,6 +384,7 @@ pub fn code<'db>(
     Some(compile_cached(&lowered.lir, &settings).map(|mut object| {
         object.module = lowered.module.clone();
         object.origins = lowered.origins.clone();
+        object.inlined = lowered.inlined.clone();
         object.details = lowered.details.clone();
         Code {
             object,

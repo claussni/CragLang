@@ -220,6 +220,12 @@ fn errors_are_shown_against_the_input_and_change_nothing() {
     assert_eq!(eval(&mut r, "double(21)"), "42\n");
 }
 
+/// Whether the tests compile in the optimizing tier, which inlines small
+/// functions and reports them as inlined frames.
+fn optimizing() -> bool {
+    crag_mir::Tier::compiled() == crag_mir::Tier::Optimizing
+}
+
 #[test]
 fn a_trap_is_reported_against_the_input() {
     let mut r = repl();
@@ -227,9 +233,16 @@ fn a_trap_is_reported_against_the_input() {
         eval(&mut r, "fn ratio(a: Int, b: Int) -> Int { a / b }"),
         ""
     );
+    // The input tail-calls `ratio`, or, inlined, runs its code.
+    let frames = match optimizing() {
+        true => "  in ratio (inlined)\n  in the input\n",
+        false => "  in ratio\n",
+    };
     assert_eq!(
         eval(&mut r, "ratio(1, 0)"),
-        "trap: division by zero\n --> ratio:1:35\n  |\n1 | fn ratio(a: Int, b: Int) -> Int { a / b }\n  |                                   ^\n  in ratio\n"
+        format!(
+            "trap: division by zero\n --> ratio:1:35\n  |\n1 | fn ratio(a: Int, b: Int) -> Int {{ a / b }}\n  |                                   ^\n{frames}"
+        )
     );
     assert_eq!(
         eval(&mut r, "1 + 9223372036854775807"),

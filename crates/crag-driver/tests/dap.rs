@@ -273,9 +273,15 @@ fn an_editor_debugs_the_app_through_the_adapter() {
     );
     let trace = client.request("stackTrace", json!({"threadId": thread}));
     let top = &trace["stackFrames"][0];
-    assert_eq!(top["name"], "reply");
+    // The optimizing tier inlines `reply` into `serve`, and that into
+    // `main`, and says so.
+    let inlined = |name: &str| match crag_mir::Tier::compiled() {
+        crag_mir::Tier::Optimizing => format!("{name} (inlined)"),
+        _ => name.to_string(),
+    };
+    assert_eq!(top["name"], inlined("reply"));
     assert_eq!(top["line"], line);
-    assert_eq!(trace["stackFrames"][1]["name"], "serve");
+    assert_eq!(trace["stackFrames"][1]["name"], inlined("serve"));
     let scopes = client.request("scopes", json!({"frameId": top["id"]}));
     let reference = scopes["scopes"][0]["variablesReference"].clone();
     let variables = client.request("variables", json!({"variablesReference": reference}));

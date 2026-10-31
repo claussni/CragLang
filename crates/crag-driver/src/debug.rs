@@ -24,9 +24,11 @@
 //! flags, and a task that reaches one stops. Breakpoints are kept by file
 //! and line, so a reload, which moves the steps, places them again.
 
+use crag_abi::Frame;
 use crag_session::PausedTask;
 
 use crate::diagnostics::line_col;
+use crate::exec::frame_name;
 use crate::project::Project;
 use crate::scratch::Scratch;
 
@@ -67,15 +69,13 @@ impl Scratch {
         let mut steps = Vec::new();
         let mut placed = vec![0; breakpoints.len()];
         for (&func, f) in &self.app.functions {
-            let file = &project.file(f.module).shown;
-            let source = project.source(f.module);
             for (k, (want_file, want_line)) in breakpoints.iter().enumerate() {
-                if file != want_file {
-                    continue;
-                }
+                // Code inlined from elsewhere has steps of its module.
                 let first = f.steps.iter().position(|step| {
-                    step.position
-                        .is_some_and(|p| line_col(source, p).0 as u32 == *want_line)
+                    &project.file(step.module).shown == want_file
+                        && step.position.is_some_and(|p| {
+                            line_col(project.source(step.module), p).0 as u32 == *want_line
+                        })
                 });
                 if let Some(step) = first {
                     steps.push((func, step as u32));
@@ -104,26 +104,37 @@ impl Scratch {
     }
 
     fn pause(&self, project: &Project, task: &PausedTask) -> Pause {
-        let name = |func| {
-            self.app
-                .functions
-                .get(&func)
-                .map_or_else(|| format!("function {}", func.0), |f| f.name.clone())
-        };
-        let (file, line) = match self.app.functions.get(&task.func) {
-            Some(f) => {
-                let position = f.steps.get(task.step as usize).and_then(|s| s.position);
-                let line = position.map_or(0, |p| line_col(project.source(f.module), p).0 as u32);
-                (project.file(f.module).shown.clone(), line)
+        let functions = &self.app.functions;
+        let step = functions
+            .get(&task.func)
+            .and_then(|f| f.steps.get(task.step as usize));
+        let (file, line) = match step {
+            Some(step) => {
+                let source = project.source(step.module);
+                let line = step.position.map_or(0, |p| line_col(source, p).0 as u32);
+                (project.file(step.module).shown.clone(), line)
             }
             None => (String::new(), 0),
         };
+        // A step in inlined code stops in the innermost function inlined
+        // there, which the others and the function itself called.
+        let inlined = step.map_or(&[][..], |s| &s.inlined[..]);
+        let mut frames: Vec<Frame> = inlined
+            .iter()
+            .map(|&func| Frame {
+                func,
+                inlined: true,
+            })
+            .collect();
+        frames.push(Frame::of(task.func));
+        frames.extend(&task.callers);
+        let mut names = frames.into_iter().map(|f| frame_name(functions, f));
         Pause {
             task: task.task,
-            function: name(task.func),
+            function: names.next().unwrap_or_default(),
             file,
             line,
-            callers: task.callers.iter().map(|&f| name(f)).collect(),
+            callers: names.collect(),
         }
     }
 

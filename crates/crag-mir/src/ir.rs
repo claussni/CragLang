@@ -62,6 +62,21 @@ pub struct MirBody<'db> {
     /// What the builder does not lower yet; each traps where it is
     /// reached.
     pub unsupported: Vec<(ExprId, &'static str)>,
+    /// The calls whose callee's code the optimizer copied in their place
+    /// (Plan §11.10.1), which the blocks of that code name.
+    pub inlined: Vec<Inlined<'db>>,
+}
+
+/// A call replaced by its callee's code. The expressions the sites of
+/// that code name are the callee's owner's, in the callee's module.
+#[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
+pub struct Inlined<'db> {
+    pub func: InstanceKey<'db>,
+    /// The call's expression, in the code of `parent`.
+    pub site: ExprId,
+    /// The inlined call whose code made the call; none for the body's
+    /// own code.
+    pub parent: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
@@ -87,6 +102,9 @@ pub struct Block<'db> {
     /// The handler of the trap handler around the block's code, which the
     /// checks of its arithmetic go to (§8.3.1).
     pub catch: Option<BlockId>,
+    /// The inlined call whose code the block is, by its index in
+    /// `MirBody::inlined`; none for the body's own code.
+    pub inlined: Option<u32>,
 }
 
 /// A local, or a part of the value in it.
@@ -664,6 +682,16 @@ pub enum Terminator<'db> {
         site: ExprId,
     },
     Return(Operand<'db>),
+    /// Goes to `inlined`, a copy of the function's code in place of a call
+    /// of it, while the function's slot holds the code loaded with this
+    /// code, and otherwise to `fallback`, which makes the call (Plan
+    /// §11.10.1): a reload that replaces the function reaches a frame
+    /// that runs on, as it reaches a call.
+    Guard {
+        func: InstanceKey<'db>,
+        inlined: BlockId,
+        fallback: BlockId,
+    },
     Trap {
         kind: TrapKind,
         site: Option<ExprId>,
@@ -699,6 +727,9 @@ impl<'db> Terminator<'db> {
                 ..
             } => [*target].into_iter().chain(*unwind).chain(*catch).collect(),
             Terminator::Trap { catch, .. } => catch.iter().copied().collect(),
+            Terminator::Guard {
+                inlined, fallback, ..
+            } => vec![*inlined, *fallback],
             Terminator::TailCall { .. }
             | Terminator::TailCallValue { .. }
             | Terminator::Return(_) => Vec::new(),
@@ -735,6 +766,9 @@ impl<'db> Terminator<'db> {
                 .chain(catch.as_mut())
                 .collect(),
             Terminator::Trap { catch, .. } => catch.as_mut().into_iter().collect(),
+            Terminator::Guard {
+                inlined, fallback, ..
+            } => vec![inlined, fallback],
             Terminator::TailCall { .. }
             | Terminator::TailCallValue { .. }
             | Terminator::Return(_) => Vec::new(),
@@ -840,7 +874,7 @@ impl<'db> Terminator<'db> {
                 out.extend(args.iter_mut().filter_map(Operand::locals_mut));
                 out
             }
-            Terminator::Jump(_) | Terminator::Trap { .. } => Vec::new(),
+            Terminator::Jump(_) | Terminator::Trap { .. } | Terminator::Guard { .. } => Vec::new(),
         }
     }
 }
@@ -897,8 +931,22 @@ impl<'db> MirBody<'db> {
                 local.ty.display(db)
             );
         }
+        for (i, inlined) in self.inlined.iter().enumerate() {
+            let parent = match inlined.parent {
+                Some(p) => format!(" in i{p}"),
+                None => String::new(),
+            };
+            out += &format!(
+                "inlined i{i}: {} at e{}{parent}\n",
+                func_name(db, inlined.func),
+                inlined.site.0
+            );
+        }
         for (i, block) in self.blocks.iter().enumerate() {
-            out += &format!("bb{i}:\n");
+            match block.inlined {
+                Some(k) => out += &format!("bb{i} (i{k}):\n"),
+                None => out += &format!("bb{i}:\n"),
+            }
             for statement in &block.statements {
                 out += &format!("  {}\n", statement_text(db, statement));
             }
@@ -1100,6 +1148,16 @@ fn terminator_text<'db>(db: &'db dyn Db, terminator: &Terminator<'db>) -> String
         Terminator::TailCallValue { callee, args, .. } => {
             format!("tail call value {}({})", op(callee), ops(args))
         }
+        Terminator::Guard {
+            func,
+            inlined,
+            fallback,
+        } => format!(
+            "guard {} bb{} else bb{}",
+            func_name(db, *func),
+            inlined.0,
+            fallback.0
+        ),
         Terminator::Return(o) => format!("return {}", op(o)),
         Terminator::Trap { kind, .. } => {
             let kind = match kind {

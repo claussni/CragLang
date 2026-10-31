@@ -207,7 +207,7 @@ pub struct Fiber {
     pub(crate) trap: Option<Trap>,
     /// The frames the trap a handler took last had unwound, so that one
     /// raised again reports where it began (Specification §8.3.1).
-    pub(crate) caught_stack: Vec<crag_abi::FuncId>,
+    pub(crate) caught_stack: Vec<crag_abi::Frame>,
     /// What metered code it runs may still use, if it is metered.
     pub(crate) metering: Option<Metering>,
     /// What it waits for while it is suspended.

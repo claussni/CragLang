@@ -47,7 +47,7 @@ extern crate crag_db as salsa;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use crag_abi::{CELL_FULL, CELL_VALUE_OFFSET, FuncId, RuntimeFn, Shapes, SlotKey, TrapKind};
+use crag_abi::{CELL_FULL, CELL_VALUE_OFFSET, Frame, FuncId, RuntimeFn, Shapes, SlotKey, TrapKind};
 use crag_backend::{Layout, code, field_words, func_id, layout, shapes, type_index};
 use crag_codegen::{CodegenSettings, OptLevel, Target, compile_entry_stub, target_for};
 use crag_db::{Db, catch_cancelled, check_cancelled};
@@ -481,7 +481,9 @@ impl<'db> Evaluation<'db> {
                         "it reaches code the compiler does not support yet".into(),
                     ),
                     kind => {
-                        let func = |f: &FuncId| self.functions.get(f);
+                        // Metered code inlines nothing, so each frame is
+                        // its function's own.
+                        let func = |f: &Frame| self.functions.get(&f.func);
                         EvalError::Trap {
                             kind,
                             position: trap

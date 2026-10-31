@@ -140,6 +140,7 @@ fn items(statements: Vec<Statement<'_>>) -> Vec<Item<'_>> {
 fn split<'db>(body: &mut MirBody<'db>, b: usize, items: Vec<Item<'db>>) {
     // The checks go to the trap handler around the block's code.
     let catch = body.blocks[b].catch;
+    let inlined = body.blocks[b].inlined;
     let terminator = std::mem::replace(
         &mut body.blocks[b].terminator,
         Terminator::Trap {
@@ -173,6 +174,7 @@ fn split<'db>(body: &mut MirBody<'db>, b: usize, items: Vec<Item<'db>>) {
                         catch,
                     },
                     catch,
+                    inlined,
                 );
                 let next = push(
                     body,
@@ -183,6 +185,7 @@ fn split<'db>(body: &mut MirBody<'db>, b: usize, items: Vec<Item<'db>>) {
                         catch: None,
                     },
                     catch,
+                    inlined,
                 );
                 body.blocks[current] = Block {
                     statements: std::mem::take(&mut statements),
@@ -192,6 +195,7 @@ fn split<'db>(body: &mut MirBody<'db>, b: usize, items: Vec<Item<'db>>) {
                         otherwise: next,
                     },
                     catch,
+                    inlined,
                 };
                 current = next.index();
             }
@@ -201,6 +205,7 @@ fn split<'db>(body: &mut MirBody<'db>, b: usize, items: Vec<Item<'db>>) {
         statements,
         terminator,
         catch,
+        inlined,
     };
 }
 
@@ -208,11 +213,13 @@ fn push<'db>(
     body: &mut MirBody<'db>,
     terminator: Terminator<'db>,
     catch: Option<BlockId>,
+    inlined: Option<u32>,
 ) -> BlockId {
     body.blocks.push(Block {
         statements: Vec::new(),
         terminator,
         catch,
+        inlined,
     });
     BlockId(body.blocks.len() as u32 - 1)
 }

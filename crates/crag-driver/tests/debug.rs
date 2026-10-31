@@ -163,6 +163,12 @@ fn stopped(s: &mut Setup) -> Pause {
     }
 }
 
+/// Whether the tests compile in the optimizing tier, which inlines small
+/// functions and reports them as inlined frames.
+fn optimizing() -> bool {
+    crag_mir::Tier::compiled() == crag_mir::Tier::Optimizing
+}
+
 #[test]
 fn a_breakpoint_stops_the_task_that_reaches_it() {
     let mut s = setup("break");
@@ -173,11 +179,16 @@ fn a_breakpoint_stops_the_task_that_reaches_it() {
         .scratch
         .set_breakpoints(&s.project, &[("app.crag".into(), line)])
         .unwrap();
-    assert_eq!(placed, [1]);
+    // Inlined, the line is in the copies in `serve` and `main` too.
+    assert_eq!(placed, [if optimizing() { 3 } else { 1 }]);
     let port = s.port;
     let client = std::thread::spawn(move || ask(port));
+    let reply = match optimizing() {
+        true => "reply (inlined)",
+        false => "reply",
+    };
     let pause = stopped(&mut s);
-    assert_eq!(pause.function, "reply");
+    assert_eq!(pause.function, reply);
     assert_eq!((pause.file.as_str(), pause.line), ("app.crag", line));
     assert_eq!(pause.callers.first().map(String::as_str), Some("serve"));
     // The locals that hold values there, `n` of the second connection
@@ -207,7 +218,7 @@ fn a_breakpoint_stops_the_task_that_reaches_it() {
     // Over the statement: the next one in the same function.
     s.scratch.resume(pause.task, Resume::Over).unwrap();
     let next = stopped(&mut s);
-    assert_eq!((next.function.as_str(), next.line), ("reply", line + 1));
+    assert_eq!((next.function.as_str(), next.line), (reply, line + 1));
     let locals = s.scratch.locals(next.task).unwrap();
     assert!(
         locals.contains(&("doubled".into(), "4".into())),
@@ -217,8 +228,12 @@ fn a_breakpoint_stops_the_task_that_reaches_it() {
     // Into the call of `answer`.
     s.scratch.resume(next.task, Resume::Into).unwrap();
     let inner = stopped(&mut s);
-    assert_eq!(inner.function, "answer");
-    assert_eq!(inner.callers.first().map(String::as_str), Some("reply"));
+    let inlined = |name: &str| match optimizing() {
+        true => format!("{name} (inlined)"),
+        false => name.to_string(),
+    };
+    assert_eq!(inner.function, inlined("answer"));
+    assert_eq!(inner.callers.first(), Some(&inlined("reply")));
 
     // Out: steps are at the starts of statements, and `reply` has none
     // after the call, so the next is in `serve`, which called it.
@@ -256,6 +271,8 @@ fn breakpoints_survive_a_reload_and_a_stop_releases_stopped_tasks() {
     s.scratch.reload(&s.project).unwrap();
     let port = s.port;
     let client = std::thread::spawn(move || ask(port));
+    // The frame waiting for the connection has old code; inlined, its copy
+    // of `reply` was replaced, so it calls the new one.
     let pause = stopped(&mut s);
     assert_eq!((pause.function.as_str(), pause.line), ("reply", line));
     // Stopping the app lets the stopped task go, so it can be cancelled.
@@ -297,13 +314,20 @@ fn the_repl_debugs_the_app() {
         assert!(Instant::now() < deadline, "no task stopped");
         std::thread::sleep(Duration::from_millis(5));
     };
-    assert_eq!(
-        paused,
-        format!("1: reply at app.crag:{line}, called from serve\n")
-    );
+    let paused_at = match optimizing() {
+        true => {
+            format!("1: reply (inlined) at app.crag:{line}, called from serve (inlined), main\n")
+        }
+        false => format!("1: reply at app.crag:{line}, called from serve\n"),
+    };
+    assert_eq!(paused, paused_at);
     let locals = eval(":locals");
     assert!(locals.contains("n = 1\n"), "{locals}");
-    assert_eq!(eval(":next"), format!("reply at app.crag:{}\n", line + 1));
+    let reply = match optimizing() {
+        true => "reply (inlined)",
+        false => "reply",
+    };
+    assert_eq!(eval(":next"), format!("{reply} at app.crag:{}\n", line + 1));
     assert!(eval(":locals 1").contains("doubled = 2\n"));
     assert_eq!(eval(":locals 2"), "error: only 1 task is stopped\n");
     assert_eq!(eval(":clear"), "no breakpoints\n");
