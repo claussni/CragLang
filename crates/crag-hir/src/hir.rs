@@ -645,8 +645,32 @@ pub enum TypeTarget<'db> {
     Item(ItemId<'db>),
     /// A type parameter, by index into the body's type parameters.
     Param(u32),
+    /// A marker the compiler owns, which only a bound may name (§3.11).
+    Marker(Marker),
     /// Reported.
     Unresolved,
+}
+
+/// The markers a bound may name, `[T: Solid]`: they are owned by the
+/// compiler and declared nowhere (§3.11, §19.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
+pub enum Marker {
+    Solid,
+}
+
+impl Marker {
+    pub fn from_name(name: &str) -> Option<Marker> {
+        match name {
+            "Solid" => Some(Marker::Solid),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Marker::Solid => "Solid",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]

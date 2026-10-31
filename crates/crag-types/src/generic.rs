@@ -32,12 +32,13 @@
 
 use crag_db::Db;
 use crag_hir::{
-    ItemId, ItemKind, ModuleId, Name, Owner, Program, Requirement, Resolution, TypeArg, TypeRef,
-    TypeRefId, TypeTarget, hir_body, module_scope,
+    ItemId, ItemKind, Marker, ModuleId, Name, Owner, Program, Requirement, Resolution, TypeArg,
+    TypeRef, TypeRefId, TypeTarget, hir_body, module_scope,
 };
 
 use crate::def::{SigParam, TypeLowerer, own_type_params, signature, type_header};
 use crate::group::result_type;
+use crate::marker::{NotSolid, solid};
 use crate::overload::{Ranked, most_specific};
 use crate::relate::{is_subtype, join, normalize, parent, subst};
 use crate::result::{ErrorKind, Site, TypeError};
@@ -84,6 +85,8 @@ pub struct Bounds<'db> {
     /// Unions of forms, of which at least one must fit (§4.7). They give
     /// no slots.
     pub any_of: Vec<Vec<FormBound<'db>>>,
+    /// The markers a type parameter must have, by its index (§3.11).
+    pub markers: Vec<(u32, Marker)>,
     pub errors: Vec<TypeError<'db>>,
 }
 
@@ -162,6 +165,13 @@ pub enum FitError<'db> {
     /// A type does not fit a derived form by its structure, or forbids
     /// the form (§19.11, §3.11).
     NotDerived { form: String, ty: Ty<'db> },
+    /// A type argument is not `Solid` where its parameter's bound says it
+    /// must be (§3.11).
+    NotSolid {
+        param: Name<'db>,
+        arg: Ty<'db>,
+        why: NotSolid<'db>,
+    },
 }
 
 impl<'db> FitError<'db> {
@@ -202,6 +212,11 @@ impl<'db> FitError<'db> {
                 "{} does not fit `{form}`: it forbids it, or holds a function or a part that does not fit; declare its own",
                 ty.display(db)
             ),
+            FitError::NotSolid { param, arg, why } => format!(
+                "the bound `Solid` of `{}` does not hold: {}",
+                param.text(db),
+                why.message(db, *arg)
+            ),
         }
     }
 }
@@ -209,6 +224,7 @@ impl<'db> FitError<'db> {
 /// A requirement as lowered: a named bound, a form, or a union of forms.
 enum Req<'db> {
     Type(u32, Ty<'db>),
+    Marker(u32, Marker),
     Form(FormBound<'db>),
     AnyOf(Vec<FormBound<'db>>),
 }
@@ -289,6 +305,20 @@ fn requirement<'db>(lower: &mut TypeLowerer<'_, 'db>, req: &Requirement) -> Opti
     if form_ref(db, lower, req.ty).is_some() {
         return form_bound(lower, req.ty, param).map(Req::Form);
     }
+    if let TypeRef::Named {
+        target: TypeTarget::Marker(marker),
+        ..
+    } = lower.body.type_ref(req.ty)
+    {
+        let marker = *marker;
+        return match req.param {
+            Some(i) => Some(Req::Marker(i, marker)),
+            None => {
+                lower.error(Site::Type(req.ty), ErrorKind::MarkerNotAType { marker });
+                None
+            }
+        };
+    }
     let ty = lower.lower(req.ty);
     match req.param {
         Some(i) => Some(Req::Type(i, ty)),
@@ -321,6 +351,10 @@ pub fn form_def<'db>(db: &'db dyn Db, program: Program, form: ItemId<'db>) -> Fo
             Some(Req::AnyOf(bounds)) => def.any_of.push(bounds),
             Some(Req::Type(..)) => {
                 let kind = ErrorKind::Unsupported("named types as bounds of forms");
+                lower.error(Site::Type(req.ty), kind);
+            }
+            Some(Req::Marker(..)) => {
+                let kind = ErrorKind::Unsupported("markers as bounds of forms");
                 lower.error(Site::Type(req.ty), kind);
             }
             None => {}
@@ -385,6 +419,7 @@ pub fn bounds<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> Boun
         }
         match requirement(&mut lower, req) {
             Some(Req::Type(i, ty)) => bounds.types.push((i, ty)),
+            Some(Req::Marker(i, marker)) => bounds.markers.push((i, marker)),
             Some(Req::Form(bound)) => forms.push(bound),
             Some(Req::AnyOf(union)) => bounds.any_of.push(union),
             None => {}
@@ -535,6 +570,21 @@ fn instantiate_at<'db>(
         if !is_subtype(db, program, arg, bound) {
             let param = type_param_names(db, program, function)[i as usize];
             return Err(FitError::Bound { param, arg, bound });
+        }
+    }
+    for &(i, marker) in &b.markers {
+        let arg = args
+            .get(i as usize)
+            .copied()
+            .unwrap_or_else(|| Ty::error(db));
+        match marker {
+            Marker::Solid => {
+                if let Err(why) = solid(db, program, arg) {
+                    let param = type_param_names(db, program, function)[i as usize];
+                    let why = why.clone();
+                    return Err(FitError::NotSolid { param, arg, why });
+                }
+            }
         }
     }
     let mut fillings = Vec::new();

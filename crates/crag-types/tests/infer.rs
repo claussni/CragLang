@@ -1895,3 +1895,50 @@ fn sum(ps: List[Point]) -> Int { 0 }
 fn total() -> Int { sum([Point(x: 1, y: 2), Point(x: 3, y: 4)]) }";
     assert_eq!(ok(text), ["ps: List[Point], -> Int", "-> Int"]);
 }
+
+#[test]
+fn solid_is_decided_from_types() {
+    let text = "type Good(a: Int, b: List[Str], f: ((Int) -> Int is Pure)) is Solid
+type Checked(v: Int) is Solid where v == 0
+type Shape(x: Int)
+type Box[T: Solid](v: T) is Solid
+fn keep[T: Solid](x: T) -> T { x }
+fn f(g: Good, s: Shape) {
+  keep(g)
+  keep(s)
+  keep([1, 2])
+}";
+    assert_eq!(errors(text), Vec::<String>::new());
+    let text = "import cLib(\"m\").{ now() -> Int }
+type Impure(f: (Int) -> Int) is Solid
+type Timed(v: Int) is Solid where v == now()
+type Later(l: Lazy[Int]) is Solid
+type Open(r: (x: Int, ..)) is Solid
+type Free[T](v: T) is Solid
+type Cell(r: Ref[Int]) is Solid
+type Shape(x: Int)
+type Round(..Shape, f: () -> Int)
+type Holder(s: Shape) is Solid
+type Plain(a: Int) is not Solid
+fn keep[T: Solid](x: T) -> T { x }
+fn f(p: Plain, l: Lazy[Int]) {
+  keep(p)
+  keep(l)
+}
+fn g(x: Solid) {}";
+    assert_eq!(
+        errors(text),
+        [
+            "`Impure`: Impure is not Solid: its field `f` holds (Int) -> Int, which is a function that is not `is Pure`",
+            "`Timed`: Timed is not Solid: it has conditions with effects",
+            "`Later`: Later is not Solid: its field `l` holds Lazy[Int], which may trap when it is read",
+            "`Open`: Open is not Solid: its field `r` holds (x: Int, ..), which is an open record, so it may hold any fields",
+            "`Free`: Free[T] is not Solid: its field `v` holds T, which is a type parameter without the bound `Solid`",
+            "`Cell`: Cell is not Solid: its field `r` holds Ref[Int], which is a cell",
+            "`Holder`: Holder is not Solid: its field `s` may hold a Round, whose field `f` holds () -> Int, which is a function that is not `is Pure`",
+            "`keep(p)`: the bound `Solid` of `T` does not hold: Plain is not Solid: it is marked `not Solid`",
+            "`keep(l)`: the bound `Solid` of `T` does not hold: Lazy[Int] is not Solid: it may trap when it is read",
+            "`Solid`: `Solid` is a marker, which only a bound may name, as in `[T: Solid]`",
+        ]
+    );
+}

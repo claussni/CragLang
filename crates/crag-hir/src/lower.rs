@@ -1949,6 +1949,9 @@ impl<'a, 'db> Lowerer<'a, 'db> {
         let target = match (param, self.scope.resolve(name)) {
             (Some(&(_, index)), _) => TypeTarget::Param(index),
             (None, Some(Resolution::Type(id) | Resolution::Form(id))) => TypeTarget::Item(*id),
+            (None, None) if let Some(marker) = Marker::from_name(token.text()) => {
+                TypeTarget::Marker(marker)
+            }
             _ => {
                 self.errors.push(LowerError::UnknownType {
                     name: token.text().to_string(),

@@ -39,6 +39,7 @@ mod generic;
 mod group;
 mod handler;
 mod infer;
+mod marker;
 mod overload;
 mod refine;
 mod relate;
@@ -70,6 +71,7 @@ pub use handler::{
     Handler, HandlerCode, Handlers, dispose_handler, lifecycle_handler, type_handlers,
 };
 pub use infer::{constant as literal_value, is_source, is_text};
+pub use marker::{NotSolid, SolidStep, Why, holds_secret, solid};
 pub use overload::{
     FinalError, Ranked, Specificity, compare_param, final_errors, most_specific, overload_errors,
 };
@@ -106,6 +108,7 @@ pub fn module_type_errors<'db>(
         .chain(recursion_errors(db, program, module))
         .chain(&derive::ban_errors(db, program, module))
         .chain(&c::c_errors(db, program, module))
+        .chain(&marker::marker_errors(db, program, module))
         .map(|(item, e)| (Owner::Item(*item), e.clone()))
         .collect();
     for owner in owners(db, module) {

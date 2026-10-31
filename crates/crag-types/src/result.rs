@@ -18,11 +18,12 @@
 //! every call, and the errors, each at the node it is about.
 
 use crag_db::Db;
-use crag_hir::{BindingId, BodySourceMap, ExprId, ItemId, Name, PatId, TypeRefId};
+use crag_hir::{BindingId, BodySourceMap, ExprId, ItemId, Marker, Name, PatId, TypeRefId};
 
 use crate::effect::{EffectSet, Restriction};
 use crate::escape::{BindingsOnly, Escapes};
 use crate::generic::{Filling, FitError, Instance};
+use crate::marker::NotSolid;
 use crate::ty::Ty;
 
 /// How a `for` walks what it iterates, where the compiler does not know
@@ -489,6 +490,15 @@ pub enum ErrorKind<'db> {
     EmbedHandler {
         ty: Ty<'db>,
     },
+    /// A type marked `is Solid` that is not (§3.11).
+    NotSolid {
+        ty: Ty<'db>,
+        why: NotSolid<'db>,
+    },
+    /// A marker where a type belongs: only a bound may name one (§3.11).
+    MarkerNotAType {
+        marker: Marker,
+    },
     /// Something core inference does not handle yet; later milestones of
     /// the Implementation Plan add it.
     Unsupported(&'static str),
@@ -651,6 +661,12 @@ impl<'db> ErrorKind<'db> {
             ),
             ErrorKind::Unfit(fit) => fit.message(db),
             ErrorKind::NotAForm { ty } => format!("{} is not a form", ty.display(db)),
+            ErrorKind::NotSolid { ty, why } => why.message(db, *ty),
+            ErrorKind::MarkerNotAType { marker } => format!(
+                "`{}` is a marker, which only a bound may name, as in `[T: {}]`",
+                marker.name(),
+                marker.name()
+            ),
             ErrorKind::MixedBound => "a bound unites forms or types, not both".into(),
             ErrorKind::NoErrors { function } => {
                 format!("`{}` of a value that has no errors", item(function))

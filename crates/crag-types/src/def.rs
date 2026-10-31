@@ -658,6 +658,10 @@ impl<'a, 'db> TypeLowerer<'a, 'db> {
         let db = self.db;
         let item = match target {
             TypeTarget::Unresolved => return Ty::error(db),
+            TypeTarget::Marker(marker) => {
+                self.error(Site::Type(id), ErrorKind::MarkerNotAType { marker });
+                return Ty::error(db);
+            }
             TypeTarget::Param(index) => {
                 if !args.is_empty() {
                     let kind = ErrorKind::TypeArgCount {

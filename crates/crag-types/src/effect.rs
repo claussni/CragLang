@@ -394,6 +394,11 @@ impl<'a, 'db> Walker<'a, 'db> {
         if pure {
             self.restrict(&found, Restriction::Pure);
         }
+        // A type's conditions run for every construction; their effects
+        // are the type's, and keep it from being Solid (§3.11).
+        for condition in self.body.type_decl.iter().flat_map(|d| &d.conditions) {
+            self.walk(condition.value, &mut found);
+        }
         for field in self.body.type_decl.iter().flat_map(|d| &d.fields) {
             if let Some(default) = field.default {
                 let mut own = Vec::new();

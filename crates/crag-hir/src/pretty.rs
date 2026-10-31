@@ -421,7 +421,7 @@ impl Printer<'_, '_> {
                         let _ = write!(out, "'{index}");
                     }
                     TypeTarget::Unresolved => out.push('?'),
-                    TypeTarget::Item(_) => {}
+                    TypeTarget::Item(_) | TypeTarget::Marker(_) => {}
                 }
                 if !args.is_empty() {
                     let args: Vec<String> = args.iter().map(|a| self.type_arg(a)).collect();
