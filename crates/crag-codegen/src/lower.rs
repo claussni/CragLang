@@ -21,7 +21,8 @@ use std::collections::HashMap;
 
 use crag_abi::{
     CELL_STATE_OFFSET, FRAME_BUDGET, FUEL_OFFSET, HandlerKind, InlinedRange, NO_POSITION,
-    RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET, STACK_LIMIT_OFFSET,
+    PROFILE_CALLS_OFFSET, PROFILE_LOOPS_OFFSET, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET,
+    STACK_LIMIT_OFFSET,
 };
 use cranelift_codegen::binemit::Reloc as ClifReloc;
 use cranelift_codegen::control::ControlPlane;
@@ -130,7 +131,7 @@ pub fn compile(lir: &LirFunction, settings: &CodegenSettings) -> Result<CodeObje
     lir.validate().map_err(CodegenError::InvalidLir)?;
     let isa = settings.target.isa(settings.opt);
 
-    let (func, keys) = build_body(lir, isa, settings.metered);
+    let (func, keys) = build_body(lir, isa, settings.metered, settings.profile);
     let body = run_backend(isa, func, &keys)?;
     let footprint = body.footprint(isa, tail_args_growth(lir));
     if footprint <= FRAME_BUDGET {
@@ -633,6 +634,17 @@ fn emit_fuel_check(b: &mut FunctionBuilder, imports: &mut Imports, ctx: Value) {
     b.switch_to_block(done);
 }
 
+/// Emits one more of what the word at `offset` of a function's profile
+/// cell counts. The add is not atomic: a count that misses a few is good
+/// enough to find hot code.
+fn emit_count(b: &mut FunctionBuilder, imports: &mut Imports, func: FuncId, offset: i32) {
+    let cell = imports.symbol(b, NS_CELL, crag_abi::profile_cell(func));
+    let cell = b.ins().symbol_value(I64, cell);
+    let count = b.ins().load(I64, MemFlagsData::trusted(), cell, offset);
+    let count = b.ins().iadd_imm_s(count, 1);
+    b.ins().store(MemFlagsData::trusted(), count, cell, offset);
+}
+
 /// Emits a side-stack push at the current position, leaves the builder in
 /// the block that follows it and returns the address of the new bytes.
 ///
@@ -684,7 +696,12 @@ fn emit_side_push(
 
 /// The body and the keys of the slots it calls through and the cells it
 /// names.
-fn build_body(lir: &LirFunction, isa: &dyn TargetIsa, metered: bool) -> (Function, Vec<SlotKey>) {
+fn build_body(
+    lir: &LirFunction,
+    isa: &dyn TargetIsa,
+    metered: bool,
+    profile: Option<FuncId>,
+) -> (Function, Vec<SlotKey>) {
     let sig = crag_signature(lir.params, lir.returns);
     let mut func = Function::with_name_signature(UserFuncName::default(), sig);
     let mut fb_ctx = FunctionBuilderContext::new();
@@ -711,6 +728,9 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa, metered: bool) -> (Functio
     emit_stack_check(&mut b, &mut imports, ctx, 0);
     if metered {
         emit_fuel_check(&mut b, &mut imports, ctx);
+    }
+    if let Some(func) = profile {
+        emit_count(&mut b, &mut imports, func, PROFILE_CALLS_OFFSET);
     }
 
     // The side-stack mark: both fields as they were on entry. Storing them
@@ -1038,6 +1058,9 @@ fn build_body(lir: &LirFunction, isa: &dyn TargetIsa, metered: bool) -> (Functio
                     emit_stack_check(&mut b, &mut imports, ctx, 0);
                     if metered {
                         emit_fuel_check(&mut b, &mut imports, ctx);
+                    }
+                    if let Some(func) = profile {
+                        emit_count(&mut b, &mut imports, func, PROFILE_LOOPS_OFFSET);
                     }
                 }
                 Inst::Inlined(k) => b.set_srcloc(SourceLoc::new(*k)),

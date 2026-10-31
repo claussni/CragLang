@@ -451,6 +451,7 @@ impl<'db> Evaluation<'db> {
             target: host().clone(),
             opt: OptLevel::None,
             metered: false,
+            profile: None,
         };
         let stub =
             compile_entry_stub(args.len() as u32, returns, &settings).expect("the stub compiles");

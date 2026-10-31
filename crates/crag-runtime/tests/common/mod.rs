@@ -54,6 +54,7 @@ impl Image {
             target: target_for("x86_64-unknown-linux-gnu").unwrap(),
             opt: OptLevel::None,
             metered,
+            profile: None,
         };
         let objects: Vec<CodeObject> = functions
             .iter()

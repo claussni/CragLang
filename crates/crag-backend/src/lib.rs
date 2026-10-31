@@ -121,8 +121,8 @@ fn compile_cached(
         return compile(lir, settings).map_err(|e| e.to_string());
     };
     let text = format!(
-        "{HOST_TRIPLE} {:?} {}\n{lir:?}",
-        settings.opt, settings.metered
+        "{HOST_TRIPLE} {:?} {} {:?}\n{lir:?}",
+        settings.opt, settings.metered, settings.profile
     );
     let Some((input, ids)) = canonical(&text) else {
         return compile(lir, settings).map_err(|e| e.to_string());
@@ -380,6 +380,9 @@ pub fn code<'db>(
             Tier::Baseline | Tier::Metered => OptLevel::None,
         },
         metered: tier == Tier::Metered,
+        // Hot baseline code is compiled again in the optimizing tier
+        // (Plan §11.10.2).
+        profile: (tier == Tier::Baseline).then(|| func_id(instance)),
     };
     Some(compile_cached(&lowered.lir, &settings).map(|mut object| {
         object.module = lowered.module.clone();

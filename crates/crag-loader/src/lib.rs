@@ -181,6 +181,13 @@ impl CellTable {
         Some(self.cell(*self.index.get(&key)?)[0].load(Ordering::Acquire))
     }
 
+    /// The words of a key's cell, state word first, as code wrote them
+    /// last, such as the counts in a profile cell.
+    pub fn words(&self, key: SlotKey) -> Option<[u64; CELL_SIZE / 8]> {
+        let cell = self.cell(*self.index.get(&key)?);
+        Some(std::array::from_fn(|i| cell[i].load(Ordering::Relaxed)))
+    }
+
     /// Fills a key's cell with a value's words, which the
     /// cell then holds with their references. Whether the key has a cell.
     /// Called while no code that reads the cell runs.

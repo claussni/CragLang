@@ -22,7 +22,7 @@
 //! runtime's test.
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
-use crag_abi::{FRAME_BUDGET, RuntimeFn, STACK_LIMIT_SENTINEL, SlotKey};
+use crag_abi::{FRAME_BUDGET, RuntimeFn, STACK_LIMIT_SENTINEL, SlotKey, profile_cell};
 use crag_codegen::{
     BinOp, Block, BlockId, CodeObject, CodegenError, CodegenSettings, Cond, FuncId, Inst,
     LirFunction, OptLevel, RelocTarget, StackCheck, Term, VReg, compile, compile_entry_stub,
@@ -37,6 +37,7 @@ fn settings(opt: OptLevel) -> CodegenSettings {
         target: target_for(TRIPLE).unwrap(),
         opt,
         metered: false,
+        profile: None,
     }
 }
 
@@ -132,6 +133,7 @@ extern "C" fn morestack_hook(ctx: *mut Ctx, needed: usize, return_slot: *const u
 /// object.
 struct Image {
     entries: Vec<usize>,
+    symbols: SymbolTable,
     /// Keeps the code mapped.
     _arena: CodeArena,
 }
@@ -150,6 +152,7 @@ fn load(objects: &[&CodeObject]) -> Image {
     let entries = load_group(&mut arena, &mut symbols, &group).unwrap();
     Image {
         entries: entries.iter().map(|e| e.addr()).collect(),
+        symbols,
         _arena: arena,
     }
 }
@@ -454,6 +457,32 @@ fn only_metered_code_calls_for_fuel() {
     // At the entry and at the poll; the runs are in the runtime's tests.
     assert_eq!(refuels(true), 2);
     assert_eq!(refuels(false), 0);
+}
+
+#[test]
+fn profiled_code_counts_calls_and_back_edges() {
+    for opt in [OptLevel::None, OptLevel::Speed] {
+        let s = CodegenSettings {
+            profile: Some(FuncId(0)),
+            ..settings(opt)
+        };
+        let sum = compile(&sum_loop_fn(), &s).unwrap();
+        let stub = compile_entry_stub(1, 1, &s).unwrap();
+        let image = load(&[&sum, &stub]);
+        let mut ctx = Ctx::new(0);
+        assert_eq!(run(&image, 1, 0, &mut ctx, &[10])[0], 55);
+        assert_eq!(run(&image, 1, 0, &mut ctx, &[5])[0], 15);
+        let cell = image.symbols.cells().words(profile_cell(FuncId(0)));
+        // Two calls; a poll on each of the 15 back-edges.
+        assert_eq!(cell.map(|w| (w[0], w[1])), Some((2, 15)));
+    }
+    let plain = compile(&sum_loop_fn(), &settings(OptLevel::None)).unwrap();
+    assert!(
+        plain
+            .relocs
+            .iter()
+            .all(|r| !matches!(r.target, RelocTarget::Cell(_)))
+    );
 }
 
 #[test]

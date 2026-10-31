@@ -404,6 +404,7 @@ impl Module {
             target: target_for("x86_64-unknown-linux-gnu").unwrap(),
             opt: OptLevel::None,
             metered: false,
+            profile: None,
         };
         Module {
             db,

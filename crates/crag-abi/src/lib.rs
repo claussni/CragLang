@@ -1913,6 +1913,18 @@ pub fn step_of_cell_word(word: u64) -> (FuncId, u32) {
     (FuncId((word >> 32) as u32), word as u32)
 }
 
+/// The cell baseline code counts its calls and loop back-edges in, for the
+/// optimizing tier (Implementation Plan §11.10.2): the function's id with
+/// signature zero, which no slot has. The state word counts calls, the
+/// next word back-edges. Workers add without synchronizing, so a count
+/// may miss some.
+pub fn profile_cell(func: FuncId) -> SlotKey {
+    SlotKey { func, signature: 0 }
+}
+
+pub const PROFILE_CALLS_OFFSET: i32 = CELL_STATE_OFFSET;
+pub const PROFILE_LOOPS_OFFSET: i32 = CELL_VALUE_OFFSET;
+
 /// The states of a cell: no value yet, or holding the value. A value that
 /// needs itself is a compile error, so a value is never read while it is
 /// computed.

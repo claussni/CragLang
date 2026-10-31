@@ -23,7 +23,8 @@
 //! in `crag_abi`. The facade emits it; producers of LIR only mark loop
 //! back-edges with [`Inst::Poll`]. Metered code (Implementation Plan
 //! §11.6.6) takes a step off its fuel after the entry check and after each
-//! poll.
+//! poll. Profiled code (§11.10.2) counts its calls after the entry check and
+//! its back-edges at each poll.
 //!
 //! Not built yet: frame tables and typed virtual registers. Every value is
 //! one machine word; `LirFunction::tracked` names the registers that hold
@@ -57,6 +58,9 @@ pub struct CodegenSettings {
     pub opt: OptLevel,
     /// The metered tier: fuel checks at the entry and at every poll.
     pub metered: bool,
+    /// Baseline code of a Crag function: the function whose profile cell
+    /// it counts calls and back-edges in (`crag_abi::profile_cell`).
+    pub profile: Option<FuncId>,
 }
 
 #[derive(Debug)]
