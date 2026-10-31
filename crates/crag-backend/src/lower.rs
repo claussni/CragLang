@@ -120,13 +120,15 @@ type Incoming = (Vec<VReg>, u32, Vec<Slot>);
 /// Lowers the MIR of an instance, whose owner's source map gives the
 /// positions of traps and steps. The code of a module-level value keeps
 /// the value in `cell` (§11.6.2). Flat records pass to and from it by
-/// value as `flat_params` and `flat_result` say (Plan §11.10.10).
+/// value as `flat_params` and `flat_result` say (Plan §11.10.10). With
+/// `direct`, calls go straight to their callees, as in release code.
 pub fn lower_to_lir<'db>(
     db: &'db dyn Db,
     program: Program,
     instance: InstanceKey<'db>,
     mir: &MirBody<'db>,
     cell: Option<SlotKey>,
+    direct: bool,
 ) -> Lowered<'db> {
     let owner = *instance.owner(db);
     let func = func_id(instance);
@@ -139,6 +141,7 @@ pub fn lower_to_lir<'db>(
         db,
         program,
         mir,
+        direct,
         positions: &lower_body(db, program, owner).source_map.exprs,
         name_at: lower_body(db, program, owner).source_map.name.start,
         vregs: 0,
@@ -399,6 +402,8 @@ struct Lower<'a, 'db> {
     db: &'db dyn Db,
     program: Program,
     mir: &'a MirBody<'db>,
+    /// Whether calls go straight to their callees instead of their slots.
+    direct: bool,
     /// Where each expression of the body is in its module's source.
     positions: &'db [Range<u32>],
     /// Where the name of the declaration starts: the position of a trap
@@ -3801,9 +3806,13 @@ impl<'a, 'db> Lower<'a, 'db> {
         dsts
     }
 
-    /// Where a call of an instance goes: through its slot.
+    /// Where a call of an instance goes: through its slot, or straight to
+    /// it in release code.
     fn slot(&self, callee: InstanceKey<'db>) -> CallTarget {
-        CallTarget::Slot(slot_key(self.db, self.program, callee))
+        match self.direct {
+            true => CallTarget::Direct(func_id(callee)),
+            false => CallTarget::Slot(slot_key(self.db, self.program, callee)),
+        }
     }
 
     /// The address of a function value's code, of the function type `ty`,

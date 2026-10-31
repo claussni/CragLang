@@ -206,6 +206,10 @@ pub enum Tier {
     /// task stops in it: a breakpoint sends the function back to its
     /// baseline code (Specification §20.3).
     Hot,
+    /// The optimizing tier for release builds (Implementation Plan
+    /// §11.10.3): no steps either, and calls go straight to their callees
+    /// instead of through slots. Its MIR is the `Hot` tier's.
+    Release,
 }
 
 impl Tier {
@@ -233,6 +237,9 @@ pub fn mir<'db>(
 ) -> Option<MirBody<'db>> {
     if tier == Tier::Metered {
         return mir(db, program, instance, Tier::Baseline).clone();
+    }
+    if tier == Tier::Release {
+        return mir(db, program, instance, Tier::Hot).clone();
     }
     if tier == Tier::Hot {
         let mut body = mir(db, program, instance, Tier::Optimizing).clone()?;

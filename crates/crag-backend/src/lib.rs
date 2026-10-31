@@ -372,11 +372,12 @@ pub fn code<'db>(
     let value = matches!(owner, Owner::Item(item) if item.kind(db).is_value());
     let cell =
         (value && *instance.entry(db) == Entry::Body).then(|| slot_key(db, program, instance));
-    let lowered = lower_to_lir(db, program, instance, &body, cell);
+    let direct = tier == Tier::Release;
+    let lowered = lower_to_lir(db, program, instance, &body, cell, direct);
     let settings = CodegenSettings {
         target: host().clone(),
         opt: match tier {
-            Tier::Optimizing | Tier::Hot => OptLevel::Speed,
+            Tier::Optimizing | Tier::Hot | Tier::Release => OptLevel::Speed,
             Tier::Baseline | Tier::Metered => OptLevel::None,
         },
         metered: tier == Tier::Metered,

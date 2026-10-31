@@ -3790,3 +3790,57 @@ fn counted(n: Int) -> Int {
     assert_eq!(trap.kind, TrapKind::Overflow);
     assert_eq!(m.worker.heap().live_blocks(), 0);
 }
+
+/// Release code (Implementation Plan §11.10.3) calls its callees straight,
+/// through no slot, closures and inlined code included, and its traps
+/// still name where they are.
+#[test]
+fn release_code_calls_its_callees_directly() {
+    let text = r#"fn inc(n: Int) -> Int { n + 1 }
+
+fn apply(f: (Int) -> Int, x: Int) -> Int { f(x) }
+
+fn count(n: Int, acc: Int) -> Int {
+  if n == 0 { acc } else { count(n - 1, apply({ k -> inc(k) }, acc)) }
+}
+
+fn sum(xs: List[Int]) -> Int {
+  var t = 0
+  for x in xs {
+    t = t + x * inc(x)
+  }
+  t
+}
+
+fn run(n: Int) -> Int { count(n, 0) + sum([1, 2, 3]) }
+
+fn overflow(n: Int) -> Int { inc(n) * 2 }
+"#;
+    let mut m = Module::compiled(text, Tier::Release);
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    assert_eq!(m.run("run", &[1000]), Ok(vec![1000 + 20]));
+    let (db, program) = (&m.db, m.program);
+    let roots: Vec<InstanceKey> = owners(db, program.modules(db)[1])
+        .into_iter()
+        .map(|owner| InstanceKey::body(db, owner))
+        .collect();
+    for key in collect_instances(db, program, &roots, Tier::Release) {
+        let object = &code(db, program, key, Tier::Release)
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .object;
+        assert!(
+            object
+                .relocs
+                .iter()
+                .all(|r| !matches!(r.target, crag_abi::RelocTarget::Slot(_))),
+            "{key:?} calls through a slot"
+        );
+    }
+    let trap = m.run("overflow", &[i64::MAX / 2]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::Overflow);
+    assert_eq!(trap.position, Some(text.find("inc(n) * 2").unwrap() as u32));
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+}

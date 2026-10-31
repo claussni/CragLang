@@ -25,6 +25,7 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-types` | Types and core inference (M1) |
 | `crates/crag-mir` | MIR builder (M1) |
 | `crates/crag-backend` | Code generation from MIR (M1) |
+| `crates/crag-aot` | The AOT object writer: release code in an ELF object file (M7) |
 | `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1); the UI with the built-in editor, the app image, hot reload, the debugger, the language server `crag lsp` and the debug adapter `crag dap` (M5) |
 | `crates/crag-session` | Session manager: image processes, their protocol and supervision (M3) |
 | `crates/crag-eval` | Compile-time evaluation of constants, `embed`s among them, in the metered tier (M3) |
