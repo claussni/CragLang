@@ -18,13 +18,16 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use crag_abi::{CELL_FULL, Frame, FuncId, RuntimeFn, Shapes, SlotKey, TrapKind, TypeDescriptor};
+use crag_abi::{
+    CELL_FULL, Frame, FuncId, RuntimeFn, Shapes, SlotKey, TrapKind, TypeDescriptor, profile_cell,
+};
 use crag_backend::{code, func_id, shapes};
 use crag_codegen::{CodeObject, CodegenSettings, OptLevel, compile_entry_stub, target_for};
 use crag_eval::{EvalSite, const_eval};
 use crag_hir::{ItemId, ModuleId, Owner};
-use crag_loader::{CodeArena, SymbolTable, load, load_group};
+use crag_loader::{CodeArena, SymbolTable, load, load_group, publish, stage_group};
 use crag_mir::{Entry, InstanceKey, Tier, collect_instances, mir};
 use crag_runtime::{
     CodeMap, Fiber, FiberConfig, FiberState, Scheduler, SchedulerConfig, Trap, Types, Worker,
@@ -36,13 +39,26 @@ use crate::diagnostics::render_at;
 use crate::project::Project;
 
 /// Loaded code with a worker to run it.
-pub struct Image {
+///
+/// While a run waits, the image compiles the functions whose baseline code
+/// counted many calls and back-edges again in the optimizing tier and
+/// swaps them in through their slots (Implementation Plan §11.10.2): the
+/// workers take a code map with the new code first, so whatever runs it
+/// can unwind it, and frames already running finish on the old code.
+pub struct Image<'a> {
+    project: &'a Project,
     arena: CodeArena,
     symbols: SymbolTable,
     settings: CodegenSettings,
     functions: HashMap<FuncId, Function>,
     /// Each function's entry.
     entries: HashMap<FuncId, usize>,
+    /// The instances compiled in the baseline tier, which may become hot.
+    baseline: HashMap<FuncId, InstanceKey<'a>>,
+    /// Every code object loaded, old code included, for the code map.
+    code: Vec<(FuncId, usize, CodeObject)>,
+    types: Vec<(u32, TypeDescriptor)>,
+    task_entries: [usize; 3],
     /// The worker whose heap holds the values the compiler computed, kept
     /// as long as they are.
     _worker: Worker,
@@ -50,6 +66,30 @@ pub struct Image {
     scheduler: Scheduler,
     /// The values the compiler computed, whose cells were filled.
     constants: usize,
+    /// The functions swapped for optimized code so far.
+    optimized: usize,
+}
+
+/// How often a run looks for hot functions.
+const PROFILE_PERIOD: Duration = Duration::from_millis(20);
+
+/// How many calls and back-edges make a function hot.
+const HOT: u64 = 10_000;
+
+/// How long a tier-up waits for the workers to take the new tables.
+const TABLES_WAIT: Duration = Duration::from_secs(2);
+
+/// How many calls and back-edges make a function hot: `HOT`, or the
+/// count `CRAG_HOT` gives, so that tests can have most code optimized
+/// while it runs; zero never optimizes. Read once.
+fn hot() -> u64 {
+    static HOT_COUNT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *HOT_COUNT.get_or_init(|| {
+        std::env::var("CRAG_HOT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(HOT)
+    })
 }
 
 /// A compiled function as runs and reports need it.
@@ -101,6 +141,8 @@ pub struct Compiled<'a> {
     pub functions: HashMap<FuncId, Function>,
     /// The module-level values reached, by the keys of their cells.
     pub values: Vec<(SlotKey, ItemId<'a>)>,
+    /// The instances compiled, by their functions.
+    pub instances: HashMap<FuncId, InstanceKey<'a>>,
 }
 
 /// The values among those compiled that the compiler computed, ready for
@@ -139,6 +181,7 @@ pub fn compile<'a>(
         types: Vec::new(),
         functions: HashMap::new(),
         values: Vec::new(),
+        instances: HashMap::new(),
     };
     // Steps name the same types again and again.
     let mut shaped: HashMap<(crag_types::Ty, bool), (std::sync::Arc<Shapes>, u32)> = HashMap::new();
@@ -175,6 +218,7 @@ pub fn compile<'a>(
             );
         }
         compiled.objects.push((code.slot, &code.object));
+        compiled.instances.insert(code.func, instance);
         if let Owner::Item(item) = owner
             && value
             && *instance.entry(db) == Entry::Body
@@ -241,6 +285,7 @@ pub fn stub_settings() -> Result<CodegenSettings, String> {
         target: target_for("x86_64-unknown-linux-gnu").map_err(|e| e.to_string())?,
         opt: OptLevel::None,
         metered: false,
+        profile: None,
     })
 }
 
@@ -319,15 +364,16 @@ pub fn owner_name(project: &Project, owner: Owner) -> String {
     }
 }
 
-impl Image {
+impl<'a> Image<'a> {
     /// Compiles the instances and everything they call, and loads them
     /// with the runtime's functions.
-    pub fn build(project: &Project, roots: &[InstanceKey]) -> Result<Image, String> {
+    pub fn build(project: &'a Project, roots: &[InstanceKey<'a>]) -> Result<Image<'a>, String> {
         let Compiled {
             objects,
             types,
             functions,
             values,
+            instances,
         } = compile(project, roots)?;
         let io = |e: std::io::Error| format!("cannot map memory for code: {e}");
         let mut arena = CodeArena::new(64 << 20).map_err(io)?;
@@ -355,6 +401,7 @@ impl Image {
         // outlives its scheduler's fibers.
         unsafe { map.set_task_entries(task_entries) };
         let mut worker = Worker::new();
+        let all_types = types.clone();
         let types = Arc::new(Types::new(types));
         let code = Arc::new(map);
         worker.set_types(types.clone());
@@ -375,15 +422,31 @@ impl Image {
             .iter()
             .filter(|(key, _)| cells.state(*key) == Some(CELL_FULL))
             .count();
+        let code = objects
+            .iter()
+            .zip(&entries)
+            .map(|(&(slot, object), entry)| (slot.func, entry.addr(), object.clone()))
+            .collect();
+        // Code compiled in the optimizing tier already counts nothing.
+        let baseline = match Tier::compiled() {
+            Tier::Baseline => instances,
+            _ => HashMap::new(),
+        };
         Ok(Image {
+            project,
             arena,
             symbols,
             settings,
             functions,
             entries: addrs,
+            baseline,
+            code,
+            types: all_types,
+            task_entries,
             _worker: worker,
             scheduler,
             constants,
+            optimized: 0,
         })
     }
 
@@ -401,7 +464,15 @@ impl Image {
         let fiber = unsafe { Fiber::new(stub.addr(), entry, &[], FiberConfig::default()) }
             .expect("a fiber's stack can be mapped");
         self.scheduler.spawn(fiber);
-        let mut stopped = self.scheduler.wait();
+        let mut stopped = loop {
+            if self.baseline.is_empty() || hot() == 0 {
+                break self.scheduler.wait();
+            }
+            if let Some(stopped) = self.scheduler.wait_timeout(PROFILE_PERIOD) {
+                break stopped;
+            }
+            self.tier_up();
+        };
         assert_eq!(stopped.len(), 1, "only the root task stops on its own");
         let fiber = stopped.pop().expect("one");
         match fiber.state() {
@@ -413,6 +484,82 @@ impl Image {
         }
     }
 
+    /// Compiles the hot functions in the optimizing tier and swaps them in
+    /// through their slots. A function whose optimized code cannot be
+    /// compiled or loaded stays as it is.
+    fn tier_up(&mut self) {
+        let project = self.project;
+        let (db, program) = (&project.db, project.program);
+        let cells = self.symbols.cells();
+        let threshold = hot();
+        let mut hot: Vec<(FuncId, InstanceKey<'a>)> = self
+            .baseline
+            .iter()
+            .filter(|&(&func, _)| {
+                cells
+                    .words(profile_cell(func))
+                    .is_some_and(|w| w[0].saturating_add(w[1]) >= threshold)
+            })
+            .map(|(&func, &instance)| (func, instance))
+            .collect();
+        if hot.is_empty() {
+            return;
+        }
+        hot.sort_by_key(|&(func, _)| func.0);
+        let mut group = Vec::new();
+        let mut types = Vec::new();
+        for (func, instance) in hot {
+            self.baseline.remove(&func);
+            // Optimized code calls what baseline code calls, and inlines it.
+            let Some(Ok(optimized)) = code(db, program, instance, Tier::Optimizing) else {
+                continue;
+            };
+            let calls = &optimized.calls;
+            if calls
+                .iter()
+                .any(|&c| !self.entries.contains_key(&func_id(c)))
+            {
+                continue;
+            }
+            for t in &optimized.types {
+                if !self.types.contains(t) && !types.contains(t) {
+                    types.push(t.clone());
+                }
+            }
+            group.push((optimized.slot, &optimized.object));
+        }
+        if group.is_empty() {
+            return;
+        }
+        let Ok(staged) = stage_group(&mut self.arena, &mut self.symbols, &group) else {
+            return;
+        };
+        let entries = staged.entries();
+        for (&(slot, object), entry) in group.iter().zip(&entries) {
+            self.code.push((slot.func, entry.addr(), object.clone()));
+        }
+        self.types.extend(types);
+        let mut map = CodeMap::new();
+        for (func, entry, object) in &self.code {
+            map.add(*func, *entry, object);
+        }
+        // SAFETY: the stubs stay loaded while the image exists, which
+        // outlives its scheduler's fibers.
+        unsafe { map.set_task_entries(self.task_entries) };
+        let types = Arc::new(Types::new(self.types.iter().cloned()));
+        let epoch = self.scheduler.update_tables(types, Arc::new(map));
+        // Workers that keep old tables cannot unwind the new code, so it
+        // is not reached; it stays loaded and in the map.
+        if !self.scheduler.wait_tables(epoch, TABLES_WAIT) {
+            return;
+        }
+        publish(&self.symbols, staged);
+        for (&(slot, _), entry) in group.iter().zip(entries) {
+            self.entries.insert(slot.func, entry.addr());
+        }
+        self.optimized += group.len();
+    }
+
     /// A trap as the user sees it.
     pub fn report(&self, project: &Project, trap: &Trap) -> String {
         report(project, &self.functions, trap)
@@ -422,5 +569,10 @@ impl Image {
     /// values the compiler computed.
     pub fn constants(&self) -> usize {
         self.constants
+    }
+
+    /// How many functions runs swapped for optimized code so far.
+    pub fn optimized(&self) -> usize {
+        self.optimized
     }
 }

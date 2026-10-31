@@ -373,3 +373,38 @@ fn constants_arrive_in_their_cells() {
     let refused = s.session().ship(&[], &[], &[], &[], &[broken]);
     assert!(refused.unwrap_err().to_string().contains("cannot decode"));
 }
+
+const HOT: &str = r#"fn step(x: Int, d: Int) -> Int {
+  (x * 31 + 7) % d
+}
+
+fn spin() -> Int {
+  var x = 1
+  for i in 1..20000000 {
+    x = step(x, 1000003)
+  }
+  x
+}
+
+fn broken() -> Int {
+  step(1, 0)
+}
+"#;
+
+#[test]
+fn hot_functions_are_optimized_while_they_run() {
+    let p = project("hot", HOT);
+    let spin = function(&p, "spin");
+    let mut image = Image::build(&p, &[spin, function(&p, "broken")]).unwrap();
+    let expected = (1..=20_000_000).fold(1i64, |x, _| (x * 31 + 7) % 1_000_003);
+    assert_eq!(image.run(func_id(spin)), Ok(vec![expected as u64]));
+    if crag_mir::Tier::compiled() == crag_mir::Tier::Baseline {
+        // The loop and the function it calls, once they counted enough.
+        assert_eq!(image.optimized(), 2);
+    }
+    // A trap in optimized code is told where its source is.
+    let trap = image.run(func_id(function(&p, "broken"))).unwrap_err();
+    let report = image.report(&p, &trap);
+    assert!(report.contains("(x * 31 + 7) % d"), "{report}");
+    assert!(report.contains("in step"), "{report}");
+}
