@@ -1568,6 +1568,112 @@ bb7:
     }
 }
 
+/// In the optimizing tier, a record that dies gives the record built from
+/// it its box (Plan §11.10.1).
+#[test]
+fn dying_records_give_their_boxes() {
+    let text = r#"type Account(name: Str, tags: Str, balance: Int)
+type Nil
+type Cons(head: Str, tail: Cons | Nil)
+
+fn deposit(a: Account, k: Int) -> Account {
+  Account(..a, balance: a.balance + k)
+}
+
+fn renamed(a: Account, n: Str) -> Account {
+  Account(..a, name: "{a.name} {n}")
+}
+
+fn tag(xs: Cons | Nil) -> Cons | Nil {
+  case xs {
+    Nil -> Nil
+    c: Cons -> Cons(head: c.head, tail: tag(c.tail))
+  }
+}
+"#;
+    let found = mir_in(text, false, Tier::Optimizing);
+    let expected = r#"deposit
+param _0: Account (a)
+param _1: Int (k)
+let _2: Int
+let _3: Int
+let _4: Str
+let _5: Str
+let _6: Account
+let _7: False | True
+let _8: Account
+bb0:
+  _2 = _0.balance
+  _7 = overflows Int.add(_2, _1)
+  branch _7 bb1 bb2
+bb1:
+  release _0
+  trap overflow
+bb2:
+  _3 = Int.add(_2, _1)
+  _4 = _0.name
+  retain _4
+  _5 = _0.tags
+  retain _5
+  reclaim _0 into _8
+  _6 = Account(name: _4, tags: _5, balance: _3) in _8
+  return _6
+renamed
+param _0: Account (a)
+param _1: Str (n) borrowed
+let _2: Str
+let _3: Str
+let _4: Str
+let _5: Int
+let _6: Account
+let _7: Account
+bb0:
+  _2 = _0.name
+  retain _2
+  _3 = concat(_2, " ", _1)
+  release _2
+  _4 = _0.tags
+  retain _4
+  _5 = _0.balance
+  reclaim _0 into _7
+  _6 = Account(name: _3, tags: _4, balance: _5) in _7
+  return _6
+tag
+param _0: Cons | Nil (xs)
+let _1: Cons (c)
+let _2: Cons | Nil
+let _3: Str
+let _4: Cons | Nil
+let _5: Cons | Nil
+let _6: Cons
+let _7: Cons | Nil
+let _8: Cons
+bb0:
+  switch _0 [Cons: bb1] else bb3
+bb1:
+  _1 = convert _0
+  jump bb2
+bb2:
+  _3 = _1.head
+  retain _3
+  _4 = _1.tail
+  retain _4
+  reclaim _1 into _8
+  _5 = call tag(_4) -> bb4
+bb3:
+  release _0
+  _2 = convert Nil
+  return _2
+bb4:
+  _6 = Cons(head: _3, tail: _5) in _8
+  _7 = convert _6
+  return _7
+"#;
+    if found != expected {
+        panic!("MIR differs; found:\n{found}");
+    }
+}
+
 /// In the optimizing tier, a call of a function value known to be a small
 /// closure runs a copy of its code, which reads the captured values; the
 /// guard's fallback makes the closure, which is otherwise not made.

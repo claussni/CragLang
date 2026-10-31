@@ -40,7 +40,7 @@
 use std::ops::Range;
 
 use crag_abi::{
-    BUFFER_HEADER, CELL_FULL, CELL_STATE_OFFSET, CELL_VALUE_OFFSET, COUNT_OFFSET,
+    BUFFER_HEADER, CELL_FULL, CELL_STATE_OFFSET, CELL_VALUE_OFFSET, COUNT_OFFSET, CountedField,
     FUNCTION_BOX_HEADER, HEADER_SIZE, HEAP_OFFSET, HandlerKind, INLINE_TEXT_MAX, INLINED_POSITION,
     InlinedCode, LEN_OFFSET, LIST_SIZE, MAP_SIZE, MEMBER_BOX_SIZE, NO_POSITION, NativeSymbol,
     PAGE_FREE_OFFSET, PAGE_USED_OFFSET, REF_ADD, REF_CELL_SIZE, REF_MUL, REF_SUB, REF_UNSIGNED,
@@ -1315,6 +1315,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             }
             Statement::Retain(local) => self.count(*local, Count::Retain),
             Statement::Release(local) => self.count(*local, Count::Release),
+            Statement::Reclaim { local, token } => self.reclaim(*local, *token),
             Statement::Poll => {
                 self.push(Inst::Poll);
                 Ok(())
@@ -1367,6 +1368,114 @@ impl<'a, 'db> Lower<'a, 'db> {
             },
         };
         self.count_form(&form, ty, &regs, how)
+    }
+
+    /// Gives up a record's reference as a release does, but takes apart a
+    /// box that no one else holds (Plan §11.10.1): its fields are
+    /// released, and the box, empty, goes to the token. A shared box gives
+    /// the token a static empty one.
+    fn reclaim(&mut self, local: Local, token: Local) -> Result<(), Unsupported> {
+        let ty = self.local_ty(local);
+        let empty = self.empty_box();
+        let t = word(&self.locals[token.index()])?;
+        self.push(Inst::Move { dst: t, src: empty });
+        let b = match (
+            &self.forms[local.index()],
+            box_form(self.db, self.program, ty),
+        ) {
+            (None, Some(b)) => b,
+            // A split record has no box.
+            _ => return self.count(local, Count::Release),
+        };
+        let ptr = word(&self.locals[local.index()])?;
+        // Fields the runtime closes when it frees the box stay with it, and
+        // a token takes only a box of its record's size class.
+        let plain = match type_descriptor(self.db, self.program, ty) {
+            Some(TypeDescriptor::Record { counted, dispose }) => {
+                dispose.is_none()
+                    && counted.iter().all(|f| {
+                        matches!(
+                            f,
+                            CountedField::Box(_)
+                                | CountedField::Union { .. }
+                                | CountedField::Guarded { .. }
+                        )
+                    })
+            }
+            _ => false,
+        };
+        let fits = box_form(self.db, self.program, self.local_ty(token)).is_some_and(|t| {
+            size_class(t.size).is_some() && size_class(t.size) == size_class(b.size)
+        });
+        if !plain || b.dispose.is_some() || !fits {
+            self.release(ptr);
+            return Ok(());
+        }
+        let (check, claim, shared, done) = (
+            self.new_block(),
+            self.new_block(),
+            self.new_block(),
+            self.new_block(),
+        );
+        // A count of one is the only reference; a static box's is negative.
+        let count = self.load(ptr, COUNT_OFFSET);
+        let one = self.constant(1);
+        let unique = self.cmp(Cond::Eq, count, one);
+        self.end(
+            Term::Branch {
+                cond: unique,
+                then: check,
+                otherwise: shared,
+            },
+            Some(check),
+        );
+        // A local of a record type may hold a subtype's larger box.
+        let header = self.load(ptr, TYPE_INDEX_OFFSET);
+        let index = self.constant(type_index(ty));
+        let exact = self.cmp(Cond::Eq, header, index);
+        self.end(
+            Term::Branch {
+                cond: exact,
+                then: claim,
+                otherwise: shared,
+            },
+            Some(claim),
+        );
+        let regs = self.load_stored(ptr, &b.slots, b.form.words());
+        self.count_form(&b.form, ty, &regs, Count::Release)?;
+        // An empty box holds no references: freed by a trap, it is freed
+        // as a buffer is.
+        let empty = self.constant(BUFFER_HEADER as i64);
+        self.push(Inst::Store {
+            src: empty,
+            addr: ptr,
+            offset: TYPE_INDEX_OFFSET,
+        });
+        self.push(Inst::Move { dst: t, src: ptr });
+        self.end(Term::Jump(done), Some(shared));
+        self.release(ptr);
+        self.end(Term::Jump(done), Some(done));
+        Ok(())
+    }
+
+    /// A static empty box: a token that holds no box to reuse.
+    fn empty_box(&mut self) -> VReg {
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend(STATIC_COUNT.to_le_bytes());
+        bytes.extend(BUFFER_HEADER.to_le_bytes());
+        let data = match self.data.iter().position(|d| *d == bytes) {
+            Some(d) => d,
+            None => {
+                self.data.push(bytes);
+                self.data.len() - 1
+            }
+        };
+        let ptr = self.reg();
+        self.push(Inst::DataAddr {
+            dst: ptr,
+            data: data as u32,
+        });
+        ptr
     }
 
     /// Retains or releases what the registers of a split value hold: each
@@ -1589,6 +1698,38 @@ impl<'a, 'db> Lower<'a, 'db> {
             value,
         });
         dst
+    }
+
+    /// A new box as `alloc` makes it, in the empty box a reclaim kept in
+    /// `token` when it holds one, whose count is one already; a static box
+    /// holds none.
+    fn alloc_in(&mut self, token: VReg, size: u32, index: i64) -> VReg {
+        let ptr = self.reg();
+        let (reuse, fresh, done) = (self.new_block(), self.new_block(), self.new_block());
+        let counted = self.counted(token);
+        self.end(
+            Term::Branch {
+                cond: counted,
+                then: reuse,
+                otherwise: fresh,
+            },
+            Some(reuse),
+        );
+        let header = self.constant(index);
+        self.push(Inst::Store {
+            src: header,
+            addr: token,
+            offset: TYPE_INDEX_OFFSET,
+        });
+        self.push(Inst::Move {
+            dst: ptr,
+            src: token,
+        });
+        self.end(Term::Jump(done), Some(fresh));
+        let new = self.alloc(size, index);
+        self.push(Inst::Move { dst: ptr, src: new });
+        self.end(Term::Jump(done), Some(done));
+        ptr
     }
 
     /// A new box of `size` bytes with a count of one and the type index in
@@ -1831,8 +1972,11 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let flag = self.cmp(cond, word(&x)?, word(&y)?);
                 Ok(vec![self.bool_of(flag)])
             }
-            // A split record is its fields' words.
-            Rvalue::Record { fields, .. } if self.forms[dst.index()].is_some() => {
+            // A split record is its fields' words, and needs no box.
+            Rvalue::Record { fields, reuse, .. } if self.forms[dst.index()].is_some() => {
+                if let Some(token) = reuse {
+                    self.count(*token, Count::Release)?;
+                }
                 let Some(Form::Fields(places)) = self.forms[dst.index()].clone() else {
                     return Err("records of this type");
                 };
@@ -1853,6 +1997,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 ty: record,
                 fields,
                 dispose,
+                reuse,
             } => {
                 let b = box_form(self.db, self.program, *record).ok_or("records of this type")?;
                 self.describe(*record)?;
@@ -1870,7 +2015,13 @@ impl<'a, 'db> Lower<'a, 'db> {
                         _ => self.split_value(op, *t, f)?,
                     });
                 }
-                let ptr = self.alloc(b.size, type_index(*record));
+                let ptr = match reuse {
+                    Some(token) => {
+                        let token = word(&self.locals[token.index()])?;
+                        self.alloc_in(token, b.size, type_index(*record))
+                    }
+                    None => self.alloc(b.size, type_index(*record)),
+                };
                 self.store_box(&b, ptr, &regs);
                 // The box holds the address of its dispose code, which the
                 // runtime gives generated code when the count reaches zero.

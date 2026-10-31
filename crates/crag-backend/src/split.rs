@@ -300,10 +300,16 @@ pub fn scalar_replace<'db>(
         .collect();
     let mut split: Vec<bool> = forms.iter().map(Option::is_some).collect();
     let mut retained = vec![false; split.len()];
+    // Records built in a box a reclaim kept (Plan §11.10.1).
+    let mut reused = vec![false; split.len()];
     for block in &body.blocks {
         for statement in &block.statements {
-            if let Statement::Retain(l) = statement {
-                retained[l.index()] = true;
+            match statement {
+                Statement::Retain(l) => retained[l.index()] = true,
+                Statement::Assign(l, Rvalue::Record { reuse: Some(_), .. }) => {
+                    reused[l.index()] = true
+                }
+                _ => {}
             }
         }
     }
@@ -338,8 +344,9 @@ pub fn scalar_replace<'db>(
         for (i, s) in split.iter_mut().enumerate() {
             // A local boxed where it escapes must not be boxed twice: not
             // when it is retained to be used again, and not when its value
-            // came out of a box, which it could pass on as it is.
-            let twice = escapes[i] && (retained[i] || from_box[i]);
+            // came out of a box, which it could pass on as it is, or when
+            // it is built in a box kept for it.
+            let twice = escapes[i] && (retained[i] || from_box[i] || reused[i]);
             if *s && (keep[i] || twice) {
                 *s = false;
                 changed = true;
@@ -455,6 +462,10 @@ impl<'db> Check<'_, 'db> {
     }
 
     fn statement(&mut self, statement: &Statement<'db>) {
+        // A box kept for reuse is a box.
+        if let Statement::Reclaim { token: t, .. } = statement {
+            self.keep[t.index()] = true;
+        }
         let Statement::Assign(dst, rvalue) = statement else {
             return;
         };

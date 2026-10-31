@@ -164,6 +164,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 ty: to,
                 fields: values,
                 dispose,
+                reuse: None,
             },
         )
     }

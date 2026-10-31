@@ -570,6 +570,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                     ty,
                     fields,
                     dispose: None,
+                    reuse: None,
                 };
                 value = b.assign(ty, record);
             }
@@ -671,6 +672,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         ty: cstr,
                         fields: vec![(Name::new(db, "bytes".to_string()), bytes)],
                         dispose: None,
+                        reuse: None,
                     };
                     let value = self.assign(cstr, record);
                     self.assign_to(dst, value, cstr);
@@ -720,6 +722,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 ty: not_utf8,
                 fields: Vec::new(),
                 dispose: None,
+                reuse: None,
             };
             let value = self.assign(not_utf8, record);
             self.assign_to(dst, value, not_utf8);
@@ -906,6 +909,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         (name("column"), int(column)),
                     ],
                     dispose: None,
+                    reuse: None,
                 },
             );
             let error = self.assign(
@@ -917,6 +921,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         (name("origin"), origin),
                     ],
                     dispose: None,
+                    reuse: None,
                 },
             );
             self.assign_to(out, error, invalid);
@@ -3049,6 +3054,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                             ty: field_ty,
                             fields: parts,
                             dispose,
+                            reuse: None,
                         },
                     )
                 }
@@ -3066,6 +3072,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 ty,
                 fields: values,
                 dispose,
+                reuse: None,
             },
         )
     }
@@ -3217,6 +3224,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         ty,
                         fields: values,
                         dispose,
+                        reuse: None,
                     },
                 )
             }
@@ -3292,6 +3300,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         ty,
                         fields: values,
                         dispose,
+                        reuse: None,
                     },
                 )
             }
@@ -4798,6 +4807,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 ty,
                 fields: out,
                 dispose,
+                reuse: None,
             },
         );
         self.check_conditions(built, ty, site)
@@ -4897,6 +4907,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 ty,
                 fields: out,
                 dispose,
+                reuse: None,
             },
         );
         self.check_conditions(built, ty, site)

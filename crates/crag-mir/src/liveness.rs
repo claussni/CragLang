@@ -168,10 +168,11 @@ pub(crate) fn statement_uses(
                 }
                 Rvalue::Cast { value, .. } => uses.operand(value, false),
                 Rvalue::FloatOverflow(locals) => uses.borrowed.extend(locals),
-                Rvalue::Record { fields, .. } => {
+                Rvalue::Record { fields, reuse, .. } => {
                     for (_, o) in fields {
                         uses.operand(o, true);
                     }
+                    uses.consumed.extend(reuse);
                 }
                 Rvalue::List(items) => {
                     for o in items {
@@ -208,6 +209,10 @@ pub(crate) fn statement_uses(
         }
         Statement::Retain(l) => uses.borrowed.push(*l),
         Statement::Release(l) => uses.consumed.push(*l),
+        Statement::Reclaim { local, token } => {
+            uses.consumed.push(*local);
+            uses.def = Some(*token);
+        }
         Statement::Poll | Statement::Step { .. } => {}
     }
     uses.counted(body, holds)

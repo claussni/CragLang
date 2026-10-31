@@ -226,11 +226,14 @@ pub enum Rvalue<'db> {
         b: Operand<'db>,
     },
     /// A record, its fields in the order of `fields_of`; for a type with a
-    /// dispose handler, the dispose code its box holds (§11.6.11).
+    /// dispose handler, the dispose code its box holds (§11.6.11). With
+    /// `reuse`, it is built in the box a `Reclaim` kept in that local when
+    /// the box is there, and consumes it (Plan §11.10.1).
     Record {
         ty: Ty<'db>,
         fields: Vec<(Name<'db>, Operand<'db>)>,
         dispose: Option<InstanceKey<'db>>,
+        reuse: Option<Local>,
     },
     /// A list, or a set when the local is one.
     List(Vec<Operand<'db>>),
@@ -589,6 +592,12 @@ pub enum Statement<'db> {
     Retain(Local),
     /// Gives up the local's reference, freeing the value with the last.
     Release(Local),
+    /// Gives up the reference of a local of a record type as `Release`
+    /// does, but a box whose reference it was is taken apart rather than
+    /// freed (Plan §11.10.1): its fields are released, and the box goes
+    /// to `token`, empty, for a record built later. A token without a box
+    /// holds a static empty one.
+    Reclaim { local: Local, token: Local },
     /// A point on a loop's back-edge where the runtime may stop the fiber.
     Poll,
     /// The start of a statement, where the debugger may stop the task
@@ -804,8 +813,9 @@ impl<'db> Rvalue<'db> {
                 out.extend(b.locals_mut());
             }
             Rvalue::FloatOverflow(locals) => out.extend(locals.iter_mut()),
-            Rvalue::Record { fields, .. } => {
-                out.extend(fields.iter_mut().filter_map(|(_, o)| o.locals_mut()))
+            Rvalue::Record { fields, reuse, .. } => {
+                out.extend(fields.iter_mut().filter_map(|(_, o)| o.locals_mut()));
+                out.extend(reuse.iter_mut());
             }
             Rvalue::List(items) | Rvalue::Concat(items) | Rvalue::Intrinsic(_, items) => {
                 out.extend(items.iter_mut().filter_map(Operand::locals_mut))
@@ -838,6 +848,7 @@ impl<'db> Statement<'db> {
                 out
             }
             Statement::Retain(l) | Statement::Release(l) => vec![l],
+            Statement::Reclaim { local, token } => vec![local, token],
             Statement::Poll => Vec::new(),
             Statement::Step { locals, .. } => locals.iter_mut().collect(),
         }
@@ -963,6 +974,9 @@ fn statement_text<'db>(db: &'db dyn Db, statement: &Statement<'db>) -> String {
         }
         Statement::Retain(local) => format!("retain _{}", local.0),
         Statement::Release(local) => format!("release _{}", local.0),
+        Statement::Reclaim { local, token } => {
+            format!("reclaim _{} into _{}", local.0, token.0)
+        }
         Statement::Poll => "poll".into(),
         Statement::Step { at, locals } => {
             let locals: Vec<String> = locals.iter().map(|l| format!("_{}", l.0)).collect();
@@ -1033,6 +1047,7 @@ fn rvalue_text<'db>(db: &'db dyn Db, rvalue: &Rvalue<'db>) -> String {
             ty,
             fields,
             dispose,
+            reuse,
         } => {
             let fields: Vec<String> = fields
                 .iter()
@@ -1046,7 +1061,11 @@ fn rvalue_text<'db>(db: &'db dyn Db, rvalue: &Rvalue<'db>) -> String {
                 Some(code) => format!(" disposed by {}", func_name(db, *code)),
                 None => String::new(),
             };
-            format!("{name}({}){dispose}", fields.join(", "))
+            let reuse = match reuse {
+                Some(token) => format!(" in _{}", token.0),
+                None => String::new(),
+            };
+            format!("{name}({}){dispose}{reuse}", fields.join(", "))
         }
         Rvalue::List(items) => format!("[{}]", ops(items)),
         Rvalue::Map(entries) if entries.is_empty() => "[:]".into(),

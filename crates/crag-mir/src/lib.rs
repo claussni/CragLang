@@ -26,7 +26,8 @@
 //! is released right after its last use, with the parameters a function
 //! only reads borrowed from its caller (§11.10.1). In the optimizing tier,
 //! small callees and calls of known small closures are inlined before the
-//! counts are placed.
+//! counts are placed, and a record that dies gives its box and its fields
+//! to what is built from it after.
 
 extern crate crag_db as salsa;
 
@@ -36,6 +37,7 @@ mod checks;
 mod inline;
 mod ir;
 mod liveness;
+mod reuse;
 mod tail;
 
 use std::collections::HashSet;
@@ -56,6 +58,7 @@ pub use ir::{
     LocalDecl, MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,
 };
 pub use liveness::{Lent, Liveness, compute_liveness, insert_drops, insert_rc_ops};
+pub use reuse::insert_reuse;
 
 /// A function, test or module-level value, or the code of a closure in
 /// one: what code is generated for. A generic function has code only per
@@ -231,6 +234,9 @@ pub fn mir<'db>(
     let live = compute_liveness(&body, lent);
     insert_rc_ops(&mut body, &live);
     insert_drops(&mut body, &live);
+    if tier == Tier::Optimizing {
+        insert_reuse(db, program, &mut body);
+    }
     Some(body)
 }
 

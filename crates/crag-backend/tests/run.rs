@@ -3492,6 +3492,102 @@ fn twice(n: Int) -> Int {
     assert_eq!(m.worker.heap().live_blocks(), 0);
 }
 
+/// In the optimizing tier, a record that dies gives its box to the record
+/// built from it, when no one else holds it (Plan §11.10.1): no box is
+/// freed and none allocated. A shared record stays as it was, and a trap
+/// between the two frees the box kept.
+#[test]
+fn dying_records_give_their_boxes_to_new_ones() {
+    let text = r#"type Nil
+type Cons(head: Int, label: Str, tail: Cons | Nil)
+type Leaf
+type Node(left: Leaf | Node, label: Str, right: Leaf | Node)
+
+fn build(n: Int, acc: Cons | Nil) -> Cons | Nil {
+  if n == 0 { return acc }
+  build(n - 1, Cons(head: n, label: "item {n}, with a label long enough for a buffer", tail: acc))
+}
+
+fn inc(xs: Cons | Nil) -> Cons | Nil {
+  case xs {
+    Nil -> Nil
+    c: Cons -> Cons(head: c.head + 1, label: c.label, tail: inc(c.tail))
+  }
+}
+
+fn sum(xs: Cons | Nil, acc: Int) -> Int {
+  case xs {
+    Nil -> acc
+    c: Cons -> sum(c.tail, acc + c.head)
+  }
+}
+
+fn bumped(n: Int) -> Int {
+  sum(inc(build(n, Nil)), 0)
+}
+
+fn shared(n: Int) -> Int {
+  let xs = build(n, Nil)
+  let ys = inc(xs)
+  sum(xs, 0) * 1000 + sum(ys, 0)
+}
+
+fn edge(n: Int) -> Int {
+  sum(inc(Cons(head: 1, label: "a", tail: Cons(head: n, label: "b", tail: Nil))), 0)
+}
+
+fn tree(n: Int) -> Leaf | Node {
+  if n == 0 { return Leaf }
+  Node(left: tree(n - 1), label: "node {n}, with a label long enough for a buffer", right: Leaf)
+}
+
+fn rename(t: Leaf | Node) -> Leaf | Node {
+  case t {
+    Leaf -> Leaf
+    n: Node -> Node(left: rename(n.left), label: "renamed", right: n.right)
+  }
+}
+
+fn renamed(t: Leaf | Node) -> Int {
+  case t {
+    Leaf -> 0
+    n: Node -> {
+      let here = if n.label == "renamed" { 1 } else { 100 }
+      here + renamed(n.left)
+    }
+  }
+}
+
+fn trees(n: Int) -> Int {
+  renamed(rename(tree(n)))
+}
+"#;
+    let mut base = Module::compiled(text, Tier::Baseline);
+    let mut m = Module::compiled(text, Tier::Optimizing);
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    RELEASED.set(0);
+    assert_eq!(base.int("bumped", &[100]), 5150);
+    let freed = RELEASED.get();
+    RELEASED.set(0);
+    assert_eq!(m.int("bumped", &[100]), 5150);
+    // Each old node of the list became a new one.
+    assert!(
+        RELEASED.get() + 100 <= freed,
+        "{} of {freed}",
+        RELEASED.get()
+    );
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("shared", &[10]), 55_065);
+    assert_eq!(m.heap.live_blocks(), 0);
+    assert_eq!(m.int("trees", &[20]), 20);
+    assert_eq!(m.heap.live_blocks(), 0);
+    // The overflow traps after the node is taken apart for the new one.
+    assert_eq!(m.run("edge", &[5]), Ok(vec![8]));
+    let trap = m.run("edge", &[i64::MAX]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::Overflow);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+}
+
 /// In the optimizing tier, a call of a function value that is known to be
 /// a small closure runs a copy of the closure's code, which reads what the
 /// closure captured: the closure need not be made (Plan §11.10.1).
