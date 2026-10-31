@@ -463,7 +463,7 @@ impl<'db> Check<'_, 'db> {
 
     fn statement(&mut self, statement: &Statement<'db>) {
         // A box kept for reuse is a box.
-        if let Statement::Reclaim { token: t, .. } = statement {
+        if let Statement::Reclaim { token: Some(t), .. } = statement {
             self.keep[t.index()] = true;
         }
         let Statement::Assign(dst, rvalue) = statement else {

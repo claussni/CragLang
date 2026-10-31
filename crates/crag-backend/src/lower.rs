@@ -183,6 +183,8 @@ pub fn lower_to_lir<'db>(
         result: result.cloned(),
         sret: None,
         fresh: None,
+        kept: Vec::new(),
+        owned: Vec::new(),
         results: None,
     };
     // The parameters' words come first: a parameter that passes by value
@@ -229,6 +231,15 @@ pub fn lower_to_lir<'db>(
     for (b, block) in mir.blocks.iter().enumerate() {
         l.current = (b, Vec::new());
         l.fresh = None;
+        l.kept = block
+            .statements
+            .iter()
+            .flat_map(|s| match s {
+                Statement::Reclaim { kept, .. } => kept.iter().map(|&(_, k)| k).collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        l.owned.clear();
         l.catch = block.catch;
         l.scope = block.inlined;
         if unknown_param || returns > 2 {
@@ -446,6 +457,10 @@ struct Lower<'a, 'db> {
     /// already: the retain that follows the read is its own, and without
     /// one the value dies at once.
     fresh: Option<Local>,
+    /// The locals the block's reclaims keep, whose reads are not retained
+    /// (Plan §11.10.1), and those of them a read gave values of their own.
+    kept: Vec<Local>,
+    owned: Vec<Local>,
     /// A buffer on the side stack for the results of more than two words
     /// that calls give by value, pushed at the entry.
     results: Option<VReg>,
@@ -1306,7 +1321,10 @@ impl<'a, 'db> Lower<'a, 'db> {
             if matches!(statement, Statement::Retain(l) if *l == fresh) {
                 return Ok(());
             }
-            self.count(fresh, Count::Release)?;
+            match self.kept.contains(&fresh) {
+                true => self.owned.push(fresh),
+                false => self.count(fresh, Count::Release)?,
+            }
         }
         match statement {
             Statement::Assign(local, rvalue) => {
@@ -1315,7 +1333,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             }
             Statement::Retain(local) => self.count(*local, Count::Retain),
             Statement::Release(local) => self.count(*local, Count::Release),
-            Statement::Reclaim { local, token } => self.reclaim(*local, *token),
+            Statement::Reclaim { local, token, kept } => self.reclaim(*local, *token, kept),
             Statement::Poll => {
                 self.push(Inst::Poll);
                 Ok(())
@@ -1371,25 +1389,71 @@ impl<'a, 'db> Lower<'a, 'db> {
     }
 
     /// Gives up a record's reference as a release does, but takes apart a
-    /// box that no one else holds (Plan §11.10.1): its fields are
-    /// released, and the box, empty, goes to the token. A shared box gives
-    /// the token a static empty one.
-    fn reclaim(&mut self, local: Local, token: Local) -> Result<(), Unsupported> {
+    /// box that no one else holds (Plan §11.10.1): the kept fields'
+    /// references pass to the locals that read them, which have the
+    /// field's words as the record holds them, the other fields are
+    /// released, and the box, empty, goes to the token or is freed. A
+    /// shared box gives each kept local a reference of its own, and the
+    /// token a static empty box.
+    fn reclaim(
+        &mut self,
+        local: Local,
+        token: Option<Local>,
+        kept: &[(Name<'db>, Local)],
+    ) -> Result<(), Unsupported> {
         let ty = self.local_ty(local);
-        let empty = self.empty_box();
-        let t = word(&self.locals[token.index()])?;
-        self.push(Inst::Move { dst: t, src: empty });
-        let b = match (
-            &self.forms[local.index()],
-            box_form(self.db, self.program, ty),
-        ) {
-            (None, Some(b)) => b,
-            // A split record has no box.
-            _ => return self.count(local, Count::Release),
+        let token = match token {
+            Some(t) => {
+                let empty = self.empty_box();
+                let reg = word(&self.locals[t.index()])?;
+                self.push(Inst::Move {
+                    dst: reg,
+                    src: empty,
+                });
+                Some((reg, self.local_ty(t)))
+            }
+            None => None,
         };
+        let split = self.forms[local.index()].clone();
+        let b = box_form(self.db, self.program, ty);
+        let holder = match (&split, &b) {
+            (Some(f), _) => f.clone(),
+            (None, Some(b)) => b.form.clone(),
+            (None, None) => return Err("records of this type"),
+        };
+        let mut moved = Vec::new();
+        for &(name, k) in kept {
+            // A read that gave a value of its own needs no reference.
+            if let Some(i) = self.owned.iter().position(|&o| o == k) {
+                self.owned.swap_remove(i);
+                continue;
+            }
+            let own = match self.forms[k.index()].clone() {
+                Some(f) => Some(f),
+                None => self.layouts[k.index()].map(Form::Words),
+            };
+            let field = holder.field(name).map(|(_, _, f)| f.clone());
+            match own.is_some() && own == field {
+                true => moved.push(name),
+                false => self.count(k, Count::Retain)?,
+            }
+        }
+        let retain_moved = |this: &mut Self| -> Result<(), Unsupported> {
+            for &(name, k) in kept {
+                if moved.contains(&name) {
+                    this.count(k, Count::Retain)?;
+                }
+            }
+            Ok(())
+        };
+        // A split record's registers hold its fields' references alone.
+        if split.is_some() {
+            let regs = self.locals[local.index()].clone();
+            return self.release_fields(&holder, &regs, &moved);
+        }
+        let b = b.expect("a box form");
         let ptr = word(&self.locals[local.index()])?;
-        // Fields the runtime closes when it frees the box stay with it, and
-        // a token takes only a box of its record's size class.
+        // Fields the runtime closes when it frees the box stay with it.
         let plain = match type_descriptor(self.db, self.program, ty) {
             Some(TypeDescriptor::Record { counted, dispose }) => {
                 dispose.is_none()
@@ -1404,10 +1468,28 @@ impl<'a, 'db> Lower<'a, 'db> {
             }
             _ => false,
         };
-        let fits = box_form(self.db, self.program, self.local_ty(token)).is_some_and(|t| {
-            size_class(t.size).is_some() && size_class(t.size) == size_class(b.size)
+        if !plain || b.dispose.is_some() {
+            retain_moved(self)?;
+            self.release(ptr);
+            return Ok(());
+        }
+        // A token takes only a box of its record's size class.
+        let token = token.filter(|&(_, t)| {
+            box_form(self.db, self.program, t).is_some_and(|t| {
+                size_class(t.size).is_some() && size_class(t.size) == size_class(b.size)
+            })
         });
-        if !plain || b.dispose.is_some() || !fits {
+        // Without a box to keep, taking it apart pays only when no field
+        // is left to release: the runtime frees a box and its fields at
+        // once.
+        let Form::Fields(fields) = &b.form else {
+            return Err("records of this type");
+        };
+        let left = fields
+            .iter()
+            .any(|(name, _, f)| !moved.contains(name) && counted_form(f));
+        if token.is_none() && (left || moved.is_empty()) {
+            retain_moved(self)?;
             self.release(ptr);
             return Ok(());
         }
@@ -1442,7 +1524,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             Some(claim),
         );
         let regs = self.load_stored(ptr, &b.slots, b.form.words());
-        self.count_form(&b.form, ty, &regs, Count::Release)?;
+        self.release_fields(&b.form, &regs, &moved)?;
         // An empty box holds no references: freed by a trap, it is freed
         // as a buffer is.
         let empty = self.constant(BUFFER_HEADER as i64);
@@ -1451,10 +1533,36 @@ impl<'a, 'db> Lower<'a, 'db> {
             addr: ptr,
             offset: TYPE_INDEX_OFFSET,
         });
-        self.push(Inst::Move { dst: t, src: ptr });
+        match token {
+            Some((t, _)) => self.push(Inst::Move { dst: t, src: ptr }),
+            None => self.release(ptr),
+        }
         self.end(Term::Jump(done), Some(shared));
+        retain_moved(self)?;
         self.release(ptr);
         self.end(Term::Jump(done), Some(done));
+        Ok(())
+    }
+
+    /// Releases the fields of a record's registers in a `Form::Fields`,
+    /// but those `moved`.
+    fn release_fields(
+        &mut self,
+        form: &Form<'db>,
+        regs: &[VReg],
+        moved: &[Name<'db>],
+    ) -> Result<(), Unsupported> {
+        let Form::Fields(fields) = form else {
+            return Err("records of this type");
+        };
+        let mut at = 0;
+        for (name, t, f) in fields {
+            let n = f.words();
+            if !moved.contains(name) {
+                self.count_form(f, *t, &regs[at..at + n], Count::Release)?;
+            }
+            at += n;
+        }
         Ok(())
     }
 

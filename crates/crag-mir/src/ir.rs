@@ -594,10 +594,17 @@ pub enum Statement<'db> {
     Release(Local),
     /// Gives up the reference of a local of a record type as `Release`
     /// does, but a box whose reference it was is taken apart rather than
-    /// freed (Plan §11.10.1): its fields are released, and the box goes
-    /// to `token`, empty, for a record built later. A token without a box
-    /// holds a static empty one.
-    Reclaim { local: Local, token: Local },
+    /// freed (Plan §11.10.1, Specification §13.4). The `kept` locals hold
+    /// fields read out of the record, by name, without references of their
+    /// own: those of the box pass to them, and the other fields are
+    /// released; when the box is shared, each gets a reference of its own.
+    /// The box itself goes to `token`, empty, for a record built later,
+    /// or is freed; a token without a box holds a static empty one.
+    Reclaim {
+        local: Local,
+        token: Option<Local>,
+        kept: Vec<(Name<'db>, Local)>,
+    },
     /// A point on a loop's back-edge where the runtime may stop the fiber.
     Poll,
     /// The start of a statement, where the debugger may stop the task
@@ -848,7 +855,10 @@ impl<'db> Statement<'db> {
                 out
             }
             Statement::Retain(l) | Statement::Release(l) => vec![l],
-            Statement::Reclaim { local, token } => vec![local, token],
+            Statement::Reclaim { local, token, kept } => std::iter::once(local)
+                .chain(token.iter_mut())
+                .chain(kept.iter_mut().map(|(_, l)| l))
+                .collect(),
             Statement::Poll => Vec::new(),
             Statement::Step { locals, .. } => locals.iter_mut().collect(),
         }
@@ -974,8 +984,19 @@ fn statement_text<'db>(db: &'db dyn Db, statement: &Statement<'db>) -> String {
         }
         Statement::Retain(local) => format!("retain _{}", local.0),
         Statement::Release(local) => format!("release _{}", local.0),
-        Statement::Reclaim { local, token } => {
-            format!("reclaim _{} into _{}", local.0, token.0)
+        Statement::Reclaim { local, token, kept } => {
+            let mut text = format!("reclaim _{}", local.0);
+            if let Some(token) = token {
+                text += &format!(" into _{}", token.0);
+            }
+            if !kept.is_empty() {
+                let kept: Vec<String> = kept
+                    .iter()
+                    .map(|(name, l)| format!("{}: _{}", name.text(db), l.0))
+                    .collect();
+                text += &format!(" keeping {}", kept.join(", "));
+            }
+            text
         }
         Statement::Poll => "poll".into(),
         Statement::Step { at, locals } => {

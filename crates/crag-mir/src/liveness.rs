@@ -209,9 +209,10 @@ pub(crate) fn statement_uses(
         }
         Statement::Retain(l) => uses.borrowed.push(*l),
         Statement::Release(l) => uses.consumed.push(*l),
-        Statement::Reclaim { local, token } => {
+        // What it keeps already lives on with references of its own.
+        Statement::Reclaim { local, token, .. } => {
             uses.consumed.push(*local);
-            uses.def = Some(*token);
+            uses.def = *token;
         }
         Statement::Poll | Statement::Step { .. } => {}
     }

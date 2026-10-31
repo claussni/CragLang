@@ -104,6 +104,7 @@ pub fn lessThan(a: Int, b: Int) -> Bool
 pub fn lessThan(a: Float, b: Float) -> Bool
 pub fn equals(a: Str, b: Str) -> Bool
 pub fn equals(a: Bytes, b: Bytes) -> Bool
+pub fn listAppend[T](xs: List[T], x: T) -> List[T]
 "#;
 
 thread_local! {
@@ -3493,9 +3494,10 @@ fn twice(n: Int) -> Int {
 }
 
 /// In the optimizing tier, a record that dies gives its box to the record
-/// built from it, when no one else holds it (Plan §11.10.1): no box is
-/// freed and none allocated. A shared record stays as it was, and a trap
-/// between the two frees the box kept.
+/// built from it, when no one else holds it, and its fields to the locals
+/// that read them (Plan §11.10.1): no box is freed and none allocated. A
+/// shared record stays as it was, and a trap between the two frees the
+/// box kept.
 #[test]
 fn dying_records_give_their_boxes_to_new_ones() {
     let text = r#"type Nil
@@ -3585,6 +3587,53 @@ fn trees(n: Int) -> Int {
     assert_eq!(m.run("edge", &[5]), Ok(vec![8]));
     let trap = m.run("edge", &[i64::MAX]).unwrap_err();
     assert_eq!(trap.kind, TrapKind::Overflow);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+}
+
+/// A field read out of a record that dies takes the record's reference
+/// to it, so an update of the field's value in a new version of the record
+/// finds it held once, and updates it in place (Specification §13.4); in
+/// a shared record the field keeps its value.
+#[test]
+fn fields_of_dying_records_are_updated_in_place() {
+    let text = r#"type Bag(items: List[Int], a: Str, b: Str)
+
+fn fill(bag: Bag, n: Int) -> Bag {
+  if n == 0 { return bag }
+  fill(Bag(..bag, items: listAppend(bag.items, n)), n - 1)
+}
+
+fn total(xs: List[Int]) -> Int {
+  var sum = 0
+  for x in xs {
+    sum = sum + x
+  }
+  sum
+}
+
+fn filled(n: Int) -> Int {
+  let bag = fill(Bag(items: [], a: "a string long enough for a buffer {n}", b: "b"), n)
+  total(bag.items)
+}
+
+fn kept(n: Int) -> Int {
+  let old = fill(Bag(items: [], a: "a", b: "b"), n)
+  let new = fill(old, 2)
+  total(old.items) * 1000 + total(new.items)
+}
+"#;
+    let mut m = Module::compiled(text, Tier::Optimizing);
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    let (db, program) = (&m.db, m.program);
+    let fill = owners(db, program.modules(db)[1])
+        .into_iter()
+        .find(|o| matches!(o, Owner::Item(i) if i.name(db).text(db) == "fill"))
+        .unwrap();
+    let body = crag_mir::mir(db, program, InstanceKey::body(db, fill), Tier::Optimizing);
+    let pretty = body.as_ref().unwrap().pretty(db);
+    assert!(pretty.contains("keeping items"), "{pretty}");
+    assert_eq!(m.run("filled", &[10]), Ok(vec![55]));
+    assert_eq!(m.run("kept", &[3]), Ok(vec![6009]));
     assert_eq!(m.worker.heap().live_blocks(), 0);
 }
 

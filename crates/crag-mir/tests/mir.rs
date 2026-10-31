@@ -1569,9 +1569,11 @@ bb7:
 }
 
 /// In the optimizing tier, a record that dies gives the record built from
-/// it its box (Plan §11.10.1).
+/// it its box, and the locals that read its fields their references: the
+/// reads move up with the release to before what uses them (Plan
+/// §11.10.1, Specification §13.4).
 #[test]
-fn dying_records_give_their_boxes() {
+fn dying_records_give_their_boxes_and_fields() {
     let text = r#"type Account(name: Str, tags: Str, balance: Int)
 type Nil
 type Cons(head: Str, tail: Cons | Nil)
@@ -1610,12 +1612,10 @@ bb1:
   release _0
   trap overflow
 bb2:
-  _3 = Int.add(_2, _1)
   _4 = _0.name
-  retain _4
   _5 = _0.tags
-  retain _5
-  reclaim _0 into _8
+  reclaim _0 into _8 keeping name: _4, tags: _5
+  _3 = Int.add(_2, _1)
   _6 = Account(name: _4, tags: _5, balance: _3) in _8
   return _6
 renamed
@@ -1633,9 +1633,8 @@ bb0:
   _3 = concat(_2, " ", _1)
   release _2
   _4 = _0.tags
-  retain _4
   _5 = _0.balance
-  reclaim _0 into _7
+  reclaim _0 into _7 keeping tags: _4
   _6 = Account(name: _3, tags: _4, balance: _5) in _7
   return _6
 tag
@@ -1655,10 +1654,8 @@ bb1:
   jump bb2
 bb2:
   _3 = _1.head
-  retain _3
   _4 = _1.tail
-  retain _4
-  reclaim _1 into _8
+  reclaim _1 into _8 keeping head: _3, tail: _4
   _5 = call tag(_4) -> bb4
 bb3:
   release _0
