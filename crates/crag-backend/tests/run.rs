@@ -3747,3 +3747,45 @@ fn later(n: Int) -> Int {
     assert_eq!(trap.kind, TrapKind::Overflow);
     assert_eq!(m.worker.heap().live_blocks(), 0);
 }
+
+/// In the optimizing tier, a part read out of a value that outlives it is
+/// borrowed from the value, not counted (Plan §11.10.1): what it holds is
+/// freed once, also when a trap ends the code while the part is live.
+#[test]
+fn parts_of_values_that_outlive_them_are_borrowed() {
+    let text = r#"fn short(s: Str) -> Bool {
+  s == "short"
+}
+
+fn count(xs: List[Str], k: Int) -> Int {
+  let a = xs[0]
+  let b = xs[1]
+  var n = 1
+  if short(a) { n = n + 1 }
+  if short(b) { n = n + k }
+  if a == b { n = n + 100 }
+  n
+}
+
+fn counted(n: Int) -> Int {
+  let xs = ["a string long enough for a buffer {n}", "short", "another long string for a buffer {n}"]
+  count(xs, n) + count([xs[2], xs[0]], 1)
+}
+"#;
+    let mut m = Module::compiled(text, Tier::Optimizing);
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    let (db, program) = (&m.db, m.program);
+    let count = owners(db, program.modules(db)[1])
+        .into_iter()
+        .find(|o| matches!(o, Owner::Item(i) if i.name(db).text(db) == "count"))
+        .unwrap();
+    let body = crag_mir::mir(db, program, InstanceKey::body(db, count), Tier::Optimizing);
+    let pretty = body.as_ref().unwrap().pretty(db);
+    assert!(!pretty.contains("retain"), "{pretty}");
+    assert!(pretty.contains("(a) borrowed"), "{pretty}");
+    assert_eq!(m.run("counted", &[3]), Ok(vec![5]));
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+    let trap = m.run("counted", &[i64::MAX]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::Overflow);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+}

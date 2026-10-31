@@ -26,14 +26,16 @@
 //! is released right after its last use, with the parameters a function
 //! only reads borrowed from its caller (§11.10.1). In the optimizing tier,
 //! small callees and calls of known small closures are inlined before the
-//! counts are placed, and a record that dies gives its box and its fields
-//! to what is built from it after.
+//! counts are placed, a record that dies gives its box and its fields to
+//! what is built from it after, and a part read out of a value that
+//! outlives it is borrowed from it rather than counted.
 
 extern crate crag_db as salsa;
 
 mod borrow;
 mod build;
 mod checks;
+mod elide;
 mod inline;
 mod ir;
 mod liveness;
@@ -49,6 +51,7 @@ use crag_types::{Filling, Handler, HandlerCode, Instance, Ty};
 pub use borrow::borrows;
 pub use build::{has_derived_code, place};
 pub use checks::insert_overflow_checks;
+pub use elide::elide_rc;
 pub use inline::{
     ClosureEnv, InlineCost, KnownClosure, inline_call, known_closure, should_inline,
     specialize_closure_call,
@@ -231,11 +234,12 @@ pub fn mir<'db>(
         inline::inline_calls(db, program, instance, &mut body);
     }
     let lent = borrow::lend(db, program, instance, &mut body);
-    let live = compute_liveness(&body, lent);
+    let live = compute_liveness(&body, lent.clone());
     insert_rc_ops(&mut body, &live);
     insert_drops(&mut body, &live);
     if tier == Tier::Optimizing {
         insert_reuse(db, program, &mut body);
+        elide_rc(db, program, &mut body, &lent);
     }
     Some(body)
 }

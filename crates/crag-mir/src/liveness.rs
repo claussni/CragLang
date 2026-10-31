@@ -219,7 +219,7 @@ pub(crate) fn statement_uses(
     uses.counted(body, holds)
 }
 
-fn terminator_uses<'db>(
+pub(crate) fn terminator_uses<'db>(
     body: &MirBody<'db>,
     holds: &[LocalSet],
     lent: &Lent<'db>,

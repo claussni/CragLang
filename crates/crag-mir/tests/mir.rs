@@ -1854,3 +1854,173 @@ bb2:
         panic!("MIR differs; found:\n{found}");
     }
 }
+
+/// In the optimizing tier, a part read out of a value that keeps its own
+/// reference all the while is borrowed from it: its retain and release
+/// cancel. A part that outlives the value, or is given away, stays
+/// counted.
+#[test]
+fn parts_of_values_that_outlive_them_are_borrowed() {
+    let text = r#"fn describe(v: Int | Str) -> Int {
+  case v {
+    "a" -> 4
+    _ -> 5
+  }
+}
+
+fn isA(s: Str) -> Bool {
+  s == "a"
+}
+
+fn both(xs: List[Str]) -> Bool {
+  let a = xs[0]
+  isA(a) and isA(xs[1]) and a == "b"
+}
+
+fn first(xs: List[Str]) -> Str {
+  let a = xs[0]
+  isA(a)
+  a
+}
+"#;
+    let found = mir_in(text, false, Tier::Optimizing);
+    let expected = r#"describe
+param _0: Int | Str (v) borrowed
+let _1: Str borrowed
+let _2: False | True
+bb0:
+  switch _0 [Str: bb1] else bb3
+bb1:
+  _1 = (_0 as Str)
+  _2 = Str.eq(_1, "a")
+  branch _2 bb2 bb3
+bb2:
+  return 4
+bb3:
+  return 5
+isA
+param _0: Str (s) borrowed
+let _1: False | True
+bb0:
+  _1 = Str.eq(_0, "a")
+  return _1
+both
+param _0: List[Str] (xs) borrowed
+let _1: Int
+let _2: False | True
+let _3: False | True
+let _4: Str borrowed
+let _5: Str (a) borrowed
+let _6: False | True
+let _7: False | True
+let _8: Int
+let _9: False | True
+let _10: False | True
+let _11: Str borrowed
+let _12: False | True
+let _13: False | True
+let _14: False | True
+let _15: False | True
+inlined i0: isA at e5
+inlined i1: isA at e10
+bb0:
+  _1 = len _0
+  _2 = Int.lt(0, 0)
+  branch _2 bb1 bb2
+bb1:
+  trap index
+bb2:
+  _3 = Int.ge(0, _1)
+  branch _3 bb3 bb4
+bb3:
+  trap index
+bb4:
+  _4 = _0[0]
+  _5 = _4
+  guard isA bb17 else bb16
+bb5:
+  _6 = convert True
+  jump bb7
+bb6:
+  _6 = convert False
+  jump bb7
+bb7:
+  return _6
+bb8:
+  _13 = Str.eq(_5, "b")
+  branch _13 bb5 bb6
+bb9:
+  _8 = len _0
+  _9 = Int.lt(1, 0)
+  branch _9 bb11 bb12
+bb10:
+  branch _7 bb9 bb20
+bb11:
+  trap index
+bb12:
+  _10 = Int.ge(1, _8)
+  branch _10 bb13 bb14
+bb13:
+  trap index
+bb14:
+  _11 = _0[1]
+  guard isA bb19 else bb18
+bb15:
+  branch _12 bb8 bb21
+bb16:
+  _7 = call isA(_5) -> bb10
+bb17 (i0):
+  _14 = Str.eq(_5, "a")
+  _7 = _14
+  jump bb10
+bb18:
+  _12 = call isA(_11) -> bb22
+bb19 (i1):
+  _15 = Str.eq(_11, "a")
+  _12 = _15
+  jump bb15
+bb20:
+  jump bb6
+bb21:
+  jump bb6
+bb22:
+  jump bb15
+first
+param _0: List[Str] (xs) borrowed
+let _1: Int
+let _2: False | True
+let _3: False | True
+let _4: Str
+let _5: Str (a)
+let _6: False | True
+let _7: False | True
+inlined i0: isA at e5
+bb0:
+  _1 = len _0
+  _2 = Int.lt(0, 0)
+  branch _2 bb1 bb2
+bb1:
+  trap index
+bb2:
+  _3 = Int.ge(0, _1)
+  branch _3 bb3 bb4
+bb3:
+  trap index
+bb4:
+  _4 = _0[0]
+  retain _4
+  _5 = _4
+  guard isA bb7 else bb6
+bb5:
+  return _5
+bb6:
+  _6 = call isA(_5) -> bb5
+bb7 (i0):
+  _7 = Str.eq(_5, "a")
+  _6 = _7
+  jump bb5
+"#;
+    if found != expected {
+        panic!("MIR differs; found:\n{found}");
+    }
+}

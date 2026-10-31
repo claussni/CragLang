@@ -80,7 +80,7 @@ fn eligible<'db>(db: &'db dyn Db, program: Program, instance: InstanceKey<'db>) 
 
 /// Whether a parameter of the type may be borrowed: a counted value that
 /// never passes by value in a storage form.
-fn borrowable<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
+pub(crate) fn borrowable<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
     fn record<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
         match ty.kind(db) {
             TyKind::Record { .. } => true,
