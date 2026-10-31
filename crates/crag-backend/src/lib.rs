@@ -376,7 +376,7 @@ pub fn code<'db>(
     let settings = CodegenSettings {
         target: host().clone(),
         opt: match tier {
-            Tier::Optimizing => OptLevel::Speed,
+            Tier::Optimizing | Tier::Hot => OptLevel::Speed,
             Tier::Baseline | Tier::Metered => OptLevel::None,
         },
         metered: tier == Tier::Metered,

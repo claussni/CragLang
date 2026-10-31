@@ -28,6 +28,11 @@
 //! id and the hash of their code, entry stubs by their words, and type
 //! descriptors by index. A shipment sends only what the image lacks, so a
 //! fresh image after a crash gets everything again.
+//!
+//! While a run in the scratch image waits, the host asks every 20 ms which
+//! functions are hot and ships optimized code for them (§11.10.2); the
+//! image answers both before the run's own answer, or after it once the
+//! run ended. The app image is asked the same between other requests.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -173,7 +178,14 @@ impl ImageHandle {
     /// image prints meanwhile, so an image that prints much never waits on
     /// a full pipe while the host waits on it.
     fn wait_for_message(&mut self) -> io::Result<()> {
+        self.wait_for_message_within(None).map(|_| ())
+    }
+
+    /// Waits as `wait_for_message` does, at most `timeout`: whether the
+    /// stream has something to read.
+    fn wait_for_message_within(&mut self, timeout: Option<Duration>) -> io::Result<bool> {
         use std::os::fd::AsRawFd;
+        let deadline = timeout.map(|t| Instant::now() + t);
         loop {
             self.drain();
             let mut fds = [
@@ -188,9 +200,19 @@ impl ImageHandle {
                     revents: 0,
                 },
             ];
+            let wait = match deadline {
+                None => -1,
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Ok(false);
+                    }
+                    left.as_millis().clamp(1, i32::MAX as u128) as i32
+                }
+            };
             // SAFETY: the array outlives the call, and a negative
             // descriptor is skipped.
-            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), 2, wait) };
             if ready < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
@@ -199,7 +221,7 @@ impl ImageHandle {
                 return Err(e);
             }
             if fds[0].revents != 0 {
-                return Ok(());
+                return Ok(true);
             }
         }
     }
@@ -358,6 +380,114 @@ fn timed_out() -> io::Error {
             CONNECT_TIMEOUT.as_secs()
         ),
     )
+}
+
+/// How often a run in the scratch image is asked for hot functions.
+pub const PROFILE_PERIOD: Duration = Duration::from_millis(20);
+
+/// What a run in the scratch image asks the host while it waits: optimized
+/// code for the functions the image found hot (Implementation Plan
+/// §11.10.2).
+pub trait TierUp {
+    /// How many calls and back-edges make a function hot.
+    fn threshold(&self) -> u64;
+    /// Optimized code for hot functions, with the descriptors of the types
+    /// it uses; none to leave them as they are.
+    fn hot(&mut self, funcs: &[FuncId]) -> Option<Optimized>;
+    /// The functions the image swapped for optimized code.
+    fn optimized(&mut self, funcs: &[FuncId]);
+}
+
+/// Optimized code for an image: descriptors and functions.
+pub type Optimized = (Vec<(u32, TypeDescriptor)>, Vec<ShippedFunction>);
+
+/// The request a run waits for besides its own answer.
+enum Asked {
+    Profile,
+    /// With the descriptors sent, which the image holds once it swapped
+    /// in code.
+    Optimize(HashMap<u32, blake3::Hash>),
+}
+
+/// The `Optimize` message for code, with the descriptors it sends: those
+/// the image lacks.
+fn optimize_message(
+    image: &ImageHandle,
+    optimized: Optimized,
+) -> (Message, HashMap<u32, blake3::Hash>) {
+    let (types, functions) = optimized;
+    let mut sent = HashMap::new();
+    let types = types
+        .into_iter()
+        .filter(|(index, d)| {
+            !image.descriptors.contains_key(index)
+                && sent.insert(*index, descriptor_hash(d)).is_none()
+        })
+        .collect();
+    (Message::Optimize { types, functions }, sent)
+}
+
+/// Sends a request that runs code to the image and returns its answer,
+/// asking for hot functions every `PROFILE_PERIOD` meanwhile and shipping
+/// optimized code for them. The image answers those before the run's
+/// answer, or after it once the run ended.
+fn converse(
+    image: &mut ImageHandle,
+    message: &Message,
+    tier: &mut dyn TierUp,
+) -> io::Result<Message> {
+    send(image, message)?;
+    let mut asked: Option<Asked> = None;
+    let mut answer = None;
+    loop {
+        if asked.is_none()
+            && let Some(answer) = answer.take()
+        {
+            return Ok(answer);
+        }
+        let timeout = match (&asked, &answer) {
+            (None, None) => Some(PROFILE_PERIOD),
+            _ => None,
+        };
+        if !image.wait_for_message_within(timeout)? {
+            let threshold = tier.threshold();
+            send(image, &Message::Profile { threshold })?;
+            asked = Some(Asked::Profile);
+            continue;
+        }
+        let reply = read_message(&mut image.stream)?;
+        image.drain();
+        match (reply, &asked) {
+            (Message::Hot(funcs), Some(Asked::Profile)) => {
+                asked = None;
+                // Code for a run that ended would only be loaded.
+                if answer.is_none()
+                    && !funcs.is_empty()
+                    && let Some(optimized) = tier.hot(&funcs)
+                {
+                    let (message, sent) = optimize_message(image, optimized);
+                    send(image, &message)?;
+                    asked = Some(Asked::Optimize(sent));
+                }
+            }
+            (Message::Optimized(funcs), Some(Asked::Optimize(_))) => {
+                let Some(Asked::Optimize(sent)) = asked.take() else {
+                    unreachable!("asked to optimize");
+                };
+                if !funcs.is_empty() {
+                    image.descriptors.extend(sent);
+                }
+                tier.optimized(&funcs);
+            }
+            (reply, _) if answer.is_none() => answer = Some(reply),
+            (reply, _) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("the image answered {reply:?} after its run ended"),
+                ));
+            }
+        }
+    }
 }
 
 /// Sends a message to the image.
@@ -555,9 +685,39 @@ impl Session {
             ImageKind::Scratch => &mut self.scratch,
             ImageKind::App => self.app.as_mut().ok_or(SessionError::NoApp)?,
         };
-        let error = match send(image, message).and_then(|()| receive(image)) {
-            Ok(reply) => return Ok(reply),
-            Err(e) => e,
+        match send(image, message).and_then(|()| receive(image)) {
+            Ok(reply) => Ok(reply),
+            Err(e) => Err(self.broken(kind, e)?),
+        }
+    }
+
+    /// Sends a request that runs code to the scratch image as `request`
+    /// does, and meanwhile swaps the functions that become hot for
+    /// optimized code, as `tier` compiles it.
+    fn request_running(
+        &mut self,
+        message: &Message,
+        tier: Option<&mut dyn TierUp>,
+    ) -> Result<Message, SessionError> {
+        let Some(tier) = tier else {
+            return self.request(message);
+        };
+        if self.scratch.state != ImageState::Running {
+            self.keep_output(ImageKind::Scratch);
+            self.scratch = spawn_image(&self.command, ImageKind::Scratch)?;
+        }
+        match converse(&mut self.scratch, message, tier) {
+            Ok(reply) => Ok(reply),
+            Err(e) => Err(self.broken(ImageKind::Scratch, e)?),
+        }
+    }
+
+    /// Reaps an image whose stream failed with `error`: the error that
+    /// tells how it ended, once a fresh scratch image runs in its place.
+    fn broken(&mut self, kind: ImageKind, error: io::Error) -> Result<SessionError, SessionError> {
+        let image = match kind {
+            ImageKind::Scratch => &mut self.scratch,
+            ImageKind::App => self.app.as_mut().ok_or(SessionError::NoApp)?,
         };
         // A stream that ended belongs to an image that is exiting; any
         // other failure to one that must be stopped.
@@ -569,16 +729,51 @@ impl Session {
         };
         let status = image.reap(grace)?;
         match kind {
-            ImageKind::Scratch => Err(SessionError::Exited(self.on_image_exit(status)?)),
+            ImageKind::Scratch => Ok(SessionError::Exited(self.on_image_exit(status)?)),
             ImageKind::App => {
                 self.keep_output(ImageKind::App);
                 let app = self.app.take().expect("an app image");
-                Err(SessionError::AppExited(ImageExit {
+                Ok(SessionError::AppExited(ImageExit {
                     kind,
                     pid: app.pid,
                     status,
                 }))
             }
+        }
+    }
+
+    /// The functions an image found hot (Implementation Plan §11.10.2).
+    pub fn profile(
+        &mut self,
+        kind: ImageKind,
+        threshold: u64,
+    ) -> Result<Vec<FuncId>, SessionError> {
+        match self.request_to(kind, &Message::Profile { threshold })? {
+            Message::Hot(funcs) => Ok(funcs),
+            other => Err(unexpected(other, "Profile")),
+        }
+    }
+
+    /// Has an image swap functions for optimized code: those it swapped.
+    pub fn optimize(
+        &mut self,
+        kind: ImageKind,
+        optimized: Optimized,
+    ) -> Result<Vec<FuncId>, SessionError> {
+        let image = self.image(kind).ok_or(SessionError::NoApp)?;
+        let (message, sent) = optimize_message(image, optimized);
+        match self.request_to(kind, &message)? {
+            Message::Optimized(funcs) => {
+                if !funcs.is_empty() {
+                    let image = match kind {
+                        ImageKind::Scratch => &mut self.scratch,
+                        ImageKind::App => self.app.as_mut().expect("answered"),
+                    };
+                    image.descriptors.extend(sent);
+                }
+                Ok(funcs)
+            }
+            other => Err(unexpected(other, "Optimize")),
         }
     }
 
@@ -703,7 +898,17 @@ impl Session {
 
     /// Runs a loaded function without parameters in the scratch image.
     pub fn run(&mut self, func: FuncId) -> Result<RunResult, SessionError> {
-        match self.request(&Message::Run(func))? {
+        self.run_with(func, None)
+    }
+
+    /// Runs a loaded function as `run` does; with `tier`, the functions
+    /// that become hot meanwhile are swapped for optimized code.
+    pub fn run_with(
+        &mut self,
+        func: FuncId,
+        tier: Option<&mut dyn TierUp>,
+    ) -> Result<RunResult, SessionError> {
+        match self.request_running(&Message::Run(func), tier)? {
             Message::Finished(words) => Ok(RunResult::Finished(words)),
             Message::Interrupted => Ok(RunResult::Interrupted),
             Message::Trapped {
@@ -831,13 +1036,26 @@ impl Session {
         root: u32,
         text: bool,
     ) -> Result<RunResult, SessionError> {
+        self.show_with(func, shapes, root, text, None)
+    }
+
+    /// Shows a function's result as `show` does; with `tier`, the
+    /// functions that become hot meanwhile are swapped for optimized code.
+    pub fn show_with(
+        &mut self,
+        func: FuncId,
+        shapes: &Shapes,
+        root: u32,
+        text: bool,
+        tier: Option<&mut dyn TierUp>,
+    ) -> Result<RunResult, SessionError> {
         let show = Message::Show {
             func,
             shapes: shapes.clone(),
             root,
             text,
         };
-        match self.request(&show)? {
+        match self.request_running(&show, tier)? {
             Message::Shown(text) => Ok(RunResult::Shown(text)),
             Message::Trapped {
                 kind,

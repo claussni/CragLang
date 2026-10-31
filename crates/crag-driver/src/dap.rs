@@ -378,9 +378,13 @@ impl Adapter {
         Ok(json!({"allThreadsContinued": false}))
     }
 
-    /// Reports newly stopped tasks, and the app's end.
+    /// Reports newly stopped tasks, and the app's end, and swaps the app's
+    /// hot functions for optimized code.
     fn poll(&mut self) {
         let pauses = self.pauses();
+        if let (Some(scratch), Some(project)) = (&mut self.scratch, &self.project) {
+            let _ = scratch.tier_up_app(project);
+        }
         for pause in pauses {
             if self.reported.contains(&pause.task) {
                 continue;

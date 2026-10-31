@@ -72,6 +72,7 @@ impl Scratch {
         }
         let main = main_instance(project)?;
         self.stop_app()?;
+        self.app_ended = None;
         self.session
             .start_app_image()
             .map_err(|e| format!("cannot start the app image: {e}"))?;
@@ -135,7 +136,11 @@ impl Scratch {
     /// How the app is doing, in words: `None` while it runs.
     pub fn app_status(&mut self, project: &Project) -> Result<Option<String>, String> {
         if self.session.app().is_none() {
-            return Ok(Some("no app runs".into()));
+            return Ok(Some(
+                self.app_ended
+                    .take()
+                    .unwrap_or_else(|| "no app runs".into()),
+            ));
         }
         Ok(
             match self.session.app_status().map_err(|e| e.to_string())? {

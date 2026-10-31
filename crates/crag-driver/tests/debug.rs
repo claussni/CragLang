@@ -118,6 +118,10 @@ impl Drop for Setup {
 }
 
 fn setup(name: &str) -> Setup {
+    setup_with(name, SERVER)
+}
+
+fn setup_with(name: &str, source: &str) -> Setup {
     watchdog();
     let root = std::env::temp_dir().join(format!("crag-debug-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
@@ -134,7 +138,7 @@ fn setup(name: &str) -> Setup {
         .port();
     fs::write(
         root.join("app.crag"),
-        SERVER.replace("PORT", &port.to_string()),
+        source.replace("PORT", &port.to_string()),
     )
     .unwrap();
     let project = Project::load(&root).unwrap();
@@ -334,4 +338,61 @@ fn the_repl_debugs_the_app() {
     assert_eq!(eval(":continue"), "");
     assert_eq!(client.join().unwrap(), "one");
     assert_eq!(eval(":paused"), "no task is stopped\n");
+}
+
+const HOT: &str = r#"fn step(x: Int, d: Int) -> Int {
+  let y = x * 31 + 7
+  y % d
+}
+
+fn main() -> () {
+  var x = 1
+  for i in 1..4000000000000 {
+    x = step(x, 1000003)
+  }
+}
+"#;
+
+/// Whether code compiled in the baseline tier is swapped for optimized
+/// code once it is hot: unless all is optimized or `CRAG_HOT=0`.
+fn tiers_up() -> bool {
+    crag_mir::Tier::compiled() == crag_mir::Tier::Baseline
+        && std::env::var("CRAG_HOT").map_or(true, |v| v != "0")
+}
+
+#[test]
+fn a_breakpoint_sends_an_optimized_function_back_to_baseline() {
+    let mut s = setup_with("hot", HOT);
+    s.scratch.start_app(&s.project).unwrap();
+    if tiers_up() {
+        // `step` and the loop of `main`, whose frame runs on in baseline
+        // code and calls `step` through its slot.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while s.scratch.optimized().1 < 2 {
+            assert!(Instant::now() < deadline, "the app never tiered up");
+            s.scratch.tier_up_app(&s.project).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // Optimized code has no steps; the baseline code of `step` stops.
+    let line = HOT.lines().position(|l| l.contains("y % d")).unwrap() as u32 + 1;
+    let placed = s
+        .scratch
+        .set_breakpoints(&s.project, &[("app.crag".into(), line)])
+        .unwrap();
+    // In `step`, and in `main` too when all is optimized and inlines it.
+    assert_eq!(placed, vec![if optimizing() { 2 } else { 1 }]);
+    let pause = stopped(&mut s);
+    let step = match optimizing() {
+        true => "step (inlined)",
+        false => "step",
+    };
+    assert_eq!((pause.function.as_str(), pause.line), (step, line));
+    // With a breakpoint, `step` is not optimized again.
+    s.scratch.resume(pause.task, Resume::Continue).unwrap();
+    let pause = stopped(&mut s);
+    assert_eq!(pause.line, line);
+    if tiers_up() {
+        assert_eq!(s.scratch.tier_up_app(&s.project), Ok(0));
+    }
 }

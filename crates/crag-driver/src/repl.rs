@@ -361,6 +361,11 @@ impl Repl {
         self.scratch.pauses(&self.project)
     }
 
+    /// Swaps the app's hot functions for optimized code: how many.
+    pub fn tier_up_app(&mut self) -> Result<usize, String> {
+        self.scratch.tier_up_app(&self.project)
+    }
+
     /// Whether the app runs.
     pub fn app_runs(&self) -> bool {
         self.scratch.app_runs()
@@ -378,6 +383,8 @@ impl Repl {
     /// errors come rendered, and leave the session as it was.
     pub fn eval_input(&mut self, text: &str) -> Result<EvalOutput, String> {
         self.shown_type = None;
+        // The line REPL has no clock, so the app tiers up between inputs.
+        let _ = self.scratch.tier_up_app(&self.project);
         let text = text.trim();
         if text.is_empty() {
             return Ok(EvalOutput::Nothing);

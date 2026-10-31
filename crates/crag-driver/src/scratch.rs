@@ -18,7 +18,7 @@
 //! host compiles what the roots reach, ships what the image lacks, and asks
 //! the image to run a root. A crash in the code ends only the image.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 
@@ -27,11 +27,12 @@ use crag_backend::{func_id, shapes};
 use crag_codegen::{CodeObject, CodegenSettings, compile_entry_stub};
 use crag_mir::InstanceKey;
 use crag_runtime::Trap;
-use crag_session::{ImageCommand, ImageKind, RunResult, Session, ShippedFunction, Stub};
+use crag_session::{ImageCommand, ImageKind, RunResult, Session, ShippedFunction, Stub, TierUp};
 use crag_types::Ty;
 
 use crate::exec::{Compiled, Function, Sources, compile, constants, report, stub_settings};
 use crate::project::Project;
+use crate::tier::{Hot, tiers_up};
 
 /// What the host knows of the code it shipped to an image.
 #[derive(Default)]
@@ -40,6 +41,14 @@ pub(crate) struct Shipped {
     /// For each module-level value, a hash of the code its value was
     /// computed with: its own and what that calls.
     pub values: HashMap<SlotKey, u64>,
+    /// The hot functions compiled in the optimizing tier since their code
+    /// was last shipped, swapped in or not (Implementation Plan §11.10.2).
+    pub tried: HashSet<FuncId>,
+    /// How many functions were swapped for optimized code.
+    pub optimized: usize,
+    /// Whether the code differs from what the image runs, which keeps the
+    /// image from tiering up until code is shipped again.
+    pub stale: bool,
 }
 
 /// What a shipment did.
@@ -62,6 +71,9 @@ pub struct Scratch {
     constants: usize,
     /// The app's breakpoints, by file and line, which reloads keep.
     pub(crate) breakpoints: Vec<(String, u32)>,
+    /// How the app image ended when a request no one waited for found out,
+    /// such as one for tier-up, to be told by the next status.
+    pub(crate) app_ended: Option<String>,
 }
 
 impl Scratch {
@@ -73,6 +85,7 @@ impl Scratch {
             app: Shipped::default(),
             constants: 0,
             breakpoints: Vec::new(),
+            app_ended: None,
         })
     }
 
@@ -111,20 +124,7 @@ impl Scratch {
         roots: &[InstanceKey],
         fill: bool,
     ) -> Result<Shipment, String> {
-        let functions: Vec<ShippedFunction> = compiled
-            .objects
-            .iter()
-            .map(|&(slot, object)| {
-                let f = &compiled.functions[&slot.func];
-                ShippedFunction {
-                    id: slot.func,
-                    signature: slot.signature,
-                    params: f.params,
-                    returns: f.returns,
-                    object: object.clone(),
-                }
-            })
-            .collect();
+        let functions = shipped_functions(compiled);
         // Tasks start in the stubs for one argument, the task's closure;
         // the host ships each stub once.
         let mut stubs = Vec::new();
@@ -189,6 +189,7 @@ impl Scratch {
         } else {
             Vec::new()
         };
+        let changed = self.session.changed(kind, &functions);
         let sent = self
             .session
             .ship_to(kind, &compiled.types, &stubs, &functions, &reset, &fills)
@@ -197,6 +198,9 @@ impl Scratch {
             ImageKind::Scratch => &mut self.scratch,
             ImageKind::App => &mut self.app,
         };
+        // New code is baseline code, which may become hot in turn.
+        shipped.tried.retain(|f| !changed.contains(f));
+        shipped.stale = false;
         shipped.functions.extend(compiled.functions.clone());
         shipped.values.extend(values);
         self.constants += fills.len();
@@ -207,10 +211,20 @@ impl Scratch {
     }
 
     /// Ships a root without parameters and runs it in the image: how the
-    /// run ended.
+    /// run ended. Functions that become hot meanwhile are swapped for
+    /// optimized code.
     pub fn execute(&mut self, project: &Project, root: InstanceKey) -> Result<RunResult, String> {
-        self.ship(project, &[root])?;
-        self.session.run(func_id(root)).map_err(|e| e.to_string())
+        let compiled = compile(project, &[root])?;
+        self.ship_to(ImageKind::Scratch, project, &compiled, &[root], true)?;
+        let mut hot = Hot {
+            project,
+            instances: &compiled.instances,
+            shipped: &mut self.scratch,
+        };
+        let tier = tiers_up().then_some(&mut hot as &mut dyn TierUp);
+        self.session
+            .run_with(func_id(root), tier)
+            .map_err(|e| e.to_string())
     }
 
     /// Ships a root without parameters and runs it in the image, which
@@ -223,10 +237,17 @@ impl Scratch {
         ty: Ty,
         text: bool,
     ) -> Result<RunResult, String> {
-        self.ship(project, &[root])?;
+        let compiled = compile(project, &[root])?;
+        self.ship_to(ImageKind::Scratch, project, &compiled, &[root], true)?;
         let (shapes, shape) = shapes(&project.db, project.program, ty);
+        let mut hot = Hot {
+            project,
+            instances: &compiled.instances,
+            shipped: &mut self.scratch,
+        };
+        let tier = tiers_up().then_some(&mut hot as &mut dyn TierUp);
         self.session
-            .show(func_id(root), &shapes, shape, text)
+            .show_with(func_id(root), &shapes, shape, text, tier)
             .map_err(|e| e.to_string())
     }
 
@@ -249,6 +270,24 @@ impl Scratch {
     pub fn report(&self, sources: &dyn Sources, trap: &Trap) -> String {
         report(sources, &self.scratch.functions, trap)
     }
+}
+
+/// The functions of compiled code as an image takes them.
+pub(crate) fn shipped_functions(compiled: &Compiled) -> Vec<ShippedFunction> {
+    compiled
+        .objects
+        .iter()
+        .map(|&(slot, object)| {
+            let f = &compiled.functions[&slot.func];
+            ShippedFunction {
+                id: slot.func,
+                signature: slot.signature,
+                params: f.params,
+                returns: f.returns,
+                object: object.clone(),
+            }
+        })
+        .collect()
 }
 
 /// A hash of the code a function runs: its own and that of every function

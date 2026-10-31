@@ -391,6 +391,13 @@ fn broken() -> Int {
 }
 "#;
 
+/// Whether code compiled in the baseline tier is swapped for optimized
+/// code once it is hot: unless all is optimized or `CRAG_HOT=0`.
+fn tiers_up() -> bool {
+    crag_mir::Tier::compiled() == crag_mir::Tier::Baseline
+        && std::env::var("CRAG_HOT").map_or(true, |v| v != "0")
+}
+
 #[test]
 fn hot_functions_are_optimized_while_they_run() {
     let p = project("hot", HOT);
@@ -398,7 +405,7 @@ fn hot_functions_are_optimized_while_they_run() {
     let mut image = Image::build(&p, &[spin, function(&p, "broken")]).unwrap();
     let expected = (1..=20_000_000).fold(1i64, |x, _| (x * 31 + 7) % 1_000_003);
     assert_eq!(image.run(func_id(spin)), Ok(vec![expected as u64]));
-    if crag_mir::Tier::compiled() == crag_mir::Tier::Baseline {
+    if tiers_up() {
         // The loop and the function it calls, once they counted enough.
         assert_eq!(image.optimized(), 2);
     }
@@ -407,4 +414,32 @@ fn hot_functions_are_optimized_while_they_run() {
     let report = image.report(&p, &trap);
     assert!(report.contains("(x * 31 + 7) % d"), "{report}");
     assert!(report.contains("in step"), "{report}");
+}
+
+#[test]
+fn hot_functions_are_optimized_while_the_scratch_image_runs_them() {
+    let p = project("hot-scratch", HOT);
+    let mut s = scratch();
+    let expected = (1..=20_000_000).fold(1i64, |x, _| (x * 31 + 7) % 1_000_003);
+    assert_eq!(
+        s.run(&p, function(&p, "spin")).unwrap(),
+        Ok(vec![expected as u64])
+    );
+    if tiers_up() {
+        assert_eq!(s.optimized(), (2, 0));
+    }
+    // `step` runs its optimized code now, and a trap there is told where
+    // its source is.
+    let report = s.run(&p, function(&p, "broken")).unwrap().unwrap_err();
+    assert!(report.contains("(x * 31 + 7) % d"), "{report}");
+    assert!(report.contains("in step"), "{report}");
+    // Shipped again unchanged, the code stays optimized and is not
+    // compiled again.
+    assert_eq!(
+        s.run(&p, function(&p, "spin")).unwrap(),
+        Ok(vec![expected as u64])
+    );
+    if tiers_up() {
+        assert_eq!(s.optimized(), (2, 0));
+    }
 }

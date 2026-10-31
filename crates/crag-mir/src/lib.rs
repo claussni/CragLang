@@ -201,6 +201,11 @@ pub enum Tier {
     /// for code run at compile time or received from elsewhere. Its MIR is
     /// the baseline tier's.
     Metered,
+    /// The optimizing tier without the debugger's steps, for the functions
+    /// that baseline code counted as hot (Implementation Plan §11.10.2). No
+    /// task stops in it: a breakpoint sends the function back to its
+    /// baseline code (Specification §20.3).
+    Hot,
 }
 
 impl Tier {
@@ -228,6 +233,15 @@ pub fn mir<'db>(
 ) -> Option<MirBody<'db>> {
     if tier == Tier::Metered {
         return mir(db, program, instance, Tier::Baseline).clone();
+    }
+    if tier == Tier::Hot {
+        let mut body = mir(db, program, instance, Tier::Optimizing).clone()?;
+        for block in &mut body.blocks {
+            block
+                .statements
+                .retain(|s| !matches!(s, Statement::Step { .. }));
+        }
+        return Some(body);
     }
     let mut body = built(db, program, instance).clone()?;
     if tier == Tier::Optimizing {

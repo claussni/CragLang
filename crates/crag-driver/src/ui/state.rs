@@ -715,7 +715,8 @@ impl Ui {
     }
 
     /// What the clock does: buffers reach the compiler after a pause in
-    /// typing, and the app's stopped tasks show.
+    /// typing, the app's stopped tasks show, and its hot functions are
+    /// swapped for optimized code.
     pub fn tick(&mut self, now: Instant) {
         if self.push_at.is_some_and(|at| now >= at) {
             self.push();
@@ -728,6 +729,7 @@ impl Ui {
                 .find(|p| !self.pauses.iter().any(|q| q.task == p.task))
                 .cloned();
             self.pauses = pauses;
+            let _ = self.repl.tier_up_app();
             if let Some(pause) = new {
                 // A breakpoint hit: the task tree, and the paused line.
                 self.right_view = RightView::Tasks;

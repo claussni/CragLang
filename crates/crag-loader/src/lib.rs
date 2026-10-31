@@ -567,6 +567,16 @@ pub fn publish(symbols: &SymbolTable, staged: Staged) {
     }
 }
 
+/// Points a function and its slot at code of it that is loaded already,
+/// such as its baseline code again after optimized code took its place
+/// (Implementation Plan §11.10.2).
+pub fn restore(symbols: &mut SymbolTable, key: SlotKey, entry: CodeAddr) {
+    symbols.functions.insert(key.func, entry);
+    if let Some(slot) = symbols.slots.index(key) {
+        slot_set(&symbols.slots, slot, entry);
+    }
+}
+
 fn enter(
     arena: &mut CodeArena,
     symbols: &mut SymbolTable,

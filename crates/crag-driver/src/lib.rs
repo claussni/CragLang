@@ -35,6 +35,7 @@ pub mod persist;
 pub mod project;
 pub mod repl;
 pub mod scratch;
+pub mod tier;
 pub mod ui;
 
 use std::io::Write;

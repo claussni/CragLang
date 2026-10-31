@@ -26,8 +26,9 @@ pub mod image;
 pub mod protocol;
 
 pub use host::{
-    AppStatus, ImageCommand, ImageExit, ImageHandle, ImageKind, ImageState, RunResult, Session,
-    SessionError, describe, descriptor_hash, receive, send, spawn_image,
+    AppStatus, ImageCommand, ImageExit, ImageHandle, ImageKind, ImageState, Optimized,
+    PROFILE_PERIOD, RunResult, Session, SessionError, TierUp, describe, descriptor_hash, receive,
+    send, spawn_image,
 };
 pub use image::{Image, serve};
 pub use protocol::{

@@ -82,7 +82,7 @@ const TABLES_WAIT: Duration = Duration::from_secs(2);
 /// How many calls and back-edges make a function hot: `HOT`, or the
 /// count `CRAG_HOT` gives, so that tests can have most code optimized
 /// while it runs; zero never optimizes. Read once.
-fn hot() -> u64 {
+pub(crate) fn hot() -> u64 {
     static HOT_COUNT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *HOT_COUNT.get_or_init(|| {
         std::env::var("CRAG_HOT")
@@ -511,7 +511,7 @@ impl<'a> Image<'a> {
         for (func, instance) in hot {
             self.baseline.remove(&func);
             // Optimized code calls what baseline code calls, and inlines it.
-            let Some(Ok(optimized)) = code(db, program, instance, Tier::Optimizing) else {
+            let Some(Ok(optimized)) = code(db, program, instance, Tier::Hot) else {
                 continue;
             };
             let calls = &optimized.calls;

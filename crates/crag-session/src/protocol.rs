@@ -34,7 +34,7 @@ use crag_abi::{
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 33;
+pub const PROTOCOL_VERSION: u32 = 34;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -131,6 +131,23 @@ pub enum Message {
     },
     /// From the image: the values `Locals` asked for, as text.
     Texts(Vec<String>),
+    /// From the host: which functions are hot (Implementation Plan
+    /// §11.10.2). The scratch image answers it during a run too.
+    Profile { threshold: u64 },
+    /// From the image: the functions whose baseline code counted at least
+    /// the threshold of calls and back-edges, without a breakpoint.
+    Hot(Vec<FuncId>),
+    /// From the host: optimized code for hot functions, with the
+    /// descriptors of the types it uses, to take their slots while their
+    /// baseline code stays loaded. The scratch image answers it during a
+    /// run too.
+    Optimize {
+        types: Vec<(u32, TypeDescriptor)>,
+        functions: Vec<ShippedFunction>,
+    },
+    /// From the image: the functions whose slots now hold the optimized
+    /// code; the others stay baseline.
+    Optimized(Vec<FuncId>),
 }
 
 /// A task stopped at a step: the task, the function and step, and the
@@ -202,6 +219,10 @@ const PAUSED: u8 = 22;
 const RESUME: u8 = 23;
 const LOCALS: u8 = 24;
 const TEXTS: u8 = 25;
+const PROFILE: u8 = 26;
+const HOT: u8 = 27;
+const OPTIMIZE: u8 = 28;
+const OPTIMIZED: u8 = 29;
 
 impl Message {
     /// The body of the message's frame.
@@ -340,6 +361,26 @@ impl Message {
                 w.u8(TEXTS);
                 w.seq(texts, |w, t| w.text(t));
             }
+            Message::Profile { threshold } => {
+                w.u8(PROFILE);
+                w.u64(*threshold);
+            }
+            Message::Hot(funcs) => {
+                w.u8(HOT);
+                w.seq(funcs, |w, f| w.u32(f.0));
+            }
+            Message::Optimize { types, functions } => {
+                w.u8(OPTIMIZE);
+                w.seq(types, |w, (index, d)| {
+                    w.u32(*index);
+                    w.descriptor(d);
+                });
+                w.seq(functions, |w, f| w.function(f));
+            }
+            Message::Optimized(funcs) => {
+                w.u8(OPTIMIZED);
+                w.seq(funcs, |w, f| w.u32(f.0));
+            }
         }
         w.0
     }
@@ -450,6 +491,15 @@ impl Message {
                 Message::Locals { task, locals }
             }
             TEXTS => Message::Texts(r.seq(|r| r.text())?),
+            PROFILE => Message::Profile {
+                threshold: r.u64()?,
+            },
+            HOT => Message::Hot(r.seq(|r| Ok(FuncId(r.u32()?)))?),
+            OPTIMIZE => Message::Optimize {
+                types: r.seq(|r| Ok((r.u32()?, r.descriptor()?)))?,
+                functions: r.seq(Reader::function)?,
+            },
+            OPTIMIZED => Message::Optimized(r.seq(|r| Ok(FuncId(r.u32()?)))?),
             tag => return Err(invalid(format!("a message with the unknown tag {tag}"))),
         };
         match r.0.len() {
@@ -1144,6 +1194,13 @@ mod tests {
                 ],
             }]),
             Message::Resume { task: 7, how: 2 },
+            Message::Profile { threshold: 10_000 },
+            Message::Hot(vec![FuncId(3), FuncId(9)]),
+            Message::Optimize {
+                types: Vec::new(),
+                functions: Vec::new(),
+            },
+            Message::Optimized(vec![FuncId(9)]),
             Message::Texts(vec!["1".into(), "Point(x: 1)".into()]),
             Message::Finished(vec![0, u64::MAX]),
             Message::Trapped {

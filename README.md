@@ -64,11 +64,11 @@ passes and Cranelift's speed setting:
 
     CRAG_OPT=1 ./cargo test
 
-Otherwise `crag run` and `crag test` compile in the baseline tier and swap
-a function for optimized code once it counted 10,000 calls and loop
-iterations. `CRAG_HOT` sets that count; `CRAG_HOT=1` optimizes nearly
-everything that runs for more than a few milliseconds, and `CRAG_HOT=0`
-never optimizes:
+Otherwise `crag run`, `crag test`, the REPL and the app the UI runs
+compile in the baseline tier and swap a function for optimized code once
+it counted 10,000 calls and loop iterations; a breakpoint sends it back.
+`CRAG_HOT` sets that count; `CRAG_HOT=1` optimizes nearly everything that
+runs for more than a few milliseconds, and `CRAG_HOT=0` never optimizes:
 
     CRAG_HOT=1 ./cargo test
 

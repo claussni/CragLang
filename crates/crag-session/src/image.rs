@@ -35,6 +35,15 @@
 //! descriptors that include it, and only then do its slots point to it,
 //! so whatever runs new code can unwind it and free its boxes (§11.8.5).
 //!
+//! Hot functions move to the optimizing tier (§11.10.2). The host asks
+//! which functions' baseline code counted many calls and back-edges, and
+//! ships optimized code for them, which takes their slots once the
+//! workers have the tables that describe it. The baseline code stays
+//! loaded: a breakpoint in an optimized function, or in one inlined into
+//! it, points the slot back to it (Specification §20.3). The scratch image
+//! answers both while a run waits, so a long REPL input speeds up as it
+//! runs.
+//!
 //! SIGINT interrupts a run (§11.6.2): the image cancels the root task,
 //! which stops at its next safepoint, a function entry, a loop's back-edge
 //! or a wait, and passes the cancellation to the tasks it started (Plan
@@ -42,7 +51,7 @@
 //! terminal sends SIGINT to the image together with the host, which
 //! ignores it while the REPL runs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -50,8 +59,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crag_abi::{CodeObject, FuncId, RuntimeFn, Shapes, SlotKey, TypeDescriptor};
-use crag_loader::{CodeArena, SymbolTable, load, publish, stage_group};
+use crag_abi::{CodeObject, FuncId, RuntimeFn, Shapes, SlotKey, TypeDescriptor, profile_cell};
+use crag_loader::{CodeAddr, CodeArena, SymbolTable, load, publish, restore, stage_group};
 use crag_runtime::{
     CodeMap, Fiber, FiberConfig, FiberState, PrintLimits, Scheduler, SchedulerConfig, Types,
     Worker, decode_value, print_value, release_value,
@@ -125,6 +134,14 @@ pub struct Image {
     breaks: Vec<SlotKey>,
     /// Whether every step's flag is set, for a task that steps.
     all_steps: bool,
+    /// Each function's slot and its latest code from a `Load`, which is
+    /// baseline code.
+    baseline: HashMap<FuncId, (SlotKey, CodeAddr)>,
+    /// The functions whose slots hold optimized code, with the functions
+    /// inlined into it.
+    optimized: HashMap<FuncId, Vec<FuncId>>,
+    /// The stream to the host, for what a run answers while it waits.
+    stream: Option<UnixStream>,
 }
 
 /// The app's run: its scheduler, which keeps running while the image
@@ -154,6 +171,9 @@ impl Image {
             steps: Vec::new(),
             breaks: Vec::new(),
             all_steps: false,
+            baseline: HashMap::new(),
+            optimized: HashMap::new(),
+            stream: None,
         })
     }
 
@@ -182,8 +202,28 @@ impl Image {
         }
     }
 
-    /// Sets the breakpoints: the flags of their steps' cells.
+    /// Sets the breakpoints: the flags of their steps' cells. An optimized
+    /// function with a breakpoint, or with one in a function inlined into
+    /// it, goes back to its baseline code, whose steps can stop a task;
+    /// frames already running the optimized code finish there.
     fn set_breaks(&mut self, breaks: Vec<(FuncId, u32)>) -> Message {
+        let stopping: HashSet<FuncId> = breaks.iter().map(|&(f, _)| f).collect();
+        let back: Vec<FuncId> = self
+            .optimized
+            .iter()
+            .filter(|(f, inlined)| {
+                stopping.contains(*f) || inlined.iter().any(|g| stopping.contains(g))
+            })
+            .map(|(&f, _)| f)
+            .collect();
+        for func in back {
+            self.optimized.remove(&func);
+            let (slot, entry) = self.baseline[&func];
+            restore(&mut self.symbols, slot, entry);
+            if let Some(f) = self.functions.get_mut(&func) {
+                f.0 = entry.addr();
+            }
+        }
         let cells = self.symbols.cells();
         for &key in &self.breaks {
             cells.set_state(key, u64::from(self.all_steps));
@@ -235,7 +275,7 @@ impl Image {
                 functions,
                 reset,
                 fills,
-            } => match self.load(types, stubs, functions) {
+            } => match self.load(types, stubs, functions, None) {
                 Ok(()) => {
                     for key in reset {
                         self.symbols.cells().reset(key);
@@ -288,6 +328,8 @@ impl Image {
                 None => Message::Failed(format!("no way of resuming is numbered {how}")),
             },
             Message::Locals { task, locals } => self.locals(task, &locals),
+            Message::Profile { threshold } => self.hot(threshold),
+            Message::Optimize { types, functions } => self.optimize(types, functions, None),
             other => Message::Failed(format!("an image does not take {other:?}")),
         })
     }
@@ -318,14 +360,9 @@ impl Image {
         types: Vec<(u32, TypeDescriptor)>,
         stubs: Vec<Stub>,
         functions: Vec<ShippedFunction>,
+        running: Option<&Scheduler>,
     ) -> Result<(), String> {
-        for (index, descriptor) in &types {
-            if let Some((_, known)) = self.types.iter().find(|(i, _)| i == index)
-                && known != descriptor
-            {
-                return Err(format!("type {index} has another descriptor already"));
-            }
-        }
+        self.check_types(&types)?;
         for stub in stubs {
             let shape = (stub.params, stub.returns);
             if !self.stubs.contains_key(&shape) {
@@ -350,24 +387,66 @@ impl Image {
             .map_err(|e| format!("cannot load the code: {e}"))?;
         let entries = staged.entries();
         for (f, entry) in functions.iter().zip(&entries) {
-            self.code.push((f.id, entry.addr(), f.object.clone()));
-            for reloc in &f.object.relocs {
-                if let crag_abi::RelocTarget::Cell(key) = reloc.target
-                    && key.signature & crag_abi::STEP_CELL != 0
-                    && !self.steps.contains(&key)
-                {
-                    // A new step's flag starts as the others are.
-                    let on = self.all_steps || self.breaks.contains(&key);
-                    self.symbols.cells().set_state(key, u64::from(on));
-                    self.steps.push(key);
-                }
+            self.add_code(f, *entry);
+        }
+        self.add_types(types);
+        self.swap_tables(running)?;
+        publish(&self.symbols, staged);
+        for (f, entry) in functions.into_iter().zip(entries) {
+            self.functions
+                .insert(f.id, (entry.addr(), f.params, f.returns));
+            let slot = SlotKey {
+                func: f.id,
+                signature: f.signature,
+            };
+            self.baseline.insert(f.id, (slot, entry));
+            self.optimized.remove(&f.id);
+        }
+        Ok(())
+    }
+
+    /// Fails for a type that has another descriptor already.
+    fn check_types(&self, types: &[(u32, TypeDescriptor)]) -> Result<(), String> {
+        for (index, descriptor) in types {
+            if let Some((_, known)) = self.types.iter().find(|(i, _)| i == index)
+                && known != descriptor
+            {
+                return Err(format!("type {index} has another descriptor already"));
             }
         }
+        Ok(())
+    }
+
+    fn add_types(&mut self, types: Vec<(u32, TypeDescriptor)>) {
         for t in types {
             if !self.types.contains(&t) {
                 self.types.push(t);
             }
         }
+    }
+
+    /// Notes a function's code, loaded at `entry`, for the code map, and
+    /// its steps.
+    fn add_code(&mut self, f: &ShippedFunction, entry: CodeAddr) {
+        self.code.push((f.id, entry.addr(), f.object.clone()));
+        for reloc in &f.object.relocs {
+            if let crag_abi::RelocTarget::Cell(key) = reloc.target
+                && key.signature & crag_abi::STEP_CELL != 0
+                && !self.steps.contains(&key)
+            {
+                // A new step's flag starts as the others are.
+                let on = self.all_steps || self.breaks.contains(&key);
+                self.symbols.cells().set_state(key, u64::from(on));
+                self.steps.push(key);
+            }
+        }
+    }
+
+    /// Gives the worker, and the workers of a running app or run, the
+    /// descriptors and the code map of everything loaded. Staged code may
+    /// be published once this succeeded: whatever runs it can then unwind
+    /// it and free its boxes (Implementation Plan §11.8.5).
+    fn swap_tables(&mut self, running: Option<&Scheduler>) -> Result<(), String> {
         self.worker
             .set_types(Arc::new(Types::new(self.types.iter().cloned())));
         let mut map = CodeMap::new();
@@ -381,25 +460,130 @@ impl Image {
         }
         self.code_map = Arc::new(map);
         self.worker.set_code_map(self.code_map.clone());
-        // A running app's workers take the new tables before any of them
-        // can reach the new code (Implementation Plan §11.8.5).
-        if let Some(app) = &self.app {
-            let epoch = app
-                .scheduler
-                .update_tables(self.worker.types(), self.code_map.clone());
-            if !app.scheduler.wait_tables(epoch, TABLES_WAIT) {
+        let schedulers = self.app.as_ref().map(|a| &a.scheduler).into_iter();
+        for scheduler in schedulers.chain(running) {
+            let epoch = scheduler.update_tables(self.worker.types(), self.code_map.clone());
+            if !scheduler.wait_tables(epoch, TABLES_WAIT) {
                 return Err(format!(
-                    "the app's workers did not take the new code within {} s",
+                    "the workers did not take the new code within {} s",
                     TABLES_WAIT.as_secs()
                 ));
             }
         }
-        publish(&self.symbols, staged);
-        for (f, entry) in functions.into_iter().zip(entries) {
-            self.functions
-                .insert(f.id, (entry.addr(), f.params, f.returns));
-        }
         Ok(())
+    }
+
+    /// The functions with a breakpoint.
+    fn stopping(&self) -> HashSet<FuncId> {
+        self.breaks.iter().map(|key| key.func).collect()
+    }
+
+    /// The functions whose baseline code counted at least `threshold` calls
+    /// and back-edges, but those with a breakpoint.
+    fn hot(&self, threshold: u64) -> Message {
+        let cells = self.symbols.cells();
+        let stopping = self.stopping();
+        let mut hot: Vec<FuncId> = self
+            .baseline
+            .keys()
+            .copied()
+            .filter(|f| !self.optimized.contains_key(f) && !stopping.contains(f))
+            .filter(|&f| {
+                cells
+                    .words(profile_cell(f))
+                    .is_some_and(|w| w[0].saturating_add(w[1]) >= threshold)
+            })
+            .collect();
+        hot.sort_by_key(|f| f.0);
+        Message::Hot(hot)
+    }
+
+    /// Swaps optimized code in for baseline code: loaded as one group, in
+    /// the slots once every worker has the tables that describe it. A
+    /// function that is optimized already, has a breakpoint in its own or
+    /// its inlined code, or comes for another slot than its baseline code
+    /// fills stays baseline, as all do when the code cannot be loaded.
+    fn optimize(
+        &mut self,
+        types: Vec<(u32, TypeDescriptor)>,
+        functions: Vec<ShippedFunction>,
+        running: Option<&Scheduler>,
+    ) -> Message {
+        let stopping = self.stopping();
+        let functions: Vec<(ShippedFunction, Vec<FuncId>)> = functions
+            .into_iter()
+            .map(|f| {
+                let inlined = f.object.inlined.iter().flat_map(|c| c.frames.clone());
+                let inlined = inlined.collect();
+                (f, inlined)
+            })
+            .filter(|(f, inlined): &(ShippedFunction, Vec<FuncId>)| {
+                self.baseline
+                    .get(&f.id)
+                    .is_some_and(|(slot, _)| slot.signature == f.signature)
+                    && !self.optimized.contains_key(&f.id)
+                    && !stopping.contains(&f.id)
+                    && !inlined.iter().any(|g| stopping.contains(g))
+            })
+            .collect();
+        if functions.is_empty() || self.check_types(&types).is_err() {
+            return Message::Optimized(Vec::new());
+        }
+        let group: Vec<(SlotKey, &CodeObject)> = functions
+            .iter()
+            .map(|(f, _)| (self.baseline[&f.id].0, &f.object))
+            .collect();
+        let Ok(staged) = stage_group(&mut self.arena, &mut self.symbols, &group) else {
+            return Message::Optimized(Vec::new());
+        };
+        let entries = staged.entries();
+        for ((f, _), entry) in functions.iter().zip(&entries) {
+            self.add_code(f, *entry);
+        }
+        self.add_types(types);
+        // Workers that keep old tables cannot unwind the new code, so it
+        // is not reached; it stays loaded and in the code map.
+        if self.swap_tables(running).is_err() {
+            return Message::Optimized(Vec::new());
+        }
+        publish(&self.symbols, staged);
+        let mut swapped = Vec::new();
+        for ((f, inlined), entry) in functions.into_iter().zip(entries) {
+            if let Some(known) = self.functions.get_mut(&f.id) {
+                known.0 = entry.addr();
+            }
+            self.optimized.insert(f.id, inlined);
+            swapped.push(f.id);
+        }
+        Message::Optimized(swapped)
+    }
+
+    /// Answers what the host asks while a run waits: which functions are
+    /// hot, and optimized code for them. Once the stream fails, the run
+    /// answers nothing more, and the loop that answers the host finds out
+    /// why when the run ended.
+    fn answer_running(&mut self, scheduler: &Scheduler) {
+        let Some(mut stream) = self.stream.take() else {
+            return;
+        };
+        while readable(&stream) {
+            let reply = match read_message(&mut stream) {
+                Ok(Message::Profile { threshold }) => self.hot(threshold),
+                Ok(Message::Optimize { types, functions }) => {
+                    self.optimize(types, functions, Some(scheduler))
+                }
+                Ok(Message::Ping(n)) => Message::Pong(n),
+                // The run's tasks may be in the middle of anything, and
+                // the process ending stops them all.
+                Ok(Message::Shutdown) => std::process::exit(0),
+                Ok(other) => Message::Failed(format!("an image that runs does not take {other:?}")),
+                Err(_) => return,
+            };
+            if write_message(&mut stream, &reply).is_err() {
+                return;
+            }
+        }
+        self.stream = Some(stream);
     }
 
     /// Starts the app: a loaded function without parameters as the root
@@ -564,6 +748,7 @@ impl Image {
                 interrupted = true;
                 cancel.cancel();
             }
+            self.answer_running(&scheduler);
         };
         drop(scheduler);
         match Self::ended(stopped.pop(), returns, interrupted) {
@@ -582,6 +767,7 @@ pub fn serve(kind: ImageKind, socket: &Path) -> io::Result<()> {
     }
     let mut image = Image::new()?;
     let mut stream = UnixStream::connect(socket)?;
+    image.stream = Some(stream.try_clone()?);
     write_message(
         &mut stream,
         &Message::Hello {
@@ -601,6 +787,19 @@ pub fn serve(kind: ImageKind, socket: &Path) -> io::Result<()> {
             None => return end(image),
         }
     }
+}
+
+/// Whether the stream has something to read, or has ended, without
+/// waiting.
+fn readable(stream: &UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut fd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: the descriptor outlives the call.
+    unsafe { libc::poll(&mut fd, 1, 0) > 0 }
 }
 
 /// Ends the image. A running app is not waited for: its tasks may be in
