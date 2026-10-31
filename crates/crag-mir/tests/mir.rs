@@ -1570,7 +1570,8 @@ bb7:
 
 /// In the optimizing tier, a record that dies gives the record built from
 /// it its box, and the locals that read its fields their references: the
-/// reads move up with the release to before what uses them (Plan
+/// reads move up with the release to before what uses them, past a call
+/// to the block before it too, and the box goes on past a branch (Plan
 /// §11.10.1, Specification §13.4).
 #[test]
 fn dying_records_give_their_boxes_and_fields() {
@@ -1584,6 +1585,18 @@ fn deposit(a: Account, k: Int) -> Account {
 
 fn renamed(a: Account, n: Str) -> Account {
   Account(..a, name: "{a.name} {n}")
+}
+
+fn grow(s: Str) -> Str {
+  if size(s) == 0 { "x" } else { grow("{s}") }
+}
+
+fn regrow(a: Account) -> Account {
+  Account(..a, name: grow(a.name))
+}
+
+fn bump(a: Account) -> Account {
+  Account(name: a.name, tags: a.tags, balance: a.balance + 1)
 }
 
 fn tag(xs: Cons | Nil) -> Cons | Nil {
@@ -1612,10 +1625,10 @@ bb1:
   release _0
   trap overflow
 bb2:
+  _3 = Int.add(_2, _1)
   _4 = _0.name
   _5 = _0.tags
   reclaim _0 into _8 keeping name: _4, tags: _5
-  _3 = Int.add(_2, _1)
   _6 = Account(name: _4, tags: _5, balance: _3) in _8
   return _6
 renamed
@@ -1629,14 +1642,93 @@ let _6: Account
 let _7: Account
 bb0:
   _2 = _0.name
-  retain _2
-  _3 = concat(_2, " ", _1)
-  release _2
   _4 = _0.tags
   _5 = _0.balance
-  reclaim _0 into _7 keeping tags: _4
+  reclaim _0 into _7 keeping name: _2, tags: _4
+  _3 = concat(_2, " ", _1)
+  release _2
   _6 = Account(name: _3, tags: _4, balance: _5) in _7
   return _6
+grow
+param _0: Str (s)
+let _1: Int
+let _2: False | True
+let _3: Str
+bb0:
+  retain _0
+  _1 = call size(_0) -> bb3
+bb1:
+  release _0
+  return "x"
+bb2:
+  _3 = concat(_0)
+  release _0
+  tail call grow(_3)
+bb3:
+  _2 = Int.eq(_1, 0)
+  branch _2 bb1 bb2
+regrow
+param _0: Account (a)
+let _1: Str
+let _2: Str
+let _3: Str
+let _4: Int
+let _5: Account
+let _6: Int
+let _7: False | True
+let _8: Str
+let _9: Account
+inlined i0: grow at e5
+bb0:
+  _1 = _0.name
+  _3 = _0.tags
+  _4 = _0.balance
+  reclaim _0 into _9 keeping name: _1, tags: _3
+  guard grow bb3 else bb2
+bb1:
+  _5 = Account(name: _2, tags: _3, balance: _4) in _9
+  return _5
+bb2:
+  _2 = call grow(_1) -> bb1
+bb3 (i0):
+  retain _1
+  _6 = call size(_1) -> bb6
+bb4 (i0):
+  release _1
+  _2 = "x"
+  jump bb1
+bb5 (i0):
+  _8 = concat(_1)
+  release _1
+  _2 = call grow(_8) -> bb1
+bb6 (i0):
+  _7 = Int.eq(_6, 0)
+  branch _7 bb4 bb5
+bump
+param _0: Account (a)
+let _1: Str
+let _2: Str
+let _3: Int
+let _4: Int
+let _5: Account
+let _6: False | True
+let _7: Account
+bb0:
+  _1 = _0.name
+  _2 = _0.tags
+  _3 = _0.balance
+  reclaim _0 into _7 keeping name: _1, tags: _2
+  _6 = overflows Int.add(_3, 1)
+  branch _6 bb1 bb2
+bb1:
+  release _7
+  release _1
+  release _2
+  trap overflow
+bb2:
+  _4 = Int.add(_3, 1)
+  _5 = Account(name: _1, tags: _2, balance: _4) in _7
+  return _5
 tag
 param _0: Cons | Nil (xs)
 let _1: Cons (c)

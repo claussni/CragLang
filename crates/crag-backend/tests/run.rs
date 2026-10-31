@@ -3504,6 +3504,7 @@ fn dying_records_give_their_boxes_to_new_ones() {
 type Cons(head: Int, label: Str, tail: Cons | Nil)
 type Leaf
 type Node(left: Leaf | Node, label: Str, right: Leaf | Node)
+type Account(name: Str, tags: Str, balance: Int)
 
 fn build(n: Int, acc: Cons | Nil) -> Cons | Nil {
   if n == 0 { return acc }
@@ -3563,6 +3564,28 @@ fn renamed(t: Leaf | Node) -> Int {
 fn trees(n: Int) -> Int {
   renamed(rename(tree(n)))
 }
+
+fn grow(s: Str) -> Str {
+  if s == "x" { "xy" } else { "x" }
+}
+
+fn regrow(a: Account) -> Account {
+  Account(..a, name: grow(a.name))
+}
+
+fn bump(a: Account) -> Account {
+  Account(name: a.name, tags: a.tags, balance: a.balance + 1)
+}
+
+fn account(n: Int) -> Account {
+  Account(name: "x", tags: "tags {n}, long enough for a buffer", balance: n)
+}
+
+fn accounts(n: Int) -> Int {
+  let a = regrow(account(n))
+  let b = bump(a)
+  if b.name == "xy" { b.balance } else { 0 }
+}
 "#;
     let mut base = Module::compiled(text, Tier::Baseline);
     let mut m = Module::compiled(text, Tier::Optimizing);
@@ -3583,6 +3606,12 @@ fn trees(n: Int) -> Int {
     assert_eq!(m.heap.live_blocks(), 0);
     assert_eq!(m.int("trees", &[20]), 20);
     assert_eq!(m.heap.live_blocks(), 0);
+    // Past a call, and past a branch to a trap, which frees the box kept.
+    assert_eq!(m.int("accounts", &[4]), 5);
+    assert_eq!(m.heap.live_blocks(), 0);
+    let trap = m.run("accounts", &[i64::MAX]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::Overflow);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
     // The overflow traps after the node is taken apart for the new one.
     assert_eq!(m.run("edge", &[5]), Ok(vec![8]));
     let trap = m.run("edge", &[i64::MAX]).unwrap_err();

@@ -60,7 +60,7 @@ pub struct Liveness<'db> {
 
 /// The locals each local borrows through the side-stack closures it may
 /// hold.
-fn holds(body: &MirBody<'_>) -> Vec<LocalSet> {
+pub(crate) fn holds(body: &MirBody<'_>) -> Vec<LocalSet> {
     let mut holds = vec![LocalSet::new(); body.locals.len()];
     loop {
         let mut changed = false;
