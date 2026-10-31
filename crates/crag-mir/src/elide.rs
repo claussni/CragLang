@@ -25,7 +25,8 @@
 //! and listed in no stack map. A value of a record type, or a union with a
 //! record member, keeps its count, since code generation may read it out
 //! of a storage form as a box of its own. A retain directly followed by
-//! the release of the same local cancels too.
+//! the release of the same local cancels too, and a block left with
+//! nothing but a jump is skipped.
 
 use std::collections::BTreeSet;
 
@@ -33,7 +34,7 @@ use crag_db::Db;
 use crag_hir::Program;
 
 use crate::borrow::borrowable;
-use crate::ir::{Local, MirBody, Operand, Place, Rvalue, Statement, Terminator};
+use crate::ir::{BlockId, Local, MirBody, Operand, Place, Rvalue, Statement, Terminator};
 use crate::liveness::{
     Lent, Liveness, LocalSet, compute_liveness, statement_uses, terminator_uses,
 };
@@ -74,6 +75,86 @@ pub fn elide_rc<'db>(db: &'db dyn Db, program: Program, body: &mut MirBody<'db>,
         let decl = &mut body.locals[l.index()];
         decl.counted = false;
         decl.borrowed = true;
+    }
+    skip_empty_blocks(body);
+}
+
+/// Lets the edges into a block that only jumps on, as one left by the
+/// releases it held, go where it jumps, and removes the block once nothing
+/// enters it. The entry stays, as do the handlers that calls and traps
+/// continue at, and the blocks the code after an `atomic` attempt does.
+fn skip_empty_blocks(body: &mut MirBody<'_>) {
+    let n = body.blocks.len();
+    let jumps_on: Vec<Option<BlockId>> = body
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(b, block)| match block.terminator {
+            Terminator::Jump(to) if b > 0 && block.statements.is_empty() => Some(to),
+            _ => None,
+        })
+        .collect();
+    // Where each block's edges lead, through empty blocks, once each.
+    let target: Vec<BlockId> = (0..n)
+        .map(|b| {
+            let mut at = BlockId(b as u32);
+            let mut seen = vec![b];
+            while let Some(to) = jumps_on[at.index()] {
+                if seen.contains(&to.index()) {
+                    break;
+                }
+                seen.push(to.index());
+                at = to;
+            }
+            at
+        })
+        .collect();
+    for block in &mut body.blocks {
+        for edge in plain_edges(&mut block.terminator) {
+            *edge = target[edge.index()];
+        }
+    }
+    // What still enters each block.
+    let mut entered = vec![false; n];
+    entered[0] = true;
+    for block in &body.blocks {
+        for s in block.terminator.successors().into_iter().chain(block.catch) {
+            entered[s.index()] = true;
+        }
+    }
+    let gone: Vec<bool> = (0..n)
+        .map(|b| !entered[b] && jumps_on[b].is_some())
+        .collect();
+    let mut index = vec![BlockId(0); n];
+    let mut kept = 0u32;
+    for (b, at) in index.iter_mut().enumerate() {
+        if !gone[b] {
+            *at = BlockId(kept);
+            kept += 1;
+        }
+    }
+    let mut b = 0;
+    body.blocks.retain(|_| {
+        b += 1;
+        !gone[b - 1]
+    });
+    for block in &mut body.blocks {
+        for edge in block.terminator.successors_mut() {
+            *edge = index[edge.index()];
+        }
+        if let Some(catch) = &mut block.catch {
+            *catch = index[catch.index()];
+        }
+    }
+}
+
+/// The edges of a terminator that go on with the code, not to a handler a
+/// call or trap continues at, nor where an `atomic` attempt ends.
+fn plain_edges<'a>(terminator: &'a mut Terminator<'_>) -> Vec<&'a mut BlockId> {
+    match terminator {
+        Terminator::Call { target, .. } | Terminator::CallValue { target, .. } => vec![target],
+        Terminator::Trap { .. } => Vec::new(),
+        other => other.successors_mut(),
     }
 }
 

@@ -1857,8 +1857,8 @@ bb2:
 
 /// In the optimizing tier, a part read out of a value that keeps its own
 /// reference all the while is borrowed from it: its retain and release
-/// cancel. A part that outlives the value, or is given away, stays
-/// counted.
+/// cancel, and the blocks left empty on edges are skipped. A part that
+/// outlives the value, or is given away, stays counted.
 #[test]
 fn parts_of_values_that_outlive_them_are_borrowed() {
     let text = r#"fn describe(v: Int | Str) -> Int {
@@ -1954,7 +1954,7 @@ bb9:
   _9 = Int.lt(1, 0)
   branch _9 bb11 bb12
 bb10:
-  branch _7 bb9 bb20
+  branch _7 bb9 bb6
 bb11:
   trap index
 bb12:
@@ -1966,7 +1966,7 @@ bb14:
   _11 = _0[1]
   guard isA bb19 else bb18
 bb15:
-  branch _12 bb8 bb21
+  branch _12 bb8 bb6
 bb16:
   _7 = call isA(_5) -> bb10
 bb17 (i0):
@@ -1974,16 +1974,10 @@ bb17 (i0):
   _7 = _14
   jump bb10
 bb18:
-  _12 = call isA(_11) -> bb22
+  _12 = call isA(_11) -> bb15
 bb19 (i1):
   _15 = Str.eq(_11, "a")
   _12 = _15
-  jump bb15
-bb20:
-  jump bb6
-bb21:
-  jump bb6
-bb22:
   jump bb15
 first
 param _0: List[Str] (xs) borrowed
