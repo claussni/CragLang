@@ -27,7 +27,7 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-backend` | Code generation from MIR (M1) |
 | `crates/crag-aot` | Release builds: the AOT object writer, which puts release code in an ELF object file, finding the runtime archive, and linking with lld (M7) |
 | `crates/crag-rt` | The runtime archive: the runtime and the start of a release executable, as a static library for musl (M7) |
-| `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1); the UI with the built-in editor, the app image, hot reload, the debugger, the language server `crag lsp` and the debug adapter `crag dap` (M5) |
+| `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1); `build`, the release executable (M7); the UI with the built-in editor, the app image, hot reload, the debugger, the language server `crag lsp` and the debug adapter `crag dap` (M5) |
 | `crates/crag-session` | Session manager: image processes and their supervision (M3) |
 | `crates/crag-eval` | Compile-time evaluation of constants, `embed`s among them, in the metered tier (M3) |
 | `crates/crag-fmt` | The formatter: the canonical layout of source files (M5) |
@@ -89,11 +89,17 @@ directory with a `package.crag` naming the package and its `main` module:
     /path/to/target/debug/crag run [argument...]
     /path/to/target/debug/crag test [filter]
     /path/to/target/debug/crag fmt [--check] [all | - | file...]
+    /path/to/target/debug/crag build [--skip-tests]
 
 `crag run` passes what follows it to the program, which reads it with
 `args()` of `std.env`. A test checks with the assertions of `std.test`;
 `crag test` reports every one that failed, at its line, and the test goes
 on after it.
+
+`crag build` runs the project's tests and, when they pass, writes its
+release executable to `dist/<package>`, linked statically with the runtime
+archive built above; `--skip-tests` builds without running them. The REPL's
+`:build` does the same, `:build skip-tests` without the tests.
 
 `crag fmt` formats every module of the project in place, or the files
 named; `-` formats standard input to standard output, and `--check` only
@@ -113,7 +119,7 @@ there; `crag registry add <name> <folder>` adds one that exists, such as a
 team's shared folder. `crag registry list` and `crag registry remove
 <name>` show and edit the list; removing leaves the folder as it is.
 
-`run`, `test` and `fmt` are short; the other commands come after the name
+`build`, `run`, `test` and `fmt` are short; the other commands come after the name
 of their area, `package` or `registry`. `crag package new <name> [--lib]`
 creates a project; `crag package add <package> [version]`, `remove`,
 `upgrade <package> [--version=V] | all`, `outdated` and `deps` manage its

@@ -178,6 +178,7 @@ name = "crag-driver"
 version = "0.0.0"
 dependencies = [
  "crag-abi",
+ "crag-aot",
  "crag-backend",
  "crag-codegen",
  "crag-db",

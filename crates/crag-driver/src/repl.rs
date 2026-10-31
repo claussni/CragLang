@@ -77,6 +77,7 @@ Enter a definition to add it to the session, or an expression to run it.
                         manage the project's packages, as the shell does
   :registry new <name> <folder> | add <name> <folder> | list | remove <name>
                         manage the registries of the settings
+  :build [skip-tests]   test the project and build its executable in dist/
   :cd [directory]       go to another directory and the project in it, with
                         a fresh session; alone, show where the session runs
   :help                 show this
@@ -441,6 +442,7 @@ impl Repl {
                 self.package_command(verb, rest)
             }
             "registry" => self.package_command("registry", rest),
+            "build" => self.build(rest),
             "stop" => {
                 self.scratch
                     .stop_app()
@@ -451,6 +453,32 @@ impl Repl {
             _ => Err(format!(
                 "error: there is no command :{name}; :help lists them\n"
             )),
+        }
+    }
+
+    /// `:build`: `crag build` in the project, as a process of its own, since
+    /// the tests it runs print as they please.
+    fn build(&mut self, rest: &str) -> Result<EvalOutput, String> {
+        let Some(root) = self.project.root.clone() else {
+            return Err("error: :build works in a project\n".into());
+        };
+        let args = crate::commands::Args::repl(rest, crate::build::BUILD)
+            .map_err(|e| format!("error: {e}\n"))?;
+        let mut command = std::process::Command::new(self.scratch.program());
+        command
+            .arg("build")
+            .args(args.switches.iter().map(|s| format!("--{s}")))
+            .args(&args.positional)
+            .current_dir(&root)
+            .stdin(std::process::Stdio::null());
+        let out = command
+            .output()
+            .map_err(|e| format!("error: cannot run crag build: {e}\n"))?;
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        match out.status.success() {
+            true => Ok(EvalOutput::Text(text)),
+            false => Err(text),
         }
     }
 

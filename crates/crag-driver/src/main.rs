@@ -28,6 +28,7 @@ use std::process::ExitCode;
 use crag_driver::{crag_fmt, crag_repl, crag_run, crag_test};
 
 const USAGE: &str = "usage: crag
+       crag build [--skip-tests]
        crag run [argument...]
        crag test [filter]
        crag fmt [--check] [all | - | file...]
@@ -53,7 +54,7 @@ fn main() -> ExitCode {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     let compiles = matches!(
         words[..],
-        [] | ["run" | "test" | "dap", ..] | ["package", "pack" | "publish", ..]
+        [] | ["build" | "run" | "test" | "dap", ..] | ["package", "pack" | "publish", ..]
     );
     if compiles {
         crag_driver::persist::install();
@@ -69,6 +70,7 @@ fn main() -> ExitCode {
             crag_runtime::set_program_args(rest.iter().map(|a| a.as_bytes().to_vec()).collect());
             ExitCode::from(crag_run(root, &mut std::io::stderr()))
         }
+        ["build", ref rest @ ..] => build(root, rest),
         ["test"] => test(root, None),
         ["test", filter] => test(root, Some(filter)),
         ["fmt", ref rest @ ..] => ExitCode::from(crag_fmt(root, rest, &mut std::io::stderr())),
@@ -106,6 +108,18 @@ fn package_command(root: &std::path::Path, command: &str, rest: &[&str]) -> Exit
         }
     };
     ExitCode::from(run(root, &args, &mut std::io::stdout()))
+}
+
+fn build(root: &std::path::Path, rest: &[&str]) -> ExitCode {
+    use crag_driver::commands::Args;
+    let args = match Args::shell(rest, crag_driver::build::BUILD) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    ExitCode::from(crag_driver::crag_build(root, &args, &mut std::io::stdout()))
 }
 
 fn test(root: &std::path::Path, filter: Option<&str>) -> ExitCode {

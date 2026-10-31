@@ -313,7 +313,7 @@ fn the_command_runs_the_project_in_the_current_directory() {
         .unwrap();
     assert_eq!(output.status.code(), Some(0));
     assert!(text(output.stdout).contains("test app.crag \"sums\" ... ok"));
-    let usage = Command::new(crag).arg("build").status().unwrap();
+    let usage = Command::new(crag).arg("frobnicate").status().unwrap();
     assert_eq!(usage.code(), Some(2));
 }
 

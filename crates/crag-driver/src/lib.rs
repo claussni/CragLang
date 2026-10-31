@@ -14,14 +14,15 @@
 // You should have received a copy of the GNU General Public License along with
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
-//! The driver (Implementation Plan §11.4.15): the `crag` command's `run`
-//! and `test`. It loads a project into the database, prints the
+//! The driver (Implementation Plan §11.4.15): the `crag` command's `run`,
+//! `test` and `build`. It loads a project into the database, prints the
 //! diagnostics of every module, compiles what the entry points reach, and
 //! runs them on fibers. `Scratch` runs code in the scratch image instead
 //! (§11.6.3).
 
 pub mod api;
 pub mod app;
+pub mod build;
 pub mod commands;
 pub mod dap;
 pub mod debug;
@@ -46,6 +47,7 @@ use crag_hir::{ItemKind, Owner, item_tree, owners};
 use crag_mir::{InstanceKey, Tier, mir};
 use crag_types::{Ty, TyKind, prelude_item, signature};
 
+pub use build::crag_build;
 pub use diagnostics::{Diagnostic, check, render_diagnostic};
 pub use exec::Image;
 pub use fmt::crag_fmt;
@@ -106,20 +108,7 @@ fn run(root: &Path, out: &mut dyn Write) -> Result<u8, String> {
     };
     let (db, program) = (&project.db, project.program);
     let key = main_instance(&project)?;
-    let result = mir(db, program, key, Tier::Baseline)
-        .as_ref()
-        .ok_or("`main` has no body")?
-        .result;
-    let exit_code =
-        prelude_item(db, program, "ExitCode").map(|i| Ty::new(db, TyKind::Named(i, Vec::new())));
-    // An `ExitCode`'s box holds the code.
-    let exit_code = if result == Ty::unit(db) {
-        None
-    } else if Some(result) == exit_code {
-        Some(result)
-    } else {
-        return Err("`main` must return `()` or `ExitCode`".into());
-    };
+    let exit_code = main_result(&project, key)?;
     open_natives(&project)?;
     let mut image = Image::build(&project, &[key])?;
     match image.run(func_id(key)) {
@@ -137,6 +126,28 @@ fn run(root: &Path, out: &mut dyn Write) -> Result<u8, String> {
             let _ = write!(out, "{}", image.report(&project, &trap));
             Ok(EXIT_TRAP)
         }
+    }
+}
+
+/// The type of `main`'s result: none for `()`, or `ExitCode`, whose box
+/// holds the exit status; an error for any other.
+pub(crate) fn main_result<'a>(
+    project: &'a Project,
+    key: InstanceKey<'a>,
+) -> Result<Option<Ty<'a>>, String> {
+    let (db, program) = (&project.db, project.program);
+    let result = mir(db, program, key, Tier::Baseline)
+        .as_ref()
+        .ok_or("`main` has no body")?
+        .result;
+    let exit_code =
+        prelude_item(db, program, "ExitCode").map(|i| Ty::new(db, TyKind::Named(i, Vec::new())));
+    if result == Ty::unit(db) {
+        Ok(None)
+    } else if Some(result) == exit_code {
+        Ok(Some(result))
+    } else {
+        Err("`main` must return `()` or `ExitCode`".into())
     }
 }
 
@@ -309,11 +320,23 @@ impl TestReport {
 /// went. A test passes when its block completes and fails when one of its
 /// assertions failed or it traps (Specification §5.7, §19.12).
 pub fn crag_test(root: &Path, filter: Option<&str>, out: &mut dyn Write) -> TestReport {
-    let mut report = TestReport::default();
     let Some(project) = checked(root, out) else {
-        report.errors = true;
-        return report;
+        return TestReport {
+            errors: true,
+            ..TestReport::default()
+        };
     };
+    run_tests(&project, filter, out)
+}
+
+/// Runs the tests of a checked project whose labels contain `filter`,
+/// printing each outcome and the failures.
+pub(crate) fn run_tests(
+    project: &Project,
+    filter: Option<&str>,
+    out: &mut dyn Write,
+) -> TestReport {
+    let mut report = TestReport::default();
     let db = &project.db;
     let mut tests = Vec::new();
     for file in project.own() {
@@ -327,7 +350,7 @@ pub fn crag_test(root: &Path, filter: Option<&str>, out: &mut dyn Write) -> Test
         }
     }
     let keys: Vec<InstanceKey> = tests.iter().map(|(_, key, _)| *key).collect();
-    let mut image = match Image::build(&project, &keys) {
+    let mut image = match Image::build(project, &keys) {
         Ok(image) => image,
         Err(e) => {
             let _ = writeln!(out, "error: {e}");
@@ -341,7 +364,7 @@ pub fn crag_test(root: &Path, filter: Option<&str>, out: &mut dyn Write) -> Test
         let failures: String = crag_runtime::take_test_failures()
             .into_iter()
             .map(|(message, position)| {
-                let (file, source, at) = exec::Sources::locate(&project, module, position as u32);
+                let (file, source, at) = exec::Sources::locate(project, module, position as u32);
                 diagnostics::render_at("assertion failed", &message, &file, source, at..at)
             })
             .collect();
@@ -358,7 +381,7 @@ pub fn crag_test(root: &Path, filter: Option<&str>, out: &mut dyn Write) -> Test
                 let _ = writeln!(out, "test {name} ... FAILED");
                 report
                     .failed
-                    .push((name, failures + &image.report(&project, &trap)));
+                    .push((name, failures + &image.report(project, &trap)));
             }
         }
     }

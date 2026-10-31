@@ -64,6 +64,8 @@ pub struct Shipment {
 /// image, and what the host knows of the code it shipped to each.
 pub struct Scratch {
     pub(crate) session: Session,
+    /// The `crag` binary the images run, which runs commands too.
+    program: std::path::PathBuf,
     settings: CodegenSettings,
     pub(crate) scratch: Shipped,
     pub(crate) app: Shipped,
@@ -79,6 +81,7 @@ pub struct Scratch {
 impl Scratch {
     pub fn start(command: ImageCommand) -> io::Result<Scratch> {
         Ok(Scratch {
+            program: command.program.clone(),
             session: Session::start(command)?,
             settings: stub_settings().map_err(io::Error::other)?,
             scratch: Shipped::default(),
@@ -93,6 +96,11 @@ impl Scratch {
     /// each time their code changed.
     pub fn constants(&self) -> usize {
         self.constants
+    }
+
+    /// The `crag` binary the images run.
+    pub fn program(&self) -> &std::path::Path {
+        &self.program
     }
 
     /// Whether the app runs.
