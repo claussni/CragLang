@@ -345,15 +345,15 @@ test "overflows in a closure" {
     let out = text(out);
     assert_eq!(report.failed.len(), 1, "{out}");
     // `apply` calls the closure in tail position, so its frame is gone,
-    // unless it is inlined into the test.
-    let apply = match optimizing() {
-        true => "  in apply (inlined)\n",
-        false => "",
+    // unless it is inlined into the test, with the closure's code.
+    let (closure, apply) = match optimizing() {
+        true => (" (inlined)", "  in apply (inlined)\n"),
+        false => ("", ""),
     };
     assert_eq!(
         report.failed[0].1,
         format!(
-            "trap: arithmetic overflow\n  --> app.crag:16:24\n   |\n16 |   let y = apply({{ n -> n * big }}, 2)\n   |                        ^\n  in a closure in test \"overflows in a closure\"\n{apply}  in test \"overflows in a closure\"\n"
+            "trap: arithmetic overflow\n  --> app.crag:16:24\n   |\n16 |   let y = apply({{ n -> n * big }}, 2)\n   |                        ^\n  in a closure in test \"overflows in a closure\"{closure}\n{apply}  in test \"overflows in a closure\"\n"
         )
     );
 }

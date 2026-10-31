@@ -1567,3 +1567,95 @@ bb7:
         panic!("MIR differs; found:\n{found}");
     }
 }
+
+/// In the optimizing tier, a call of a function value known to be a small
+/// closure runs a copy of its code, which reads the captured values; the
+/// guard's fallback makes the closure, which is otherwise not made.
+#[test]
+fn known_closures_are_called_as_copies() {
+    let text = r#"fn scaled(n: Int, k: Int) -> Int {
+  let f = { x: Int -> x * k }
+  f(n) + f(1)
+}
+"#;
+    let found = mir_in(text, false, Tier::Optimizing);
+    let expected = r#"scaled
+param _0: Int (n)
+param _1: Int (k)
+let _2: (Int) -> Int is Pure
+let _3: (Int) -> Int is Pure (f)
+let _4: Int
+let _5: Int
+let _6: Int
+let _7: False | True
+let _8: (Int) -> Int is Pure
+let _9: Int (k)
+let _10: Int
+let _11: False | True
+let _12: (Int) -> Int is Pure
+let _13: Int (x)
+let _14: Int (k)
+let _15: Int
+let _16: False | True
+inlined i0: scaled#5 at e8
+inlined i1: scaled#5 at e11
+bb0:
+  guard scaled#5 bb6 else bb5
+bb1:
+  guard scaled#5 bb10 else bb9
+bb2:
+  _7 = overflows Int.add(_4, _5)
+  branch _7 bb3 bb4
+bb3:
+  trap overflow
+bb4:
+  _6 = Int.add(_4, _5)
+  return _6
+bb5:
+  _8 = closure scaled#5 heap(_1)
+  _4 = call value _8(_0) -> bb1
+bb6 (i0):
+  _9 = _1
+  _11 = overflows Int.mul(_0, _9)
+  branch _11 bb7 bb8
+bb7 (i0):
+  trap overflow
+bb8 (i0):
+  _10 = Int.mul(_0, _9)
+  _4 = _10
+  jump bb1
+bb9:
+  _12 = closure scaled#5 heap(_1)
+  _5 = call value _12(1) -> bb2
+bb10 (i1):
+  _13 = 1
+  _14 = _1
+  _16 = overflows Int.mul(_13, _14)
+  branch _16 bb11 bb12
+bb11 (i1):
+  trap overflow
+bb12 (i1):
+  _15 = Int.mul(_13, _14)
+  _5 = _15
+  jump bb2
+scaled#5
+param _0: (0: Int)
+param _1: Int (x)
+let _2: Int (k)
+let _3: Int
+let _4: False | True
+bb0:
+  _2 = _0.0
+  release _0
+  _4 = overflows Int.mul(_1, _2)
+  branch _4 bb1 bb2
+bb1:
+  trap overflow
+bb2:
+  _3 = Int.mul(_1, _2)
+  return _3
+"#;
+    if found != expected {
+        panic!("MIR differs; found:\n{found}");
+    }
+}

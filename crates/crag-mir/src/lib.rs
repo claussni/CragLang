@@ -25,7 +25,8 @@
 //! reference counts, which follow from a liveness analysis so that a value
 //! is released right after its last use, with the parameters a function
 //! only reads borrowed from its caller (§11.10.1). In the optimizing tier,
-//! small callees are inlined before the counts are placed.
+//! small callees and calls of known small closures are inlined before the
+//! counts are placed.
 
 extern crate crag_db as salsa;
 
@@ -46,7 +47,10 @@ use crag_types::{Filling, Handler, HandlerCode, Instance, Ty};
 pub use borrow::borrows;
 pub use build::{has_derived_code, place};
 pub use checks::insert_overflow_checks;
-pub use inline::{InlineCost, inline_call, should_inline};
+pub use inline::{
+    ClosureEnv, InlineCost, KnownClosure, inline_call, known_closure, should_inline,
+    specialize_closure_call,
+};
 pub use ir::{
     BinOp, Block, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Inlined, Intrinsic, Local,
     LocalDecl, MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,

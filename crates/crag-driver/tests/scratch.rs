@@ -223,10 +223,11 @@ fn a_changed_definition_replaces_the_old_code() {
     }
 
     // A closure's code is reached through its slot too: `bump`, which
-    // makes the closure, has the code it had and is not sent again.
+    // makes the closure, has the code it had and is not sent again, unless
+    // it has a copy of the closure's code.
     assert_eq!(s.run(&p, function(&p, "bump")).unwrap(), Ok(vec![2]));
     p.set_source(module, APP.replace("n + 1", "n + 5"));
-    assert_eq!(s.ship(&p, &[function(&p, "bump")]).unwrap(), 1);
+    assert_eq!(s.ship(&p, &[function(&p, "bump")]).unwrap(), sent);
     assert_eq!(s.run(&p, function(&p, "bump")).unwrap(), Ok(vec![6]));
 
     // Back to the first text: the image gets the first code again.

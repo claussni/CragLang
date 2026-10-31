@@ -3491,3 +3491,85 @@ fn twice(n: Int) -> Int {
     assert_eq!(trap.stack, vec![Frame::of(twice)]);
     assert_eq!(m.worker.heap().live_blocks(), 0);
 }
+
+/// In the optimizing tier, a call of a function value that is known to be
+/// a small closure runs a copy of the closure's code, which reads what the
+/// closure captured: the closure need not be made (Plan §11.10.1).
+#[test]
+fn known_closures_are_called_as_copies() {
+    let text = r#"fn scaled(n: Int, k: Int) -> Int {
+  let f = { x: Int -> x * k }
+  f(n) + f(1)
+}
+
+fn apply(f: (Int) -> Int, n: Int) -> Int {
+  f(n)
+}
+
+fn outer(n: Int, k: Int) -> Int {
+  apply({ x: Int -> x + k }, n)
+}
+
+fn sum(n: Int) -> Int {
+  fn go(i: Int, acc: Int) -> Int {
+    if i == 0 { acc } else { go(i - 1, acc + i) }
+  }
+  go(n, 0)
+}
+
+fn total(xs: List[Int]) -> Int {
+  var sum = 0
+  for x in xs {
+    sum = sum + x
+  }
+  sum
+}
+
+fn lists(n: Int) -> Int {
+  let xs = [n, n, n]
+  let f = { k: Int -> total(xs) + k }
+  f(1) + f(2)
+}
+
+fn later(n: Int) -> Int {
+  var c = n
+  let f = { k: Int -> c + k }
+  c = c + 1
+  f(0)
+}
+"#;
+    let mut m = Module::compiled(text, Tier::Optimizing);
+    assert_eq!(m.unsupported, Vec::<String>::new());
+    let (db, program) = (&m.db, m.program);
+    let scaled = owners(db, program.modules(db)[1])
+        .into_iter()
+        .find(|o| matches!(o, Owner::Item(i) if i.name(db).text(db) == "scaled"))
+        .unwrap();
+    let body = crag_mir::mir(db, program, InstanceKey::body(db, scaled), Tier::Optimizing);
+    let body = body.as_ref().unwrap();
+    assert_eq!(body.inlined.len(), 2);
+    // Only the guards' fallbacks make the closure.
+    let made = body
+        .blocks
+        .iter()
+        .filter(|b| b.inlined.is_none())
+        .flat_map(|b| &b.statements)
+        .filter(|s| {
+            matches!(
+                s,
+                crag_mir::Statement::Assign(_, crag_mir::Rvalue::Closure { .. })
+            )
+        })
+        .count();
+    assert_eq!(made, 2);
+    assert_eq!(m.int("scaled", &[5, 3]), 18);
+    assert_eq!(m.int("outer", &[5, 3]), 8);
+    assert_eq!(m.int("sum", &[10]), 55);
+    assert_eq!(m.int("lists", &[2]), 15);
+    assert_eq!(m.heap.live_blocks(), 0);
+    // Refs need a fiber's task context.
+    assert_eq!(m.run("later", &[4]), Ok(vec![5]));
+    let trap = m.run("scaled", &[i64::MAX, 2]).unwrap_err();
+    assert_eq!(trap.kind, TrapKind::Overflow);
+    assert_eq!(m.worker.heap().live_blocks(), 0);
+}
