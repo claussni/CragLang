@@ -39,7 +39,6 @@
 
 use std::sync::atomic::Ordering;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crag_abi::{
@@ -58,13 +57,13 @@ pub struct CodeMap {
     /// Return addresses, sorted, with the offsets of the slots that hold
     /// boxes from the stack pointer at the call.
     safepoints: Vec<(usize, Box<[u32]>)>,
-    /// The start and end of each function's code, sorted.
-    functions: Vec<(usize, usize, FuncId)>,
+    /// The start and end of each function's code, sorted, with where its
+    /// traps lie in its module. A function may have code of several
+    /// tiers or versions loaded, each with its own.
+    functions: Vec<(usize, usize, FuncId, Arc<Origins>)>,
     /// Return addresses of calls with a handler, sorted, with the
     /// handler's address, the frame offset of the call and what it takes.
     handlers: Vec<(usize, usize, u32, HandlerKind)>,
-    /// Where the traps of each function's code lie in its module.
-    origins: HashMap<FuncId, Arc<Origins>>,
     /// Where the code of inlined calls lies, sorted, with the functions
     /// whose code it is, innermost first (Implementation Plan §11.10.1).
     inlined: Vec<(usize, usize, Arc<[FuncId]>)>,
@@ -81,7 +80,14 @@ impl CodeMap {
     /// Adds a code object loaded with its entry point at `entry`.
     pub fn add(&mut self, func: FuncId, entry: usize, object: &CodeObject) {
         let base = entry - object.entry as usize;
-        self.functions.push((base, base + object.code.len(), func));
+        let origins = Arc::new(Origins {
+            module: object.module.clone(),
+            origins: object.origins.clone(),
+            details: object.details.clone(),
+            inlined: object.inlined.clone(),
+        });
+        self.functions
+            .push((base, base + object.code.len(), func, origins));
         self.functions.sort_unstable_by_key(|f| f.0);
         for map in &object.stack_maps {
             let ret = base + map.return_offset as usize;
@@ -97,15 +103,6 @@ impl CodeMap {
                 h.kind,
             ));
         }
-        self.origins.insert(
-            func,
-            Arc::new(Origins {
-                module: object.module.clone(),
-                origins: object.origins.clone(),
-                details: object.details.clone(),
-                inlined: object.inlined.clone(),
-            }),
-        );
         self.handlers.sort_unstable_by_key(|h| h.0);
         let frames: Vec<Arc<[FuncId]>> = object
             .inlined
@@ -156,10 +153,10 @@ impl CodeMap {
             .map(|h| (h.1, h.2))
     }
 
-    /// The module, line and column of a position in the code of `func`,
-    /// and what the position word's upper half names.
-    pub fn origin(&self, func: FuncId, position: u64) -> Option<(String, u32, u32, String)> {
-        let origins = self.origins.get(&func)?;
+    /// The module, line and column of a position in the code that holds
+    /// `pc`, and what the position word's upper half names.
+    pub fn origin(&self, pc: usize, position: u64) -> Option<(String, u32, u32, String)> {
+        let origins = self.code_at(pc)?.3.as_ref();
         let at = origins.at(position)?;
         let detail = (position >> 32) as usize;
         let detail = detail
@@ -174,9 +171,9 @@ impl CodeMap {
     }
 
     /// The byte offset in its module's source of a position in the code
-    /// of `func`, which differs from the position in inlined code.
-    pub fn offset(&self, func: FuncId, position: u64) -> Option<u32> {
-        Some(self.origins.get(&func)?.at(position)?.offset)
+    /// that holds `pc`, which differs from the position in inlined code.
+    pub fn offset(&self, pc: usize, position: u64) -> Option<u32> {
+        Some(self.code_at(pc)?.3.at(position)?.offset)
     }
 
     /// Gives the entry stubs of tasks: from `compile_entry_stub` with one
@@ -195,9 +192,13 @@ impl CodeMap {
 
     /// The function whose code holds `pc`.
     pub fn function_at(&self, pc: usize) -> Option<FuncId> {
+        Some(self.code_at(pc)?.2)
+    }
+
+    fn code_at(&self, pc: usize) -> Option<&(usize, usize, FuncId, Arc<Origins>)> {
         let i = self.functions.partition_point(|f| f.0 <= pc);
-        let &(start, end, func) = self.functions.get(i.checked_sub(1)?)?;
-        (start..end).contains(&pc).then_some(func)
+        let code = self.functions.get(i.checked_sub(1)?)?;
+        (code.0..code.1).contains(&pc).then_some(code)
     }
 
     /// The slots of the call returning to `ret`; none for a call that holds
@@ -312,15 +313,18 @@ unsafe extern "C" fn trap_entry(
             land(fp_at - offset as usize, fp_at, handler)
         };
         unwind(worker, ret, fp, trap_kind.catchable(), land_at, &mut stack);
-        // The trapping frame is the first of the function that trapped,
-        // whose code holds the position.
+        // The position lies in the code that trapped first: this code, or
+        // where the handler took a trap raised again.
         let code = Worker::code(worker);
-        let own = stack.iter().find(|f| !f.inlined).map(|f| f.func);
-        let detail = own
-            .and_then(|f| code.origin(f, position))
+        let at = match again {
+            true => (*ctx).caught_ret.load(Ordering::Relaxed),
+            false => first,
+        };
+        let detail = code
+            .origin(at, position)
             .map(|(_, _, _, detail)| detail)
             .filter(|d| !d.is_empty());
-        let offset = own.and_then(|f| code.offset(f, position));
+        let offset = code.offset(at, position);
         let trap = Trap {
             kind: trap_kind,
             position: (position != NO_POSITION).then(|| offset.unwrap_or(position as u32)),
@@ -579,8 +583,10 @@ unsafe extern "C" fn caught_text_entry(ctx: *const TaskContext, which: u64) -> T
 unsafe fn caught_origin(ctx: &TaskContext) -> Option<(String, u32, u32, String)> {
     // SAFETY: as the caller promises.
     let code = unsafe { Worker::code(ctx.worker.load(Ordering::Relaxed)) };
-    let func = code.function_at(ctx.caught_ret.load(Ordering::Relaxed))?;
-    code.origin(func, ctx.caught_position.load(Ordering::Relaxed))
+    code.origin(
+        ctx.caught_ret.load(Ordering::Relaxed),
+        ctx.caught_position.load(Ordering::Relaxed),
+    )
 }
 
 /// Continues a frame at a handler: its stack and frame pointers, and where.
