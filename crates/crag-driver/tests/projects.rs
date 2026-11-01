@@ -240,6 +240,31 @@ fn printing_and_transforms_that_print_are_not_pure() {
     assert!(out.contains(" --> app.crag:8:3"), "{out}");
 }
 
+#[test]
+fn handles_are_not_solid() {
+    // §3.11, §5.5: a type with an `on Dispose` handler is not Solid, so a
+    // module-level binding cannot hold one.
+    let app = "distinct type Token(n: Int) is Solid\n  on Dispose closeToken\n\
+               fn closeToken(t: Token) -> () {}\n\
+               let token = Token(n: 1)\n\
+               fn main() {}\n";
+    let root = project("handles", &[("package.crag", MANIFEST), ("app.crag", app)]);
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 1);
+    let out = text(out);
+    assert!(
+        out.contains("error: Token is not Solid: it has an `on Dispose` handler"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "error: a module-level binding holds only Solid values, and this is not: Token is \
+             not Solid: it has an `on Dispose` handler"
+        ),
+        "{out}"
+    );
+}
+
 /// Whether the tests compile in the optimizing tier, which inlines small
 /// functions and reports them as inlined frames.
 fn optimizing() -> bool {

@@ -326,6 +326,95 @@ impl<'db> Body<'db> {
         }
         assigned
     }
+
+    /// The bindings `expr` uses that it does not declare itself: what a
+    /// closure or `lazy` expression captures, sorted.
+    pub fn free_bindings(&self, expr: ExprId) -> Vec<BindingId> {
+        let mut used = Vec::new();
+        let mut declared = Vec::new();
+        let mut pending = vec![expr];
+        while let Some(e) = pending.pop() {
+            match self.expr(e) {
+                Expr::Name {
+                    local: Some(binding),
+                    ..
+                } => used.push(*binding),
+                Expr::Closure { params, .. } => {
+                    for param in params {
+                        self.pat_bindings(param.pat, &mut declared);
+                    }
+                }
+                Expr::Case { arms, .. } => {
+                    for arm in arms {
+                        self.pat_bindings(arm.pat, &mut declared);
+                    }
+                }
+                Expr::Block { stmts, .. } => {
+                    for stmt in stmts {
+                        match stmt {
+                            Stmt::Let { pat, .. } | Stmt::For { pat, .. } => {
+                                self.pat_bindings(*pat, &mut declared)
+                            }
+                            Stmt::LetElse { pat, rest, .. } => {
+                                self.pat_bindings(*pat, &mut declared);
+                                if let Some(rest) = rest {
+                                    self.pat_bindings(*rest, &mut declared);
+                                }
+                            }
+                            Stmt::Bind { binding, .. } => declared.push(*binding),
+                            Stmt::Assign { binding, .. } => used.push(*binding),
+                            Stmt::Fn { binding, function } => {
+                                declared.push(*binding);
+                                declared.extend(function.params.iter().map(|p| p.binding));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            pending.extend(self.children(e));
+        }
+        used.retain(|b| !declared.contains(b));
+        used.sort();
+        used.dedup();
+        used
+    }
+
+    /// The bindings a pattern introduces.
+    pub fn pat_bindings(&self, pat: PatId, out: &mut Vec<BindingId>) {
+        match self.pat(pat) {
+            Pat::Bind { binding, sub } => {
+                out.push(*binding);
+                if let Some(sub) = sub {
+                    self.pat_bindings(*sub, out);
+                }
+            }
+            Pat::Record { fields, .. } => {
+                for field in fields {
+                    self.pat_bindings(field.pat, out);
+                }
+            }
+            Pat::List {
+                before,
+                rest,
+                after,
+            } => {
+                for &p in before.iter().chain(after) {
+                    self.pat_bindings(p, out);
+                }
+                if let Some(Some(rest)) = rest {
+                    out.push(*rest);
+                }
+            }
+            Pat::Or(alternatives) => {
+                for &p in alternatives {
+                    self.pat_bindings(p, out);
+                }
+            }
+            Pat::Missing | Pat::Wildcard | Pat::Type(_) | Pat::Literal(_) | Pat::Range { .. } => {}
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]

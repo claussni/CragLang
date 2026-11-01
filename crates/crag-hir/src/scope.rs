@@ -39,6 +39,10 @@ use crate::patterns;
 /// The module imported into every other one (§19.3).
 pub const PRELUDE: &str = "std.core";
 
+/// The module of a REPL session's definitions, whose bindings may hold any
+/// value, unlike a source module's (§5.5).
+pub const SESSION: &str = "repl";
+
 /// The modules of a program by path, and the directories the paths imply.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModuleIndex {

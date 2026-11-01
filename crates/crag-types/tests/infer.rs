@@ -1942,3 +1942,54 @@ fn g(x: Solid) {}";
         ]
     );
 }
+
+#[test]
+fn pure_closures_capture_only_solid_values() {
+    let text = "fn apply(f: ((Int) -> Int is Pure), x: Int) -> Int { f(x) }
+fn keep(l: Lazy[Int]) -> Int { 0 }
+fn f(l: Lazy[Int], k: Int, g: (Int) -> Int) -> Int {
+  let a = apply({ n -> n + k }, 1)
+  let b = apply({ n -> n + keep(l) }, 2)
+  fn helper(n: Int) -> Int { n + keep(l) }
+  let c = apply({ n -> helper(n) }, 3)
+  let d = g(4)
+  fn exact(n: Int) -> Int is Pure { n + keep(l) }
+  a + b + c + d + exact(5)
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`{ n -> n + keep(l) }`: an `is Pure` closure captures only Solid values, and `l` is \
+             not: Lazy[Int] is not Solid: it may trap when it is read",
+            "`{ n -> helper(n) }`: an `is Pure` closure captures only Solid values, and `l` is \
+             not: Lazy[Int] is not Solid: it may trap when it is read",
+            "`{ n + keep(l) }`: an `is Pure` closure captures only Solid values, and `l` is \
+             not: Lazy[Int] is not Solid: it may trap when it is read",
+        ]
+    );
+}
+
+#[test]
+fn module_values_and_signals_are_solid() {
+    // §5.5, §11.1.
+    let text = "type Password(raw: Bytes) is Secret
+type Login(..Signal, user: Str, password: Password)
+type Progress(..Signal, done: Int, next: () -> Int)
+type Tick(..Signal, at: Int)
+let limit = 10
+let later: Lazy[Int] = lazy 1
+let step: (Int) -> Int = { n -> n + 1 }
+let double: ((Int) -> Int is Pure) = { n -> n + n }";
+    assert_eq!(
+        errors(text),
+        [
+            "`Login`: a signal holds no secrets, but the field `password` of Login holds one",
+            "`Progress`: a signal type must be Solid: Progress is not Solid: its field `next` \
+             holds () -> Int, which is a function that is not `is Pure`",
+            "`lazy 1`: a module-level binding holds only Solid values, and this is not: \
+             Lazy[Int] is not Solid: it may trap when it is read",
+            "`{ n -> n + 1 }`: a module-level binding holds only Solid values, and this is not: \
+             (Int) -> Int is not Solid: it is a function that is not `is Pure`",
+        ]
+    );
+}

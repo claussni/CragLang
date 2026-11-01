@@ -117,7 +117,20 @@ pub fn infer_in_group<'db>(
     let result = match owner {
         Owner::Item(item) => match *item.kind(db) {
             ItemKind::Function => cx.function(),
-            ItemKind::Value | ItemKind::Embed => cx.module_value(),
+            ItemKind::Value | ItemKind::Embed => {
+                let ty = cx.module_value();
+                // Module-level bindings hold only Solid values (§5.5); a
+                // REPL session's may hold any.
+                if let (Some(ty), Some(root)) = (ty, body.root)
+                    && item.module(db).path(db) != crag_hir::SESSION
+                    && let Err(why) = crate::marker::solid(db, program, ty)
+                {
+                    let why = why.clone();
+                    cx.lower
+                        .error(Site::Expr(root), ErrorKind::ValueNotSolid { ty, why });
+                }
+                ty
+            }
             ItemKind::Type => {
                 cx.type_defaults(item);
                 None
@@ -179,6 +192,8 @@ pub fn infer_in_group<'db>(
                 EscapeWalker::new(db, body, &cx.bindings, &cx.callees, &summary_of, &names_of);
             let walked = walker.walk_body();
             cx.lower.errors.extend(walked.errors);
+            let captures = crate::marker::capture_errors(db, program, body, &cx.bindings);
+            cx.lower.errors.extend(captures);
             walked.escapes
         }
     };
@@ -803,7 +818,7 @@ impl<'a, 'db> Infer<'a, 'db> {
             }
             Expr::Closure { params, body: root } => {
                 let ty = self.closure(params, *root, expected);
-                self.pure_if_effectless(id, ty)
+                self.pure_if_effectless(id, ty, expected)
             }
             Expr::If {
                 condition,
@@ -1070,8 +1085,14 @@ impl<'a, 'db> Infer<'a, 'db> {
         )
     }
 
-    /// A closure's type, Pure when its body has no effects.
-    fn pure_if_effectless(&mut self, closure: ExprId, ty: Ty<'db>) -> Ty<'db> {
+    /// A closure's type, Pure when its body has no effects and it captures
+    /// only Solid values.
+    fn pure_if_effectless(
+        &mut self,
+        closure: ExprId,
+        ty: Ty<'db>,
+        expected: Option<Ty<'db>>,
+    ) -> Ty<'db> {
         let db = self.db;
         let TyKind::Fn { params, result, .. } = ty.kind(db) else {
             return ty;
@@ -1086,7 +1107,24 @@ impl<'a, 'db> Infer<'a, 'db> {
             &self.callees,
             &effects_of,
         );
-        let pure = walker.closure(closure).is_empty();
+        let mut pure = walker.closure(closure).is_empty();
+        // A closure that captures what is not Solid is never Pure, so that
+        // every Pure function value is Solid (§3.11). Where it must be, the
+        // capture is the error.
+        if pure
+            && let Some((name, ty, why)) =
+                crate::marker::unsolid_capture(db, self.program, self.body, &self.bindings, closure)
+        {
+            let wanted = expected.map(|e| crate::relate::unrefined(db, self.program, e));
+            if wanted.is_some_and(|w| matches!(w.kind(db), TyKind::Fn { pure: true, .. })) {
+                self.error(
+                    Site::Expr(closure),
+                    ErrorKind::PureCapture { name, ty, why },
+                );
+            } else {
+                pure = false;
+            }
+        }
         Ty::new(
             db,
             TyKind::Fn {

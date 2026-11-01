@@ -495,6 +495,28 @@ pub enum ErrorKind<'db> {
         ty: Ty<'db>,
         why: NotSolid<'db>,
     },
+    /// A capture of an `is Pure` closure that is not `Solid` (§3.11).
+    PureCapture {
+        name: Name<'db>,
+        ty: Ty<'db>,
+        why: NotSolid<'db>,
+    },
+    /// A module-level `let` or `embed` whose value is not `Solid` (§5.5).
+    ValueNotSolid {
+        ty: Ty<'db>,
+        why: NotSolid<'db>,
+    },
+    /// A signal type that is not `Solid` (§11.1).
+    SignalNotSolid {
+        ty: Ty<'db>,
+        why: NotSolid<'db>,
+    },
+    /// A signal type that holds a `Secret`, at the path of fields given
+    /// (§11.1).
+    SecretInSignal {
+        ty: Ty<'db>,
+        path: Vec<Name<'db>>,
+    },
     /// A marker where a type belongs: only a bound may name one (§3.11).
     MarkerNotAType {
         marker: Marker,
@@ -662,6 +684,29 @@ impl<'db> ErrorKind<'db> {
             ErrorKind::Unfit(fit) => fit.message(db),
             ErrorKind::NotAForm { ty } => format!("{} is not a form", ty.display(db)),
             ErrorKind::NotSolid { ty, why } => why.message(db, *ty),
+            ErrorKind::PureCapture { name, ty, why } => format!(
+                "an `is Pure` closure captures only Solid values, and `{}` is not: {}",
+                name.text(db),
+                why.message(db, *ty)
+            ),
+            ErrorKind::ValueNotSolid { ty, why } => format!(
+                "a module-level binding holds only Solid values, and this is not: {}",
+                why.message(db, *ty)
+            ),
+            ErrorKind::SignalNotSolid { ty, why } => {
+                format!("a signal type must be Solid: {}", why.message(db, *ty))
+            }
+            ErrorKind::SecretInSignal { ty, path } => match path.is_empty() {
+                true => format!("{} is a signal type and is `Secret`", ty.display(db)),
+                false => {
+                    let path: Vec<&str> = path.iter().map(|n| n.text(db).as_str()).collect();
+                    format!(
+                        "a signal holds no secrets, but the field `{}` of {} holds one",
+                        path.join("."),
+                        ty.display(db)
+                    )
+                }
+            },
             ErrorKind::MarkerNotAType { marker } => format!(
                 "`{}` is a marker, which only a bound may name, as in `[T: {}]`",
                 marker.name(),

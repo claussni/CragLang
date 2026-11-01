@@ -55,8 +55,8 @@ pub use package::{PackageScope, Packages};
 pub use pretty::pretty;
 pub use scope::{
     Entries, Entry, ImportCycle, ImportGraph, ImportTarget, Imports, ModuleIndex, ModuleScope,
-    NameError, Origin, PRELUDE, PathError, PathTarget, Resolution, Selection, import_graph,
-    imports, module_index, module_scope, resolve_path, same_signature, scope_entries,
+    NameError, Origin, PRELUDE, PathError, PathTarget, Resolution, SESSION, Selection,
+    import_graph, imports, module_index, module_scope, resolve_path, same_signature, scope_entries,
     type_identity, type_names,
 };
 pub use shadow::{Previous, Redeclaration, check_shadowing};

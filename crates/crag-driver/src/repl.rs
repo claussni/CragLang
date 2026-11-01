@@ -30,7 +30,7 @@
 use std::collections::BTreeSet;
 
 use crag_db::Setter;
-use crag_hir::{ItemKind, ModuleId, Owner, SourceFile, item_tree, module_scope};
+use crag_hir::{ItemKind, ModuleId, Owner, SESSION, SourceFile, item_tree, module_scope};
 use crag_mir::{InstanceKey, Tier, mir};
 use crag_session::RunResult;
 use crag_syntax::{TokenKind, lex};
@@ -51,9 +51,6 @@ const SHOWN: &str = "__shown";
 
 /// The name of the alias `:layout` gives the type it shows.
 const LAYOUT: &str = "__Layout";
-
-/// The path of the session's module.
-const SESSION: &str = "repl";
 
 const HELP: &str = "\
 Enter a definition to add it to the session, or an expression to run it.

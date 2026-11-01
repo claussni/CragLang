@@ -394,13 +394,12 @@ fn clock() -> Int { now() }
 
 let stamp = clock()
 let adder = { n: Int -> n + 1 }
-let named: (Int) -> Int = inc
+let named: ((Int) -> Int is Pure) = inc
 let pair = (f: inc, n: 1)
 
 distinct type Guard(n: Int)
   on Dispose close
 fn close(g: Guard) -> () {}
-let guard = Guard(n: 1)
 let through = { let g = Guard(n: 2); g.n }
 "#,
     );
@@ -411,16 +410,14 @@ let through = { let g = Guard(n: 2); g.n }
             "{name}"
         );
     }
-    // Dispose handlers run when the program drops values.
-    for name in ["guard", "through"] {
-        assert_eq!(
-            p.eval(name),
-            Err(EvalError::NotConstant(
-                "it makes values with dispose handlers".into()
-            )),
-            "{name}"
-        );
-    }
+    // Dispose handlers run when the program drops values. A module value
+    // that holds one is not Solid (§5.5), but one may make and drop one.
+    assert_eq!(
+        p.eval("through"),
+        Err(EvalError::NotConstant(
+            "it makes values with dispose handlers".into()
+        ))
+    );
     // Compile-time code does no I/O.
     assert_eq!(
         p.eval("stamp"),

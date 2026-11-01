@@ -275,14 +275,12 @@ nested
 param _0: Int (k)
 let _1: (Int) -> Int is Pure
 let _2: (Int) -> Int (f)
-let _3: (Int) -> Int is Pure
-let _4: (Int) -> Int
+let _3: (Int) -> Int
 bb0:
   _1 = closure nested#5 heap(_0)
   _2 = convert _1
   _3 = closure nested#11 heap(_2)
-  _4 = convert _3
-  tail call apply(_4, 2)
+  tail call apply(_3, 2)
 nested#5
 param _0: (0: Int)
 param _1: Int (n)

@@ -31,10 +31,13 @@
 //! part of it is one.
 
 use crag_db::Db;
-use crag_hir::{ItemKind, Marker, ModuleId, Name, Owner, Program, hir_body, item_tree};
+use crag_hir::{
+    BindingId, BindingKind, Body, Expr, ExprId, ItemId, ItemKind, Marker, ModuleId, Name, Owner,
+    Program, Stmt, hir_body, item_tree,
+};
 
 use crate::body_types;
-use crate::def::{TypeDefKind, type_def, type_header};
+use crate::def::{TypeDefKind, prelude_item, type_def, type_header};
 use crate::derive::bans;
 use crate::generic::{bounds, param_bound};
 use crate::handler::dispose_handler;
@@ -357,17 +360,47 @@ fn is_secret(db: &dyn Db, program: Program, ty: Ty<'_>) -> bool {
     false
 }
 
-/// The types of a module marked `is Solid` that are not (§3.11).
+/// The types of a module marked `is Solid` that are not (§3.11), and its
+/// signal types that are not `Solid` or hold a `Secret` (§11.1).
 pub(crate) fn marker_errors<'db>(
     db: &'db dyn Db,
     program: Program,
     module: ModuleId,
-) -> Vec<(crag_hir::ItemId<'db>, TypeError<'db>)> {
+) -> Vec<(ItemId<'db>, TypeError<'db>)> {
+    let signal =
+        prelude_item(db, program, "Signal").map(|s| crag_hir::type_identity(db, program, s));
     let mut errors = Vec::new();
     for item in &item_tree(db, module).items {
         let item = item.id;
         if *item.kind(db) != ItemKind::Type {
             continue;
+        }
+        let identity = crag_hir::type_identity(db, program, item);
+        let names = type_header(db, program, item).params.clone();
+        let params = (0..names.len())
+            .map(|i| Ty::new(db, TyKind::Param(Some(identity), i as u32, names[i])))
+            .collect();
+        let ty = Ty::new(db, TyKind::Named(identity, params));
+        let error = |kind| {
+            (
+                item,
+                TypeError {
+                    site: Site::Name,
+                    kind,
+                },
+            )
+        };
+        // A signal type's subtypes report their own parts (§11.1).
+        if signal.is_some_and(|s| s != identity && spreads(db, program, ty, s)) {
+            if let Err(why) = solid(db, program, ty)
+                && !why.path.iter().any(|s| matches!(s, SolidStep::Subtype(_)))
+            {
+                let why = why.clone();
+                errors.push(error(ErrorKind::SignalNotSolid { ty, why }));
+            }
+            if let Some(path) = own_secret(db, program, ty) {
+                errors.push(error(ErrorKind::SecretInSignal { ty, path }));
+            }
         }
         let asserted = hir_body(db, program, Owner::Item(item))
             .type_decl
@@ -380,24 +413,118 @@ pub(crate) fn marker_errors<'db>(
         if !asserted {
             continue;
         }
-        let identity = crag_hir::type_identity(db, program, item);
-        let names = type_header(db, program, item).params.clone();
-        let params = (0..names.len())
-            .map(|i| Ty::new(db, TyKind::Param(Some(identity), i as u32, names[i])))
-            .collect();
-        let ty = Ty::new(db, TyKind::Named(identity, params));
         if let Err(why) = solid(db, program, ty) {
-            errors.push((
-                item,
-                TypeError {
-                    site: Site::Name,
-                    kind: ErrorKind::NotSolid {
-                        ty,
-                        why: why.clone(),
-                    },
-                },
-            ));
+            let why = why.clone();
+            errors.push(error(ErrorKind::NotSolid { ty, why }));
         }
     }
     errors
+}
+
+/// Whether a type spreads `parent`, directly or through its parents.
+fn spreads<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>, parent: ItemId<'db>) -> bool {
+    let mut current = crate::relate::parent(db, program, ty);
+    while let Some(t) = current {
+        if matches!(t.kind(db), TyKind::Named(item, _) if *item == parent) {
+            return true;
+        }
+        current = crate::relate::parent(db, program, t);
+    }
+    false
+}
+
+/// The path to a `Secret` part of a type's own fields, leaving out its
+/// subtypes, which are checked on their own.
+fn own_secret<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Vec<Name<'db>>> {
+    if is_secret(db, program, ty) {
+        return Some(Vec::new());
+    }
+    fields_of(db, program, ty)?
+        .into_iter()
+        .find_map(|(name, t)| {
+            holds_secret(db, program, t).clone().map(|mut path| {
+                path.insert(0, name);
+                path
+            })
+        })
+}
+
+/// The local functions marked `is Pure` that capture what is not
+/// `Solid`; a closure's capture is reported where it must be Pure.
+pub(crate) fn capture_errors<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    body: &Body<'db>,
+    bindings: &[Option<Ty<'db>>],
+) -> Vec<TypeError<'db>> {
+    let mut errors = Vec::new();
+    for expr in &body.exprs {
+        let Expr::Block { stmts, .. } = expr else {
+            continue;
+        };
+        for stmt in stmts {
+            if let Stmt::Fn { function, .. } = stmt
+                && function.pure
+                && let Some(root) = function.body
+                && let Some((name, ty, why)) = unsolid_capture(db, program, body, bindings, root)
+            {
+                errors.push(TypeError {
+                    site: Site::Expr(root),
+                    kind: ErrorKind::PureCapture { name, ty, why },
+                });
+            }
+        }
+    }
+    errors
+}
+
+/// The first capture of a closure or local function that is not
+/// `Solid`, which keeps it from being `is Pure`: a local function it calls
+/// counts as what that function captures.
+pub(crate) fn unsolid_capture<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    body: &Body<'db>,
+    bindings: &[Option<Ty<'db>>],
+    frame: ExprId,
+) -> Option<(Name<'db>, Ty<'db>, NotSolid<'db>)> {
+    let local_fn = |binding: BindingId| {
+        body.exprs.iter().find_map(|e| match e {
+            Expr::Block { stmts, .. } => stmts.iter().find_map(|s| match s {
+                Stmt::Fn {
+                    binding: b,
+                    function,
+                } if *b == binding => function.body,
+                _ => None,
+            }),
+            _ => None,
+        })
+    };
+    let mut pending = body.free_bindings(frame);
+    pending.reverse();
+    let mut seen = Vec::new();
+    while let Some(binding) = pending.pop() {
+        if seen.contains(&binding) {
+            continue;
+        }
+        seen.push(binding);
+        let declared = body.binding(binding);
+        match declared.kind {
+            BindingKind::Module => {}
+            BindingKind::Fn => {
+                if let Some(root) = local_fn(binding) {
+                    pending.extend(body.free_bindings(root).into_iter().rev());
+                }
+            }
+            _ => {
+                let ty = bindings.get(binding.index()).copied().flatten();
+                if let (Some(name), Some(ty)) = (declared.name, ty)
+                    && let Err(why) = solid(db, program, ty)
+                {
+                    return Some((name, ty, why.clone()));
+                }
+            }
+        }
+    }
+    None
 }
