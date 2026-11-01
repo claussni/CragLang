@@ -29,17 +29,21 @@
 //!
 //! Only a declaration makes a type `Secret`; a type holds one when any
 //! part of it is one.
+//!
+//! A type parameter carries or lacks a marker as its requirements say,
+//! `where T is { Solid, not Secret }` (§4.2); with neither, whether it
+//! does is not known.
 
 use crag_db::Db;
 use crag_hir::{
     BindingId, BindingKind, Body, Expr, ExprId, ItemId, ItemKind, Marker, ModuleId, Name, Owner,
-    Program, Stmt, hir_body, item_tree,
+    Polarity, Program, Stmt, hir_body, item_tree,
 };
 
 use crate::body_types;
 use crate::def::{TypeDefKind, prelude_item, type_def, type_header};
 use crate::derive::bans;
-use crate::generic::{bounds, param_bound};
+use crate::generic::{MarkerBound, bounds, param_bound};
 use crate::handler::dispose_handler;
 use crate::relate::{fields_of, record_subtypes, subst};
 use crate::result::{ErrorKind, Site, TypeError};
@@ -78,11 +82,11 @@ pub enum Why {
     Dispose,
     /// A type whose `where` conditions have effects.
     Condition,
-    /// `is not Solid`.
+    /// `is not Solid`, or a type parameter required not to be.
     Marked,
     /// An open record, which may hold fields of any type.
     Open,
-    /// A type parameter without the bound `Solid`.
+    /// A type parameter not required to be `Solid`.
     Param,
 }
 
@@ -96,9 +100,9 @@ impl Why {
             Why::C => "is a C type",
             Why::Dispose => "has an `on Dispose` handler",
             Why::Condition => "has conditions with effects",
-            Why::Marked => "is marked `not Solid`",
+            Why::Marked => "is marked or required `not Solid`",
             Why::Open => "is an open record, so it may hold any fields",
-            Why::Param => "is a type parameter without the bound `Solid`",
+            Why::Param => "is a type parameter not required to be `Solid`",
         }
     }
 }
@@ -220,11 +224,10 @@ impl<'db> Walk<'db> {
                 let Some(owner) = *owner else {
                     return self.not(ty, Why::Param);
                 };
-                let marked = bounds(db, self.program, owner)
-                    .markers
-                    .contains(&(*index, Marker::Solid));
-                if marked {
-                    return Ok(());
+                match param_marker(db, self.program, ty, Marker::Solid) {
+                    Some(true) => return Ok(()),
+                    Some(false) => return self.not(ty, Why::Marked),
+                    None => {}
                 }
                 match param_bound(db, self.program, owner, *index) {
                     Some(bound) => self.solid(bound),
@@ -305,6 +308,9 @@ fn secret_path<'db>(
         })
     };
     let found = match ty.kind(db) {
+        TyKind::Param(..) if param_marker(db, program, ty, Marker::Secret) == Some(true) => {
+            Some(Vec::new())
+        }
         TyKind::Union(members) => members
             .iter()
             .find_map(|&m| secret_path(db, program, m, seen)),
@@ -340,6 +346,11 @@ fn secret_path<'db>(
 
 /// Whether a declared type, or a parent it spreads, is `is Secret`.
 fn is_secret(db: &dyn Db, program: Program, ty: Ty<'_>) -> bool {
+    declares(db, program, ty, Marker::Secret)
+}
+
+/// Whether a declared type, or a parent it spreads, is marked `marker`.
+fn declares(db: &dyn Db, program: Program, ty: Ty<'_>, marker: Marker) -> bool {
     let mut current = Some(ty);
     while let Some(t) = current {
         if let TyKind::Named(item, _) = t.kind(db) {
@@ -349,7 +360,7 @@ fn is_secret(db: &dyn Db, program: Program, ty: Ty<'_>) -> bool {
                 .is_some_and(|d| {
                     d.markers
                         .iter()
-                        .any(|(name, negated)| !negated && name.text(db) == "Secret")
+                        .any(|(name, negated)| !negated && name.text(db) == marker.name())
                 });
             if marked {
                 return true;
@@ -358,6 +369,81 @@ fn is_secret(db: &dyn Db, program: Program, ty: Ty<'_>) -> bool {
         current = crate::relate::parent(db, program, t);
     }
     false
+}
+
+/// Whether a type parameter is required to carry `marker` or to lack it;
+/// none when neither, or for another type (§4.2).
+fn param_marker(db: &dyn Db, program: Program, ty: Ty<'_>, marker: Marker) -> Option<bool> {
+    let TyKind::Param(Some(owner), index, _) = ty.kind(db) else {
+        return None;
+    };
+    let markers = &bounds(db, program, *owner).markers;
+    let wants = |polarity| markers.contains(&MarkerBound::new(*index, marker, polarity));
+    if wants(Polarity::Carries) {
+        Some(true)
+    } else if wants(Polarity::Lacks) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Whether a type carries a marker that describes types (§3.11, §4.2):
+/// none when that is not known, because a type parameter in it is
+/// required neither to carry the marker nor to lack it.
+pub fn carries<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    ty: Ty<'db>,
+    marker: Marker,
+) -> Option<bool> {
+    if let TyKind::Param(..) = ty.kind(db)
+        && let Some(known) = param_marker(db, program, ty, marker)
+    {
+        return Some(known);
+    }
+    match marker {
+        Marker::Solid => match solid(db, program, ty) {
+            Ok(()) => Some(true),
+            Err(why) if why.why == Why::Param => None,
+            Err(_) => Some(false),
+        },
+        Marker::Secret => {
+            if holds_secret(db, program, ty).is_some() {
+                Some(true)
+            } else if unknown_secret(db, program, ty) {
+                None
+            } else {
+                Some(false)
+            }
+        }
+        Marker::Pure => match ty.kind(db) {
+            TyKind::Fn { pure, .. } => Some(*pure),
+            TyKind::Param(..) => None,
+            _ => Some(false),
+        },
+        Marker::Immediate => match ty.kind(db) {
+            TyKind::Named(..) => Some(declares(db, program, ty, Marker::Immediate)),
+            TyKind::Param(..) => None,
+            _ => Some(false),
+        },
+        Marker::Deferred => carries(db, program, ty, Marker::Immediate).map(|i| !i),
+        // Not required yet: stores are not built (§21.5).
+        Marker::Storable => None,
+    }
+}
+
+/// Whether a type parameter in a type may hold a secret: one required
+/// neither to be `Secret` nor not to be.
+fn unknown_secret<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
+    let go = |t: &Ty<'db>| unknown_secret(db, program, *t);
+    match ty.kind(db) {
+        TyKind::Param(..) => param_marker(db, program, ty, Marker::Secret).is_none(),
+        TyKind::Builtin(_, args) | TyKind::Named(_, args) => args.iter().any(go),
+        TyKind::Record { fields, .. } => fields.iter().any(|(_, t)| go(t)),
+        TyKind::Union(members) => members.iter().any(go),
+        TyKind::Error | TyKind::Fn { .. } => false,
+    }
 }
 
 /// The types of a module marked `is Solid` that are not (§3.11), and its

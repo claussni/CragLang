@@ -1708,6 +1708,15 @@ impl<'a, 'db> Infer<'a, 'db> {
         }
     }
 
+    /// The type a number literal has when nothing else fixes it.
+    fn default_type(&self, id: ExprId) -> Option<Ty<'db>> {
+        match self.body.expr(id) {
+            Expr::Literal(Literal::Int(_)) => Some(self.builtin(Builtin::Int)),
+            Expr::Literal(Literal::Float(_)) => Some(self.builtin(Builtin::Float)),
+            _ => None,
+        }
+    }
+
     /// Whether a pending argument takes the type `param` without help of
     /// the context: a literal of its default type (§2.6).
     fn default_fits(&self, id: ExprId, param: Ty<'db>) -> bool {
@@ -2340,6 +2349,27 @@ impl<'a, 'db> Infer<'a, 'db> {
                 .collect();
             if !defaults.is_empty() {
                 viable = defaults;
+            }
+        }
+        // Overloads that require a marker and its absence are told apart
+        // by the literals' default types too (§4.7).
+        if viable.len() > 1 {
+            let defaulted: Vec<Arg<'db>> = positional
+                .iter()
+                .map(|&a| match a {
+                    Arg::Pending(e) => self.default_type(e).map_or(a, |t| Arg::Typed(e, t)),
+                    a => a,
+                })
+                .collect();
+            let holding: Vec<_> = viable
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    self.bounds_hold(&candidates[i], &defaulted, named, builds_record, targs)
+                })
+                .collect();
+            if !holding.is_empty() {
+                viable = holding;
             }
         }
         match viable.as_slice() {

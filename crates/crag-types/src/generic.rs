@@ -32,13 +32,13 @@
 
 use crag_db::Db;
 use crag_hir::{
-    ItemId, ItemKind, Marker, ModuleId, Name, Owner, Program, Requirement, Resolution, TypeArg,
-    TypeRef, TypeRefId, TypeTarget, hir_body, module_scope,
+    ItemId, ItemKind, Marker, ModuleId, Name, Owner, Polarity, Program, Requirement, Resolution,
+    TypeArg, TypeRef, TypeRefId, TypeTarget, hir_body, module_scope,
 };
 
 use crate::def::{SigParam, TypeLowerer, own_type_params, signature, type_header};
 use crate::group::result_type;
-use crate::marker::{NotSolid, solid};
+use crate::marker::{NotSolid, Why, carries, solid};
 use crate::overload::{Ranked, most_specific};
 use crate::relate::{is_subtype, join, normalize, parent, subst};
 use crate::result::{ErrorKind, Site, TypeError};
@@ -85,9 +85,48 @@ pub struct Bounds<'db> {
     /// Unions of forms, of which at least one must fit (§4.7). They give
     /// no slots.
     pub any_of: Vec<Vec<FormBound<'db>>>,
-    /// The markers a type parameter must have, by its index (§3.11).
-    pub markers: Vec<(u32, Marker)>,
+    /// The markers a type parameter must carry or lack (§4.2).
+    pub markers: Vec<MarkerBound>,
     pub errors: Vec<TypeError<'db>>,
+}
+
+/// A marker a type parameter must carry or lack, by the parameter's
+/// index: `where T is Solid` (§4.2). `Deferred` is kept as lacking
+/// `Immediate`, which it means (§3.11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
+pub struct MarkerBound {
+    pub param: u32,
+    pub marker: Marker,
+    pub polarity: Polarity,
+}
+
+impl MarkerBound {
+    pub(crate) fn new(param: u32, marker: Marker, polarity: Polarity) -> MarkerBound {
+        let flip = |p| match p {
+            Polarity::Carries => Polarity::Lacks,
+            Polarity::Lacks => Polarity::Carries,
+        };
+        match marker {
+            Marker::Deferred => MarkerBound {
+                param,
+                marker: Marker::Immediate,
+                polarity: flip(polarity),
+            },
+            _ => MarkerBound {
+                param,
+                marker,
+                polarity,
+            },
+        }
+    }
+
+    /// As source writes it, for type parameter `name`.
+    pub fn display(self, name: &str) -> String {
+        match self.polarity {
+            Polarity::Carries => format!("{name} is {}", self.marker.name()),
+            Polarity::Lacks => format!("{name} is not {}", self.marker.name()),
+        }
+    }
 }
 
 /// A form's requirements, in its own type parameters.
@@ -98,6 +137,8 @@ pub struct FormDef<'db> {
     pub requires: Vec<FormBound<'db>>,
     /// The union of forms it stands for, or required unions.
     pub any_of: Vec<Vec<FormBound<'db>>>,
+    /// The markers its type parameters must carry or lack (§4.2).
+    pub markers: Vec<MarkerBound>,
     /// Its functions.
     pub slots: Vec<ItemId<'db>>,
     pub errors: Vec<TypeError<'db>>,
@@ -165,12 +206,19 @@ pub enum FitError<'db> {
     /// A type does not fit a derived form by its structure, or forbids
     /// the form (§19.11, §3.11).
     NotDerived { form: String, ty: Ty<'db> },
-    /// A type argument is not `Solid` where its parameter's bound says it
-    /// must be (§3.11).
+    /// A type argument is not `Solid` where its parameter is required to
+    /// be (§3.11, §4.2).
     NotSolid {
         param: Name<'db>,
         arg: Ty<'db>,
         why: NotSolid<'db>,
+    },
+    /// A type argument does not carry or lack a marker as its parameter
+    /// is required to, or is a type parameter not known to (§4.2).
+    Marker {
+        param: Name<'db>,
+        arg: Ty<'db>,
+        bound: MarkerBound,
     },
 }
 
@@ -213,9 +261,14 @@ impl<'db> FitError<'db> {
                 ty.display(db)
             ),
             FitError::NotSolid { param, arg, why } => format!(
-                "the bound `Solid` of `{}` does not hold: {}",
+                "the requirement `{} is Solid` does not hold: {}",
                 param.text(db),
                 why.message(db, *arg)
+            ),
+            FitError::Marker { param, arg, bound } => format!(
+                "the requirement `{}` does not hold for {}",
+                bound.display(param.text(db)),
+                arg.display(db)
             ),
         }
     }
@@ -224,7 +277,7 @@ impl<'db> FitError<'db> {
 /// A requirement as lowered: a named bound, a form, or a union of forms.
 enum Req<'db> {
     Type(u32, Ty<'db>),
-    Marker(u32, Marker),
+    Marker(MarkerBound),
     Form(FormBound<'db>),
     AnyOf(Vec<FormBound<'db>>),
 }
@@ -280,6 +333,20 @@ fn form_bound<'db>(
 /// Lowers a requirement, reporting what is wrong with it.
 fn requirement<'db>(lower: &mut TypeLowerer<'_, 'db>, req: &Requirement) -> Option<Req<'db>> {
     let db = lower.db;
+    // `T is M` names a marker, never a form or a type (§4.2).
+    if req.marker.is_some()
+        && !matches!(
+            lower.body.type_ref(req.ty),
+            TypeRef::Missing
+                | TypeRef::Named {
+                    target: TypeTarget::Marker(_),
+                    ..
+                }
+        )
+    {
+        lower.error(Site::Type(req.ty), ErrorKind::NotAMarker);
+        return None;
+    }
     let param = req.param.map(|i| {
         let name = lower.body.type_params[i as usize];
         Ty::new(db, TyKind::Param(lower.owner, i, name))
@@ -311,13 +378,27 @@ fn requirement<'db>(lower: &mut TypeLowerer<'_, 'db>, req: &Requirement) -> Opti
     } = lower.body.type_ref(req.ty)
     {
         let marker = *marker;
-        return match req.param {
-            Some(i) => Some(Req::Marker(i, marker)),
-            None => {
+        if marker == Marker::Storable && req.marker.is_some() {
+            let kind = ErrorKind::Unsupported("`Storable` requirements, until stores are built");
+            lower.error(Site::Type(req.ty), kind);
+            return None;
+        }
+        return match (req.param, req.marker) {
+            (Some(i), Some(polarity)) => Some(Req::Marker(MarkerBound::new(i, marker, polarity))),
+            (Some(i), None) => {
+                let param = lower.body.type_params[i as usize];
+                let kind = ErrorKind::MarkerBound { param, marker };
+                lower.error(Site::Type(req.ty), kind);
+                None
+            }
+            (None, _) => {
                 lower.error(Site::Type(req.ty), ErrorKind::MarkerNotAType { marker });
                 None
             }
         };
+    }
+    if req.marker.is_some() {
+        return None;
     }
     let ty = lower.lower(req.ty);
     match req.param {
@@ -344,7 +425,11 @@ pub fn form_def<'db>(db: &'db dyn Db, program: Program, form: ItemId<'db>) -> Fo
         .form
         .as_ref()
         .and_then(|f| f.alias)
-        .map(|ty| Requirement { param: None, ty });
+        .map(|ty| Requirement {
+            param: None,
+            ty,
+            marker: None,
+        });
     for req in body.requirements.iter().chain(&alias) {
         match requirement(&mut lower, req) {
             Some(Req::Form(bound)) => def.requires.push(bound),
@@ -353,10 +438,7 @@ pub fn form_def<'db>(db: &'db dyn Db, program: Program, form: ItemId<'db>) -> Fo
                 let kind = ErrorKind::Unsupported("named types as bounds of forms");
                 lower.error(Site::Type(req.ty), kind);
             }
-            Some(Req::Marker(..)) => {
-                let kind = ErrorKind::Unsupported("markers as bounds of forms");
-                lower.error(Site::Type(req.ty), kind);
-            }
+            Some(Req::Marker(bound)) => def.markers.push(bound),
             None => {}
         }
     }
@@ -402,6 +484,47 @@ fn expand<'db>(
     }
 }
 
+/// The markers a form bound requires of its type arguments (§4.2): each
+/// argument, with the requirement on the form's type parameter it fills.
+fn form_markers<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    bound: &FormBound<'db>,
+) -> Vec<(Ty<'db>, MarkerBound)> {
+    form_def(db, program, bound.form)
+        .markers
+        .iter()
+        .filter_map(|m| bound.args.get(m.param as usize).map(|&arg| (arg, *m)))
+        .collect()
+}
+
+/// Whether a type argument carries or lacks a marker as required.
+fn check_marker<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    param: Name<'db>,
+    arg: Ty<'db>,
+    bound: MarkerBound,
+) -> Result<(), FitError<'db>> {
+    if arg.is_error(db) {
+        return Ok(());
+    }
+    // What makes a type not `Solid` is worth naming.
+    if bound.marker == Marker::Solid
+        && bound.polarity == Polarity::Carries
+        && let Err(why) = solid(db, program, arg)
+        && why.why != Why::Param
+    {
+        let why = why.clone();
+        return Err(FitError::NotSolid { param, arg, why });
+    }
+    let wanted = bound.polarity == Polarity::Carries;
+    if carries(db, program, arg, bound.marker) != Some(wanted) {
+        return Err(FitError::Marker { param, arg, bound });
+    }
+    Ok(())
+}
+
 /// The bounds of a generic function's type parameters, those of its form
 /// typed parameters included (§4.3), or of a generic type's, which its
 /// constructions must fit (§4.7).
@@ -419,7 +542,11 @@ pub fn bounds<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> Boun
         }
         match requirement(&mut lower, req) {
             Some(Req::Type(i, ty)) => bounds.types.push((i, ty)),
-            Some(Req::Marker(i, marker)) => bounds.markers.push((i, marker)),
+            Some(Req::Marker(bound)) => {
+                if !bounds.markers.contains(&bound) {
+                    bounds.markers.push(bound);
+                }
+            }
             Some(Req::Form(bound)) => forms.push(bound),
             Some(Req::AnyOf(union)) => bounds.any_of.push(union),
             None => {}
@@ -433,6 +560,29 @@ pub fn bounds<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> Boun
     }
     for bound in forms {
         expand(db, program, bound, &mut bounds.forms, &mut bounds.any_of);
+    }
+    // A marker a form requires is required of the type parameter that
+    // the bound gives the form (§4.2).
+    for form in bounds.forms.clone() {
+        for (arg, mut marker) in form_markers(db, program, &form) {
+            match arg.kind(db) {
+                TyKind::Param(Some(o), i, _) if *o == item => {
+                    marker.param = *i;
+                    if !bounds.markers.contains(&marker) {
+                        bounds.markers.push(marker);
+                    }
+                }
+                _ => {
+                    let kind = ErrorKind::Unsupported(
+                        "a form's markers required of a type that is not a type parameter",
+                    );
+                    lower.errors.push(TypeError {
+                        site: Site::Name,
+                        kind,
+                    });
+                }
+            }
+        }
     }
     bounds.errors = lower.errors;
     bounds
@@ -451,6 +601,14 @@ pub fn param_bound<'db>(
     let mut lower = TypeLowerer::new(db, program, body, Some(item));
     let req = body.requirements.iter().find(|r| {
         r.param == Some(index)
+            && r.marker.is_none()
+            && !matches!(
+                body.type_ref(r.ty),
+                TypeRef::Named {
+                    target: TypeTarget::Marker(_),
+                    ..
+                }
+            )
             && form_ref(db, &lower, r.ty).is_none()
             && !matches!(body.type_ref(r.ty), TypeRef::Union(m)
                 if m.iter().any(|&m| form_ref(db, &lower, m).is_some()))
@@ -572,20 +730,11 @@ fn instantiate_at<'db>(
             return Err(FitError::Bound { param, arg, bound });
         }
     }
-    for &(i, marker) in &b.markers {
-        let arg = args
-            .get(i as usize)
-            .copied()
-            .unwrap_or_else(|| Ty::error(db));
-        match marker {
-            Marker::Solid => {
-                if let Err(why) = solid(db, program, arg) {
-                    let param = type_param_names(db, program, function)[i as usize];
-                    let why = why.clone();
-                    return Err(FitError::NotSolid { param, arg, why });
-                }
-            }
-        }
+    for &bound in &b.markers {
+        let i = bound.param as usize;
+        let arg = args.get(i).copied().unwrap_or_else(|| Ty::error(db));
+        let param = type_param_names(db, program, function)[i];
+        check_marker(db, program, param, arg, bound)?;
     }
     let mut fillings = Vec::new();
     for bound in &b.forms {
@@ -625,6 +774,10 @@ fn fits<'db>(
     let mut any_of = Vec::new();
     expand(db, program, bound.clone(), &mut forms, &mut any_of);
     for form in &forms {
+        let names = &type_header(db, program, form.form).params;
+        for (arg, marker) in form_markers(db, program, form) {
+            check_marker(db, program, names[marker.param as usize], arg, marker)?;
+        }
         fit_slots(db, program, form, at, depth)?;
     }
     for union in &any_of {

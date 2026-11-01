@@ -166,3 +166,15 @@ fn a_file_that_does_not_parse_is_left_alone() {
         Err(crag_fmt::FormatError::Syntax(_))
     ));
 }
+
+#[test]
+fn markers_required_of_type_parameters() {
+    check(
+        "fn send[T](x: T) -> T where T is {Solid,not Secret} { x }\n",
+        "fn send[T](x: T) -> T where T is { Solid, not Secret } { x }\n",
+    );
+    check(
+        "type Box[T](v: T)\n  where T is not Secret\n  is Solid\n",
+        "type Box[T](v: T) where T is not Secret is Solid\n",
+    );
+}

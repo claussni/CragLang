@@ -23,16 +23,21 @@
 //! instances of each other, a concrete type beats a type parameter, and of
 //! two type parameters the one with the larger requirement set wins: its
 //! named bound fits the other's, it has every form the other has, and a
-//! union of forms is weaker than each of its members.
+//! union of forms is weaker than each of its members, and it requires
+//! every marker the other does. Two type parameters, one required to carry
+//! a marker and the other to lack it, are disjoint: no type fits both
+//! (§4.7).
 //!
 //! Candidates are ranked wherever they are declared. A module must not
 //! declare two overloads with the same parameter shape and incomparable
 //! bounds unless it declares their combined overload too, so a call never
-//! meets that ambiguity inside one module. No overload in scope may be
+//! meets that ambiguity inside one module; disjoint overloads need none. No overload in scope may be
 //! more specific than a `final` function.
 
 use crag_db::Db;
-use crag_hir::{ItemId, ItemKind, ModuleId, Name, Origin, Program, item_tree, scope_entries};
+use crag_hir::{
+    ItemId, ItemKind, Marker, ModuleId, Name, Origin, Polarity, Program, item_tree, scope_entries,
+};
 
 use crate::def::signature;
 use crate::generic::{FormBound, bind, bounds, mentions};
@@ -47,6 +52,9 @@ pub enum Specificity {
     Less,
     Equal,
     Incomparable,
+    /// No argument fits both: one requires a marker the other requires
+    /// absent.
+    Disjoint,
 }
 
 /// A candidate as ranking sees it: the function whose type parameters its
@@ -102,6 +110,7 @@ enum Atom<'db> {
     Type(Ty<'db>),
     Form(FormBound<'db>),
     AnyOf(Vec<FormBound<'db>>),
+    Marker(Marker, Polarity),
 }
 
 /// The requirements on type parameter `index` of `owner`: its named
@@ -148,6 +157,12 @@ fn requirements<'db>(
             .filter(|u| u.iter().any(|f| f.args.iter().any(names_it)))
             .map(|u| Atom::AnyOf(u.iter().map(form).collect())),
     );
+    atoms.extend(
+        b.markers
+            .iter()
+            .filter(|m| m.param == index)
+            .map(|m| Atom::Marker(m.marker, m.polarity)),
+    );
     atoms
 }
 
@@ -161,9 +176,24 @@ fn implies<'db>(db: &'db dyn Db, program: Program, a: &[Atom<'db>], b: &Atom<'db
         Atom::AnyOf(union) => a.iter().any(|x| match x {
             Atom::Form(f) => union.contains(f),
             Atom::AnyOf(other) => other.iter().all(|f| union.contains(f)),
-            Atom::Type(_) => false,
+            Atom::Type(_) | Atom::Marker(..) => false,
         }),
+        Atom::Marker(..) => a.contains(b),
     }
+}
+
+/// Whether `a` requires a marker that `b` requires absent, or the reverse.
+fn contradicts(a: &[Atom<'_>], b: &[Atom<'_>]) -> bool {
+    a.iter().any(|x| match x {
+        Atom::Marker(m, p) => {
+            let other = match p {
+                Polarity::Carries => Polarity::Lacks,
+                Polarity::Lacks => Polarity::Carries,
+            };
+            b.contains(&Atom::Marker(*m, other))
+        }
+        _ => false,
+    })
 }
 
 /// How requirement set `a` compares with `b`.
@@ -173,6 +203,9 @@ fn compare_requirements<'db>(
     a: &[Atom<'db>],
     b: &[Atom<'db>],
 ) -> Specificity {
+    if contradicts(a, b) {
+        return Specificity::Disjoint;
+    }
     let a_covers = b.iter().all(|x| implies(db, program, a, x));
     let b_covers = a.iter().all(|x| implies(db, program, b, x));
     match (a_covers, b_covers) {
@@ -207,6 +240,7 @@ fn compare<'db>(
     };
     let mut more = false;
     let mut less = false;
+    let mut disjoint = false;
     for (i, arg) in b_args.iter().enumerate() {
         match (arg, bare(*arg, fa)) {
             (None, _) => {}
@@ -221,6 +255,7 @@ fn compare<'db>(
                         more = true;
                         less = true;
                     }
+                    Specificity::Disjoint => disjoint = true,
                     Specificity::Equal => {}
                 }
             }
@@ -232,6 +267,7 @@ fn compare<'db>(
         }
     }
     let spec = match (more, less) {
+        _ if disjoint => Specificity::Disjoint,
         (true, false) => Specificity::More,
         (false, true) => Specificity::Less,
         (false, false) => Specificity::Equal,
@@ -261,7 +297,7 @@ fn dominates<'db>(db: &'db dyn Db, program: Program, a: &Ranked<'db>, b: &Ranked
         match compare_param(db, program, (a.function, *pa), (b.function, *pb)) {
             Specificity::More => strictly = true,
             Specificity::Equal => {}
-            Specificity::Less | Specificity::Incomparable => return false,
+            Specificity::Less | Specificity::Incomparable | Specificity::Disjoint => return false,
         }
     }
     strictly
@@ -450,6 +486,8 @@ fn clash<'db>(
                 more = true;
                 less = true;
             }
+            // No argument fits both, so no call meets both.
+            Specificity::Disjoint => return None,
             Specificity::Equal => {}
         }
         bind(db, program, b, pb.ty, pa.ty, &mut binding);
@@ -523,6 +561,14 @@ fn combined_signature<'db>(
                 .collect(),
         }
         .display(db));
+    }
+    for m in &ba.markers {
+        add(m.display(names[m.param as usize].text(db)));
+    }
+    for m in &bb.markers {
+        if let Some(target) = to_a.get(m.param as usize) {
+            add(m.display(&target.display(db)));
+        }
     }
     for union in ba.any_of.iter().chain(&bb.any_of) {
         let forms: Vec<String> = union.iter().map(|f| f.display(db)).collect();

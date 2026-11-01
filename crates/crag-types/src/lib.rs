@@ -60,8 +60,8 @@ pub use derive::{Derived, derived_op, derived_parts};
 pub use effect::{EffectSet, Restriction};
 pub use escape::{BindingsOnly, EscapeLevel, Escapes};
 pub use generic::{
-    Bounds, CallSite, Filling, FitError, FormBound, FormDef, Instance, Slot, bounds, form_def,
-    instantiate, param_bound, slots, type_param_names, written_show,
+    Bounds, CallSite, Filling, FitError, FormBound, FormDef, Instance, MarkerBound, Slot, bounds,
+    form_def, instantiate, param_bound, slots, type_param_names, written_show,
 };
 pub use group::{
     Group, GroupMember, callees, error_members, error_type, function_effects, group_errors,
@@ -71,7 +71,7 @@ pub use handler::{
     Handler, HandlerCode, Handlers, dispose_handler, lifecycle_handler, type_handlers,
 };
 pub use infer::{constant as literal_value, is_source, is_text};
-pub use marker::{NotSolid, SolidStep, Why, holds_secret, solid};
+pub use marker::{NotSolid, SolidStep, Why, carries, holds_secret, solid};
 pub use overload::{
     FinalError, Ranked, Specificity, compare_param, final_errors, most_specific, overload_errors,
 };

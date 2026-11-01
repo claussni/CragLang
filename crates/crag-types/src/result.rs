@@ -517,10 +517,19 @@ pub enum ErrorKind<'db> {
         ty: Ty<'db>,
         path: Vec<Name<'db>>,
     },
-    /// A marker where a type belongs: only a bound may name one (§3.11).
+    /// A marker where a type belongs: only a requirement may name one
+    /// (§4.2).
     MarkerNotAType {
         marker: Marker,
     },
+    /// A marker as a bound in brackets, `[T: Solid]`, which a `where`
+    /// clause writes `T is Solid` (§4.2).
+    MarkerBound {
+        param: Name<'db>,
+        marker: Marker,
+    },
+    /// `T is X` where `X` is not a marker that describes types (§4.2).
+    NotAMarker,
     /// Something core inference does not handle yet; later milestones of
     /// the Implementation Plan add it.
     Unsupported(&'static str),
@@ -708,10 +717,16 @@ impl<'db> ErrorKind<'db> {
                 }
             },
             ErrorKind::MarkerNotAType { marker } => format!(
-                "`{}` is a marker, which only a bound may name, as in `[T: {}]`",
+                "`{}` is a marker, which only a requirement may name, as in `where T is {}`",
                 marker.name(),
                 marker.name()
             ),
+            ErrorKind::MarkerBound { param, marker } => format!(
+                "a marker is required in a `where` clause: `where {} is {}`",
+                param.text(db),
+                marker.name()
+            ),
+            ErrorKind::NotAMarker => "only a marker that describes types can be required of a type parameter: `Solid`, `Pure`, `Secret`, `Storable`, `Immediate` or `Deferred`".into(),
             ErrorKind::MixedBound => "a bound unites forms or types, not both".into(),
             ErrorKind::NoErrors { function } => {
                 format!("`{}` of a value that has no errors", item(function))

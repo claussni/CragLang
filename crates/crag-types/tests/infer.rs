@@ -1901,8 +1901,10 @@ fn solid_is_decided_from_types() {
     let text = "type Good(a: Int, b: List[Str], f: ((Int) -> Int is Pure)) is Solid
 type Checked(v: Int) is Solid where v == 0
 type Shape(x: Int)
-type Box[T: Solid](v: T) is Solid
-fn keep[T: Solid](x: T) -> T { x }
+type Box[T](v: T)
+  where T is Solid
+  is Solid
+fn keep[T](x: T) -> T where T is Solid { x }
 fn f(g: Good, s: Shape) {
   keep(g)
   keep(s)
@@ -1920,7 +1922,7 @@ type Shape(x: Int)
 type Round(..Shape, f: () -> Int)
 type Holder(s: Shape) is Solid
 type Plain(a: Int) is not Solid
-fn keep[T: Solid](x: T) -> T { x }
+fn keep[T](x: T) -> T where T is Solid { x }
 fn f(p: Plain, l: Lazy[Int]) {
   keep(p)
   keep(l)
@@ -1933,14 +1935,83 @@ fn g(x: Solid) {}";
             "`Timed`: Timed is not Solid: it has conditions with effects",
             "`Later`: Later is not Solid: its field `l` holds Lazy[Int], which may trap when it is read",
             "`Open`: Open is not Solid: its field `r` holds (x: Int, ..), which is an open record, so it may hold any fields",
-            "`Free`: Free[T] is not Solid: its field `v` holds T, which is a type parameter without the bound `Solid`",
+            "`Free`: Free[T] is not Solid: its field `v` holds T, which is a type parameter not required to be `Solid`",
             "`Cell`: Cell is not Solid: its field `r` holds Ref[Int], which is a cell",
             "`Holder`: Holder is not Solid: its field `s` may hold a Round, whose field `f` holds () -> Int, which is a function that is not `is Pure`",
-            "`keep(p)`: the bound `Solid` of `T` does not hold: Plain is not Solid: it is marked `not Solid`",
-            "`keep(l)`: the bound `Solid` of `T` does not hold: Lazy[Int] is not Solid: it may trap when it is read",
-            "`Solid`: `Solid` is a marker, which only a bound may name, as in `[T: Solid]`",
+            "`keep(p)`: the requirement `T is Solid` does not hold: Plain is not Solid: it is marked or required `not Solid`",
+            "`keep(l)`: the requirement `T is Solid` does not hold: Lazy[Int] is not Solid: it may trap when it is read",
+            "`Solid`: `Solid` is a marker, which only a requirement may name, as in `where T is Solid`",
         ]
     );
+}
+
+#[test]
+fn type_parameters_are_required_to_carry_or_lack_markers() {
+    let text = "type Key(raw: Str) is Secret
+type Plain(a: Int) is not Solid
+type Box[T](v: T)
+  where T is { Solid, not Secret }
+  is Solid
+form Sendable[T] where T is { Solid, not Secret } {}
+fn send[T](x: T) -> T where T is { Solid, not Secret } { x }
+fn relay[U](x: U) -> U where U is { Solid, not Secret } { send(x) }
+fn alias[V: Sendable](x: V) -> V { send(x) }
+fn call[F](f: F) -> F where F is Pure { f }
+fn inc(n: Int) -> Int is Pure { n + 1 }
+fn ok() {
+  send(1)
+  send([\"a\"])
+  relay(Box(v: 2))
+  alias(3)
+  call(inc)
+}";
+    assert_eq!(errors(text), Vec::<String>::new());
+}
+
+#[test]
+fn unmet_marker_requirements_are_errors() {
+    let text = "type Key(raw: Str) is Secret
+type Plain(a: Int) is not Solid
+form Sendable[T] where T is { Solid, not Secret } {}
+fn send[T](x: T) -> T where T is { Solid, not Secret } { x }
+fn secret[T](x: T) -> T where T is Secret { x }
+fn relay[U](x: U) -> U { send(x) }
+fn alias[V: Sendable](x: V) -> V { x }
+fn call[F](f: F) -> F where F is Pure { f }
+fn bracket[T: Solid](x: T) -> T { x }
+form Sized[T] { size(x: T) -> Int }
+fn sized[T](x: T) -> T where T is Sized { x }
+fn bad(k: Key, p: Plain, g: (Int) -> Int) {
+  send(k)
+  send([k])
+  send(p)
+  secret(1)
+  alias(k)
+  call(g)
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`send(x)`: the requirement `T is Solid` does not hold for U",
+            "`Solid`: a marker is required in a `where` clause: `where T is Solid`",
+            "`Sized`: only a marker that describes types can be required of a type parameter: `Solid`, `Pure`, `Secret`, `Storable`, `Immediate` or `Deferred`",
+            "`send(k)`: the requirement `T is not Secret` does not hold for Key",
+            "`send([k])`: the requirement `T is not Secret` does not hold for List[Key]",
+            "`send(p)`: the requirement `T is Solid` does not hold: Plain is not Solid: it is marked or required `not Solid`",
+            "`secret(1)`: the requirement `T is Secret` does not hold for Int",
+            "`alias(k)`: the requirement `V is not Secret` does not hold for Key",
+            "`call(g)`: the requirement `F is Pure` does not hold for (Int) -> Int",
+        ]
+    );
+}
+
+#[test]
+fn overloads_that_require_a_marker_and_its_absence_are_disjoint() {
+    let text = "type Key(raw: Str) is Secret
+fn mask[T](x: T) -> Int where T is Secret { 0 }
+fn mask[T](x: T) -> Int where T is not Secret { 1 }
+fn f(k: Key) -> Int { mask(k) + mask(1) }";
+    assert_eq!(errors(text), Vec::<String>::new());
 }
 
 #[test]

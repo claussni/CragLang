@@ -123,6 +123,7 @@ fn expr_bp(p: &mut Parser, min_power: u8, cx: Context) {
     }
     // The left power of the last operator that does not chain.
     let mut unchained = None;
+    let mut tested = false;
     loop {
         let op = p.current();
         let Some((left, right)) = binding_power(op) else {
@@ -131,6 +132,12 @@ fn expr_bp(p: &mut Parser, min_power: u8, cx: Context) {
         if left < min_power {
             return;
         }
+        // `is` after a type test begins a declaration's markers, as in
+        // `where T is Solid is Solid` (§3.10).
+        if op == T::Is && tested {
+            return;
+        }
+        tested = op == T::Is;
         if unchained == Some(left) {
             p.error(match op {
                 T::DotDot => "ranges cannot be chained",
@@ -140,8 +147,14 @@ fn expr_bp(p: &mut Parser, min_power: u8, cx: Context) {
         match op {
             T::Is => {
                 p.start_at(start, S::IsExpr);
-                p.bump();
-                ty(p);
+                // A requirement on a type parameter may group markers or
+                // negate one: `T is { Solid, not Secret }` (§4.2).
+                if matches!(p.nth(1), T::LBrace | T::Not) {
+                    is_clause(p);
+                } else {
+                    p.bump();
+                    ty(p);
+                }
             }
             T::DotDot => {
                 p.start_at(start, S::RangeExpr);

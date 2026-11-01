@@ -313,6 +313,7 @@ impl<'a, 'db> Lowerer<'a, 'db> {
                 self.body.requirements.push(Requirement {
                     param: Some(index),
                     ty,
+                    marker: None,
                 });
             }
         }
@@ -322,10 +323,63 @@ impl<'a, 'db> Lowerer<'a, 'db> {
     fn requirements(&mut self, node: &SyntaxNode) {
         if let Some(clause) = child(node, S::WhereClause) {
             for entry in clause.children() {
+                if self.marker_requirements(&entry) {
+                    continue;
+                }
                 let ty = self.type_node(&entry);
-                self.body.requirements.push(Requirement { param: None, ty });
+                self.body.requirements.push(Requirement {
+                    param: None,
+                    ty,
+                    marker: None,
+                });
             }
         }
+    }
+
+    /// A `where` entry that requires a type parameter to carry or lack
+    /// markers, `T is Solid` or `T is { Solid, not Secret }` (§4.2): its
+    /// requirements, one per marker. False for any other entry.
+    fn marker_requirements(&mut self, entry: &SyntaxNode) -> bool {
+        if entry.kind() != S::IsExpr {
+            return false;
+        }
+        let mut nodes = entry.children();
+        let Some(token) = nodes
+            .next()
+            .filter(|n| n.kind() == S::NameRef)
+            .and_then(|n| ident(&n))
+        else {
+            return false;
+        };
+        let name = self.name(token.text());
+        let Some(&(_, param)) = self.type_scopes.iter().rev().find(|(n, _)| *n == name) else {
+            return false;
+        };
+        let markers = match nodes.next() {
+            Some(clause) if clause.kind() == S::IsClause => clause
+                .children()
+                .filter(|n| n.kind() == S::Marker)
+                .map(|marker| {
+                    let negated = marker.tokens().any(|t| t.kind() == LeafKind::Token(T::Not));
+                    (negated, marker.children().next(), marker)
+                })
+                .collect(),
+            other => vec![(false, other, entry.clone())],
+        };
+        for (negated, node, at) in markers {
+            let ty = self.type_or_missing(node, &at);
+            let marker = Some(if negated {
+                Polarity::Lacks
+            } else {
+                Polarity::Carries
+            });
+            self.body.requirements.push(Requirement {
+                param: Some(param),
+                ty,
+                marker,
+            });
+        }
+        true
     }
 
     /// A form declaration: its type parameters, requirements and functions,
@@ -501,10 +555,14 @@ impl<'a, 'db> Lowerer<'a, 'db> {
                     decl.handlers.push(HandlerClause { kind, handler });
                 }
                 // The kind's form is the compiler's to know, by name
-                // (§11.4); a form applied to types is a requirement (§4.4),
-                // and other entries are conditions (§3.10).
+                // (§11.4); a form applied to types or markers of a type
+                // parameter are requirements (§4.2, §4.4), and other
+                // entries are conditions (§3.10).
                 S::WhereClause => {
                     for entry in clause.children() {
+                        if self.marker_requirements(&entry) {
+                            continue;
+                        }
                         let form = entry.kind() == S::BracketExpr
                             && entry.children().next().is_some_and(|n| {
                                 n.kind() == S::NameRef && n.text() == "HandlerForm"
@@ -516,7 +574,11 @@ impl<'a, 'db> Lowerer<'a, 'db> {
                             decl.form = Some(HandlerForm { ty, pure });
                         } else if self.names_form(&entry) {
                             let ty = self.type_node(&entry);
-                            self.body.requirements.push(Requirement { param: None, ty });
+                            self.body.requirements.push(Requirement {
+                                param: None,
+                                ty,
+                                marker: None,
+                            });
                         } else {
                             conditions.push(entry);
                         }
@@ -1102,7 +1164,17 @@ impl<'a, 'db> Lowerer<'a, 'db> {
             S::IsExpr => {
                 let mut nodes = node.children();
                 let expr = self.expr_or_missing(nodes.next().as_ref(), node);
-                let ty = self.type_or_missing(nodes.next(), node);
+                // Markers are required of type parameters, never tested
+                // on values (§4.2).
+                let ty = match nodes.next() {
+                    Some(clause) if clause.kind() == S::IsClause => {
+                        self.errors.push(LowerError::ExpectedType {
+                            range: clause.range(),
+                        });
+                        self.alloc_type(TypeRef::Missing, clause.range())
+                    }
+                    other => self.type_or_missing(other, node),
+                };
                 Expr::Is { expr, ty }
             }
             S::CallExpr => self.call(node),

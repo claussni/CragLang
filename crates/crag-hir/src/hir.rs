@@ -79,12 +79,23 @@ pub struct Body<'db> {
 }
 
 /// A requirement on type parameters: a bound `T: B` in brackets, of the
-/// type parameter at `param`, or an entry of a `where` clause, which
-/// names its types itself.
+/// type parameter at `param`, an entry of a `where` clause, which names
+/// its types itself, or a marker the type parameter at `param` must carry
+/// or lack, `where T is M` (§4.2).
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
 pub struct Requirement {
     pub param: Option<u32>,
     pub ty: TypeRefId,
+    /// For `T is M`: whether `T` must carry the marker `ty` or lack it.
+    pub marker: Option<Polarity>,
+}
+
+/// Whether a requirement wants a marker carried, `T is M`, or lacked,
+/// `T is not M` (§4.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
+pub enum Polarity {
+    Carries,
+    Lacks,
 }
 
 /// A form: the functions it requires, or the union of forms it stands
@@ -734,23 +745,35 @@ pub enum TypeTarget<'db> {
     Item(ItemId<'db>),
     /// A type parameter, by index into the body's type parameters.
     Param(u32),
-    /// A marker the compiler owns, which only a bound may name (§3.11).
+    /// A marker the compiler owns, which only a requirement `T is M` may
+    /// name (§4.2).
     Marker(Marker),
     /// Reported.
     Unresolved,
 }
 
-/// The markers a bound may name, `[T: Solid]`: they are owned by the
-/// compiler and declared nowhere (§3.11, §19.1).
+/// The markers that describe types, which a type parameter can be
+/// required to carry or lack, `where T is Solid` (§3.11, §4.2). They are
+/// owned by the compiler and declared nowhere (§19.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
 pub enum Marker {
     Solid,
+    Pure,
+    Secret,
+    Storable,
+    Immediate,
+    Deferred,
 }
 
 impl Marker {
     pub fn from_name(name: &str) -> Option<Marker> {
         match name {
             "Solid" => Some(Marker::Solid),
+            "Pure" => Some(Marker::Pure),
+            "Secret" => Some(Marker::Secret),
+            "Storable" => Some(Marker::Storable),
+            "Immediate" => Some(Marker::Immediate),
+            "Deferred" => Some(Marker::Deferred),
             _ => None,
         }
     }
@@ -758,6 +781,11 @@ impl Marker {
     pub fn name(self) -> &'static str {
         match self {
             Marker::Solid => "Solid",
+            Marker::Pure => "Pure",
+            Marker::Secret => "Secret",
+            Marker::Storable => "Storable",
+            Marker::Immediate => "Immediate",
+            Marker::Deferred => "Deferred",
         }
     }
 }
