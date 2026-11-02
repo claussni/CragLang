@@ -134,6 +134,8 @@ pub fn module_type_errors<'db>(
         }
         let result = body_types(db, program, owner);
         errors.extend(result.errors.iter().map(|e| (owner, e.clone())));
+        let private = transport::private_type_errors(db, program, owner);
+        errors.extend(private.into_iter().map(|e| (owner, e)));
     }
     errors
 }

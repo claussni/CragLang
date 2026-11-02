@@ -2132,6 +2132,41 @@ fn f(l: Lazy[Int], k: Key, login: Login, g: (Int) -> Int) -> Int {
 }
 
 #[test]
+fn expr_trees_name_no_private_distinct_or_opaque_types() {
+    // §18.6: a receiver resolves a type by its declaring module and never
+    // another module's private names. Structural types are spelled out.
+    let text = "import std.transport
+distinct type Meters(raw: Int)
+opaque type Token(raw: Int)
+pub distinct type Feet(raw: Int)
+type Pair(a: Int, b: Int)
+fn remote(p: Expr[((Int) -> Int is Pure)]) -> Int { p(1) }
+fn wrap(n: Int) -> Int { Token(raw: n).raw }
+fn twice(n: Int) -> Int { wrap(n) + wrap(n) }
+fn f(m: Meters) -> Int {
+  let a = remote({ n -> Meters(raw: n).raw })
+  let b = remote({ n -> n + m.raw })
+  let c = remote({ n -> twice(n) })
+  let d = remote({ n -> Feet(raw: n).raw + Pair(a: n, b: n).a })
+  let e = remote({ n: Int -> {\n    let x: Meters = Meters(raw: n)\n    let y = Meters(raw: 1)\n    x.raw + y.raw\n  } })
+  a + b + c + d + e
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`Meters(raw: n)`: code sent as an `Expr` names only types a receiver can resolve, \
+             and the distinct type `Meters` is not `pub`",
+            "`{ n -> n + m.raw }`: code sent as an `Expr` names only types a receiver can \
+             resolve, and the distinct type `Meters` is not `pub`",
+            "`twice(n)`: code sent as an `Expr` names only types a receiver can resolve, and \
+             `wrap`, which it bundles, names the opaque type `Token`, which is not `pub`",
+            "`Meters`: code sent as an `Expr` names only types a receiver can resolve, and the \
+             distinct type `Meters` is not `pub`",
+        ]
+    );
+}
+
+#[test]
 fn module_values_and_signals_are_solid() {
     // §5.5, §11.1.
     let text = "type Password(raw: Bytes) is Secret

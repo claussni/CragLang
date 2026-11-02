@@ -536,6 +536,14 @@ pub enum ErrorKind<'db> {
     PrivateExpr {
         function: ItemId<'db>,
     },
+    /// A private `distinct` or `opaque` type that the tree of a closure
+    /// sent as an `Expr` would name, itself or through the `helper` it
+    /// bundles, so no receiver could resolve it (§18.6).
+    PrivateTypeSent {
+        ty: ItemId<'db>,
+        opaque: bool,
+        helper: Option<ItemId<'db>>,
+    },
     /// A module-level `let` or `embed` whose value is not `Solid` (§5.5).
     ValueNotSolid {
         ty: Ty<'db>,
@@ -768,6 +776,22 @@ impl<'db> ErrorKind<'db> {
                 "only a `pub` function can be passed as an `Expr`, and `{}` is not `pub`",
                 item(function)
             ),
+            ErrorKind::PrivateTypeSent { ty, opaque, helper } => {
+                let kind = if *opaque { "opaque" } else { "distinct" };
+                match helper {
+                    None => format!(
+                        "code sent as an `Expr` names only types a receiver can resolve, and the \
+                         {kind} type `{}` is not `pub`",
+                        item(ty)
+                    ),
+                    Some(helper) => format!(
+                        "code sent as an `Expr` names only types a receiver can resolve, and \
+                         `{}`, which it bundles, names the {kind} type `{}`, which is not `pub`",
+                        item(helper),
+                        item(ty)
+                    ),
+                }
+            }
             ErrorKind::ValueNotSolid { ty, why } => format!(
                 "a module-level binding holds only Solid values, and this is not: {}",
                 why.message(db, *ty)
