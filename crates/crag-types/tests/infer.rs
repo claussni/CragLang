@@ -2094,6 +2094,7 @@ fn local(age: Int) -> Bool { age > 18 }
 fn remote(p: Expr[((Int) -> Int is Pure)]) -> Int { p(1) }
 fn bad(e: Expr[(Int) -> Int]) {}
 let limit = 3
+let master = Key(raw: \"m\")
 fn f(l: Lazy[Int], k: Key, login: Login, g: (Int) -> Int) -> Int {
   let a = remote({ n -> n + keep(l) })
   let b = remote({ n -> g(n) })
@@ -2103,6 +2104,7 @@ fn f(l: Lazy[Int], k: Key, login: Login, g: (Int) -> Int) -> Int {
   let h = remote({ n -> ??? })
   let i: Expr[((Int) -> Bool is Pure)] = local
   let j = remote({ n -> n + limit })
+  let o = remote({ n -> case master { _ -> n } })
   fn inc(n: Int) -> Int { n + 1 }
   let m = remote({ n -> inc(n) })
   a + b + c + d + e + h
@@ -2122,8 +2124,7 @@ fn f(l: Lazy[Int], k: Key, login: Login, g: (Int) -> Int) -> Int {
             "`r`: code sent as an `Expr` cannot hold a `ref` binding",
             "`???`: code sent as an `Expr` cannot hold `???`, which can only trap",
             "`local`: only a `pub` function can be passed as an `Expr`, and `local` is not `pub`",
-            "`limit`: code sent as an `Expr` cannot read the module value `limit` yet; bind it to \
-             a local first",
+            "`master`: code sent as an `Expr` captures no secrets, and `master` is a Key",
             "`{ n -> inc(n) }`: code sent as an `Expr` cannot call the local function `inc` from \
              outside it yet",
         ]

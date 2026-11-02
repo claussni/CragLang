@@ -37,7 +37,7 @@ use crag_hir::{
 };
 use crag_types::{
     Builtin, Callee, InferenceResult, Ty, TyKind, body_types, function_effects, is_public,
-    result_type, signature, subst, type_hash,
+    module_values, result_type, signature, subst, type_hash, value_type,
 };
 
 use crate::shape::shapes;
@@ -97,11 +97,7 @@ pub fn transport_type<'db>(db: &'db dyn Db, program: Program, name: &str) -> Opt
 }
 
 /// The bytes of a tree, of the shape of `Tree`.
-pub fn encode_tree(
-    db: &dyn Db,
-    program: Program,
-    tree: &Value,
-) -> Result<Vec<u8>, Untreeable> {
+pub fn encode_tree(db: &dyn Db, program: Program, tree: &Value) -> Result<Vec<u8>, Untreeable> {
     let ty = transport_type(db, program, "Tree").ok_or("a program without std.transport")?;
     let (shapes, root) = shapes(db, program, ty);
     let mut out = Vec::new();
@@ -260,15 +256,15 @@ pub fn expr_tree<'db>(
         Expr::Name { .. } => cx.reference(expr)?,
         _ => return Err("an expression that is no closure or function".into()),
     };
-    let captures = cx
-        .captures
-        .clone()
-        .into_iter()
-        .map(|b| {
-            let ty = cx.types.binding(b).ok_or("a capture without a type")?;
-            cx.type_node(ty)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut captures = Vec::new();
+    for b in cx.captures.clone() {
+        let ty = cx.types.binding(b).ok_or("a capture without a type")?;
+        captures.push(cx.type_node(ty)?);
+    }
+    for v in cx.module_values.clone() {
+        let ty = value_type(db, program, v).ok_or("a module value without a type")?;
+        captures.push(cx.type_node(ty)?);
+    }
     let tree = tree(db, program, root, captures, &mut helpers, true)?;
     let bytes = encode_tree(db, program, &tree)?;
     Ok((*blake3::hash(&bytes).as_bytes(), bytes))
@@ -373,6 +369,9 @@ struct Reify<'a, 'db> {
     generic: Option<(ItemId<'db>, Vec<Ty<'db>>)>,
     locals: Vec<(BindingId, i64)>,
     captures: Vec<BindingId>,
+    /// The module values the root closure reads, captured after its
+    /// bindings (§18.6).
+    module_values: Vec<ItemId<'db>>,
 }
 
 impl<'a, 'db> Reify<'a, 'db> {
@@ -394,6 +393,7 @@ impl<'a, 'db> Reify<'a, 'db> {
             generic: None,
             locals: Vec::new(),
             captures: Vec::new(),
+            module_values: Vec::new(),
         }
     }
 
@@ -416,11 +416,14 @@ impl<'a, 'db> Reify<'a, 'db> {
     ) -> Result<Value, Untreeable> {
         for b in self.body.free_bindings(frame) {
             match self.body.binding(b).kind {
-                BindingKind::Module => return Err("a module value in a tree".into()),
                 BindingKind::Fn => return Err("a captured local function in a tree".into()),
                 _ => self.captures.push(b),
             }
         }
+        self.module_values = module_values(self.body, frame)
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect();
         self.closure_value(params, inner)
     }
 
@@ -536,7 +539,17 @@ impl<'a, 'db> Reify<'a, 'db> {
                 }
                 callee
             }
-            Expr::Name { .. } => return Err("a module value in a tree".into()),
+            Expr::Name {
+                item:
+                    Some(Resolution::Value {
+                        value: Some(value), ..
+                    }),
+                ..
+            } => match self.module_values.iter().position(|v| v == value) {
+                Some(k) => record("CaptureRef", vec![("index", int(self.captures.len() + k))]),
+                None => return Err("a module value outside the root closure".into()),
+            },
+            Expr::Name { .. } => return Err("a name without a resolution".into()),
             Expr::Call {
                 callee,
                 args,

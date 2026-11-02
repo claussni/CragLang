@@ -18,12 +18,14 @@
 //! Implementation Plan §11.10.13). Its body is `Pure` and its captures
 //! `Solid`, which inference checks against `F`; here are the rest: no
 //! `ref` or `ext`, as bindings or captures, no `atomic`, `embed` or `on`
-//! handler, no `???`, and no capture that holds a `Secret`.
+//! handler, no `???`, and no capture that holds a `Secret`. A module value
+//! the body reads is a capture too, and checked as one.
 
 use crag_db::Db;
-use crag_hir::{BindingKind, Body, Expr, ExprId, Program, Resolution, Stmt};
+use crag_hir::{BindingKind, Body, Expr, ExprId, ItemId, Program, Resolution, Stmt};
 
-use crate::marker::holds_secret;
+use crate::def::value_type;
+use crate::marker::{holds_secret, solid};
 use crate::result::{ErrorKind, Site, TypeError};
 use crate::ty::Ty;
 
@@ -68,19 +70,6 @@ pub(crate) fn literal_errors<'db>(
             Expr::Atomic(_) => Some(Untransported::Atomic),
             Expr::Embed => Some(Untransported::Embed),
             Expr::Hole => Some(Untransported::Hole),
-            // A module value is read where it is, never captured.
-            Expr::Name {
-                name,
-                local: None,
-                item: Some(Resolution::Value { value: Some(_), .. }),
-            } => {
-                let kind = ErrorKind::OuterCapture {
-                    name: *name,
-                    function: false,
-                };
-                error(Site::Expr(e), kind);
-                None
-            }
             Expr::Block { stmts, .. } => {
                 for stmt in stmts {
                     let (site, form) = match stmt {
@@ -113,14 +102,9 @@ pub(crate) fn literal_errors<'db>(
                 let ext = declared.kind == BindingKind::Ext;
                 error(Site::Expr(closure), ErrorKind::CellCapture { name, ext });
             }
-            // The tree carries neither: a module value is no capture, and
-            // a local function is code the tree does not bundle.
-            BindingKind::Module | BindingKind::Fn => {
-                let function = declared.kind == BindingKind::Fn;
-                error(
-                    Site::Expr(closure),
-                    ErrorKind::OuterCapture { name, function },
-                );
+            // A local function is code, which the tree does not bundle.
+            BindingKind::Fn => {
+                error(Site::Expr(closure), ErrorKind::OuterFunction { name });
             }
             _ => {
                 let ty = bindings.get(binding.index()).copied().flatten();
@@ -139,5 +123,54 @@ pub(crate) fn literal_errors<'db>(
             }
         }
     }
+    // A module value the body reads is a capture too, read when the
+    // `Expr` is made (§18.6), so it is checked as one: a session's values
+    // need not be Solid.
+    for (value, at) in module_values(body, closure) {
+        let Expr::Name { name, .. } = body.expr(at) else {
+            continue;
+        };
+        let Some(ty) = value_type(db, program, value) else {
+            continue;
+        };
+        if let Err(why) = solid(db, program, ty) {
+            let kind = ErrorKind::PureCapture {
+                name: *name,
+                ty,
+                why: why.clone(),
+            };
+            error(Site::Expr(at), kind);
+        } else if let Some(path) = holds_secret(db, program, ty) {
+            let kind = ErrorKind::SecretCapture {
+                name: *name,
+                ty,
+                path: path.clone(),
+            };
+            error(Site::Expr(at), kind);
+        }
+    }
     errors
+}
+
+/// The module values the body of a closure sent as an `Expr` reads, each
+/// with where it is first read, in that order: its captures after those
+/// of its bindings, in its environment and its tree alike (§18.6).
+pub fn module_values<'db>(body: &Body<'db>, closure: ExprId) -> Vec<(ItemId<'db>, ExprId)> {
+    let mut out: Vec<(ItemId<'db>, ExprId)> = Vec::new();
+    let mut pending = vec![closure];
+    while let Some(e) = pending.pop() {
+        if let Expr::Name {
+            local: None,
+            item: Some(Resolution::Value {
+                value: Some(value), ..
+            }),
+            ..
+        } = body.expr(e)
+            && !out.iter().any(|(v, _)| v == value)
+        {
+            out.push((*value, e));
+        }
+        pending.extend(body.children(e).into_iter().rev());
+    }
+    out
 }

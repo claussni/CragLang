@@ -2715,6 +2715,10 @@ fn b(limit: Int) -> Int { count({ years -> limit < older(years, 1) }) }
 fn c(min: Int) -> Int { count({ age -> min < older(age, 2) }) }
 fn d() -> Tree { treeOf(adult) }
 fn e(min: Int) -> Tree { treeOf({ age -> min < older(age, 1) }) }
+let base = 1
+fn apply(p: Expr[((Int) -> Bool is Pure)], x: Int) -> Bool { p(x) }
+fn f(min: Int) -> Int { count({ age -> min < older(age, base) }) }
+fn g(x: Int) -> Int { if apply({ age -> base < age }, x) { 1 } else { 0 } }
 "#,
     );
     let tree = |m: &Module, name: &str| {
@@ -2733,6 +2737,11 @@ fn e(min: Int) -> Tree { treeOf({ age -> min < older(age, 1) }) }
     assert_ne!(a.0, c.0);
     assert_eq!(a.0, *blake3::hash(&a.1).as_bytes());
     assert_eq!(tree(&m, "e"), a);
+    // A module value the body reads is a capture after its bindings, read
+    // when the `Expr` is made (§18.6).
+    assert_ne!(tree(&m, "f").0, a.0);
+    assert_eq!(m.run("g", &[2]).unwrap(), [1]);
+    assert_eq!(m.run("g", &[1]).unwrap(), [0]);
     let ty = crag_backend::tree::transport_type(&m.db, m.program, "Tree").unwrap();
     let (shapes, root) = shapes(&m.db, m.program, ty);
     let limits = PrintLimits::default();

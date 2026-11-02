@@ -396,6 +396,9 @@ pub struct MirBuilder<'a, 'db> {
     params: usize,
     /// Whether local 0 is an environment.
     env: bool,
+    /// The module values an `Expr`'s code reads out of its environment,
+    /// where it captured them (§18.6).
+    module_locals: Vec<(ItemId<'db>, Local)>,
     result: Ty<'db>,
     /// Whether the code is a test's, which gives no value.
     test: bool,
@@ -465,6 +468,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             unsupported: Vec::new(),
             params: 0,
             env: false,
+            module_locals: Vec::new(),
             result: Ty::unit(db),
             test: false,
             loops: 0,
@@ -1003,7 +1007,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         self.result = result;
         let (captures, env_ty) = self.environment(frame, own);
         // The code reads its captures out of the environment as it is
-        // made, an `Expr`'s tree before them.
+        // made, an `Expr`'s tree before them and its module values after.
+        let env_ty = self.with_module_values(frame, env_ty, captures.len());
         let (env_ty, _) = self.with_tree(frame, env_ty, Vec::new());
         let env = self.temp(env_ty);
         self.env = true;
@@ -1044,6 +1049,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 path: vec![Step::Field(capture_name(db, i))],
             };
             self.push(Statement::Assign(local, Rvalue::Read(place)));
+        }
+        for (k, (value, at)) in self.module_captures(frame).into_iter().enumerate() {
+            let local = self.temp(self.ty(at));
+            let place = Place {
+                local: env,
+                path: vec![Step::Field(capture_name(db, captures.len() + k))],
+            };
+            self.push(Statement::Assign(local, Rvalue::Read(place)));
+            self.module_locals.push((value, local));
         }
         // A local function calls itself through its own environment.
         if let Some(own) = own {
@@ -1319,6 +1333,32 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             })
             .collect();
         (captures, Ty::record(db, fields, false))
+    }
+
+    /// The module values a closure literal that becomes an `Expr` reads,
+    /// which it captures after its bindings (§18.6).
+    fn module_captures(&self, frame: ExprId) -> Vec<(ItemId<'db>, ExprId)> {
+        match self.types.sent.contains(&frame)
+            && matches!(self.body.expr(frame), Expr::Closure { .. })
+        {
+            true => crag_types::module_values(self.body, frame),
+            false => Vec::new(),
+        }
+    }
+
+    /// The environment with a field for each module value the closure
+    /// captures, after its `bound` captured bindings.
+    fn with_module_values(&self, frame: ExprId, env: Ty<'db>, bound: usize) -> Ty<'db> {
+        let values = self.module_captures(frame);
+        if values.is_empty() {
+            return env;
+        }
+        let db = self.db;
+        let mut fields = fields_of(db, self.program, env).unwrap_or_default();
+        for (k, (_, at)) in values.into_iter().enumerate() {
+            fields.push((capture_name(db, bound + k), self.ty(at)));
+        }
+        Ty::record(db, fields, false)
     }
 
     /// The environment of a closure or function value that becomes an
@@ -2471,6 +2511,14 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         for &binding in &captures {
             ops.push(Operand::Local(self.binding(binding)));
         }
+        let env = self.with_module_values(frame, env, captures.len());
+        let values = self.module_captures(frame);
+        // The environment takes what it read of the module values, which
+        // no local keeps live for one on the side stack.
+        let heap = !values.is_empty();
+        for (value, at) in values {
+            ops.push(self.module_value(at, value));
+        }
         let (env, ops) = self.with_tree(frame, env, ops);
         let level = self
             .types
@@ -2479,7 +2527,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             .iter()
             .find(|(f, _)| *f == frame)
             .map_or(EscapeLevel::Escaping, |(_, l)| *l);
-        let placement = place(level, self.loops > 0);
+        let placement = match heap {
+            true => ClosurePlacement::Heap,
+            false => place(level, self.loops > 0),
+        };
         let code = self.closure_code(frame);
         self.assign(
             ty,
@@ -3531,7 +3582,15 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             return self.assign(self.ty(expr), value);
         }
         match item {
-            Some(Resolution::Value { value: Some(v), .. }) => self.module_value(expr, *v),
+            Some(Resolution::Value { value: Some(v), .. }) => {
+                match self.module_locals.iter().find(|(m, _)| m == v) {
+                    Some(&(_, local)) => {
+                        let from = self.locals[local.index()].ty;
+                        self.coerce(Operand::Local(local), from, self.ty(expr))
+                    }
+                    None => self.module_value(expr, *v),
+                }
+            }
             // A unit record is built like `T()` (§3.3).
             Some(Resolution::Type(item))
                 if matches!(

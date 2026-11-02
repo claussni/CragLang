@@ -86,7 +86,7 @@ pub use relate::{
 pub use result::{
     Callee, Dispatch, DispatchArm, ErrorKind, InferenceResult, Iteration, Optional, Site, TypeError,
 };
-pub use transport::Untransported;
+pub use transport::{Untransported, module_values};
 pub use ty::{Builtin, Ty, TyKind};
 
 /// The types of a body: a function, a module-level `let`, a test, or the

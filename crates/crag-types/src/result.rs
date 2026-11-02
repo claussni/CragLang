@@ -519,11 +519,10 @@ pub enum ErrorKind<'db> {
         name: Name<'db>,
         ext: bool,
     },
-    /// A module value or a local function from outside a closure sent as
-    /// an `Expr`, which its tree cannot carry yet (§18.6).
-    OuterCapture {
+    /// A local function from outside a closure sent as an `Expr`, which
+    /// its tree cannot carry yet (§18.6).
+    OuterFunction {
         name: Name<'db>,
-        function: bool,
     },
     /// A capture of a closure sent as an `Expr` that holds a `Secret`, at
     /// the path of fields given (§18.6).
@@ -746,16 +745,10 @@ impl<'db> ErrorKind<'db> {
                 if *ext { "`ext`" } else { "`ref`" },
                 name.text(db)
             ),
-            ErrorKind::OuterCapture { name, function } => match function {
-                true => format!(
-                    "code sent as an `Expr` cannot call the local function `{}` from outside it yet",
-                    name.text(db)
-                ),
-                false => format!(
-                    "code sent as an `Expr` cannot read the module value `{}` yet; bind it to a local first",
-                    name.text(db)
-                ),
-            },
+            ErrorKind::OuterFunction { name } => format!(
+                "code sent as an `Expr` cannot call the local function `{}` from outside it yet",
+                name.text(db)
+            ),
             ErrorKind::SecretCapture { name, ty, path } => match path.is_empty() {
                 true => format!(
                     "code sent as an `Expr` captures no secrets, and `{}` is a {}",

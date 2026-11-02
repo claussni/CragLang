@@ -666,10 +666,19 @@ fn expr_values_run_as_the_closures_they_are() {
         "True\n"
     );
     assert!(eval(&mut r, "young(40).select.tree").starts_with("Tree(version: 1, root: Closure("));
-    let outer = eval(&mut r, "count(ages, { a -> ages == [a] })");
+    // A module value the body reads is captured when the `Expr` is made
+    // (§18.6), and travels in the tree as a capture.
+    assert_eq!(eval(&mut r, "let adulthood = 40"), "");
+    assert_eq!(eval(&mut r, "count(ages, { a -> a >= adulthood })"), "2\n");
+    eval(
+        &mut r,
+        "fn atLimit(p: Expr[((Int) -> Bool is Pure)]) -> Tree { p.tree }",
+    );
+    let tree = eval(&mut r, "atLimit({ a -> a >= adulthood })");
+    assert!(tree.contains("CaptureRef(index: 0)"), "{tree}");
     assert!(
-        outer.starts_with("error: code sent as an `Expr` cannot read the module value `ages` yet"),
-        "{outer}"
+        tree.contains("captures: [Named(ty: TypeRef(package: \"std\""),
+        "{tree}"
     );
     let hole = eval(&mut r, "count(ages, { a -> a > ??? })");
     assert!(
