@@ -447,7 +447,7 @@ pub(crate) fn implicit_params<'db>(db: &'db dyn Db, body: &Body<'db>) -> Vec<Typ
 }
 
 /// Whether a declaration is `pub`.
-pub(crate) fn is_public(db: &dyn Db, item: ItemId) -> bool {
+pub fn is_public(db: &dyn Db, item: ItemId) -> bool {
     let tree = item_tree(db, *item.module(db));
     tree.items.iter().any(|i| i.id == item && i.public)
 }
@@ -724,10 +724,14 @@ impl<'a, 'db> TypeLowerer<'a, 'db> {
             HeaderKind::Builtin(f @ (Builtin::Oks | Builtin::Errs)) => {
                 relate::type_function(db, self.program, f, lowered[0])
             }
-            // An `Expr` is a Pure closure (§18.6).
+            // An `Expr` is a Pure closure (§18.6); a type parameter stands
+            // for the function type of one.
             HeaderKind::Builtin(Builtin::Expr)
                 if !lowered[0].is_error(db)
-                    && !matches!(lowered[0].kind(db), TyKind::Fn { pure: true, .. }) =>
+                    && !matches!(
+                        lowered[0].kind(db),
+                        TyKind::Fn { pure: true, .. } | TyKind::Param(..)
+                    ) =>
             {
                 let kind = ErrorKind::ExprNotPure { ty: lowered[0] };
                 self.error(Site::Type(id), kind);

@@ -28,6 +28,9 @@
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct PackageScope {
     pub name: String,
+    /// The major version its manifest declares, zero without one; code
+    /// transport names it in references (§18.6).
+    pub major: u32,
     /// The paths its manifest exports: modules, or directories whose
     /// modules directly in them are exported.
     pub exports: Vec<String>,

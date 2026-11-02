@@ -57,7 +57,8 @@ use crag_db::plumbing::AsId;
 use crag_hir::{ExprId, ItemId, Name, Owner, Program, Threading, hir_body, lower_body};
 use crag_mir::{
     BinOp, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Entry, InstanceKey, Intrinsic,
-    Local, LocalDecl, MirBody, Operand, Place, Rvalue, Statement, Terminator, Tier, TrapKind,
+    Local, LocalDecl, MirBody, Operand, Place, Rvalue, Statement, TREE, TREE_HASH, Terminator,
+    Tier, TrapKind,
 };
 use crag_types::{Builtin, CForm, Step, Ty, TyKind, prelude_item, signature};
 
@@ -140,6 +141,7 @@ pub fn lower_to_lir<'db>(
     let mut l = Lower {
         db,
         program,
+        instance,
         mir,
         direct,
         positions: &lower_body(db, program, owner).source_map.exprs,
@@ -401,6 +403,9 @@ struct Scope<'db> {
 struct Lower<'a, 'db> {
     db: &'db dyn Db,
     program: Program,
+    /// The instance whose MIR this is, whose type arguments code trees
+    /// put in.
+    instance: InstanceKey<'db>,
     mir: &'a MirBody<'db>,
     /// Whether calls go straight to their callees instead of their slots.
     direct: bool,
@@ -1263,6 +1268,20 @@ impl<'a, 'db> Lower<'a, 'db> {
             }
             Constant::Str(s) => self.text_literal(s.as_bytes())?,
             Constant::Bytes(b) => self.text_literal(b)?,
+            Constant::Tree { owner, expr, hash } => {
+                let (db, program) = (self.db, self.program);
+                let args = self.instance.args(db);
+                let generic = match owner {
+                    Owner::Item(item) if !args.is_empty() => Some((*item, &args[..])),
+                    _ => None,
+                };
+                let (digest, bytes) = crate::tree::expr_tree(db, program, *owner, *expr, generic)
+                    .map_err(|_| "code of this form as an `Expr`")?;
+                match hash {
+                    true => self.text_literal(&digest)?,
+                    false => self.text_literal(&bytes)?,
+                }
+            }
         })
     }
 
@@ -1301,6 +1320,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             Operand::Local(l) => self.local_ty(*l),
             Operand::Const(Constant::Tag(ty)) => *ty,
             Operand::Const(Constant::Unit) => Ty::unit(self.db),
+            Operand::Const(Constant::Tree { .. }) => Ty::builtin(self.db, Builtin::Bytes),
             Operand::Const(_) => otherwise,
         }
     }
@@ -2240,12 +2260,18 @@ impl<'a, 'db> Lower<'a, 'db> {
                 };
                 // An environment on the side stack borrows what it holds.
                 let borrows = *placement == ClosurePlacement::SideStack;
+                // An `Expr`'s tree comes before the captures.
+                let tree = places
+                    .iter()
+                    .filter(|(n, ..)| n.text(self.db).starts_with('$'))
+                    .count();
                 let mut regs = Vec::new();
                 for (name, t, f) in places {
-                    let i: usize = name
-                        .text(self.db)
-                        .parse()
-                        .map_err(|_| "captures of this type")?;
+                    let i = match name.text(self.db).as_str() {
+                        TREE_HASH => 0,
+                        TREE => 1,
+                        n => n.parse::<usize>().map_err(|_| "captures of this type")? + tree,
+                    };
                     let op = captures.get(i).ok_or("captures of this type")?;
                     regs.extend(match (f, op) {
                         (Form::Words(_), _) => self.operand(op, *t)?,
@@ -3306,6 +3332,28 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let which = word(&self.operand(which, int)?)?;
                 Ok(vec![self.runtime(RuntimeFn::EnvPlatform, vec![which])])
             }
+            // The tree's hash and bytes lie first in an `Expr`'s
+            // environment (`crag_mir::TREE_HASH`), borrowed from it.
+            (Intrinsic::ExprTreeHash | Intrinsic::ExprTree, [e]) => {
+                let e_ty = self.operand_ty(e, ty);
+                let [_, env] = self.operand(e, e_ty)?[..] else {
+                    return Err("values of this type");
+                };
+                let at = match intrinsic {
+                    Intrinsic::ExprTreeHash => HEADER_SIZE as i32,
+                    _ => HEADER_SIZE as i32 + 16,
+                };
+                let bytes = vec![self.load(env, at), self.load(env, at + 8)];
+                if let Intrinsic::ExprTreeHash = intrinsic {
+                    self.count_words(Some(Layout::Pair), ty, &bytes, Self::retain)?;
+                    return Ok(bytes);
+                }
+                self.describe_reachable(ty)?;
+                let shapes = self.value_shapes(ty)?;
+                let mut args = vec![shapes];
+                args.extend(bytes);
+                Ok(vec![self.runtime(RuntimeFn::ValueDecode, args)])
+            }
             (Intrinsic::CollCount, [c]) => {
                 let c_ty = self.operand_ty(c, ty);
                 let ptr = word(&self.operand(c, c_ty)?)?;
@@ -3989,6 +4037,34 @@ impl<'a, 'db> Lower<'a, 'db> {
             });
         };
         self.types.push((index, descriptor));
+        Ok(())
+    }
+
+    /// Describes the types of the boxes a value of `ty` may hold, so that
+    /// the runtime can build one.
+    fn describe_reachable(&mut self, ty: Ty<'db>) -> Result<(), Unsupported> {
+        let (db, program) = (self.db, self.program);
+        let mut seen = Vec::new();
+        let mut pending = vec![ty];
+        while let Some(t) = pending.pop() {
+            if seen.contains(&t) {
+                continue;
+            }
+            seen.push(t);
+            if layout(db, program, t) == Some(Layout::Box) {
+                self.describe(t)?;
+            }
+            match t.kind(db) {
+                TyKind::Union(members) => pending.extend(members),
+                TyKind::Builtin(_, args) => pending.extend(args),
+                TyKind::Named(..) | TyKind::Record { .. } => {
+                    let fields = crag_types::fields_of(db, program, t).unwrap_or_default();
+                    pending.extend(fields.into_iter().map(|(_, f)| f));
+                    pending.extend(crag_types::record_subtypes(db, program, t));
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 

@@ -222,6 +222,7 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::TxUnwind => stm::rt_tx_unwind as *const () as usize,
         RuntimeFn::CCall => ffi::rt_c_call as *const () as usize,
         RuntimeFn::CStrOf => ffi::rt_c_str_of as *const () as usize,
+        RuntimeFn::ValueDecode => values::rt_value_decode as *const () as usize,
     }
 }
 

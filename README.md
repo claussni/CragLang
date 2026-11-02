@@ -24,7 +24,7 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-hir` | Item trees, names and imports, and HIR lowering (M1) |
 | `crates/crag-types` | Types and core inference (M1) |
 | `crates/crag-mir` | MIR builder (M1) |
-| `crates/crag-backend` | Code generation from MIR (M1) |
+| `crates/crag-backend` | Code generation from MIR (M1); code trees, the code an `Expr` carries as data (M7) |
 | `crates/crag-aot` | Release builds: the AOT object writer, which puts release code in an ELF object file, finding the runtime archive, and linking with lld (M7) |
 | `crates/crag-rt` | The runtime archive: the runtime and the start of a release executable, as a static library for musl (M7) |
 | `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1); `build`, the release executable (M7); the UI with the built-in editor, the app image, hot reload, the debugger, the language server `crag lsp` and the debug adapter `crag dap` (M5) |

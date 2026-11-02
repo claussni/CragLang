@@ -58,7 +58,7 @@ pub use inline::{
 };
 pub use ir::{
     BinOp, Block, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Inlined, Intrinsic, Local,
-    LocalDecl, MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,
+    LocalDecl, MirBody, Operand, Place, Rvalue, Statement, TREE, TREE_HASH, Terminator, TrapKind,
 };
 pub use liveness::{Lent, Liveness, compute_liveness, insert_drops, insert_rc_ops};
 pub use reuse::insert_reuse;

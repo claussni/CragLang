@@ -46,6 +46,7 @@ mod layout;
 mod lower;
 mod shape;
 mod split;
+pub mod tree;
 
 use std::collections::HashMap;
 use std::sync::OnceLock;

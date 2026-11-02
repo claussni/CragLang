@@ -50,7 +50,7 @@ use crag_types::{
 
 use crate::ir::{
     BinOp, Block, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Intrinsic, Local, LocalDecl,
-    MirBody, Operand, Place, Rvalue, Statement, Terminator, TrapKind,
+    MirBody, Operand, Place, Rvalue, Statement, TREE, TREE_HASH, Terminator, TrapKind,
 };
 use crate::{Entry, InstanceKey};
 
@@ -1002,6 +1002,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let param_tys = &param_tys;
         self.result = result;
         let (captures, env_ty) = self.environment(frame, own);
+        // The code reads its captures out of the environment as it is
+        // made, an `Expr`'s tree before them.
+        let (env_ty, _) = self.with_tree(frame, env_ty, Vec::new());
         let env = self.temp(env_ty);
         self.env = true;
         // Parameters that are patterns are matched once all are in place.
@@ -1316,6 +1319,34 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             })
             .collect();
         (captures, Ty::record(db, fields, false))
+    }
+
+    /// The environment of a closure or function value that becomes an
+    /// `Expr`, with its tree's hash and bytes before the captures, which
+    /// `e.treeHash` and `e.tree` read (Plan §11.10.13); any other as it is.
+    fn with_tree(
+        &self,
+        expr: ExprId,
+        env: Ty<'db>,
+        ops: Vec<Operand<'db>>,
+    ) -> (Ty<'db>, Vec<Operand<'db>>) {
+        let db = self.db;
+        if !self.types.sent.contains(&expr) {
+            return (env, ops);
+        }
+        let bytes = Ty::builtin(db, Builtin::Bytes);
+        let mut fields = fields_of(db, self.program, env).unwrap_or_default();
+        fields.push((Name::new(db, TREE_HASH.to_string()), bytes));
+        fields.push((Name::new(db, TREE.to_string()), bytes));
+        let tree = |hash| {
+            Operand::Const(Constant::Tree {
+                owner: self.owner,
+                expr,
+                hash,
+            })
+        };
+        let ops = [tree(true), tree(false)].into_iter().chain(ops).collect();
+        (Ty::record(db, fields, false), ops)
     }
 
     fn closure_code(&self, frame: ExprId) -> InstanceKey<'db> {
@@ -2276,6 +2307,8 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         Some(
             match (module.as_str(), function.name(db).text(db).as_str()) {
                 ("std.time", "sleepNanos") => Intrinsic::Sleep,
+                ("std.transport", "treeHash") => Intrinsic::ExprTreeHash,
+                ("std.transport", "tree") => Intrinsic::ExprTree,
                 ("std.task", "scopeNew") => Intrinsic::ScopeNew,
                 ("std.task", "scopeStart") => Intrinsic::ScopeStart,
                 ("std.task", "scopeNext") => Intrinsic::ScopeNext,
@@ -2438,6 +2471,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         for &binding in &captures {
             ops.push(Operand::Local(self.binding(binding)));
         }
+        let (env, ops) = self.with_tree(frame, env, ops);
         let level = self
             .types
             .escapes
@@ -3487,10 +3521,11 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         // A function used as a value gets code that calls it.
         if self.is_call(expr) {
             let code = self.instance.with_entry(self.db, Entry::Function(expr));
+            let (env, captures) = self.with_tree(expr, Ty::unit(self.db), Vec::new());
             let value = Rvalue::Closure {
                 code,
-                env: Ty::unit(self.db),
-                captures: Vec::new(),
+                env,
+                captures,
                 placement: ClosurePlacement::Heap,
             };
             return self.assign(self.ty(expr), value);

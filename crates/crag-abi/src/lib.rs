@@ -970,6 +970,13 @@ pub enum RuntimeFn {
     /// A copy of the NUL-terminated bytes at the address, which is not
     /// null, as `Bytes`: with the NUL when `nul` is not zero.
     CStrOf = 112,
+
+    /// `rt_value_decode(ctx, handle, b0, b1) -> word`.
+    ///
+    /// The value whose encoding the bytes `b0`, `b1` are, of a type of one
+    /// word and a handle of `ValueShapes`, built on the heap: the tree of
+    /// an `Expr`, which the compiler wrote (Plan §11.10.11).
+    ValueDecode = 113,
 }
 
 /// The kinds of C values of a [`RuntimeFn::CCall`] descriptor.
@@ -1191,7 +1198,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 113] = [
+    pub const ALL: [RuntimeFn; 114] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -1305,6 +1312,7 @@ impl RuntimeFn {
         RuntimeFn::TxUnwind,
         RuntimeFn::CCall,
         RuntimeFn::CStrOf,
+        RuntimeFn::ValueDecode,
     ];
 
     /// The symbol the loader looks up.
@@ -1423,6 +1431,7 @@ impl RuntimeFn {
             RuntimeFn::TxUnwind => "rt_tx_unwind",
             RuntimeFn::CCall => "rt_c_call",
             RuntimeFn::CStrOf => "rt_c_str_of",
+            RuntimeFn::ValueDecode => "rt_value_decode",
         }
     }
 

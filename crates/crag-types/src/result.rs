@@ -76,6 +76,9 @@ pub struct InferenceResult<'db> {
     pub trap_handlers: Vec<(ExprId, Ty<'db>)>,
     /// Every `?.` access on a value that can be `Empty` (§6.8).
     pub optional: Vec<(ExprId, Optional<'db>)>,
+    /// The closure literals and named functions that become `Expr`
+    /// values, whose code travels as trees (§18.6).
+    pub sent: Vec<ExprId>,
     /// What the body does beyond computing (§3.14).
     pub effects: EffectSet,
     /// Where its parameters and closures go (§11.5.8).
@@ -516,6 +519,12 @@ pub enum ErrorKind<'db> {
         name: Name<'db>,
         ext: bool,
     },
+    /// A module value or a local function from outside a closure sent as
+    /// an `Expr`, which its tree cannot carry yet (§18.6).
+    OuterCapture {
+        name: Name<'db>,
+        function: bool,
+    },
     /// A capture of a closure sent as an `Expr` that holds a `Secret`, at
     /// the path of fields given (§18.6).
     SecretCapture {
@@ -737,6 +746,16 @@ impl<'db> ErrorKind<'db> {
                 if *ext { "`ext`" } else { "`ref`" },
                 name.text(db)
             ),
+            ErrorKind::OuterCapture { name, function } => match function {
+                true => format!(
+                    "code sent as an `Expr` cannot call the local function `{}` from outside it yet",
+                    name.text(db)
+                ),
+                false => format!(
+                    "code sent as an `Expr` cannot read the module value `{}` yet; bind it to a local first",
+                    name.text(db)
+                ),
+            },
             ErrorKind::SecretCapture { name, ty, path } => match path.is_empty() {
                 true => format!(
                     "code sent as an `Expr` captures no secrets, and `{}` is a {}",

@@ -56,8 +56,8 @@ pub use case::{ListLen, Value};
 pub use decision::{Bindings, DecisionTree, Position, Step, decision_tree, decision_tree_with};
 pub use def::{
     FieldDef, HeaderKind, SigParam, Signature, TypeDef, TypeDefKind, TypeHeader, alias_target,
-    c_out, c_signature, is_cstr, place_positional, prelude_item, signature, success_type, type_def,
-    type_header, type_parent, value_type,
+    c_out, c_signature, is_cstr, is_public, place_positional, prelude_item, signature,
+    success_type, type_def, type_header, type_parent, value_type,
 };
 pub use derive::{Derived, derived_op, derived_parts};
 pub use effect::{EffectSet, Restriction};

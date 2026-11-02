@@ -21,7 +21,7 @@
 //! handler, no `???`, and no capture that holds a `Secret`.
 
 use crag_db::Db;
-use crag_hir::{BindingKind, Body, Expr, ExprId, Program, Stmt};
+use crag_hir::{BindingKind, Body, Expr, ExprId, Program, Resolution, Stmt};
 
 use crate::marker::holds_secret;
 use crate::result::{ErrorKind, Site, TypeError};
@@ -68,6 +68,19 @@ pub(crate) fn literal_errors<'db>(
             Expr::Atomic(_) => Some(Untransported::Atomic),
             Expr::Embed => Some(Untransported::Embed),
             Expr::Hole => Some(Untransported::Hole),
+            // A module value is read where it is, never captured.
+            Expr::Name {
+                name,
+                local: None,
+                item: Some(Resolution::Value { value: Some(_), .. }),
+            } => {
+                let kind = ErrorKind::OuterCapture {
+                    name: *name,
+                    function: false,
+                };
+                error(Site::Expr(e), kind);
+                None
+            }
             Expr::Block { stmts, .. } => {
                 for stmt in stmts {
                     let (site, form) = match stmt {
@@ -100,7 +113,15 @@ pub(crate) fn literal_errors<'db>(
                 let ext = declared.kind == BindingKind::Ext;
                 error(Site::Expr(closure), ErrorKind::CellCapture { name, ext });
             }
-            BindingKind::Module | BindingKind::Fn => {}
+            // The tree carries neither: a module value is no capture, and
+            // a local function is code the tree does not bundle.
+            BindingKind::Module | BindingKind::Fn => {
+                let function = declared.kind == BindingKind::Fn;
+                error(
+                    Site::Expr(closure),
+                    ErrorKind::OuterCapture { name, function },
+                );
+            }
             _ => {
                 let ty = bindings.get(binding.index()).copied().flatten();
                 if let Some(ty) = ty

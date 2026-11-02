@@ -20,3 +20,135 @@
 // is usable anywhere an `F` is (Implementation Plan §11.10.13).
 
 pub type Expr[F]
+
+// The tree of an `Expr`'s code, decoded from the bytes the compiler wrote.
+pub fn tree[F](e: Expr[F]) -> Tree
+
+// The content hash of an `Expr`'s tree: BLAKE3 of its bytes, by which a
+// receiver may keep what it compiled.
+pub fn treeHash[F](e: Expr[F]) -> Bytes
+
+// A code tree (Implementation Plan §11.10.11): the body of an `Expr` as
+// Solid data, resolved by the sender and without the types the receiver
+// infers. Locals, the root's parameters first, are numbered in order of
+// introduction, and captures apart, so names never travel. The format is versioned: a change
+// to these types raises `version`.
+pub type Tree(version: Int, root: Closure, helpers: List[Helper], captures: List[TypeNode])
+
+// A closure: its parameters' patterns with the types written for them,
+// and its body.
+pub type Closure(params: List[ClosureParam], body: Node)
+pub type ClosureParam(pat: Pat, ty: Option[TypeNode])
+
+// A function that is not `pub` and that the body reaches, bundled: its
+// signature, with type parameters by index, and its body.
+pub type Helper(typeParams: Int, params: List[FnParam], result: TypeNode, body: Node)
+pub type FnParam(local: Int, ty: TypeNode, default: Option[Node])
+
+// A `pub` function, as the receiver resolves it, with the hash of its
+// body as a tree.
+pub type FnRef(package: Str, major: Int, module: Str, name: Str, signature: TypeNode, body: Bytes)
+
+// A named type, as the receiver resolves it, with the hash of its
+// canonical form.
+pub type TypeRef(
+  package: Str,
+  major: Int,
+  module: Str,
+  name: Str,
+  args: List[TypeNode],
+  hash: Bytes,
+)
+
+pub type Node = Lit | Text | Reference | Operation | Construction | Control | Closure
+pub type Reference = CaptureRef | LocalRef | Function | HelperRef | TypeName
+pub type Operation = Call | Field | Index | And | Or | Not | RangeNode | Is
+pub type Construction = RecordNode | ListNode | MapNode | GridNode
+pub type Control = Block | If | Case | Pass | LazyNode
+
+// A literal, as written: a number by its digits, since it takes its type
+// from the context.
+pub type Lit = IntLit | FloatLit | StrLit | BytesLit | CodePointLit
+pub type IntLit(digits: Str)
+pub type FloatLit(digits: Str)
+pub type StrLit(value: Str)
+pub type BytesLit(value: Bytes)
+pub type CodePointLit(value: CodePoint)
+
+// A string with interpolations, as its parts.
+pub type Text(parts: List[Str | Node])
+
+pub type CaptureRef(index: Int)
+pub type LocalRef(index: Int)
+pub type Function(target: FnRef)
+pub type HelperRef(index: Int)
+// A type where a value is expected: called, it constructs or converts.
+pub type TypeName(ty: TypeNode)
+
+// A call of one callee, its type arguments, positional arguments and
+// field list.
+pub type Call(callee: Node, typeArgs: List[TypeNode], args: List[Node], fields: List[FieldNode])
+// A read of a field, `?.` when optional.
+pub type Field(receiver: Node, name: Str, optional: Bool)
+pub type Index(base: Node, args: List[Node])
+pub type And(left: Node, right: Node)
+pub type Or(left: Node, right: Node)
+pub type Not(value: Node)
+pub type RangeNode(start: Node, end: Option[Node])
+pub type Is(value: Node, ty: TypeNode)
+pub type RecordNode(fields: List[FieldNode])
+pub type ListNode(items: List[Node])
+pub type MapNode(entries: List[Entry])
+pub type Entry(key: Node, value: Node)
+pub type GridNode(rows: List[List[Node]])
+pub type FieldNode = FieldArg | Spread
+pub type FieldArg(path: List[Str], value: Node)
+pub type Spread(value: Node)
+pub type Block(stmts: List[Stmt], tail: Option[Node])
+pub type If(condition: Node, then: Node, otherwise: Option[Node])
+pub type Case(subject: Node, arms: List[Arm])
+pub type Arm(pat: Pat, guard: Option[Node], body: Node)
+pub type Pass
+pub type LazyNode(value: Node)
+
+pub type Stmt = ExprStmt | Let | LetElse | Var | Assign | For | Return | LocalFn
+pub type ExprStmt(value: Node)
+pub type Let(pat: Pat, ty: Option[TypeNode], value: Node)
+pub type LetElse(pat: Pat, ty: Option[TypeNode], value: Node, rest: Option[Pat], otherwise: Node)
+pub type Var(local: Int, ty: Option[TypeNode], value: Node)
+pub type Assign(local: Int, value: Node)
+pub type For(pat: Pat, iterable: Node, body: Node)
+pub type Return(value: Option[Node])
+
+pub type LocalFn(
+  local: Int,
+  params: List[FnParam],
+  result: Option[TypeNode],
+  pure: Bool,
+  body: Node,
+)
+
+pub type Pat = Wildcard | Bind | TypePat | RecordPat | ListPat | LitPat | RangePat | OrPat
+pub type Wildcard
+pub type Bind(local: Int, sub: Option[Pat])
+pub type TypePat(ty: TypeNode)
+pub type RecordPat(ty: Option[TypeNode], fields: List[PatField])
+pub type PatField(name: Option[Str], pat: Pat)
+// `[a, ..rest, b]`: the rest, bound or not, if there is one.
+pub type ListPat(before: List[Pat], rest: Option[Rest], after: List[Pat])
+pub type Rest(local: Option[Int])
+pub type LitPat(negative: Bool, lit: Lit)
+pub type RangePat(start: LitPat, end: LitPat)
+pub type OrPat(alternatives: List[Pat])
+
+// A type as written, with structural aliases spelled out.
+pub type TypeNode = Named | RecordType | FnType | UnionType | UnitType | TypeParam | Scale
+pub type Named(ty: TypeRef)
+pub type RecordType(fields: List[TypeField], open: Bool)
+pub type TypeField(name: Str, ty: TypeNode)
+pub type FnType(params: List[TypeNode], result: TypeNode, pure: Bool)
+pub type UnionType(members: List[TypeNode])
+pub type UnitType
+pub type TypeParam(index: Int)
+// The scale of `Fixed[S]`.
+pub type Scale(digits: Int)

@@ -643,17 +643,34 @@ fn expr_values_run_as_the_closures_they_are() {
         "fn plain(xs: List[Int], p: ((Int) -> Bool is Pure)) -> Int { count(xs, { x -> p(x) }) }",
     );
     eval(&mut r, "let ages = [3, 17, 18, 40, 65]");
-    eval(&mut r, "let limit = 40");
-    assert_eq!(eval(&mut r, "count(ages, { a -> a >= limit })"), "2\n");
+    eval(
+        &mut r,
+        "fn atLeast(xs: List[Int], limit: Int) -> Int { count(xs, { a -> a >= limit }) }",
+    );
+    assert_eq!(eval(&mut r, "atLeast(ages, 40)"), "2\n");
     assert_eq!(eval(&mut r, "count(ages, adult)"), "3\n");
     assert_eq!(eval(&mut r, "plain(ages, adult)"), "3\n");
     eval(&mut r, "let j = Job(name: \"adults\", select: adult)");
     assert_eq!(eval(&mut r, "j.select(20)"), "True\n");
     eval(
         &mut r,
-        "let k = Job(name: \"young\", select: { a -> a < limit })",
+        "fn young(limit: Int) -> Job { Job(name: \"young\", select: { a -> a < limit }) }",
     );
-    assert_eq!(eval(&mut r, "count(ages, k.select)"), "3\n");
+    assert_eq!(eval(&mut r, "count(ages, young(40).select)"), "3\n");
+    // The tree travels with the closure: its hash, and the tree itself.
+    assert_eq!(
+        eval(
+            &mut r,
+            "young(40).select.treeHash == young(41).select.treeHash"
+        ),
+        "True\n"
+    );
+    assert!(eval(&mut r, "young(40).select.tree").starts_with("Tree(version: 1, root: Closure("));
+    let outer = eval(&mut r, "count(ages, { a -> ages == [a] })");
+    assert!(
+        outer.starts_with("error: code sent as an `Expr` cannot read the module value `ages` yet"),
+        "{outer}"
+    );
     let hole = eval(&mut r, "count(ages, { a -> a > ??? })");
     assert!(
         hole.starts_with("error: code sent as an `Expr` cannot hold `???`, which can only trap\n"),

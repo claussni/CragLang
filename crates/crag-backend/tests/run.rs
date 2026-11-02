@@ -39,7 +39,9 @@ use crag_codegen::{
     CodeObject, CodegenSettings, OptLevel, SlotKey, compile_entry_stub, target_for,
 };
 use crag_db::RootDatabase;
-use crag_hir::{ItemKind, ModuleId, Owner, Program, Resource, SourceFile, lower_body, owners};
+use crag_hir::{
+    ItemKind, ModuleId, Owner, Program, Resource, SourceFile, item_tree, lower_body, owners,
+};
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{InstanceKey, Tier, collect_instances};
 use crag_runtime::text::TextWords;
@@ -295,7 +297,12 @@ impl Module {
                 (module, source.to_string(), Resource::new(&db, content))
             })
             .collect();
-        let mut modules = vec![core, module];
+        let transport = ModuleId::new(
+            &db,
+            "std.transport".to_string(),
+            SourceFile::new(&db, include_str!("../../../std/transport.crag").to_string()),
+        );
+        let mut modules = vec![core, module, transport];
         if let Some(library) = library {
             let file = SourceFile::new(&db, library.to_string());
             modules.push(ModuleId::new(&db, "lib".to_string(), file));
@@ -2690,6 +2697,88 @@ fn large_recursive_groups_of_types_lay_out() {
     );
     let mut m = Module::new(&text);
     assert_eq!(m.call("total", &[]), [3]);
+}
+
+#[test]
+fn closures_sent_as_expr_become_trees() {
+    // Plan §11.10.11: the tree of a closure is written in the codec, and
+    // two closures that differ only in names give the same bytes. `e.tree`
+    // decodes them, and they encode again to themselves.
+    let mut m = Module::new(
+        r#"import std.transport
+pub fn adult(age: Int) -> Bool { 17 < age }
+fn older(age: Int, by: Int) -> Int { age + by }
+fn count(p: Expr[((Int) -> Bool is Pure)]) -> Int { 0 }
+fn treeOf(p: Expr[((Int) -> Bool is Pure)]) -> Tree { p.tree }
+fn a(min: Int) -> Int { count({ age -> min < older(age, 1) }) }
+fn b(limit: Int) -> Int { count({ years -> limit < older(years, 1) }) }
+fn c(min: Int) -> Int { count({ age -> min < older(age, 2) }) }
+fn d() -> Tree { treeOf(adult) }
+fn e(min: Int) -> Tree { treeOf({ age -> min < older(age, 1) }) }
+"#,
+    );
+    let tree = |m: &Module, name: &str| {
+        let (db, program) = (&m.db, m.program);
+        let module = program.modules(db)[1];
+        let owner = owners(db, module)
+            .into_iter()
+            .find(|o| matches!(o, Owner::Item(i) if i.name(db).text(db) == name))
+            .unwrap();
+        let sent = crag_types::body_types(db, program, owner).sent.clone();
+        assert_eq!(sent.len(), 1, "{name}");
+        crag_backend::tree::expr_tree(db, program, owner, sent[0], None).unwrap()
+    };
+    let (a, b, c) = (tree(&m, "a"), tree(&m, "b"), tree(&m, "c"));
+    assert_eq!(a, b);
+    assert_ne!(a.0, c.0);
+    assert_eq!(a.0, *blake3::hash(&a.1).as_bytes());
+    assert_eq!(tree(&m, "e"), a);
+    let ty = crag_backend::tree::transport_type(&m.db, m.program, "Tree").unwrap();
+    let (shapes, root) = shapes(&m.db, m.program, ty);
+    let limits = PrintLimits::default();
+    for (name, args, shown) in [
+        (
+            "e",
+            &[3i64][..],
+            "Tree(version: 1, root: Closure(params: [ClosureParam(pat: Bind(local: 0, sub: Empty), \
+             ty: Empty)], body: Block(stmts: [], tail: Call(callee: Function(target: \
+             FnRef(package: \"std\", major: 0, module: \"std.core\", name: \"lessThan\"",
+        ),
+        (
+            "d",
+            &[][..],
+            "Tree(version: 1, root: Closure(params: [ClosureParam(pat: Bind(local: 0, sub: Empty), \
+             ty: Empty)], body: Call(callee: Function(target: FnRef(package: \"app\", major: 0, \
+             module: \"app\", name: \"adult\"",
+        ),
+    ] {
+        let expected = tree(&m, name).1;
+        let words = m.run(name, args).unwrap();
+        TYPES.set(&m.types);
+        // SAFETY: the words are the function's result, a `Tree`.
+        unsafe {
+            let printed = print_value(&words, &shapes, root, &m.types, limits);
+            assert!(printed.starts_with(shown), "{printed}");
+            assert_eq!(
+                encode_value(&words, &shapes, root, &m.types).unwrap(),
+                expected
+            );
+            release_value(&mut m.heap, &m.types, &words, &shapes, root);
+        }
+    }
+    assert_eq!(m.heap.live_blocks(), 0);
+    // A function of the prelude without a body hashes by its declaration.
+    let function = |name: &str| {
+        let core = m.program.modules(&m.db)[0];
+        item_tree(&m.db, core)
+            .items
+            .iter()
+            .find(|i| i.id.name(&m.db).text(&m.db) == name)
+            .unwrap()
+            .id
+    };
+    let hash = |name| crag_backend::tree::body_hash(&m.db, m.program, function(name));
+    assert_ne!(hash("lessThan"), hash("add"));
 }
 
 #[test]

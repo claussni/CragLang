@@ -143,7 +143,21 @@ pub enum Constant<'db> {
     /// The value of a tag type.
     Tag(Ty<'db>),
     Unit,
+    /// The `Bytes` of the code tree of the closure literal or named
+    /// function `expr` of `owner`'s body that becomes an `Expr`, or of its
+    /// content hash (Plan §11.10.11).
+    Tree {
+        owner: Owner<'db>,
+        expr: ExprId,
+        hash: bool,
+    },
 }
+
+/// The fields of the environment of an `Expr` that hold its tree's
+/// content hash and bytes, before its captures: `$` sorts before the
+/// digits that name captures, so they lie right after the box's header.
+pub const TREE_HASH: &str = "$hash";
+pub const TREE: &str = "$tree";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
 pub enum BinOp {
@@ -508,6 +522,10 @@ pub enum Intrinsic<'db> {
     CStrOf {
         nul: bool,
     },
+    /// The content hash of an `Expr`'s tree, `Bytes`, and the tree,
+    /// decoded: `std.transport.treeHash` and `tree` (Plan §11.10.13).
+    ExprTreeHash,
+    ExprTree,
     /// The number of elements of a list, map or set.
     CollCount,
     /// The list with an element replaced, which consumes the list and the
@@ -1249,6 +1267,10 @@ fn operand_text<'db>(db: &'db dyn Db, operand: &Operand<'db>) -> String {
             Constant::Bytes(b) => format!("b{:?}", String::from_utf8_lossy(b)),
             Constant::Tag(ty) => ty.display(db),
             Constant::Unit => "()".into(),
+            Constant::Tree { expr, hash, .. } => match hash {
+                true => format!("tree_hash#{}", expr.index()),
+                false => format!("tree#{}", expr.index()),
+            },
         },
     }
 }

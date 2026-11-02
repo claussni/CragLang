@@ -103,7 +103,10 @@ fn setup(db: &RootDatabase, text: &str) -> (Program, ModuleId, ModuleId) {
     let transport = ModuleId::new(
         db,
         "std.transport".to_string(),
-        SourceFile::new(db, "pub type Expr[F]\n".to_string()),
+        SourceFile::new(
+            db,
+            "pub type Expr[F]\npub fn treeHash[F](e: Expr[F]) -> Bytes\n".to_string(),
+        ),
     );
     let module = ModuleId::new(db, "app".to_string(), SourceFile::new(db, text.to_string()));
     (
@@ -2059,7 +2062,10 @@ fn f(min: Int) -> Bool {
   let e: Expr[((Int) -> Bool is Pure)] = { age -> age > min }
   let j = Job(name: \"adults\", select: adult)
   remote({ age -> age > min }) and remote(adult) and plain(e) and j.select(3)
-}";
+}
+fn h(j: Job) -> Bytes { j.select.treeHash }
+fn h2(e: Expr[((Int) -> Bool is Pure)]) -> Bytes { treeHash(e) }
+fn h3(e: Expr[((Int) -> Bool is Pure)]) -> Bytes { e.treeHash }";
     assert_eq!(
         ok(text),
         [
@@ -2069,6 +2075,9 @@ fn f(min: Int) -> Bool {
             "p: (Int) -> False | True is Pure, -> False | True",
             "min: Int, age: Int, e: Expr[(Int) -> False | True is Pure], j: Job, age: Int, \
              -> False | True",
+            "j: Job, -> Bytes",
+            "e: Expr[(Int) -> False | True is Pure], -> Bytes",
+            "e: Expr[(Int) -> False | True is Pure], -> Bytes",
         ]
     );
 }
@@ -2084,6 +2093,7 @@ fn keep(l: Lazy[Int]) -> Int { 0 }
 fn local(age: Int) -> Bool { age > 18 }
 fn remote(p: Expr[((Int) -> Int is Pure)]) -> Int { p(1) }
 fn bad(e: Expr[(Int) -> Int]) {}
+let limit = 3
 fn f(l: Lazy[Int], k: Key, login: Login, g: (Int) -> Int) -> Int {
   let a = remote({ n -> n + keep(l) })
   let b = remote({ n -> g(n) })
@@ -2092,6 +2102,9 @@ fn f(l: Lazy[Int], k: Key, login: Login, g: (Int) -> Int) -> Int {
   let e = remote({ n -> {\n    ref r = n\n    n\n  } })
   let h = remote({ n -> ??? })
   let i: Expr[((Int) -> Bool is Pure)] = local
+  let j = remote({ n -> n + limit })
+  fn inc(n: Int) -> Int { n + 1 }
+  let m = remote({ n -> inc(n) })
   a + b + c + d + e + h
 }";
     assert_eq!(
@@ -2109,6 +2122,10 @@ fn f(l: Lazy[Int], k: Key, login: Login, g: (Int) -> Int) -> Int {
             "`r`: code sent as an `Expr` cannot hold a `ref` binding",
             "`???`: code sent as an `Expr` cannot hold `???`, which can only trap",
             "`local`: only a `pub` function can be passed as an `Expr`, and `local` is not `pub`",
+            "`limit`: code sent as an `Expr` cannot read the module value `limit` yet; bind it to \
+             a local first",
+            "`{ n -> inc(n) }`: code sent as an `Expr` cannot call the local function `inc` from \
+             outside it yet",
         ]
     );
 }

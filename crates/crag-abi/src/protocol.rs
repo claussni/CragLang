@@ -34,7 +34,7 @@ use crate::{
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 35;
+pub const PROTOCOL_VERSION: u32 = 36;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.

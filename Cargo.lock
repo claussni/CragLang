@@ -145,6 +145,7 @@ dependencies = [
 name = "crag-backend"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "crag-abi",
  "crag-codegen",
  "crag-db",

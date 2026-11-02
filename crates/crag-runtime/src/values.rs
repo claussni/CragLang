@@ -30,6 +30,7 @@ use std::sync::Mutex;
 use crag_abi::value_op::{COMPARE, EQUALS, UNORDERED};
 use crag_abi::{Number, Shape, Shapes, TYPE_INDEX_OFFSET};
 
+use crate::codec::decode_value;
 use crate::fiber::TaskContext;
 use crate::print::{PrintLimits, field_words, member_words, print_value, value_at};
 use crate::rc::Types;
@@ -69,6 +70,13 @@ system_stack_fn! {
     /// `crag_abi::RuntimeFn::ValueOp`.
     fn rt_value_op(ctx: *const TaskContext, packed: u64, a0: u64, a1: u64, b0: u64, b1: u64) -> u64
         => op_entry
+}
+
+system_stack_fn! {
+    /// `rt_value_decode(ctx, handle, b0, b1)`: see
+    /// `crag_abi::RuntimeFn::ValueDecode`.
+    fn rt_value_decode(ctx: *const TaskContext, handle: u64, b0: u64, b1: u64) -> u64
+        => decode_entry
 }
 
 system_stack_fn! {
@@ -162,6 +170,25 @@ unsafe extern "C" fn show_entry(
     let text = unsafe { print_value(&[w0, w1], &table.shapes, table.root, types, limits) };
     let [w0, w1] = make_text(heap, &[text.as_bytes()]);
     TextWords(w0, w1)
+}
+
+/// See `show_entry`.
+unsafe extern "C" fn decode_entry(ctx: *const TaskContext, handle: u64, b0: u64, b1: u64) -> u64 {
+    let table = table(handle);
+    let words = [b0, b1];
+    // SAFETY: as the caller promises.
+    let (heap, types) = unsafe { worker_of(ctx) };
+    // SAFETY: the bytes are a live value; the shapes give the boxes the
+    // layouts code generation gave them.
+    let decoded = unsafe {
+        let bytes = bytes_of(&words);
+        decode_value(bytes, &table.shapes, table.root, heap, types)
+    };
+    match decoded.as_deref() {
+        Ok([word]) => *word,
+        Ok(_) => die("a decoded value of more than a word"),
+        Err(e) => die(&format!("bytes the compiler wrote do not decode: {}", e.0)),
+    }
 }
 
 /// FNV-1a over words.

@@ -99,6 +99,7 @@ pub fn infer_in_group<'db>(
         optional: Vec::new(),
         iterations: Vec::new(),
         shows: Vec::new(),
+        sent: Vec::new(),
         trap_handlers: Vec::new(),
         typed: HashMap::new(),
         frames: Vec::new(),
@@ -209,6 +210,7 @@ pub fn infer_in_group<'db>(
         iterations: cx.iterations,
         shows: cx.shows,
         trap_handlers: cx.trap_handlers,
+        sent: cx.sent,
         effects,
         escapes,
         errors: cx.lower.errors,
@@ -246,6 +248,7 @@ struct Infer<'a, 'db> {
     iterations: Vec<(ExprId, Iteration<'db>)>,
     shows: Vec<(ExprId, Filling<'db>)>,
     trap_handlers: Vec<(ExprId, Ty<'db>)>,
+    sent: Vec<ExprId>,
     /// Expressions already typed, which their next check takes as they
     /// are: the field values a construction infers its type arguments
     /// from.
@@ -843,6 +846,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                             id,
                         );
                         self.lower.errors.extend(errors);
+                        self.sent.push(id);
                         self.builtin_of(Builtin::Expr, vec![ty])
                     }
                     None => ty,
@@ -1159,7 +1163,10 @@ impl<'a, 'db> Infer<'a, 'db> {
                 self.error(Site::Expr(id), ErrorKind::PrivateExpr { function });
                 self.err_ty()
             }
-            Some(_) => self.builtin_of(Builtin::Expr, vec![ty]),
+            Some(_) => {
+                self.sent.push(id);
+                self.builtin_of(Builtin::Expr, vec![ty])
+            }
             None => ty,
         }
     }

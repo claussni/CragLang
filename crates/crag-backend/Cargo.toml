@@ -17,6 +17,7 @@ crag-db = { path = "../crag-db" }
 crag-hir = { path = "../crag-hir" }
 crag-mir = { path = "../crag-mir" }
 crag-types = { path = "../crag-types" }
+blake3 = "1.8.7"
 
 [dev-dependencies]
 crag-loader = { path = "../crag-loader" }

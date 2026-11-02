@@ -522,6 +522,7 @@ fn verify_sbom(root: &Path, manifest: &Manifest, resolution: &Resolution) -> Res
 fn packages(manifest: &Manifest, resolution: &Resolution) -> Packages {
     let scope = |m: &Manifest| PackageScope {
         name: m.package.clone(),
+        major: m.version.as_ref().map_or(0, |v| v.major),
         exports: m.exports.clone(),
         imports: m
             .imports
