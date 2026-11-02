@@ -2667,6 +2667,32 @@ fn placed() -> (name: Str, at: Tile, tiles: List[Tile]) {
 }
 
 #[test]
+fn large_recursive_groups_of_types_lay_out() {
+    // Forty record types, each holding the union of all of them, as the
+    // types of code trees do: their layouts and signatures take time linear in the
+    // types, where the walks over fields were exponential.
+    let n = 40;
+    let mut text = format!(
+        "type Node = {}\n",
+        (0..n)
+            .map(|i| format!("N{i}"))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    for i in 0..n {
+        text.push_str(&format!(
+            "type N{i}(b: Option[Node], c: List[Node], d: Int)\n"
+        ));
+    }
+    text.push_str(
+        "fn depth(n: Option[Node]) -> Int { case n { x: N0 -> x.d + depth(x.b)\n x: N1 -> x.d\n _ -> 0 } }\n\
+         fn total() -> Int { depth(N0(b: N1(b: Empty, c: [], d: 2), c: [], d: 1)) }\n",
+    );
+    let mut m = Module::new(&text);
+    assert_eq!(m.call("total", &[]), [3]);
+}
+
+#[test]
 fn every_program_encodes_a_value_alike() {
     // The bytes depend on the types alone (Plan §11.10.11): a program that
     // knows more subtypes, and met its types in another order, writes the

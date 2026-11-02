@@ -355,6 +355,7 @@ fn builtin(b: Builtin) -> Option<Layout<'static>> {
 }
 
 /// Why a declared type or an open record is boxed whatever its size.
+#[crag_db::tracked(returns(copy))]
 fn forced<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<BoxReason> {
     match ty.kind(db) {
         TyKind::Record { open: true, .. } => Some(BoxReason::OpenParent),
@@ -797,7 +798,7 @@ fn reaches<'db>(db: &'db dyn Db, program: Program, from: Ty<'db>, to: &[Ty<'db>]
         if to.contains(&ty) {
             return Reach::Yes;
         }
-        for next in contained(db, program, ty) {
+        for &next in contained(db, program, ty) {
             if !seen.contains(&next) {
                 if seen.len() == MAX_UNFOLD {
                     return Reach::Unbounded;
@@ -811,7 +812,8 @@ fn reaches<'db>(db: &'db dyn Db, program: Program, from: Ty<'db>, to: &[Ty<'db>]
 }
 
 /// The types a value of `ty` stored flat holds flat: its fields' members,
-/// or an alias's target.
+/// or an alias's target. Kept, since every walk of `reaches` asks.
+#[crag_db::tracked(returns(ref))]
 fn contained<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Vec<Ty<'db>> {
     if forced(db, program, ty).is_some() {
         return Vec::new();

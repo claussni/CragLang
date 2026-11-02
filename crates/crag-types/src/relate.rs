@@ -393,16 +393,32 @@ pub fn subst<'db>(
         },
         // A member can become a union, or contain another member.
         TyKind::Union(members) => {
-            return normalize(db, program, members.iter().map(|&t| go(t)).collect()).0;
+            let members: Vec<Ty<'db>> = members.iter().map(|&t| go(t)).collect();
+            return normalized(db, program, Ty::new(db, TyKind::Union(members)));
         }
     };
     Ty::new(db, kind)
+}
+
+/// The union of the members of `members`, a union as substitution left
+/// it, kept: types such as `Option[T]` of a large union are substituted
+/// at every step of the walks over fields.
+#[crag_db::tracked(returns(copy))]
+fn normalized<'db>(db: &'db dyn Db, program: Program, members: Ty<'db>) -> Ty<'db> {
+    normalize(db, program, members.members(db)).0
 }
 
 /// The record types of the program without type parameters that are
 /// subtypes of `ty`, other than `ty`; none when `ty` is not a named type
 /// without arguments.
 pub fn record_subtypes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Vec<Ty<'db>> {
+    subtypes_of(db, program, ty).clone()
+}
+
+/// `record_subtypes`, kept: layouts ask for it at every step of their
+/// walks over the fields of types.
+#[crag_db::tracked(returns(ref))]
+fn subtypes_of<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Vec<Ty<'db>> {
     let mut out = Vec::new();
     if !matches!(ty.kind(db), TyKind::Named(_, args) if args.is_empty()) {
         return out;

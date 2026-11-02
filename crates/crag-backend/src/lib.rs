@@ -280,7 +280,6 @@ fn structure<'db>(
                 structure(db, program, t, open, memo).hash(hasher);
             }
         };
-    let mut cut = false;
     match ty.kind(db) {
         TyKind::Error => 0u8.hash(&mut hasher),
         TyKind::Builtin(builtin, args) => {
@@ -300,9 +299,7 @@ fn structure<'db>(
             item.name(db).text(db).hash(&mut hasher);
             item.ordinal(db).hash(&mut hasher);
             list(args, open, &mut hasher);
-            if open.contains(&ty) {
-                cut = true;
-            } else {
+            if !open.contains(&ty) {
                 open.push(ty);
                 match box_form(db, program, ty) {
                     Some(b) => {
@@ -350,10 +347,10 @@ fn structure<'db>(
         }
     }
     let hash = hasher.finish();
-    // A type cut short within itself is not the whole type.
-    if !cut {
-        memo.insert(ty, hash);
-    }
+    // A type cut short within itself hashes alike wherever the walk meets
+    // it again, since the walk goes the same way each time; keeping it
+    // keeps the walk linear in the types.
+    memo.insert(ty, hash);
     hash
 }
 
