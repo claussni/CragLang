@@ -199,7 +199,7 @@ fn item_decl(db: &dyn Db, item: crag_hir::ItemId) -> u32 {
         .map_or(0, |i| i.decl)
 }
 
-fn name_error(db: &dyn Db, error: &NameError) -> String {
+pub(crate) fn name_error(db: &dyn Db, error: &NameError) -> String {
     match error {
         NameError::Path {
             error: PathError::Unknown(path),
@@ -264,7 +264,7 @@ fn redeclared(db: &dyn Db, r: &Redeclaration) -> String {
     )
 }
 
-fn lower_error(db: &dyn Db, error: &LowerError) -> (Range<u32>, String) {
+pub(crate) fn lower_error(db: &dyn Db, error: &LowerError) -> (Range<u32>, String) {
     match error {
         LowerError::Unresolved { name, range } => {
             (range.clone(), format!("`{name}` is not defined"))

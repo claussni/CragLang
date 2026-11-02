@@ -34,6 +34,7 @@ pub mod lsp;
 pub mod packages;
 pub mod persist;
 pub mod project;
+pub mod receive;
 pub mod repl;
 pub mod scratch;
 pub mod tier;

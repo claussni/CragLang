@@ -28,6 +28,8 @@
 //! `Tree` as the runtime's codec walks a value's words, so the bytes are
 //! the codec's and `e.tree` decodes them with it.
 
+use std::borrow::Cow;
+
 use crag_abi::{Shape, Shapes, narrow};
 use crag_db::Db;
 use crag_hir::{
@@ -56,12 +58,23 @@ pub enum Value {
     CodePoint(char),
     Bool(bool),
     List(Vec<Value>),
-    Record(&'static str, Vec<(&'static str, Value)>),
-    Tag(&'static str),
+    Record(Name, Vec<(Name, Value)>),
+    Tag(Name),
 }
 
+/// The name of a type or a field: the builder's own, or one a decoded
+/// tree carries.
+pub type Name = Cow<'static, str>;
+
 fn record(name: &'static str, fields: Vec<(&'static str, Value)>) -> Value {
-    Value::Record(name, fields)
+    Value::Record(
+        name.into(),
+        fields.into_iter().map(|(n, v)| (n.into(), v)).collect(),
+    )
+}
+
+fn tag(name: &'static str) -> Value {
+    Value::Tag(name.into())
 }
 
 fn int(n: impl TryInto<i64>) -> Value {
@@ -69,7 +82,7 @@ fn int(n: impl TryInto<i64>) -> Value {
 }
 
 fn option(v: Option<Value>) -> Value {
-    v.unwrap_or(Value::Tag("Empty"))
+    v.unwrap_or(tag("Empty"))
 }
 
 fn text(t: &str) -> Value {
@@ -233,6 +246,188 @@ fn field<'v>(v: &'v Value, name: &str) -> Result<&'v Value, Untreeable> {
         .ok_or_else(|| format!("{r} has no field {name}"))
 }
 
+/// A tree from its bytes, as the codec reads a value of the shape of
+/// `Tree`. The bytes are untrusted: whatever they hold, decoding ends
+/// with a value or an error.
+pub fn decode_tree(db: &dyn Db, program: Program, bytes: &[u8]) -> Result<Value, Untreeable> {
+    let ty = transport_type(db, program, "Tree").ok_or("a program without std.transport")?;
+    let (shapes, root) = shapes(db, program, ty);
+    let mut reader = Reader { bytes, at: 0 };
+    let value = decode(&mut reader, &shapes, root, 0)?;
+    if reader.at != bytes.len() {
+        return Err("bytes after the tree".into());
+    }
+    Ok(value)
+}
+
+/// How deep a decoded tree may nest, so that forged bytes cannot exhaust
+/// the stack.
+const DEPTH: u32 = 2000;
+
+struct Reader<'b> {
+    bytes: &'b [u8],
+    at: usize,
+}
+
+impl<'b> Reader<'b> {
+    fn take(&mut self, n: usize) -> Result<&'b [u8], Untreeable> {
+        let end = self.at.checked_add(n).filter(|&e| e <= self.bytes.len());
+        let end = end.ok_or("the bytes end inside the tree")?;
+        let out = &self.bytes[self.at..end];
+        self.at = end;
+        Ok(out)
+    }
+
+    fn word(&mut self) -> Result<u64, Untreeable> {
+        let b = self.take(8)?;
+        Ok(u64::from_le_bytes(b.try_into().expect("eight bytes")))
+    }
+
+    fn u32(&mut self) -> Result<u32, Untreeable> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes(b.try_into().expect("four bytes")))
+    }
+
+    /// A length, which no more bytes than are left can hold.
+    fn len(&mut self) -> Result<usize, Untreeable> {
+        let n = self.word()?;
+        match usize::try_from(n) {
+            Ok(n) if n <= self.bytes.len() - self.at => Ok(n),
+            _ => Err("a length past the end of the bytes".into()),
+        }
+    }
+}
+
+fn decode(r: &mut Reader, shapes: &Shapes, shape: u32, depth: u32) -> Result<Value, Untreeable> {
+    if depth > DEPTH {
+        return Err("a tree nested too deeply".into());
+    }
+    if let Some(stored) = shapes.plain(shape) {
+        let Shape::Stored {
+            form, size, slots, ..
+        } = &shapes.shapes[stored as usize]
+        else {
+            return Err(format!("shape {stored} is no storage form"));
+        };
+        let bytes = r.take(*size as usize)?;
+        let mut register = vec![0u64; register_words(shapes, *form)];
+        crag_abi::widen(slots, bytes, &mut register);
+        return from_words(&register, shapes, *form);
+    }
+    let depth = depth + 1;
+    Ok(match &shapes.shapes[shape as usize] {
+        Shape::Unit => Value::List(Vec::new()),
+        Shape::Tag(n) => Value::Tag(Cow::Owned(n.clone())),
+        Shape::Number(crag_abi::Number::CodePoint) => {
+            let c = u32::try_from(r.word()?).ok().and_then(char::from_u32);
+            Value::CodePoint(c.ok_or("a code point out of range")?)
+        }
+        Shape::Number(_) => Value::Int(r.word()? as i64),
+        Shape::Union { members, .. } | Shape::Variant { members, .. } => {
+            let at = r.u32()? as usize;
+            let &(_, member) = members.get(at).ok_or("a union member out of range")?;
+            decode(r, shapes, member, depth)?
+        }
+        Shape::Record { name, fields } => {
+            if name.is_some() {
+                let identity: [u8; 16] = r.take(16)?.try_into().expect("sixteen bytes");
+                if shapes.identity(shape) != Some(identity) {
+                    return Err("a record of another type".into());
+                }
+            }
+            let mut out = Vec::new();
+            for f in fields {
+                let field = match &shapes.shapes[f.shape as usize] {
+                    Shape::Stored { form, .. } => *form,
+                    _ => f.shape,
+                };
+                out.push((Cow::Owned(f.name.clone()), decode(r, shapes, field, depth)?));
+            }
+            let name = name.clone().map_or(Cow::Borrowed(""), Cow::Owned);
+            Value::Record(name, out)
+        }
+        Shape::Inline { name, fields, .. } => {
+            let mut out = Vec::new();
+            for f in fields {
+                out.push((
+                    Cow::Owned(f.name.clone()),
+                    decode(r, shapes, f.shape, depth)?,
+                ));
+            }
+            let name = name.clone().map_or(Cow::Borrowed(""), Cow::Owned);
+            Value::Record(name, out)
+        }
+        &Shape::List(element) => {
+            let element = match &shapes.shapes[element as usize] {
+                Shape::Stored { form, .. } => *form,
+                _ => element,
+            };
+            let n = r.len()?;
+            let mut items = Vec::new();
+            for _ in 0..n {
+                items.push(decode(r, shapes, element, depth)?);
+            }
+            Value::List(items)
+        }
+        Shape::Str => {
+            let n = r.len()?;
+            let s = std::str::from_utf8(r.take(n)?).map_err(|_| "a string that is no UTF-8")?;
+            Value::Str(s.to_string())
+        }
+        Shape::Bytes => {
+            let n = r.len()?;
+            Value::Bytes(r.take(n)?.to_vec())
+        }
+        s => return Err(format!("a tree holds no {s:?}")),
+    })
+}
+
+/// How many words the register form of a shape takes.
+fn register_words(shapes: &Shapes, shape: u32) -> usize {
+    match &shapes.shapes[shape as usize] {
+        Shape::Unit | Shape::Tag(_) => 0,
+        Shape::Union { words, .. } | Shape::Variant { words, .. } => (*words as usize).max(1),
+        Shape::Inline { words, .. } => *words as usize,
+        _ => 1,
+    }
+}
+
+/// A Plain value from its register form, the inverse of `words`.
+fn from_words(w: &[u64], shapes: &Shapes, shape: u32) -> Result<Value, Untreeable> {
+    let word = |i: usize| w.get(i).copied().ok_or("a register form too short");
+    Ok(match &shapes.shapes[shape as usize] {
+        Shape::Unit => Value::List(Vec::new()),
+        Shape::Tag(n) => Value::Tag(Cow::Owned(n.clone())),
+        Shape::Number(crag_abi::Number::CodePoint) => {
+            let c = u32::try_from(word(0)?).ok().and_then(char::from_u32);
+            Value::CodePoint(c.ok_or("a code point out of range")?)
+        }
+        Shape::Number(_) => Value::Int(word(0)? as i64),
+        Shape::Union { members, .. } | Shape::Variant { members, .. } => {
+            let index = word(0)?;
+            let &(_, member) = members
+                .iter()
+                .find(|(i, _)| u64::from(*i) == index)
+                .ok_or("a union member out of range")?;
+            from_words(w.get(1..).unwrap_or_default(), shapes, member)?
+        }
+        Shape::Inline { name, fields, .. } => {
+            let mut out = Vec::new();
+            for f in fields {
+                let at = f.offset as usize;
+                let rest = w.get(at..).ok_or("a register form too short")?;
+                out.push((
+                    Cow::Owned(f.name.clone()),
+                    from_words(rest, shapes, f.shape)?,
+                ));
+            }
+            let name = name.clone().map_or(Cow::Borrowed(""), Cow::Owned);
+            Value::Record(name, out)
+        }
+        s => return Err(format!("{s:?} in a register form")),
+    })
+}
+
 /// The tree of a closure literal or a named function that becomes an
 /// `Expr` in the body of `owner`, the type parameters of `generic` put
 /// in, and its content hash: the hash of its bytes.
@@ -243,6 +438,19 @@ pub fn expr_tree<'db>(
     expr: ExprId,
     generic: Option<(ItemId<'db>, &[Ty<'db>])>,
 ) -> Result<([u8; 32], Vec<u8>), Untreeable> {
+    let tree = expr_tree_value(db, program, owner, expr, generic)?;
+    let bytes = encode_tree(db, program, &tree)?;
+    Ok((*blake3::hash(&bytes).as_bytes(), bytes))
+}
+
+/// The tree `expr_tree` encodes, as a value.
+pub fn expr_tree_value<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    owner: Owner<'db>,
+    expr: ExprId,
+    generic: Option<(ItemId<'db>, &[Ty<'db>])>,
+) -> Result<Value, Untreeable> {
     let mut helpers = Vec::new();
     let body = hir_body(db, program, owner);
     let types = body_types(db, program, owner);
@@ -265,9 +473,7 @@ pub fn expr_tree<'db>(
         let ty = value_type(db, program, v).ok_or("a module value without a type")?;
         captures.push(cx.type_node(ty)?);
     }
-    let tree = tree(db, program, root, captures, &mut helpers, true)?;
-    let bytes = encode_tree(db, program, &tree)?;
-    Ok((*blake3::hash(&bytes).as_bytes(), bytes))
+    tree(db, program, root, captures, &mut helpers, true)
 }
 
 /// The tree with its helpers, each reified once, those they reach too.
@@ -507,7 +713,8 @@ impl<'a, 'db> Reify<'a, 'db> {
             Expr::Hole | Expr::Embed | Expr::Atomic(_) => {
                 return Err("a form a tree may not hold".into());
             }
-            Expr::Literal(l) => lit(l),
+            // A literal written with its sign keeps it (§6.2.1).
+            Expr::Literal(l) => signed(lit(l), self.body.is_negative(id)),
             Expr::Str(parts) => {
                 let mut out = Vec::new();
                 for part in parts {
@@ -717,7 +924,7 @@ impl<'a, 'db> Reify<'a, 'db> {
                     vec![("subject", subject), ("arms", Value::List(out))],
                 )
             }
-            Expr::Pass => Value::Tag("Pass"),
+            Expr::Pass => tag("Pass"),
             Expr::Lazy(inner) => record("LazyNode", vec![("value", self.node(*inner)?)]),
         })
     }
@@ -913,7 +1120,7 @@ impl<'a, 'db> Reify<'a, 'db> {
     fn pat(&mut self, id: PatId) -> Result<Value, Untreeable> {
         Ok(match self.body.pat(id) {
             Pat::Missing => return Err("a pattern with errors".into()),
-            Pat::Wildcard => Value::Tag("Wildcard"),
+            Pat::Wildcard => tag("Wildcard"),
             Pat::Bind { binding, sub } => {
                 let local = self.bind(*binding);
                 let sub = sub.map(|s| self.pat(s)).transpose()?;
@@ -993,93 +1200,118 @@ impl<'a, 'db> Reify<'a, 'db> {
         Ok(record("TypeName", vec![("ty", self.type_node(ty)?)]))
     }
 
-    /// A type, spelled out: a named type by its reference.
+    /// A type, spelled out, the type parameters of `generic` put in.
     fn type_node(&mut self, ty: Ty<'db>) -> Result<Value, Untreeable> {
-        let db = self.db;
         let ty = match &self.generic {
-            Some((item, args)) => subst(db, self.program, ty, *item, args),
+            Some((item, args)) => subst(self.db, self.program, ty, *item, args),
             None => ty,
         };
-        let list = |this: &mut Self, types: &[Ty<'db>]| -> Result<Value, Untreeable> {
-            let nodes = types
-                .iter()
-                .map(|&t| this.type_node(t))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Value::List(nodes))
-        };
-        Ok(match ty.kind(db) {
-            TyKind::Error => return Err("a type with errors".into()),
-            TyKind::Builtin(b, args) => {
-                let args = match b {
-                    Builtin::Fixed(scale) => {
-                        Value::List(vec![record("Scale", vec![("digits", int(*scale))])])
-                    }
-                    _ => list(self, args)?,
-                };
-                let module = match b {
-                    Builtin::Expr => "std.transport",
-                    Builtin::RuntimeStream | Builtin::RuntimeHub => "std.stream",
-                    Builtin::RuntimeSocket => "std.io",
-                    Builtin::CF32 | Builtin::CPtr | Builtin::COut => "std.c",
-                    _ => crag_hir::PRELUDE,
-                };
-                self.type_ref(ty, module, b.name(), args)
-            }
-            TyKind::Named(item, args) => {
-                let args = list(self, args)?;
-                self.type_ref(ty, item.module(db).path(db), item.name(db).text(db), args)
-            }
-            TyKind::Record { fields, open } if fields.is_empty() && !open => Value::Tag("UnitType"),
-            TyKind::Record { fields, open } => {
-                let mut out = Vec::new();
-                for (name, t) in fields {
-                    out.push(record(
-                        "TypeField",
-                        vec![("name", text(name.text(db))), ("ty", self.type_node(*t)?)],
-                    ));
-                }
-                record(
-                    "RecordType",
-                    vec![("fields", Value::List(out)), ("open", Value::Bool(*open))],
-                )
-            }
-            TyKind::Fn {
-                params,
-                result,
-                pure,
-            } => record(
-                "FnType",
-                vec![
-                    ("params", list(self, params)?),
-                    ("result", self.type_node(*result)?),
-                    ("pure", Value::Bool(*pure)),
-                ],
-            ),
-            TyKind::Union(members) => {
-                let mut members = members.clone();
-                members.sort_by_key(|&m| type_hash(db, self.program, m));
-                record("UnionType", vec![("members", list(self, &members)?)])
-            }
-            TyKind::Param(_, index, _) => record("TypeParam", vec![("index", int(*index))]),
-        })
+        type_value(self.db, self.program, ty)
     }
+}
 
-    fn type_ref(&mut self, ty: Ty<'db>, module: &str, name: &str, args: Value) -> Value {
-        let (package, major) = package(self.db, self.program, module);
-        let hash = type_hash(self.db, self.program, ty).0.to_vec();
-        let reference = record(
-            "TypeRef",
+/// A type, spelled out: a named type by its reference.
+pub fn type_value<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    ty: Ty<'db>,
+) -> Result<Value, Untreeable> {
+    let list = |types: &[Ty<'db>]| -> Result<Value, Untreeable> {
+        let nodes = types
+            .iter()
+            .map(|&t| type_value(db, program, t))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Value::List(nodes))
+    };
+    Ok(match ty.kind(db) {
+        TyKind::Error => return Err("a type with errors".into()),
+        TyKind::Builtin(b, args) => {
+            let args = match b {
+                Builtin::Fixed(scale) => {
+                    Value::List(vec![record("Scale", vec![("digits", int(*scale))])])
+                }
+                _ => list(args)?,
+            };
+            let module = match b {
+                Builtin::Expr => "std.transport",
+                Builtin::RuntimeStream | Builtin::RuntimeHub => "std.stream",
+                Builtin::RuntimeSocket => "std.io",
+                Builtin::CF32 | Builtin::CPtr | Builtin::COut => "std.c",
+                _ => crag_hir::PRELUDE,
+            };
+            type_ref(db, program, ty, module, b.name(), args)
+        }
+        TyKind::Named(item, args) => {
+            let args = list(args)?;
+            type_ref(
+                db,
+                program,
+                ty,
+                item.module(db).path(db),
+                item.name(db).text(db),
+                args,
+            )
+        }
+        TyKind::Record { fields, open } if fields.is_empty() && !open => tag("UnitType"),
+        TyKind::Record { fields, open } => {
+            let mut out = Vec::new();
+            for (name, t) in fields {
+                out.push(record(
+                    "TypeField",
+                    vec![
+                        ("name", text(name.text(db))),
+                        ("ty", type_value(db, program, *t)?),
+                    ],
+                ));
+            }
+            record(
+                "RecordType",
+                vec![("fields", Value::List(out)), ("open", Value::Bool(*open))],
+            )
+        }
+        TyKind::Fn {
+            params,
+            result,
+            pure,
+        } => record(
+            "FnType",
             vec![
-                ("package", text(&package)),
-                ("major", int(major)),
-                ("module", text(module)),
-                ("name", text(name)),
-                ("args", args),
-                ("hash", Value::Bytes(hash)),
+                ("params", list(params)?),
+                ("result", type_value(db, program, *result)?),
+                ("pure", Value::Bool(*pure)),
             ],
-        );
-        record("Named", vec![("ty", reference)])
-    }
+        ),
+        TyKind::Union(members) => {
+            let mut members = members.clone();
+            members.sort_by_key(|&m| type_hash(db, program, m));
+            record("UnionType", vec![("members", list(&members)?)])
+        }
+        TyKind::Param(_, index, _) => record("TypeParam", vec![("index", int(*index))]),
+    })
+}
+
+fn type_ref(
+    db: &dyn Db,
+    program: Program,
+    ty: Ty<'_>,
+    module: &str,
+    name: &str,
+    args: Value,
+) -> Value {
+    let (package, major) = package(db, program, module);
+    let hash = type_hash(db, program, ty).0.to_vec();
+    let reference = record(
+        "TypeRef",
+        vec![
+            ("package", text(&package)),
+            ("major", int(major)),
+            ("module", text(module)),
+            ("name", text(name)),
+            ("args", args),
+            ("hash", Value::Bytes(hash)),
+        ],
+    );
+    record("Named", vec![("ty", reference)])
 }
 
 fn call(callee: Value, targs: Vec<Value>, args: Vec<Value>, fields: Vec<Value>) -> Value {
@@ -1103,6 +1335,19 @@ fn field_node(receiver: Value, name: &str, optional: bool) -> Value {
             ("optional", Value::Bool(optional)),
         ],
     )
+}
+
+/// A number literal with a `-` before its digits.
+fn signed(lit: Value, negative: bool) -> Value {
+    match lit {
+        Value::Record(name, mut fields) if negative => {
+            if let Some((_, Value::Str(digits))) = fields.first_mut() {
+                digits.insert(0, '-');
+            }
+            Value::Record(name, fields)
+        }
+        lit => lit,
+    }
 }
 
 fn lit(l: &Literal) -> Value {
