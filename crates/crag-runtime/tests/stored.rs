@@ -51,6 +51,9 @@ fn field(name: &str, offset: u32, shape: u32) -> ShapeField {
 /// `type Label(at: Point, name: Str | Empty)` with
 /// `type Point(x: Int16, y: Int16)`: `at` in four bytes after the
 /// header, `name` as a tag byte and the string's two words after it.
+/// The identity of `Label`, which the codec writes before its fields.
+const LABEL_IDENTITY: [u8; 16] = [7; 16];
+
 fn shapes() -> Shapes {
     let int16 = StoredKind::Int { signed: true };
     Shapes {
@@ -98,6 +101,7 @@ fn shapes() -> Shapes {
         records: vec![(LABEL, 7)],
         boxes: vec![(7, LABEL, 48)],
         plain: Vec::new(),
+        identities: vec![(7, LABEL_IDENTITY)],
     }
 }
 
@@ -119,7 +123,7 @@ fn stored_fields_go_through_their_shapes() {
         },
     )]);
     let text = "a name longer than fifteen bytes";
-    let mut bytes = 7u32.to_le_bytes().to_vec();
+    let mut bytes = LABEL_IDENTITY.to_vec();
     bytes.extend(3u64.to_le_bytes());
     bytes.extend((-4i64 as u64).to_le_bytes());
     bytes.extend(0u32.to_le_bytes());

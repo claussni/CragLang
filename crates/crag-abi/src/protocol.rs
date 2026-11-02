@@ -34,7 +34,7 @@ use crate::{
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 34;
+pub const PROTOCOL_VERSION: u32 = 35;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -89,7 +89,7 @@ pub enum Message {
     /// own `show` wrote (§19.11).
     Show {
         func: FuncId,
-        shapes: Shapes,
+        shapes: Box<Shapes>,
         root: u32,
         text: bool,
     },
@@ -452,7 +452,7 @@ impl Message {
                 }
                 Message::Show {
                     func,
-                    shapes,
+                    shapes: Box::new(shapes),
                     root,
                     text,
                 }
@@ -1186,6 +1186,7 @@ mod tests {
                         records: Vec::new(),
                         boxes: vec![(0, 5, 40)],
                         plain: Vec::new(),
+                        identities: Vec::new(),
                     },
                     root: 0,
                     bytes: vec![1, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0],
@@ -1246,7 +1247,7 @@ mod tests {
             Message::Interrupted,
             Message::Show {
                 func: FuncId(9),
-                shapes: Shapes {
+                shapes: Box::new(Shapes {
                     shapes: vec![
                         Shape::Record {
                             name: Some("Point".into()),
@@ -1337,7 +1338,8 @@ mod tests {
                     records: vec![(7, 0)],
                     boxes: vec![(0, 7, 32), (4, 9, 16), (5, 10, 40)],
                     plain: vec![(18, 19)],
-                },
+                    identities: Vec::new(),
+                }),
                 root: 2,
                 text: false,
             },
@@ -1536,12 +1538,14 @@ mod tests {
                 records: Vec::new(),
                 boxes: Vec::new(),
                 plain: Vec::new(),
+                identities: Vec::new(),
             },
             Shapes {
                 shapes: vec![Shape::Unit],
                 records: vec![(3, 1)],
                 boxes: Vec::new(),
                 plain: Vec::new(),
+                identities: Vec::new(),
             },
             // A box's shape.
             Shapes {
@@ -1549,6 +1553,7 @@ mod tests {
                 records: Vec::new(),
                 boxes: vec![(1, 3, 16)],
                 plain: Vec::new(),
+                identities: Vec::new(),
             },
             // A storage form that is no stored shape.
             Shapes {
@@ -1556,6 +1561,7 @@ mod tests {
                 records: Vec::new(),
                 boxes: Vec::new(),
                 plain: vec![(0, 0)],
+                identities: Vec::new(),
             },
             // The root, too.
             Shapes {
@@ -1563,11 +1569,12 @@ mod tests {
                 records: Vec::new(),
                 boxes: Vec::new(),
                 plain: Vec::new(),
+                identities: Vec::new(),
             },
         ] {
             let show = Message::Show {
                 func: FuncId(1),
-                shapes,
+                shapes: Box::new(shapes),
                 root: 0,
                 text: false,
             };

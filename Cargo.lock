@@ -304,6 +304,7 @@ version = "0.0.0"
 name = "crag-types"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "crag-db",
  "crag-hir",
 ]

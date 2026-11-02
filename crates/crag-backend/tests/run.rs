@@ -2606,13 +2606,10 @@ fn placed() -> (name: Str, at: Tile, tiles: List[Tile]) {
         // A length beyond the bytes.
         [&[9, 0, 0, 0, 0, 0, 0, 0][..], &bytes[8..]].concat(),
     ];
-    // The first point's box of a shape that is no record.
-    let mut not_record = bytes.clone();
-    not_record[8..12].copy_from_slice(&(root).to_le_bytes());
-    broken.push(not_record);
-    let mut no_shape = bytes.clone();
-    no_shape[8..12].copy_from_slice(&999u32.to_le_bytes());
-    broken.push(no_shape);
+    // The first point's box of a type this program does not know.
+    let mut unknown = bytes.clone();
+    unknown[8..24].fill(0xff);
+    broken.push(unknown);
     for (i, b) in broken.iter().enumerate() {
         // SAFETY: as above.
         let result = unsafe { decode_value(b, &shapes, root, &mut m.heap, types) };
@@ -2626,12 +2623,10 @@ fn placed() -> (name: Str, at: Tile, tiles: List[Tile]) {
     // SAFETY: as above.
     let bytes = unsafe { encode_value(&words, &shapes, root, &m.types).unwrap() };
     unsafe { release_value(&mut m.heap, &m.types, &words, &shapes, root) };
-    let shape_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-    // The outer record, then `p`'s shape and two words, then `w`'s shape.
-    let (point, wide) = (shape_at(4), shape_at(4 + 4 + 16));
-    let mut swapped = bytes.clone();
-    swapped[4..8].copy_from_slice(&wide.to_le_bytes());
-    swapped[4 + 4 + 16..4 + 4 + 16 + 4].copy_from_slice(&point.to_le_bytes());
+    // The anonymous outer record names no type, then `p`'s type and two
+    // words, then `w`'s type.
+    let (point, wide) = (&bytes[..16], &bytes[32..48]);
+    let swapped = [wide, &bytes[16..32], point, &bytes[48..]].concat();
     // SAFETY: as above.
     let result = unsafe { decode_value(&swapped, &shapes, root, &mut m.heap, &m.types) };
     assert!(result.is_err());
@@ -2645,19 +2640,19 @@ fn placed() -> (name: Str, at: Tile, tiles: List[Tile]) {
     // SAFETY: as above.
     let bytes = unsafe { encode_value(&words, &shapes, root, &m.types).unwrap() };
     unsafe { release_value(&mut m.heap, &m.types, &words, &shapes, root) };
-    // The record's shape, then its fields by name: the bytes, the name
-    // and the empty string, each its length and then its bytes.
+    // The anonymous record's fields by name: the bytes, the name and the
+    // empty string, each its length and then its bytes.
     let name = "Grüße aus Crag, lang genug".len();
-    assert_eq!(bytes.len(), 4 + 8 + 2 + 8 + name + 8);
-    assert_eq!(bytes[4..12], 2u64.to_le_bytes());
-    assert_eq!(bytes[14..22], (name as u64).to_le_bytes());
+    assert_eq!(bytes.len(), 8 + 2 + 8 + name + 8);
+    assert_eq!(bytes[..8], 2u64.to_le_bytes());
+    assert_eq!(bytes[10..18], (name as u64).to_le_bytes());
     let mut not_utf8 = bytes.clone();
-    not_utf8[22] = 0xff;
+    not_utf8[18] = 0xff;
     // SAFETY: as above.
     let result = unsafe { decode_value(&not_utf8, &shapes, root, &mut m.heap, &m.types) };
     assert!(result.is_err());
     let mut other_bytes = bytes.clone();
-    other_bytes[12] = 0xfe;
+    other_bytes[8] = 0xfe;
     // SAFETY: as above.
     unsafe {
         let decoded = decode_value(&other_bytes, &shapes, root, &mut m.heap, &m.types).unwrap();
@@ -2669,6 +2664,51 @@ fn placed() -> (name: Str, at: Tile, tiles: List[Tile]) {
         release_value(&mut m.heap, &m.types, &decoded, &shapes, root);
     }
     assert_eq!(m.heap.live_blocks(), 0);
+}
+
+#[test]
+fn every_program_encodes_a_value_alike() {
+    // The bytes depend on the types alone (Plan §11.10.11): a program that
+    // knows more subtypes, and met its types in another order, writes the
+    // same bytes and reads the other's.
+    let shared = r#"type Point(x: Int, y: Int)
+type Point3(..Point, z: Int)
+type Nil
+type Cons(head: Point | Str, tail: Cons | Nil)
+fn value() -> List[Cons | Int | Str] {
+  [Cons(head: Point3(x: 1, y: 2, z: 3), tail: Cons(head: "a", tail: Nil)), 4, "b"]
+}
+"#;
+    let mut a = Module::new(shared);
+    let mut b = Module::new(&format!(
+        "type Wide(..Point, w: Int, v: Int)\nfn other() -> Str | Nil | Int {{ Nil }}\n{shared}type Point4(..Point3, q: Int)\n"
+    ));
+    let encoded = |m: &mut Module| {
+        let words = m.call("value", &[]);
+        let (shapes, root) = m.result_shapes("value");
+        // SAFETY: the words are the function's result, of the shape.
+        unsafe {
+            let bytes = encode_value(&words, &shapes, root, &m.types).unwrap();
+            let shown = print_value(&words, &shapes, root, &m.types, PrintLimits::default());
+            release_value(&mut m.heap, &m.types, &words, &shapes, root);
+            (bytes, shown, shapes, root)
+        }
+    };
+    let (from_a, shown, shapes_a, root_a) = encoded(&mut a);
+    let (from_b, _, shapes_b, root_b) = encoded(&mut b);
+    assert_ne!(shapes_a, shapes_b);
+    assert_eq!(from_a, from_b);
+    for (m, shapes, root) in [(&mut a, &shapes_a, root_a), (&mut b, &shapes_b, root_b)] {
+        TYPES.set(&m.types);
+        // SAFETY: the decoded value is built for the module's types.
+        unsafe {
+            let decoded = decode_value(&from_a, shapes, root, &mut m.heap, &m.types).unwrap();
+            let again = print_value(&decoded, shapes, root, &m.types, PrintLimits::default());
+            assert_eq!(again, shown);
+            release_value(&mut m.heap, &m.types, &decoded, shapes, root);
+        }
+        assert_eq!(m.heap.live_blocks(), 0);
+    }
 }
 
 #[test]

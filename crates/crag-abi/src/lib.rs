@@ -2124,6 +2124,10 @@ pub struct Shapes {
     /// shape of its storage form, which the codec writes it in (Compiler
     /// Architecture §A11.4).
     pub plain: Vec<(u32, u32)>,
+    /// For each shape of a box of a named record type, the hash of the
+    /// type's canonical form (Compiler Architecture §A11.2), by which the
+    /// codec names the type of a box: every program agrees on it.
+    pub identities: Vec<(u32, [u8; 16])>,
 }
 
 impl Shapes {
@@ -2144,6 +2148,20 @@ impl Shapes {
     /// if it is one.
     pub fn plain(&self, shape: u32) -> Option<u32> {
         self.plain.iter().find(|p| p.0 == shape).map(|p| p.1)
+    }
+
+    /// The identity of the named record type of a shape's boxes, if known.
+    pub fn identity(&self, shape: u32) -> Option<[u8; 16]> {
+        self.identities.iter().find(|i| i.0 == shape).map(|i| i.1)
+    }
+
+    /// The shape of the boxes of the named record type of an identity, if
+    /// known.
+    pub fn by_identity(&self, identity: [u8; 16]) -> Option<u32> {
+        self.identities
+            .iter()
+            .find(|i| i.1 == identity)
+            .map(|i| i.0)
     }
 
     /// The table as bytes, as the session protocol sends it and generated
@@ -2261,6 +2279,11 @@ impl Shapes {
             u32(&mut out, shape);
             u32(&mut out, stored);
         }
+        u32(&mut out, self.identities.len() as u32);
+        for &(shape, identity) in &self.identities {
+            u32(&mut out, shape);
+            out.extend_from_slice(&identity);
+        }
         out
     }
 
@@ -2273,6 +2296,13 @@ impl Shapes {
             records: r.seq(|r| Ok((r.u32()?, r.u32()?)))?,
             boxes: r.seq(|r| Ok((r.u32()?, r.u32()?, r.u32()?)))?,
             plain: r.seq(|r| Ok((r.u32()?, r.u32()?)))?,
+            identities: r.seq(|r| {
+                let shape = r.u32()?;
+                let mut identity = [0; 16];
+                identity[..8].copy_from_slice(&r.u64()?.to_le_bytes());
+                identity[8..].copy_from_slice(&r.u64()?.to_le_bytes());
+                Ok((shape, identity))
+            })?,
         };
         if r.at != bytes.len() {
             return Err("bytes after the shapes".into());
@@ -2293,6 +2323,7 @@ impl Shapes {
         if !named
             || !shapes.records.iter().map(|r| &r.1).all(inside)
             || !shapes.boxes.iter().map(|b| &b.0).all(inside)
+            || !shapes.identities.iter().map(|i| &i.0).all(inside)
             || !shapes.plain.iter().all(|p| {
                 inside(&p.0)
                     && matches!(shapes.shapes.get(p.1 as usize), Some(Shape::Stored { .. }))

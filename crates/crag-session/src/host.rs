@@ -1051,7 +1051,7 @@ impl Session {
     ) -> Result<RunResult, SessionError> {
         let show = Message::Show {
             func,
-            shapes: shapes.clone(),
+            shapes: Box::new(shapes.clone()),
             root,
             text,
         };

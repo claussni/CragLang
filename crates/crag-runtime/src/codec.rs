@@ -16,16 +16,19 @@
 
 //! The Solid value codec (Implementation Plan §11.6.7 and §11.6.8): a
 //! value as bytes, walked through the shape of its type as printing walks
-//! it, and back. The bytes are canonical, so equal values give equal bytes
-//! and equal hashes:
+//! it, and back. The bytes are canonical, so equal values give equal
+//! bytes and equal hashes, and they depend on the types alone, so every
+//! program writes and reads a value the same way (Plan §11.10.11):
 //!
 //! - `()` and a tag: nothing.
 //! - A number: its word, eight bytes little-endian.
 //! - A union: the member's place among the shape's members, four bytes,
-//!   then the member.
-//! - A record: the index of the shape of the box's own type in the table,
-//!   four bytes, since the box may be one of a subtype, then its fields in
-//!   the shape's order.
+//!   then the member. The members are in the order of the hashes of their
+//!   canonical forms (Compiler Architecture §A11.2).
+//! - A record: for a named type, the hash of the canonical form of the
+//!   box's own type, sixteen bytes, since the box may be one of a subtype;
+//!   then its fields in the shape's order, a named type's as it declares
+//!   them, an anonymous record's by name.
 //! - A list: its length, eight bytes, then its elements.
 //! - A map or a set: its length, then its entries in the order of their
 //!   keys' bytes, each the key and then the value.
@@ -115,7 +118,7 @@ unsafe fn encode(
                 encode(payload, shapes, member, types, out)?
             };
         }
-        Shape::Record { .. } => {
+        Shape::Record { name, .. } => {
             let ptr = word as *const u8;
             // SAFETY: the word points at a live box of a record type.
             let index = unsafe { ptr.offset(TYPE_INDEX_OFFSET as isize).cast::<u32>().read() };
@@ -123,7 +126,12 @@ unsafe fn encode(
             let Shape::Record { fields, .. } = &shapes.shapes[own as usize] else {
                 return Err(NotSolid(format!("a box of type {index}")));
             };
-            out.extend(own.to_le_bytes());
+            if name.is_some() {
+                let Some(identity) = shapes.identity(own) else {
+                    return Err(NotSolid(format!("a box of type {index} without identity")));
+                };
+                out.extend(identity);
+            }
             for f in fields {
                 // SAFETY: the box has the field.
                 unsafe {
@@ -467,6 +475,19 @@ impl Decoder<'_> {
         Ok(taken)
     }
 
+    /// The shape of the box of a record of the shape `shape`: a named
+    /// type's box by the identity of its own type, which may be a subtype,
+    /// and an anonymous record's of its shape.
+    fn own(&mut self, shapes: &Shapes, shape: u32) -> Result<u32, DecodeError> {
+        let Some(Shape::Record { name: Some(_), .. }) = shapes.shapes.get(shape as usize) else {
+            return Ok(shape);
+        };
+        let identity = self.take::<16>()?;
+        shapes
+            .by_identity(identity)
+            .ok_or_else(|| DecodeError(format!("a box of a type unknown here, {identity:02x?}")))
+    }
+
     /// Reads past a value of the shape, checking it fits.
     fn check(&mut self, shapes: &Shapes, shape: u32) -> Result<(), DecodeError> {
         let shape_of = |s: u32| {
@@ -521,7 +542,7 @@ impl Decoder<'_> {
                 self.check(shapes, member)?;
             }
             Shape::Record { .. } => {
-                let own = self.u32()?;
+                let own = self.own(shapes, shape)?;
                 let Shape::Record { fields, .. } = shape_of(own)? else {
                     return Err(DecodeError(format!("shape {own} is no record")));
                 };
@@ -650,7 +671,7 @@ impl Decoder<'_> {
                 out
             }
             Shape::Record { .. } => {
-                let own = self.u32().expect(ok);
+                let own = self.own(shapes, shape).expect(ok);
                 let Shape::Record { fields, .. } = &shapes.shapes[own as usize] else {
                     unreachable!("checked");
                 };

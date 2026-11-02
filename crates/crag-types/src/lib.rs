@@ -28,6 +28,7 @@
 extern crate crag_db as salsa;
 
 mod c;
+mod canonical;
 pub use c::{CForm, NON_FINITE};
 mod case;
 mod decision;
@@ -50,6 +51,7 @@ mod ty;
 use crag_db::Db;
 use crag_hir::{ItemKind, ModuleId, Owner, Program, owners};
 
+pub use canonical::{TypeHash, type_hash};
 pub use case::{ListLen, Value};
 pub use decision::{Bindings, DecisionTree, Position, Step, decision_tree, decision_tree_with};
 pub use def::{

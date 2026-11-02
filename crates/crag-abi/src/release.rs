@@ -42,7 +42,7 @@ pub const SECTION: &str = ".crag_code";
 pub const SYMBOL: &str = "crag_code";
 
 /// The version of the table's layout.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// The length of the header: the version and the length of the table.
 pub const HEADER: usize = 8;

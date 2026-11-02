@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use crag_abi::{HEADER_SIZE, LIST_SIZE, MAP_SIZE, Number, Shape, ShapeField, Shapes};
 use crag_db::Db;
 use crag_hir::{Name, Program};
-use crag_types::{Builtin, Ty, TyKind, declared_fields, record_subtypes};
+use crag_types::{Builtin, Ty, TyKind, declared_fields, record_subtypes, type_hash};
 
 use crate::boxes::{box_form, rebase, select, span, stored_slots};
 use crate::flat::{self, LayoutClass};
@@ -99,8 +99,8 @@ impl<'db> Builder<'db> {
                 None => opaque(1),
             },
             (Some(l @ (Layout::Tag | Layout::Union)), TyKind::Union(members)) => Shape::Union {
-                members: members
-                    .clone()
+                members: self
+                    .canonical(members.clone())
                     .into_iter()
                     .map(|m| (type_index(m) as u32, self.shape(m)))
                     .collect(),
@@ -139,6 +139,8 @@ impl<'db> Builder<'db> {
             && matches!(self.shapes.shapes[index as usize], Shape::Record { .. })
         {
             self.shapes.records.push((type_index(ty) as u32, index));
+            let identity = type_hash(db, program, ty).0;
+            self.shapes.identities.push((index, identity));
             // A value may be of a subtype, which its box says.
             for sub in record_subtypes(db, program, ty) {
                 self.shape(sub);
@@ -199,6 +201,8 @@ impl<'db> Builder<'db> {
         if let Form::Union(members) = f {
             let index = self.shapes.shapes.len() as u32;
             self.shapes.shapes.push(Shape::Unit);
+            let mut members = members.clone();
+            members.sort_by_key(|(m, _)| type_hash(db, self.program, *m));
             let members = members
                 .iter()
                 .map(|(m, inner)| (type_index(*m) as u32, self.inline(*m, inner)))
@@ -241,6 +245,13 @@ impl<'db> Builder<'db> {
             words: f.words() as u32,
         };
         index
+    }
+
+    /// The members of a union in the order the codec numbers them: by the
+    /// hashes of their canonical forms, which every program agrees on.
+    fn canonical(&self, mut members: Vec<Ty<'db>>) -> Vec<Ty<'db>> {
+        members.sort_by_key(|&m| type_hash(self.db, self.program, m));
+        members
     }
 
     /// A record's fields at their offsets in its box: a named type's in

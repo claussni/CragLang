@@ -175,14 +175,14 @@ fn sum(n: Int) -> Int {
     // its storage form is its encoding, with no shape before it.
     assert_eq!(p.bytes("defaulted"), words(&[1, 2, 8]));
     assert_eq!(p.bytes("scaled"), words(&[12]));
-    // A record that may hold a subtype: the shape of its box's type, then
-    // its fields.
+    // A record that may hold a subtype: the identity of its box's type,
+    // then its fields.
     let origin = p.bytes("origin");
-    assert_eq!(origin[4..], words(&[1, 2]));
-    // A subtype's box has a shape of its own and keeps its fields.
+    assert_eq!(origin[16..], words(&[1, 2]));
+    // A subtype's box has an identity of its own and keeps its fields.
     let deep = p.bytes("deep");
-    assert_ne!(deep[..4], origin[..4]);
-    assert_eq!(deep[4..], words(&[1, 2, 3]));
+    assert_ne!(deep[..16], origin[..16]);
+    assert_eq!(deep[16..], words(&[1, 2, 3]));
     assert_eq!(p.bytes("numbers"), words(&[3, 3, 1, 2]));
     // A map's entries come in the order their keys came in, so equal maps
     // written in other orders encode differently (Specification §12.2).
@@ -264,11 +264,11 @@ distinct type Shout(text: Str)
 embed shout: Shout from "who.txt"
 "#;
     let mut p = Project::with(text, &[("who.txt", b"Ada")]);
-    // The record's shape, then its fields as the type declares them.
+    // The record's identity, then its fields as the type declares them.
     let value = p.bytes("who");
     let text = "Ada, as a name long enough for a buffer";
     let expected = [
-        &value[..4],
+        &value[..16],
         &(text.len() as u64).to_le_bytes()[..],
         text.as_bytes(),
         &2u64.to_le_bytes()[..],
@@ -277,9 +277,9 @@ embed shout: Shout from "who.txt"
     assert_eq!(value, expected);
     // The handler of a generic type, for one of its instances: its box,
     // the name's box, the name, its length and the empty list. With flat
-    // layouts the name is stored in the box, without a shape of its own.
+    // layouts the name is stored in the box, without an identity of its own.
     let names = p.bytes("names");
-    let name = if crag_backend::flat_layouts() { 4 } else { 8 };
+    let name = if crag_backend::flat_layouts() { 16 } else { 32 };
     assert_eq!(
         names[name..],
         [
@@ -292,7 +292,7 @@ embed shout: Shout from "who.txt"
     );
     // A closure as the handler.
     assert_eq!(
-        p.bytes("shout")[4..],
+        p.bytes("shout")[16..],
         [&4u64.to_le_bytes()[..], b"Ada!"].concat()
     );
     // The handler's error, released with the rest.
