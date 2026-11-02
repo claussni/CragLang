@@ -53,7 +53,7 @@ pub enum HeaderKind {
 /// A type declaration of the prelude stands for a builtin when it has the
 /// builtin's name and number of type parameters, and neither fields nor an
 /// alias target; so does one of the runtime's handles in `std.stream` and
-/// `std.io` (§19.2).
+/// `std.io` (§19.2), and `Expr` in `std.transport`.
 #[crag_db::tracked(returns(ref))]
 pub fn type_header<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) -> TypeHeader<'db> {
     let body = hir_body(db, program, Owner::Item(item));
@@ -73,6 +73,7 @@ pub fn type_header<'db>(db: &'db dyn Db, program: Program, item: ItemId<'db>) ->
                 Builtin::RuntimeStream | Builtin::RuntimeHub => "std.stream",
                 Builtin::RuntimeSocket => "std.io",
                 Builtin::CF32 | Builtin::CPtr | Builtin::COut => "std.c",
+                Builtin::Expr => "std.transport",
                 _ => PRELUDE,
             };
             module == owner && !decl.record && decl.alias.is_none()
@@ -445,6 +446,12 @@ pub(crate) fn implicit_params<'db>(db: &'db dyn Db, body: &Body<'db>) -> Vec<Typ
         .collect()
 }
 
+/// Whether a declaration is `pub`.
+pub(crate) fn is_public(db: &dyn Db, item: ItemId) -> bool {
+    let tree = item_tree(db, *item.module(db));
+    tree.items.iter().any(|i| i.id == item && i.public)
+}
+
 /// A function's own type parameters, not those of its local functions.
 pub(crate) fn own_type_params(db: &dyn Db, item: ItemId) -> usize {
     let tree = item_tree(db, *item.module(db));
@@ -716,6 +723,15 @@ impl<'a, 'db> TypeLowerer<'a, 'db> {
         match kind {
             HeaderKind::Builtin(f @ (Builtin::Oks | Builtin::Errs)) => {
                 relate::type_function(db, self.program, f, lowered[0])
+            }
+            // An `Expr` is a Pure closure (§18.6).
+            HeaderKind::Builtin(Builtin::Expr)
+                if !lowered[0].is_error(db)
+                    && !matches!(lowered[0].kind(db), TyKind::Fn { pure: true, .. }) =>
+            {
+                let kind = ErrorKind::ExprNotPure { ty: lowered[0] };
+                self.error(Site::Type(id), kind);
+                Ty::error(db)
             }
             HeaderKind::Builtin(builtin) => Ty::new(db, TyKind::Builtin(builtin, lowered)),
             HeaderKind::Alias => match alias_target(db, self.program, item) {

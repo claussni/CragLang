@@ -99,7 +99,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         to: Ty<'db>,
     ) -> Option<Operand<'db>> {
         let db = self.db;
-        if matches!(from.kind(db), TyKind::Fn { .. }) || self.kept(from, to) {
+        if from.is_fn(db) || self.kept(from, to) {
             return None;
         }
         let value = self.materialize(op, from);

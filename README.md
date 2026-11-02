@@ -32,7 +32,7 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-eval` | Compile-time evaluation of constants, `embed`s among them, in the metered tier (M3) |
 | `crates/crag-fmt` | The formatter: the canonical layout of source files (M5) |
 | `crates/crag-package` | Packages: manifests, versions, folder registries, resolution and the SBOM (M6) |
-| `std` | The standard library: the prelude `std.core` with its functions on text, bytes and collections, `std.time`, `std.task`, `std.stream`, `std.io`, `std.env` and `std.test` |
+| `std` | The standard library: the prelude `std.core` with its functions on text, bytes and collections, `std.time`, `std.task`, `std.stream`, `std.io`, `std.env`, `std.test` and `std.transport`, which declares `Expr` |
 | `examples` | Small programs to run and explore: hello world, reading a file, loading a web page |
 
 ## Build

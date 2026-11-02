@@ -1081,6 +1081,8 @@ pub(crate) fn bind<'db>(
                 go(p, f, args);
             }
         }
+        // An `Expr[F]` passed where a function is expected is its `F`.
+        (_, TyKind::Builtin(Builtin::Expr, fs)) => go(pattern, fs[0], args),
         (TyKind::Named(a, ps), TyKind::Named(b, fs)) => {
             if a == b && ps.len() == fs.len() {
                 for (&p, &f) in ps.iter().zip(fs) {

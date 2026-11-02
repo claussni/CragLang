@@ -53,6 +53,7 @@ const STD: &[(&str, &str)] = &[
     ("std.test", include_str!("../../../std/test.crag")),
     ("std.env", include_str!("../../../std/env.crag")),
     ("std.c", include_str!("../../../std/c.crag")),
+    ("std.transport", include_str!("../../../std/transport.crag")),
 ];
 
 /// A module's file, where diagnostics name it.

@@ -48,7 +48,7 @@ use std::collections::HashSet;
 
 use crag_db::Db;
 use crag_hir::{ExprId, ItemKind, Name, Owner, Program, c_function};
-use crag_types::{Step, Ty, TyKind, fields_of};
+use crag_types::{Step, Ty, fields_of};
 
 use crate::borrow::assigned;
 use crate::ir::{
@@ -467,7 +467,7 @@ fn remove_unused_closures<'db>(db: &'db dyn Db, body: &mut MirBody<'db>) {
                 let Statement::Assign(dst, rvalue) = s else {
                     return true;
                 };
-                let function = matches!(body.locals[dst.index()].ty.kind(db), TyKind::Fn { .. });
+                let function = body.locals[dst.index()].ty.is_fn(db);
                 let made = match rvalue {
                     Rvalue::Closure { .. } | Rvalue::FnValue { .. } => true,
                     Rvalue::Use(Operand::Local(_)) | Rvalue::Convert(Operand::Local(_)) => function,

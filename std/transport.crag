@@ -1,0 +1,22 @@
+// This file is part of Crag.
+//
+// Copyright (C) 2026 Ralf Claussnitzer
+//
+// Crag is free software: you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the Free Software
+// Foundation, either version 3 of the License, or (at your option) any later
+// version.
+//
+// Crag is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+// A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along with
+// Crag. If not, see <https://www.gnu.org/licenses/>.
+
+// Code transport (Specification §18.6), as far as M7 reaches. An
+// `Expr[F]` is a closure of the `is Pure` function type `F` that a closure
+// literal or a `pub` function becomes where the context asks for one; it
+// is usable anywhere an `F` is (Implementation Plan §11.10.13).
+
+pub type Expr[F]

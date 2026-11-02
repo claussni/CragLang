@@ -621,3 +621,42 @@ fn derived_functions_use_the_own_functions_of_parts() {
         "True\n"
     );
 }
+
+#[test]
+fn expr_values_run_as_the_closures_they_are() {
+    // §18.6: a closure literal or a `pub` function becomes an `Expr` where
+    // the parameter asks for one, and calling it calls the closure.
+    let mut r = repl();
+    assert_eq!(eval(&mut r, "import std.transport"), "");
+    eval(&mut r, "pub fn adult(age: Int) -> Bool { age >= 18 }");
+    eval(
+        &mut r,
+        "type Job(name: Str, select: Expr[((Int) -> Bool is Pure)])",
+    );
+    eval(
+        &mut r,
+        "fn count(xs: List[Int], p: Expr[((Int) -> Bool is Pure)]) -> Int { \
+         var n = 0\n for x in xs { if p(x) { n = n + 1 } }\n n }",
+    );
+    eval(
+        &mut r,
+        "fn plain(xs: List[Int], p: ((Int) -> Bool is Pure)) -> Int { count(xs, { x -> p(x) }) }",
+    );
+    eval(&mut r, "let ages = [3, 17, 18, 40, 65]");
+    eval(&mut r, "let limit = 40");
+    assert_eq!(eval(&mut r, "count(ages, { a -> a >= limit })"), "2\n");
+    assert_eq!(eval(&mut r, "count(ages, adult)"), "3\n");
+    assert_eq!(eval(&mut r, "plain(ages, adult)"), "3\n");
+    eval(&mut r, "let j = Job(name: \"adults\", select: adult)");
+    assert_eq!(eval(&mut r, "j.select(20)"), "True\n");
+    eval(
+        &mut r,
+        "let k = Job(name: \"young\", select: { a -> a < limit })",
+    );
+    assert_eq!(eval(&mut r, "count(ages, k.select)"), "3\n");
+    let hole = eval(&mut r, "count(ages, { a -> a > ??? })");
+    assert!(
+        hole.starts_with("error: code sent as an `Expr` cannot hold `???`, which can only trap\n"),
+        "{hole}"
+    );
+}

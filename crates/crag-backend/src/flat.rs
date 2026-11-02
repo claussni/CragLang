@@ -339,6 +339,8 @@ fn builtin(b: Builtin) -> Option<Layout<'static>> {
             Layout::sized(int_size(b), LayoutClass::Immediate)
         }
         Builtin::Str | Builtin::Bytes => Layout::pair(PointerKind::Text, 0),
+        // An `Expr` is a closure (§18.6).
+        Builtin::Expr => Layout::pair(PointerKind::Env, 8),
         Builtin::List | Builtin::Map | Builtin::Set => Layout::boxed(BoxReason::Collection),
         Builtin::Ref
         | Builtin::Ext

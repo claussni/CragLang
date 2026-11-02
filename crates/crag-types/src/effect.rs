@@ -678,8 +678,7 @@ impl<'a, 'db> Walker<'a, 'db> {
                     .find(|(n, _)| n == name)
                     .map(|(_, t)| t)
             });
-            let is_fn =
-                |t: Option<Ty<'db>>| matches!(t.map(|t| t.kind(db)), Some(TyKind::Fn { .. }));
+            let is_fn = |t: Option<Ty<'db>>| t.is_some_and(|t| t.is_fn(db));
             if is_fn(self.exprs.get(value.index()).copied().flatten())
                 && field_ty.is_some_and(|t| !is_fn(Some(t)))
             {
@@ -830,7 +829,7 @@ impl<'a, 'db> Walker<'a, 'db> {
     }
 
     fn is_pure(&self, ty: Option<Ty<'db>>) -> bool {
-        ty.is_some_and(|t| matches!(t.kind(self.db), TyKind::Fn { pure: true, .. }))
+        ty.is_some_and(|t| t.as_fn(self.db).is_some_and(|(.., pure)| pure))
     }
 
     fn local_pure(&self, root: ExprId) -> bool {

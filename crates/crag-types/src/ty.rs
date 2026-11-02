@@ -86,6 +86,9 @@ pub enum Builtin {
     /// The locking ref of an `ext` binding (§9.6).
     Ext,
     Lazy,
+    /// `Expr[F]`, a closure of the `is Pure` function type `F` that carries
+    /// its code as data (§18.6), which only `std.transport` declares.
+    Expr,
     /// The runtime's handles of an end of a stream and of a hub, which only
     /// `std.stream` declares and uses (§19.2).
     RuntimeStream,
@@ -129,6 +132,7 @@ impl Builtin {
             "Ref" => (Builtin::Ref, 1),
             "Ext" => (Builtin::Ext, 1),
             "Lazy" => (Builtin::Lazy, 1),
+            "Expr" => (Builtin::Expr, 1),
             "RuntimeStream" => (Builtin::RuntimeStream, 0),
             "RuntimeHub" => (Builtin::RuntimeHub, 0),
             "RuntimeSocket" => (Builtin::RuntimeSocket, 0),
@@ -162,6 +166,7 @@ impl Builtin {
             Builtin::Ref => "Ref",
             Builtin::Ext => "Ext",
             Builtin::Lazy => "Lazy",
+            Builtin::Expr => "Expr",
             Builtin::RuntimeStream => "RuntimeStream",
             Builtin::RuntimeHub => "RuntimeHub",
             Builtin::RuntimeSocket => "RuntimeSocket",
@@ -232,6 +237,27 @@ impl<'db> Ty<'db> {
             TyKind::Builtin(b, args) => Some((*b, args)),
             _ => None,
         }
+    }
+
+    /// The parameters, result and purity of the function a value of this
+    /// type is called as: a function type's own, or those of `F` for an
+    /// `Expr[F]`, which is a closure too (§18.6).
+    pub fn as_fn(self, db: &'db dyn Db) -> Option<(&'db [Ty<'db>], Ty<'db>, bool)> {
+        match self.kind(db) {
+            TyKind::Fn {
+                params,
+                result,
+                pure,
+            } => Some((params, *result, *pure)),
+            TyKind::Builtin(Builtin::Expr, args) => args.first()?.as_fn(db),
+            _ => None,
+        }
+    }
+
+    /// Whether a value of this type is a function: a function type or an
+    /// `Expr`.
+    pub fn is_fn(self, db: &'db dyn Db) -> bool {
+        self.as_fn(db).is_some()
     }
 
     /// The members of a union, or the type itself.

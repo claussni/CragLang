@@ -100,9 +100,14 @@ fn setup(db: &RootDatabase, text: &str) -> (Program, ModuleId, ModuleId) {
         "std.core".to_string(),
         SourceFile::new(db, PRELUDE.to_string()),
     );
+    let transport = ModuleId::new(
+        db,
+        "std.transport".to_string(),
+        SourceFile::new(db, "pub type Expr[F]\n".to_string()),
+    );
     let module = ModuleId::new(db, "app".to_string(), SourceFile::new(db, text.to_string()));
     (
-        Program::new(db, vec![core, module], Vec::new()),
+        Program::new(db, vec![core, transport, module], Vec::new()),
         core,
         module,
     )
@@ -2036,6 +2041,74 @@ fn f(l: Lazy[Int], k: Int, g: (Int) -> Int) -> Int {
              not: Lazy[Int] is not Solid: it may trap when it is read",
             "`{ n + keep(l) }`: an `is Pure` closure captures only Solid values, and `l` is \
              not: Lazy[Int] is not Solid: it may trap when it is read",
+        ]
+    );
+}
+
+#[test]
+fn closures_become_expr_values_where_the_context_asks() {
+    // §18.6: a closure literal or a `pub` function checked against
+    // `Expr[F]` is an `Expr`, which is usable as an `F`.
+    let text = "import std.transport
+pub fn adult(age: Int) -> Bool { age > 18 }
+fn local(age: Int) -> Bool { age > 18 }
+type Job(name: Str, select: Expr[((Int) -> Bool is Pure)])
+fn remote(p: Expr[((Int) -> Bool is Pure)]) -> Bool { p(1) }
+fn plain(p: ((Int) -> Bool is Pure)) -> Bool { p(2) }
+fn f(min: Int) -> Bool {
+  let e: Expr[((Int) -> Bool is Pure)] = { age -> age > min }
+  let j = Job(name: \"adults\", select: adult)
+  remote({ age -> age > min }) and remote(adult) and plain(e) and j.select(3)
+}";
+    assert_eq!(
+        ok(text),
+        [
+            "age: Int, -> False | True",
+            "age: Int, -> False | True",
+            "p: Expr[(Int) -> False | True is Pure], -> False | True",
+            "p: (Int) -> False | True is Pure, -> False | True",
+            "min: Int, age: Int, e: Expr[(Int) -> False | True is Pure], j: Job, age: Int, \
+             -> False | True",
+        ]
+    );
+}
+
+#[test]
+fn expr_literals_hold_only_what_can_travel() {
+    // §18.6: the body is Pure, every capture Solid and not Secret, and no
+    // `ref`, `ext`, `atomic`, `embed`, `on` or `???`.
+    let text = "import std.transport
+type Key(raw: Str) is Secret
+type Login(user: Str, key: Key)
+fn keep(l: Lazy[Int]) -> Int { 0 }
+fn local(age: Int) -> Bool { age > 18 }
+fn remote(p: Expr[((Int) -> Int is Pure)]) -> Int { p(1) }
+fn bad(e: Expr[(Int) -> Int]) {}
+fn f(l: Lazy[Int], k: Key, login: Login, g: (Int) -> Int) -> Int {
+  let a = remote({ n -> n + keep(l) })
+  let b = remote({ n -> g(n) })
+  let c = remote({ n -> case k { _ -> n } })
+  let d = remote({ n -> case login { _ -> n } })
+  let e = remote({ n -> {\n    ref r = n\n    n\n  } })
+  let h = remote({ n -> ??? })
+  let i: Expr[((Int) -> Bool is Pure)] = local
+  a + b + c + d + e + h
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`Expr[(Int) -> Int]`: `Expr` takes an `is Pure` function type, and (Int) -> Int is \
+             not one",
+            "`{ n -> n + keep(l) }`: an `is Pure` closure captures only Solid values, and `l` \
+             is not: Lazy[Int] is not Solid: it may trap when it is read",
+            "`{ n -> g(n) }`: expected (Int) -> Int is Pure, found (Int) -> Int",
+            "`{ n -> case k { _ -> n } }`: code sent as an `Expr` captures no secrets, and `k` \
+             is a Key",
+            "`{ n -> case login { _ -> n } }`: code sent as an `Expr` captures no secrets, and \
+             the field `key` of `login` holds one",
+            "`r`: code sent as an `Expr` cannot hold a `ref` binding",
+            "`???`: code sent as an `Expr` cannot hold `???`, which can only trap",
+            "`local`: only a `pub` function can be passed as an `Expr`, and `local` is not `pub`",
         ]
     );
 }

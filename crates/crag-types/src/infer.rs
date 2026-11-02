@@ -620,7 +620,11 @@ impl<'a, 'db> Infer<'a, 'db> {
 
     /// Checks an expression against an expected type and returns its own.
     fn check(&mut self, id: ExprId, expected: Ty<'db>) -> Ty<'db> {
-        let ty = self.infer(id, Some(expected));
+        let mut ty = self.infer(id, Some(expected));
+        if self.sendable(id, ty, expected) {
+            ty = self.reference(id, ty);
+            self.exprs[id.index()] = Some(ty);
+        }
         self.expect(Site::Expr(id), ty, expected);
         ty
     }
@@ -816,9 +820,33 @@ impl<'a, 'db> Infer<'a, 'db> {
                 }
                 whole
             }
+            // A closure literal becomes an `Expr` where its context asks
+            // for one, checked against the function type (§18.6).
             Expr::Closure { params, body: root } => {
-                let ty = self.closure(params, *root, expected);
-                self.pure_if_effectless(id, ty, expected)
+                let sent = self.sent_as(expected, Some(params.len()));
+                let context = sent.or(expected);
+                let ty = self.closure(params, *root, context);
+                let ty = self.pure_if_effectless(id, ty, context);
+                match sent {
+                    // Reported as for a plain closure: the function type
+                    // must fit.
+                    Some(f) if !self.fits(ty, f) => {
+                        self.expect(Site::Expr(id), ty, f);
+                        self.builtin_of(Builtin::Expr, vec![f])
+                    }
+                    Some(_) => {
+                        let errors = crate::transport::literal_errors(
+                            db,
+                            self.program,
+                            self.body,
+                            &self.bindings,
+                            id,
+                        );
+                        self.lower.errors.extend(errors);
+                        self.builtin_of(Builtin::Expr, vec![ty])
+                    }
+                    None => ty,
+                }
             }
             Expr::If {
                 condition,
@@ -1054,13 +1082,85 @@ impl<'a, 'db> Infer<'a, 'db> {
             Some(Resolution::Value {
                 value: None,
                 functions,
-            }) => self.function_value(id, name, functions, None, expected),
+            }) => match self.sent_as(expected, None) {
+                Some(f) => self.function_sent(id, name, functions, f),
+                None => self.function_value(id, name, functions, None, expected),
+            },
             Some(Resolution::Type(item)) => self.type_value(id, name, *item, Vec::new(), expected),
             Some(Resolution::Form(_)) => {
                 self.error(Site::Expr(id), ErrorKind::NotAValue { name });
                 self.err_ty()
             }
             None => self.err_ty(),
+        }
+    }
+
+    /// The function type `F` of the `Expr[F]` the context asks for, with
+    /// `arity` parameters if given; none when it asks for no `Expr`.
+    fn sent_as(&self, expected: Option<Ty<'db>>, arity: Option<usize>) -> Option<Ty<'db>> {
+        let db = self.db;
+        expected?.members(db).into_iter().find_map(|m| {
+            let m = crate::relate::unrefined(db, self.program, m);
+            match m.as_builtin(db) {
+                Some((Builtin::Expr, &[f]))
+                    if f.as_fn(db)
+                        .is_some_and(|(p, ..)| arity.is_none_or(|n| p.len() == n)) =>
+                {
+                    Some(f)
+                }
+                _ => None,
+            }
+        })
+    }
+
+    /// Whether `id` names a function, typed `ty` before it was known that
+    /// `expected` asks for an `Expr` of it, as an argument is.
+    fn sendable(&self, id: ExprId, ty: Ty<'db>, expected: Ty<'db>) -> bool {
+        matches!(ty.kind(self.db), TyKind::Fn { .. })
+            && matches!(
+                self.body.expr(id),
+                Expr::Name {
+                    local: None,
+                    item: Some(Resolution::Value { value: None, .. }),
+                    ..
+                }
+            )
+            && self
+                .sent_as(Some(expected), None)
+                .is_some_and(|f| self.fits(ty, f))
+    }
+
+    /// A named function passed where an `Expr[F]` is expected: a `pub`
+    /// one travels as a reference (§18.6).
+    fn function_sent(
+        &mut self,
+        id: ExprId,
+        name: Name<'db>,
+        functions: &[ItemId<'db>],
+        f: Ty<'db>,
+    ) -> Ty<'db> {
+        let ty = self.function_value(id, name, functions, None, Some(f));
+        self.reference(id, ty)
+    }
+
+    /// The `Expr` of a named function of type `ty`, whose callee `id`
+    /// recorded, when it is `pub`.
+    fn reference(&mut self, id: ExprId, ty: Ty<'db>) -> Ty<'db> {
+        let db = self.db;
+        let function = self.callees.iter().rev().find_map(|(e, c)| match c {
+            _ if *e != id => None,
+            Callee::Function(function) => Some(*function),
+            Callee::Instance(instance) => Some(instance.function),
+            _ => None,
+        });
+        match function {
+            _ if ty.is_error(db) => ty,
+            Some(function) if !crate::def::is_public(db, function) => {
+                self.error(Site::Expr(id), ErrorKind::PrivateExpr { function });
+                self.err_ty()
+            }
+            Some(_) => self.builtin_of(Builtin::Expr, vec![ty]),
+            None => ty,
         }
     }
 
@@ -1524,7 +1624,7 @@ impl<'a, 'db> Infer<'a, 'db> {
         fields: Option<&[FieldArg<'db>]>,
     ) -> Ty<'db> {
         let db = self.db;
-        let TyKind::Fn { params, result, .. } = ty.kind(db) else {
+        let Some((params, result, _)) = ty.as_fn(db) else {
             if !ty.is_error(db) {
                 self.error(Site::Expr(id), ErrorKind::NotCallable { ty });
             }
@@ -1540,7 +1640,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                     self.check(arg, param);
                 }
                 self.build_record(id, record, fields);
-                return *result;
+                return result;
             }
             for field in fields {
                 let value = field_value(field);
@@ -1568,7 +1668,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                 }
             }
         }
-        *result
+        result
     }
 
     /// Whether an expression takes its type from the context, so an
@@ -1662,9 +1762,9 @@ impl<'a, 'db> Infer<'a, 'db> {
                 any(&|k| !matches!(k, TyKind::Builtin(..)))
             }
             Expr::Hole => true,
-            Expr::Closure { params, .. } => {
-                any(&|k| matches!(k, TyKind::Fn { params: p, .. } if p.len() == params.len()))
-            }
+            Expr::Closure { params, .. } => members.iter().any(|m| {
+                m.is_error(db) || m.as_fn(db).is_some_and(|(p, ..)| p.len() == params.len())
+            }),
             Expr::Str(_) | Expr::Literal(Literal::Str(_)) => builtin(&[Builtin::Str]),
             Expr::Literal(Literal::Bytes(_)) => builtin(&[Builtin::Bytes]),
             Expr::Literal(Literal::CodePoint(_)) => builtin(&[Builtin::CodePoint]),
@@ -1703,7 +1803,7 @@ impl<'a, 'db> Infer<'a, 'db> {
             Expr::Name {
                 item: Some(Resolution::Value { value: None, .. }),
                 ..
-            } => any(&|k| matches!(k, TyKind::Fn { .. })),
+            } => members.iter().any(|m| m.is_error(db) || m.is_fn(db)),
             _ => true,
         }
     }
@@ -2861,7 +2961,8 @@ impl<'a, 'db> Infer<'a, 'db> {
         named: &[(Name<'db>, Arg<'db>)],
     ) -> bool {
         let arg_fits = |arg: Arg<'db>, param: Ty<'db>| match arg {
-            Arg::Typed(_, t) | Arg::Receiver(_, t) => self.fits(t, param),
+            Arg::Typed(e, t) => self.fits(t, param) || self.sendable(e, t, param),
+            Arg::Receiver(_, t) => self.fits(t, param),
             Arg::Pending(e) => self.could_fit(e, param),
         };
         match plan {
@@ -2989,6 +3090,11 @@ impl<'a, 'db> Infer<'a, 'db> {
         match arg {
             Arg::Pending(e) => {
                 self.check(e, param);
+            }
+            Arg::Typed(e, t) if self.sendable(e, t, param) => {
+                let t = self.reference(e, t);
+                self.exprs[e.index()] = Some(t);
+                self.expect(Site::Expr(e), t, param);
             }
             Arg::Typed(e, t) | Arg::Receiver(e, t) => self.expect(Site::Expr(e), t, param),
         }
@@ -3413,9 +3519,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                     }
                     self.field_value(name, *value, field_ty, current.is_some(), true);
                     // A transform takes the spread's value, which must fit.
-                    let transforms = |t: Option<Ty<'db>>| {
-                        matches!(t.map(|t| t.kind(db)), Some(TyKind::Fn { .. }))
-                    };
+                    let transforms = |t: Option<Ty<'db>>| t.is_some_and(|t| t.is_fn(db));
                     if let Some(current) = current
                         && transforms(self.exprs[value.index()])
                         && !transforms(Some(field_ty))
@@ -3460,7 +3564,7 @@ impl<'a, 'db> Infer<'a, 'db> {
         strict: bool,
     ) -> Ty<'db> {
         let db = self.db;
-        if field_ty.is_error(db) || matches!(field_ty.kind(db), TyKind::Fn { .. }) {
+        if field_ty.is_error(db) || field_ty.is_fn(db) {
             return if strict {
                 self.check(value, field_ty);
                 field_ty
@@ -3481,7 +3585,7 @@ impl<'a, 'db> Infer<'a, 'db> {
         } else {
             self.infer(value, Some(field_ty))
         };
-        if !matches!(found.kind(db), TyKind::Fn { .. }) {
+        if !found.is_fn(db) {
             if !strict {
                 return found;
             }
@@ -3819,7 +3923,7 @@ impl<'a, 'db> Infer<'a, 'db> {
     ) -> Ty<'db> {
         let db = self.db;
         if let Some(field) = self.field_ty(receiver_ty, name)
-            && let TyKind::Fn { .. } = field.kind(db)
+            && field.is_fn(db)
         {
             self.callees.push((id, Callee::Value));
             return self.call_value(id, field, args, fields);
@@ -4173,9 +4277,7 @@ impl<'a, 'db> Infer<'a, 'db> {
                     Expr::Call { callee, .. } => self.exprs[callee.index()],
                     _ => None,
                 }?;
-                let TyKind::Fn { params, .. } = callee_ty.kind(db) else {
-                    return None;
-                };
+                let (params, ..) = callee_ty.as_fn(db)?;
                 return params.get(at?).copied();
             }
             _ => return None,

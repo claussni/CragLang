@@ -185,6 +185,7 @@ pub(crate) fn counted<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bo
                 | Builtin::Ref
                 | Builtin::Ext
                 | Builtin::Lazy
+                | Builtin::Expr
                 | Builtin::RuntimeStream
                 | Builtin::RuntimeHub
                 | Builtin::RuntimeSocket
@@ -204,7 +205,7 @@ pub(crate) fn counted<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bo
 pub(crate) fn two_words<'db>(db: &'db dyn Db, ty: Ty<'db>) -> bool {
     matches!(
         ty.kind(db),
-        TyKind::Builtin(Builtin::Str | Builtin::Bytes, _) | TyKind::Fn { .. }
+        TyKind::Builtin(Builtin::Str | Builtin::Bytes | Builtin::Expr, _) | TyKind::Fn { .. }
     )
 }
 
@@ -993,8 +994,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 Some((Builtin::Lazy, &[value])) => (Vec::new(), value),
                 _ => return None,
             },
-            (TyKind::Fn { params, result, .. }, _) => (params.clone(), *result),
-            _ => return None,
+            _ => match ty.as_fn(db) {
+                Some((params, result, _)) => (params.to_vec(), result),
+                None => return None,
+            },
         };
         let param_tys = &param_tys;
         self.result = result;
@@ -1083,28 +1086,18 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let [from, to] = self.instance.args(db)[..] else {
             return None;
         };
-        let (
-            TyKind::Fn {
-                params: from_params,
-                result: from_result,
-                ..
-            },
-            TyKind::Fn {
-                params: to_params,
-                result: to_result,
-                ..
-            },
-        ) = (from.kind(db), to.kind(db))
+        let (Some((from_params, from_result, _)), Some((to_params, to_result, _))) =
+            (from.as_fn(db), to.as_fn(db))
         else {
             return None;
         };
-        self.result = *to_result;
+        self.result = to_result;
         let env_ty = Ty::record(db, vec![(capture_name(db, 0), from)], false);
         let env = self.temp(env_ty);
         self.env = true;
         let args: Vec<(Local, Ty<'db>)> = to_params.iter().map(|&t| (self.temp(t), t)).collect();
         self.params = self.locals.len();
-        let (from_params, from_result) = (from_params.clone(), *from_result);
+        let from_params = from_params.to_vec();
         Some(Box::new(move |b| {
             let place = Place {
                 local: env,
@@ -1136,19 +1129,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     /// adapter when the two lay out parameters or results differently.
     fn adapted(&mut self, op: Operand<'db>, from: Ty<'db>, to: Ty<'db>) -> Option<Operand<'db>> {
         let db = self.db;
-        let (
-            TyKind::Fn {
-                params: a,
-                result: r,
-                ..
-            },
-            TyKind::Fn {
-                params: b,
-                result: s,
-                ..
-            },
-        ) = (from.kind(db), to.kind(db))
-        else {
+        let (Some((a, r, _)), Some((b, s, _))) = (from.as_fn(db), to.as_fn(db)) else {
             return None;
         };
         if a == b && r == s {
@@ -1226,12 +1207,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     fn function_entry(&mut self, expr: ExprId) -> Option<Start<'a, 'db>> {
         let db = self.db;
         let ty = self.expr_ty(expr)?;
-        let TyKind::Fn { params, result, .. } = ty.kind(db) else {
-            return None;
-        };
+        let (params, result, _) = ty.as_fn(db)?;
         let callee = self.types.callee(expr)?.clone();
         let instance = self.callee_instance(&callee);
-        self.result = *result;
+        self.result = result;
         self.temp(Ty::unit(db));
         self.env = true;
         let args: Vec<(Local, Ty<'db>)> = params.iter().map(|&t| (self.temp(t), t)).collect();
@@ -1748,10 +1727,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 let f = self.expr(positional[1]);
                 let f_ty = self.ty(positional[1]);
                 let f = self.typed(f, f_ty);
-                let TyKind::Fn { result, .. } = f_ty.kind(db) else {
+                let Some((_, result, _)) = f_ty.as_fn(db) else {
                     return self.trap(TrapKind::Error, Some(expr));
                 };
-                let dst = self.temp(*result);
+                let dst = self.temp(result);
                 let target = self.new_block();
                 self.terminate(Terminator::CallValue {
                     callee: f,
@@ -1992,10 +1971,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let closure = |b: &mut Self| {
             let f = b.expr(positional[1]);
             let f_ty = b.ty(positional[1]);
-            let result = match f_ty.kind(db) {
-                TyKind::Fn { result, .. } => Some(*result),
-                _ => None,
-            };
+            let result = f_ty.as_fn(db).map(|(_, result, _)| result);
             (b.typed(f, f_ty), result)
         };
         self.assign(
@@ -2138,10 +2114,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let f = self.expr(closure);
         let f_ty = self.ty(closure);
         let f = Operand::Local(self.materialize(f, f_ty));
-        let TyKind::Fn { result, .. } = f_ty.kind(db) else {
+        let Some((_, result_ty, _)) = f_ty.as_fn(db) else {
             return self.trap(TrapKind::Error, Some(expr));
         };
-        let result_ty = *result;
         let value = self.temp(self.ty(expr));
         let (head, join) = (self.new_block(), self.new_block());
         self.terminate(Terminator::Jump(head));
@@ -3786,7 +3761,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             }
             _ => return self.trap(TrapKind::Error, Some(expr)),
         };
-        let TyKind::Fn { params, result, .. } = fn_ty.kind(db) else {
+        let Some((params, result, _)) = fn_ty.as_fn(db) else {
             return self.trap(TrapKind::Error, Some(expr));
         };
         let callee = self.typed(callee, fn_ty);
@@ -3799,7 +3774,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         if let (Some(fields), Some(&record)) = (fields, params.get(args.len())) {
             ops.push(self.record_value(expr, record, &[], fields));
         }
-        if tail && *result == self.result {
+        if tail && result == self.result {
             self.terminate(Terminator::TailCallValue {
                 callee,
                 args: ops,
@@ -3807,7 +3782,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             });
             return self.unit();
         }
-        let dst = self.temp(*result);
+        let dst = self.temp(result);
         let target = self.new_block();
         self.terminate(Terminator::CallValue {
             callee,
@@ -4818,8 +4793,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
     /// none (§6.7).
     fn transforms(&self, e: ExprId, field_ty: Ty<'db>) -> bool {
         let db = self.db;
-        matches!(self.ty(e).kind(db), TyKind::Fn { .. })
-            && !matches!(field_ty.kind(db), TyKind::Fn { .. })
+        self.ty(e).is_fn(db) && !field_ty.is_fn(db)
     }
 
     /// Calls the transform `f` on the current value `old` of a field.
@@ -4832,10 +4806,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         field_ty: Ty<'db>,
         site: ExprId,
     ) -> Operand<'db> {
-        let TyKind::Fn { params, result, .. } = f_ty.kind(self.db) else {
+        let Some((params, result, _)) = f_ty.as_fn(self.db) else {
             return self.trap(TrapKind::Error, Some(site));
         };
-        let (param, result) = (params[0], *result);
+        let param = params[0];
         let callee = self.typed(f, f_ty);
         let arg = self.coerce(old, from, param);
         let dst = self.temp(result);

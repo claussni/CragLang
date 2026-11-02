@@ -104,6 +104,8 @@ fn subtype<'db>(db: &'db dyn Db, program: Program, s: Ty<'db>, t: Ty<'db>, depth
                 && t_params.iter().zip(s_params).all(|(&x, &y)| fits(x, y))
                 && fits(*s_result, *t_result)
         }
+        // An `Expr[F]` is usable anywhere an `F` is (§18.6).
+        (TyKind::Builtin(Builtin::Expr, args), _) => fits(args[0], t),
         _ => false,
     }
 }

@@ -83,6 +83,8 @@ pub fn layout<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Lay
             | Builtin::RuntimeStream
             | Builtin::RuntimeHub
             | Builtin::RuntimeSocket => Layout::Box,
+            // An `Expr` is a closure (§18.6).
+            Builtin::Expr => Layout::Closure,
             b => Layout::Imm(*b),
         },
         TyKind::Named(item, _) => match type_def(db, program, *item).kind {

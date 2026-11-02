@@ -24,6 +24,7 @@ use crate::effect::{EffectSet, Restriction};
 use crate::escape::{BindingsOnly, Escapes};
 use crate::generic::{Filling, FitError, Instance};
 use crate::marker::NotSolid;
+use crate::transport::Untransported;
 use crate::ty::Ty;
 
 /// How a `for` walks what it iterates, where the compiler does not know
@@ -501,6 +502,32 @@ pub enum ErrorKind<'db> {
         ty: Ty<'db>,
         why: NotSolid<'db>,
     },
+    /// `Expr[F]` of a type other than an `is Pure` function type (§18.6).
+    ExprNotPure {
+        ty: Ty<'db>,
+    },
+    /// A form that code sent as an `Expr` may not hold (§18.6).
+    NotTransportable {
+        form: Untransported,
+    },
+    /// A capture of a closure sent as an `Expr` that is a `ref` or an
+    /// `ext`, which are bindings and never values (§18.6).
+    CellCapture {
+        name: Name<'db>,
+        ext: bool,
+    },
+    /// A capture of a closure sent as an `Expr` that holds a `Secret`, at
+    /// the path of fields given (§18.6).
+    SecretCapture {
+        name: Name<'db>,
+        ty: Ty<'db>,
+        path: Vec<Name<'db>>,
+    },
+    /// A function passed as an `Expr` that is not `pub`, so no receiver
+    /// could resolve it (§18.6).
+    PrivateExpr {
+        function: ItemId<'db>,
+    },
     /// A module-level `let` or `embed` whose value is not `Solid` (§5.5).
     ValueNotSolid {
         ty: Ty<'db>,
@@ -697,6 +724,37 @@ impl<'db> ErrorKind<'db> {
                 "an `is Pure` closure captures only Solid values, and `{}` is not: {}",
                 name.text(db),
                 why.message(db, *ty)
+            ),
+            ErrorKind::ExprNotPure { ty } => format!(
+                "`Expr` takes an `is Pure` function type, and {} is not one",
+                ty.display(db)
+            ),
+            ErrorKind::NotTransportable { form } => {
+                format!("code sent as an `Expr` cannot hold {}", form.text())
+            }
+            ErrorKind::CellCapture { name, ext } => format!(
+                "code sent as an `Expr` cannot capture the {} `{}`, which is a binding and not a value",
+                if *ext { "`ext`" } else { "`ref`" },
+                name.text(db)
+            ),
+            ErrorKind::SecretCapture { name, ty, path } => match path.is_empty() {
+                true => format!(
+                    "code sent as an `Expr` captures no secrets, and `{}` is a {}",
+                    name.text(db),
+                    ty.display(db)
+                ),
+                false => {
+                    let path: Vec<&str> = path.iter().map(|n| n.text(db).as_str()).collect();
+                    format!(
+                        "code sent as an `Expr` captures no secrets, and the field `{}` of `{}` holds one",
+                        path.join("."),
+                        name.text(db)
+                    )
+                }
+            },
+            ErrorKind::PrivateExpr { function } => format!(
+                "only a `pub` function can be passed as an `Expr`, and `{}` is not `pub`",
+                item(function)
             ),
             ErrorKind::ValueNotSolid { ty, why } => format!(
                 "a module-level binding holds only Solid values, and this is not: {}",

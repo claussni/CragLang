@@ -3835,14 +3835,14 @@ impl<'a, 'db> Lower<'a, 'db> {
     /// The words of the parameters, the environment's included, and of the
     /// result of a function value's code.
     fn value_words(&self, ty: Ty<'db>) -> Result<(u32, u32), Unsupported> {
-        let TyKind::Fn { params, result, .. } = ty.kind(self.db) else {
+        let Some((params, result, _)) = ty.as_fn(self.db) else {
             return Err("values of this type");
         };
         let mut words = 1;
         for &p in params {
             words += self.layout_of(p)?.words() as u32;
         }
-        let returns = self.layout_of(*result)?.words() as u32;
+        let returns = self.layout_of(result)?.words() as u32;
         if returns > 2 {
             return Err("types of parameters or results");
         }
@@ -4299,19 +4299,8 @@ impl<'a, 'db> Lower<'a, 'db> {
     /// Whether values of two function types call the same code: their
     /// parameters and results are the same, if not whether they are Pure.
     fn same_code(&self, from: Ty<'db>, to: Ty<'db>) -> bool {
-        match (from.kind(self.db), to.kind(self.db)) {
-            (
-                TyKind::Fn {
-                    params: a,
-                    result: r,
-                    ..
-                },
-                TyKind::Fn {
-                    params: b,
-                    result: q,
-                    ..
-                },
-            ) => a == b && r == q,
+        match (from.as_fn(self.db), to.as_fn(self.db)) {
+            (Some((a, r, _)), Some((b, q, _))) => a == b && r == q,
             _ => false,
         }
     }
@@ -4950,7 +4939,7 @@ impl<'a, 'db> Lower<'a, 'db> {
         args: &[Operand<'db>],
     ) -> Result<(VReg, Vec<VReg>), Unsupported> {
         let fn_ty = self.operand_ty(callee, Ty::error(self.db));
-        let TyKind::Fn { params, .. } = fn_ty.kind(self.db) else {
+        let Some((params, ..)) = fn_ty.as_fn(self.db) else {
             return Err("calls of values of this type");
         };
         let value = self.operand(callee, fn_ty)?;
