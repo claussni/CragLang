@@ -35,6 +35,7 @@ mod input;
 mod items;
 pub mod literal;
 mod lower;
+mod messages;
 mod package;
 mod patterns;
 mod pretty;
@@ -44,13 +45,14 @@ mod shadow;
 pub use body::{LoweredBody, Owner, hir_body, lower_body, owners, prefixes};
 pub use embed::{embed_content, embed_source, embed_sources};
 pub use hir::*;
-pub use input::{ModuleId, Parse, Program, Resource, SourceFile, parse};
+pub use input::{ModuleId, Parse, Program, Resource, SourceFile, TypeIndices, parse};
 pub use items::{
     CFunction, Import, ImportItem, Item, ItemId, ItemKind, ItemTree, Name, SlotItem, Test, TestId,
     Threading, c_function, c_function_info, form_slots, item_tree, slot_item, type_param_count,
 };
 pub use literal::Literal;
 pub use lower::{BodySourceMap, LowerError};
+pub use messages::{lower_message, name_message, redeclared};
 pub use package::{PackageScope, Packages};
 pub use pretty::pretty;
 pub use scope::{

@@ -56,14 +56,14 @@ use crag_backend::{code, func_id, shapes};
 use crag_codegen::{CodegenSettings, OptLevel, compile_entry_stub, target_for};
 use crag_db::Db;
 use crag_hir::{Owner, Program};
-use crag_mir::{InstanceKey, Tier, collect_instances, mir};
+use crag_mir::{Entry, InstanceKey, Tier, collect_instances, mir};
 use object::write::{Object, Relocation, StandardSection, Symbol, SymbolId, SymbolSection};
 use object::{
     Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags, SymbolKind,
     SymbolScope, elf,
 };
 
-pub use link::{LinkError, Target, Toolchain, link, link_with, runtime_archive};
+pub use link::{LinkError, Target, Toolchain, link, link_with, receiving_archive, runtime_archive};
 
 /// The section that holds the table the runtime starts from.
 pub const CODE_SECTION: &str = release::SECTION;
@@ -79,6 +79,9 @@ pub struct Emitted<'db> {
     /// The functions in it, each at its place: the `n` of its symbol and
     /// its id in `CODE_SECTION`.
     pub instances: Vec<InstanceKey<'db>>,
+    /// Whether the program runs received code, so that it links with the
+    /// archive that holds the receiver (Implementation Plan §11.10.9).
+    pub receives: bool,
 }
 
 /// Compiles what the roots reach in the release tier into an x86-64 ELF
@@ -108,6 +111,8 @@ pub fn emit_object<'db>(
     let mut objects = Vec::with_capacity(instances.len());
     let mut types: Vec<(u32, TypeDescriptor)> = Vec::new();
     let mut words = HashMap::new();
+    // The cells of the values, by `module.name`, for a receiver.
+    let mut cells = Vec::new();
     for &key in &instances {
         let name = instance_name(db, key);
         let code = match code(db, program, key, Tier::Release) {
@@ -125,7 +130,30 @@ pub fn emit_object<'db>(
         }
         words.insert(func_id(key), (code.params, code.returns));
         objects.push((name, renumber(&code.object, &place)?));
+        if let (Owner::Item(item), Entry::Body) = (*key.owner(db), key.entry(db))
+            && item.kind(db).is_value()
+        {
+            let value = format!("{}.{}", item.module(db).path(db), item.name(db).text(db));
+            let cell = SlotKey {
+                func: place(code.slot.func)?,
+                signature: code.slot.signature,
+            };
+            cells.push((value, cell));
+        }
     }
+    // A program that runs received code carries what its receiver
+    // rebuilds it from (§11.10.9).
+    let receives = instances.iter().any(|&key| match *key.owner(db) {
+        Owner::Item(item) => {
+            item.module(db).path(db) == "std.transport" && item.name(db).text(db) == "run"
+        }
+        Owner::Test(_) => false,
+    });
+    let receiving = receives.then(|| {
+        let indices = crag_backend::program_indices(db, program, &instances, Tier::Release);
+        let bundle = crag_receive::Bundle::of(db, program, indices, Vec::new()).encode();
+        (bundle, cells)
+    });
     types.sort_by_key(|&(index, _)| index);
     let settings = stub_settings()?;
     let stub = |params, returns| {
@@ -148,8 +176,12 @@ pub fn emit_object<'db>(
         });
     }
     let tasks = [stub(1, 0)?, stub(1, 1)?, stub(1, 2)?];
-    let bytes = write_object(&objects, &entries, &tasks, &types)?;
-    Ok(Emitted { bytes, instances })
+    let bytes = write_object(&objects, &entries, &tasks, &types, receiving.as_ref())?;
+    Ok(Emitted {
+        bytes,
+        instances,
+        receives,
+    })
 }
 
 /// The settings entry stubs are compiled with.
@@ -195,6 +227,10 @@ fn renumber(
     Ok(object)
 }
 
+/// What a program that runs received code carries: its bundle, and the
+/// cells of its values by `module.name`.
+pub type Receiving = (Vec<u8>, Vec<(String, SlotKey)>);
+
 /// The symbol of a function at its place.
 fn function_symbol(n: u32, name: &str) -> String {
     format!("crag.{n}.{name}")
@@ -218,12 +254,15 @@ pub struct ObjectRoot<'a> {
 /// Writes functions, each with the name of its owner and the functions it
 /// names by their places, into an ELF object file, with a global symbol
 /// for each root, the stubs tasks start in, for none, one and two result
-/// words, and the descriptors of the types the code uses.
+/// words, and the descriptors of the types the code uses; for a program
+/// that runs received code, the bundle of the program and the cells of
+/// its values by `module.name`, those the code uses.
 pub fn write_object(
     functions: &[(String, CodeObject)],
     roots: &[ObjectRoot],
     tasks: &[CodeObject; 3],
     types: &[(u32, TypeDescriptor)],
+    receiving: Option<&Receiving>,
 ) -> Result<Vec<u8>, String> {
     let mut obj = Object::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
     let text = obj.section_id(StandardSection::Text);
@@ -292,6 +331,22 @@ pub fn write_object(
     for (task, &start) in tasks.iter().zip(&task_starts) {
         relocs.add(&mut obj, start, task)?;
     }
+    // The cells of the values the code uses, each by its symbol.
+    let mut cell_symbols = Vec::new();
+    let receiving = receiving.map(|(bundle, cells)| {
+        let cells = cells
+            .iter()
+            .filter_map(|(value, key)| {
+                let symbol = *relocs.cells.get(key)?;
+                cell_symbols.push(symbol);
+                Some((value.clone(), 0))
+            })
+            .collect();
+        release::Receiving {
+            bundle: bundle.clone(),
+            cells,
+        }
+    });
     let table = Table {
         task_entries: [0, 1, 2].map(|k| task_starts[k] + u64::from(tasks[k].entry)),
         functions: functions
@@ -316,8 +371,9 @@ pub fn write_object(
                 result: root.result,
             })
             .collect(),
+        receiving,
     };
-    write_table(&mut obj, text_symbol, &table)?;
+    write_table(&mut obj, text_symbol, &cell_symbols, &table)?;
     obj.write().map_err(|e| e.to_string())
 }
 
@@ -426,7 +482,12 @@ const ABS64: RelocationFlags = RelocationFlags::Elf {
 /// Writes the table into `CODE_SECTION`, at the global symbol
 /// `release::SYMBOL`, its addresses, which are offsets in `.text`, as
 /// relocations.
-fn write_table(obj: &mut Object, text_symbol: SymbolId, table: &Table) -> Result<(), String> {
+fn write_table(
+    obj: &mut Object,
+    text_symbol: SymbolId,
+    cell_symbols: &[SymbolId],
+    table: &Table,
+) -> Result<(), String> {
     let section = obj.add_section(
         Vec::new(),
         CODE_SECTION.as_bytes().to_vec(),
@@ -450,13 +511,20 @@ fn write_table(obj: &mut Object, text_symbol: SymbolId, table: &Table) -> Result
         section: SymbolSection::Section(section),
         flags: SymbolFlags::None,
     });
-    for (at, value) in values {
+    // The cells' addresses come last, each at its own symbol; the others
+    // lie in `.text`.
+    let text_words = values.len() - cell_symbols.len();
+    for (k, (at, value)) in values.into_iter().enumerate() {
+        let (symbol, addend) = match k.checked_sub(text_words) {
+            Some(cell) => (cell_symbols[cell], 0),
+            None => (text_symbol, value as i64),
+        };
         obj.add_relocation(
             section,
             Relocation {
                 offset: base + at as u64,
-                symbol: text_symbol,
-                addend: value as i64,
+                symbol,
+                addend,
                 flags: ABS64,
             },
         )

@@ -87,6 +87,7 @@ pub mod teardown;
 mod testing;
 pub mod text;
 pub mod timer;
+pub mod transport;
 pub mod unwind;
 mod values;
 
@@ -97,7 +98,7 @@ pub use env::set_program_args;
 pub use fiber::{Fiber, FiberConfig, FiberState, TaskContext, Worker};
 pub use heap::{Heap, alloc_box};
 pub use meter::Meter;
-pub use print::{PrintLimits, print_value, record_field, release_value};
+pub use print::{PrintLimits, print_value, record_field, release_value, retain_value};
 pub use rc::{Disposal, Types, next_disposal, release_box};
 pub use sched::{FiberRef, Scheduler, SchedulerConfig, WaitReason, WorkerStats, wake};
 pub use sentinel::{StopHandle, StopReason, request_stop};
@@ -223,6 +224,7 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::CCall => ffi::rt_c_call as *const () as usize,
         RuntimeFn::CStrOf => ffi::rt_c_str_of as *const () as usize,
         RuntimeFn::ValueDecode => values::rt_value_decode as *const () as usize,
+        RuntimeFn::TransportRun => transport::rt_transport_run as *const () as usize,
     }
 }
 

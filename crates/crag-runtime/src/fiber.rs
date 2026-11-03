@@ -214,6 +214,8 @@ pub struct Fiber {
     pub(crate) wait: WaitReason,
     /// The scope it is a task of, if a scope started it.
     pub(crate) task: Option<Member>,
+    /// The caller it runs received code for (Plan §11.10.9).
+    pub(crate) received: Option<Box<crate::transport::Waiter>>,
     /// Its transaction log, once it has run an `atomic` block (Plan
     /// §11.7.7).
     pub(crate) tx: Option<Box<TxLog>>,
@@ -319,6 +321,7 @@ impl Fiber {
             metering: None,
             wait: WaitReason::Yield,
             task: None,
+            received: None,
             tx: None,
             ext: None,
             signals: Default::default(),

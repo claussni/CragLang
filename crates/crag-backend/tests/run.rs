@@ -634,7 +634,11 @@ impl Module {
     /// The type index of a prelude tag, as a `Bool` or a union carries it.
     fn tag(&self, name: &str) -> u64 {
         let item = prelude_item(&self.db, self.program, name).unwrap();
-        type_index(Ty::new(&self.db, TyKind::Named(item, Vec::new()))) as u64
+        type_index(
+            &self.db,
+            self.program,
+            Ty::new(&self.db, TyKind::Named(item, Vec::new())),
+        ) as u64
     }
 }
 

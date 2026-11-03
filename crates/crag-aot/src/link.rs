@@ -58,8 +58,10 @@ impl Target {
     }
 }
 
-/// The name of the runtime archive.
+/// The name of the runtime archive, and of the one with the receiver of
+/// code, which programs that run received code link with (§11.10.9).
 const ARCHIVE: &str = "libcrag_rt.a";
+const RECEIVING_ARCHIVE: &str = "libcrag_rt_receive.a";
 
 /// The start files linked before the objects, and after the libraries.
 const START: [&str; 3] = ["crt1.o", "crti.o", "crtbegin.o"];
@@ -137,9 +139,20 @@ fn shipped_dir() -> Option<PathBuf> {
 /// The runtime archive for the target: the shipped one, or the one cargo
 /// built into the target directory the running executable is in.
 pub fn runtime_archive(target: Target) -> Result<PathBuf, LinkError> {
+    find_archive(target, ARCHIVE, "crag-rt")
+}
+
+/// The runtime archive with the receiver of code, the crate
+/// `crag-rt-receive`, for programs that run received code (§11.10.9):
+/// found as `runtime_archive` finds its own.
+pub fn receiving_archive(target: Target) -> Result<PathBuf, LinkError> {
+    find_archive(target, RECEIVING_ARCHIVE, "crag-rt-receive")
+}
+
+fn find_archive(target: Target, name: &str, package: &str) -> Result<PathBuf, LinkError> {
     let triple = target.triple();
     if let Some(dir) = shipped_dir() {
-        let archive = dir.join(triple).join(ARCHIVE);
+        let archive = dir.join(triple).join(name);
         if archive.is_file() {
             return Ok(archive);
         }
@@ -149,12 +162,12 @@ pub fn runtime_archive(target: Target) -> Result<PathBuf, LinkError> {
     exe.ancestors()
         .skip(1)
         .take(3)
-        .map(|dir| dir.join(triple).join("release").join(ARCHIVE))
+        .map(|dir| dir.join(triple).join("release").join(name))
         .find(|archive| archive.is_file())
         .ok_or_else(|| {
             LinkError(format!(
-                "no runtime archive for {triple}; build it with \
-                 `cargo build -p crag-rt --release --target {triple}`"
+                "no runtime archive {name} for {triple}; build it with \
+                 `cargo build -p {package} --release --target {triple}`"
             ))
         })
 }

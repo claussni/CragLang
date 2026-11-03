@@ -130,8 +130,9 @@ impl CodeMap {
         };
         // The call ends where it returns to.
         let at = ret - 1;
-        let i = self.inlined.partition_point(|r| r.0 <= at);
-        if let Some((_, end, frames)) = i.checked_sub(1).map(|i| &self.inlined[i])
+        let map = self.pick(at);
+        let i = map.inlined.partition_point(|r| r.0 <= at);
+        if let Some((_, end, frames)) = i.checked_sub(1).map(|i| &map.inlined[i])
             && at < *end
         {
             out.extend(frames.iter().map(|&func| Frame {
@@ -145,8 +146,9 @@ impl CodeMap {
     /// The handler of the kind of the call returning to `ret` and the
     /// call's frame offset, if it has one.
     fn handler(&self, ret: usize, kind: HandlerKind) -> Option<(usize, u32)> {
-        let start = self.handlers.partition_point(|h| h.0 < ret);
-        self.handlers[start..]
+        let map = self.pick(ret - 1);
+        let start = map.handlers.partition_point(|h| h.0 < ret);
+        map.handlers[start..]
             .iter()
             .take_while(|h| h.0 == ret)
             .find(|h| h.3 == kind)
@@ -190,22 +192,30 @@ impl CodeMap {
         self.task_entries
     }
 
+    /// The map that describes the code at `pc`: the overlay of received
+    /// code for an address in its arena, else this one (Plan §11.10.9).
+    fn pick(&self, pc: usize) -> &CodeMap {
+        crate::transport::code_at(pc).unwrap_or(self)
+    }
+
     /// The function whose code holds `pc`.
     pub fn function_at(&self, pc: usize) -> Option<FuncId> {
         Some(self.code_at(pc)?.2)
     }
 
     fn code_at(&self, pc: usize) -> Option<&(usize, usize, FuncId, Arc<Origins>)> {
-        let i = self.functions.partition_point(|f| f.0 <= pc);
-        let code = self.functions.get(i.checked_sub(1)?)?;
+        let map = self.pick(pc);
+        let i = map.functions.partition_point(|f| f.0 <= pc);
+        let code = map.functions.get(i.checked_sub(1)?)?;
         (code.0..code.1).contains(&pc).then_some(code)
     }
 
     /// The slots of the call returning to `ret`; none for a call that holds
     /// no box across it, or for code not in the map.
     fn slots(&self, ret: usize) -> &[u32] {
-        match self.safepoints.binary_search_by_key(&ret, |s| s.0) {
-            Ok(i) => &self.safepoints[i].1,
+        let map = self.pick(ret - 1);
+        match map.safepoints.binary_search_by_key(&ret, |s| s.0) {
+            Ok(i) => &map.safepoints[i].1,
             Err(_) => &[],
         }
     }

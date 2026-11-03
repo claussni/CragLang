@@ -17,6 +17,7 @@
 //! The inputs: source files, the modules they make and the program the
 //! modules belong to, and the parse of a file.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crag_syntax::{GreenNode, ParseError, lex};
@@ -54,6 +55,27 @@ pub struct Program {
     #[default]
     #[returns(ref)]
     pub packages: Packages,
+    /// The type indices of the program this one's code is compiled for,
+    /// in place of its own: received code runs on the receiver's heap
+    /// (Implementation Plan §11.10.9). Empty for a program of its own.
+    #[default]
+    #[returns(ref)]
+    pub type_indices: TypeIndices,
+}
+
+/// The type indices of another program by the canonical hash of each type
+/// (Compiler Architecture §A11.2), and the first index past them, from
+/// which a type that program does not have takes one of its own.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct TypeIndices {
+    pub by_hash: BTreeMap<[u8; 16], u32>,
+    pub base: u32,
+}
+
+impl TypeIndices {
+    pub fn is_empty(&self) -> bool {
+        self.by_hash.is_empty() && self.base == 0
+    }
 }
 
 /// The content of a resource an `embed` names, as the driver read it, or

@@ -38,7 +38,7 @@ use crag_hir::Program;
 use crag_types::{Builtin, Step, Ty};
 
 use crate::flat;
-use crate::layout::{self, type_index};
+use crate::layout;
 use crate::split::{
     Form, NicheTest, Slot, SlotKind, UnionTag, element_storage, fields_form, fields_slots,
     flat_layouts,
@@ -112,15 +112,15 @@ pub fn select(slots: &[Slot], at: usize, n: usize) -> Vec<Slot> {
 }
 
 /// The slots of a union's member, from the member's first register:
-/// `slots` are the union's.
-pub fn member_slots(slots: &[Slot], member: Ty<'_>) -> Option<Vec<Slot>> {
+/// `slots` are the union's, `index` the member's type index.
+pub fn member_slots(slots: &[Slot], index: i64) -> Option<Vec<Slot>> {
     let [union] = slots else {
         return None;
     };
     let SlotKind::Union { members, .. } = &union.kind else {
         return None;
     };
-    let (_, own) = members.iter().find(|(m, _)| *m == type_index(member))?;
+    let (_, own) = members.iter().find(|(m, _)| *m == index)?;
     Some(own.iter().map(|s| shift(s, union.at + 1)).collect())
 }
 

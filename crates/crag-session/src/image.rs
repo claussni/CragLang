@@ -142,6 +142,10 @@ pub struct Image {
     optimized: HashMap<FuncId, Vec<FuncId>>,
     /// The stream to the host, for what a run answers while it waits.
     stream: Option<UnixStream>,
+    /// The receiver of the code the program receives, once the host sent
+    /// its bundle (Implementation Plan §11.10.9); every run's scheduler
+    /// gets it.
+    receiver: Option<Arc<crag_receive::Receiver>>,
 }
 
 /// The app's run: its scheduler, which keeps running while the image
@@ -174,6 +178,7 @@ impl Image {
             baseline: HashMap::new(),
             optimized: HashMap::new(),
             stream: None,
+            receiver: None,
         })
     }
 
@@ -330,6 +335,7 @@ impl Image {
             Message::Locals { task, locals } => self.locals(task, &locals),
             Message::Profile { threshold } => self.hot(threshold),
             Message::Optimize { types, functions } => self.optimize(types, functions, None),
+            Message::Receive(bundle) => self.receive(&bundle),
             other => Message::Failed(format!("an image does not take {other:?}")),
         })
     }
@@ -587,6 +593,41 @@ impl Image {
     }
 
     /// Starts the app: a loaded function without parameters as the root
+    /// Makes the receiver of the program the bundle holds, whose values
+    /// keep the cells the image has for them.
+    fn receive(&mut self, bundle: &[u8]) -> Message {
+        let bundle = match crag_receive::Bundle::decode(bundle) {
+            Ok(bundle) => bundle,
+            Err(why) => return Message::Failed(format!("a bundle that does not decode: {why}")),
+        };
+        let cells = self.symbols.cells();
+        let addresses = bundle
+            .cells
+            .iter()
+            .filter_map(|(name, key)| Some((name.clone(), cells.address(*key)?)))
+            .collect();
+        match crag_receive::Receiver::new(bundle, addresses) {
+            Ok(receiver) => {
+                self.receiver = Some(Arc::new(receiver));
+                Message::Done
+            }
+            Err(e) => Message::Failed(format!("cannot start the receiver of code: {e}")),
+        }
+    }
+
+    /// A scheduler for the image's code, with the program's receiver.
+    fn scheduler(&self) -> Scheduler {
+        let scheduler = Scheduler::new(
+            SchedulerConfig::default(),
+            self.worker.types(),
+            self.code_map.clone(),
+        );
+        if let Some(receiver) = &self.receiver {
+            scheduler.set_receiver(receiver.clone());
+        }
+        scheduler
+    }
+
     /// task of a scheduler that runs on while the image answers.
     fn start(&mut self, func: FuncId) -> Message {
         if self.app.is_some() {
@@ -597,11 +638,7 @@ impl Image {
             Err(reply) => return reply,
         };
         let cancel = fiber.cancel_handle();
-        let scheduler = Scheduler::new(
-            SchedulerConfig::default(),
-            self.worker.types(),
-            self.code_map.clone(),
-        );
+        let scheduler = self.scheduler();
         scheduler.spawn(fiber);
         self.app = Some(App {
             scheduler,
@@ -732,11 +769,7 @@ impl Image {
     fn run(&mut self, func: FuncId) -> Result<Vec<u64>, Message> {
         let (fiber, returns) = self.root_fiber(func)?;
         let cancel = fiber.cancel_handle();
-        let scheduler = Scheduler::new(
-            SchedulerConfig::default(),
-            self.worker.types(),
-            self.code_map.clone(),
-        );
+        let scheduler = self.scheduler();
         INTERRUPTED.store(false, Ordering::SeqCst);
         scheduler.spawn(fiber);
         let mut interrupted = false;

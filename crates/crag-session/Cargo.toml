@@ -14,5 +14,6 @@ workspace = true
 blake3 = "1.8.7"
 crag-abi = { path = "../crag-abi" }
 crag-loader = { path = "../crag-loader" }
+crag-receive = { path = "../crag-receive" }
 crag-runtime = { path = "../crag-runtime" }
 libc = "0.2.190"

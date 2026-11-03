@@ -30,11 +30,16 @@
 //! The archive is built for `x86_64-unknown-linux-musl`, whose C library
 //! and start files come with the Rust target, so executables link
 //! statically and need nothing of the host they are built on.
+//!
+//! A program that runs received code links with the archive of
+//! `crag-rt-receive` instead, this crate with the feature `receive`: it
+//! holds the receiver of code (Implementation Plan §11.10.9), which `main`
+//! makes from the bundle in the table and gives the scheduler.
 
 use std::ffi::{CStr, c_char, c_int};
 use std::sync::Arc;
 
-use crag_abi::release::{HEADER, Table};
+use crag_abi::release::{HEADER, Receiving, Table};
 use crag_abi::{CodeObject, FuncId};
 use crag_runtime::{
     CodeMap, Fiber, FiberConfig, FiberState, Scheduler, SchedulerConfig, Trap, Types, record_field,
@@ -106,6 +111,9 @@ fn run() -> Result<c_int, String> {
     unsafe { map.set_task_entries(table.task_entries.map(|e| e as usize)) };
     let types = Arc::new(Types::new(table.types.iter().cloned()));
     let scheduler = Scheduler::new(SchedulerConfig::default(), types, Arc::new(map));
+    if let Some(receiving) = &table.receiving {
+        receive(&scheduler, receiving)?;
+    }
     // SAFETY: the stub was compiled for the root's words, and both are part
     // of the executable.
     let fiber = unsafe {
@@ -132,6 +140,29 @@ fn run() -> Result<c_int, String> {
         }
         state => Err(format!("the root task ended {state:?}")),
     }
+}
+
+/// Gives the scheduler the program's receiver of code, made from the
+/// bundle the table holds, which shares the cells of the program's values.
+#[cfg(feature = "receive")]
+fn receive(scheduler: &Scheduler, receiving: &Receiving) -> Result<(), String> {
+    let bundle = crag_receive::Bundle::decode(&receiving.bundle)?;
+    let cells = receiving
+        .cells
+        .iter()
+        .map(|(value, at)| (value.clone(), *at as usize))
+        .collect();
+    let receiver = crag_receive::Receiver::new(bundle, cells)
+        .map_err(|e| format!("cannot start the receiver of code: {e}"))?;
+    receiver.install(scheduler);
+    Ok(())
+}
+
+/// A program that runs received code is linked with the archive that has
+/// the receiver; this one has none.
+#[cfg(not(feature = "receive"))]
+fn receive(_: &Scheduler, _: &Receiving) -> Result<(), String> {
+    Err("the program runs received code, but was linked without its receiver".into())
 }
 
 /// A trap as the user sees it: what went wrong, where, and the functions

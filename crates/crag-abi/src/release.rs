@@ -24,8 +24,11 @@
 //! code and relocations, which holds its stack maps, handlers and the
 //! origins of its traps (§11.6.3); the descriptors of the types the code
 //! uses; the entry stubs tasks start in; and the roots, each with its
-//! function, the stub it starts in, and the shapes of its result. Function
-//! ids in it are places in the table.
+//! function, the stub it starts in, and the shapes of its result. A
+//! program that runs received code carries what its receiver needs
+//! (Implementation Plan §11.10.9): the bundle it rebuilds the program from,
+//! and the cells of the program's values. Function ids in it are places in
+//! the table.
 //!
 //! Integers are little-endian, and a sequence is its length as a `u32` and
 //! then its items. Addresses are words the linker fills, at the offsets
@@ -42,7 +45,7 @@ pub const SECTION: &str = ".crag_code";
 pub const SYMBOL: &str = "crag_code";
 
 /// The version of the table's layout.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// The length of the header: the version and the length of the table.
 pub const HEADER: usize = 8;
@@ -55,6 +58,19 @@ pub struct Table {
     pub functions: Vec<Function>,
     pub types: Vec<(u32, TypeDescriptor)>,
     pub roots: Vec<Root>,
+    /// What the receiver of code needs, for a program that runs received
+    /// code.
+    pub receiving: Option<Receiving>,
+}
+
+/// What the receiver of a release executable needs (Plan §11.10.9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Receiving {
+    /// The bundle of the program, `crag_receive::Bundle`'s bytes.
+    pub bundle: Vec<u8>,
+    /// The cells of the program's values, by `module.name`, with their
+    /// addresses, or in the object zero.
+    pub cells: Vec<(String, u64)>,
 }
 
 /// A function of the program, at its place.
@@ -84,8 +100,8 @@ pub struct Root {
 
 impl Table {
     /// The table's bytes, and the offsets of its addresses in them: the
-    /// task entries, each function's start and each root's entry, in that
-    /// order.
+    /// task entries, each function's start, each root's entry and each
+    /// cell of the receiving, in that order.
     pub fn encode(&self) -> (Vec<u8>, Vec<usize>) {
         let mut w = Writer::default();
         w.u32(VERSION);
@@ -113,6 +129,18 @@ impl Table {
             w.address(root.entry);
             w.bytes(&root.shapes.encode());
             w.u32(root.result);
+        }
+        match &self.receiving {
+            None => w.u32(0),
+            Some(receiving) => {
+                w.u32(1);
+                w.bytes(&receiving.bundle);
+                w.u32(receiving.cells.len() as u32);
+                for (name, at) in &receiving.cells {
+                    w.bytes(name.as_bytes());
+                    w.address(*at);
+                }
+            }
         }
         let len = w.out.len() as u32;
         w.out[4..8].copy_from_slice(&len.to_le_bytes());
@@ -159,12 +187,22 @@ impl Table {
                 })
             })
             .collect::<Result<_, String>>()?;
+        let receiving = match r.u32()? {
+            0 => None,
+            _ => Some(Receiving {
+                bundle: r.bytes()?.to_vec(),
+                cells: (0..r.u32()?)
+                    .map(|_| Ok((r.text()?, r.u64()?)))
+                    .collect::<Result<_, String>>()?,
+            }),
+        };
         match r.0.is_empty() {
             true => Ok(Table {
                 task_entries,
                 functions,
                 types,
                 roots,
+                receiving,
             }),
             false => Err("bytes after the table".into()),
         }
@@ -269,6 +307,10 @@ mod tests {
                 },
                 result: 0,
             }],
+            receiving: Some(Receiving {
+                bundle: vec![1, 2, 3],
+                cells: vec![("demo.app.table".into(), 0x100)],
+            }),
         };
         let (bytes, addresses) = table.encode();
         assert_eq!(Table::decode(&bytes), Ok(table.clone()));
@@ -276,7 +318,7 @@ mod tests {
             .iter()
             .map(|&at| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()))
             .collect();
-        assert_eq!(words, [1, 2, 3, 0x40, 0x80]);
+        assert_eq!(words, [1, 2, 3, 0x40, 0x80, 0x100]);
         assert!(Table::decode(&bytes[..bytes.len() - 1]).is_err());
     }
 }

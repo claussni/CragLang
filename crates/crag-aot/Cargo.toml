@@ -17,6 +17,7 @@ crag-codegen = { path = "../crag-codegen" }
 crag-db = { path = "../crag-db" }
 crag-hir = { path = "../crag-hir" }
 crag-mir = { path = "../crag-mir" }
+crag-receive = { path = "../crag-receive" }
 object = { version = "0.37", default-features = false, features = ["std", "elf", "read_core", "write_core"] }
 
 [dev-dependencies]

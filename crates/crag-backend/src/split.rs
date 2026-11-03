@@ -848,7 +848,13 @@ fn slots_of<'db>(
                     let TagPlace::Bytes(_) = union.tag else {
                         return None;
                     };
-                    SlotKind::Tag(union.members.iter().map(|m| type_index(m.ty)).collect())
+                    SlotKind::Tag(
+                        union
+                            .members
+                            .iter()
+                            .map(|m| type_index(db, program, m.ty))
+                            .collect(),
+                    )
                 }
             };
             let size = match kind {
@@ -946,7 +952,7 @@ fn union_slot<'db>(
             leaf,
             &mut slots,
         )?;
-        placed.push((type_index(place.ty), slots));
+        placed.push((type_index(db, program, place.ty), slots));
     }
     Some(Slot {
         at,

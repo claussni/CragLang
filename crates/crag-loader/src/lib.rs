@@ -149,10 +149,22 @@ type Cell = [AtomicU64; CELL_SIZE / 8];
 pub struct CellTable {
     chunks: Vec<Box<[Cell; CELL_CHUNK]>>,
     index: HashMap<SlotKey, usize>,
+    /// Cells that lie elsewhere, by address: those of the program that
+    /// received code shares (Implementation Plan §11.10.9).
+    shared: HashMap<SlotKey, usize>,
 }
 
 impl CellTable {
+    /// Makes code that names `key` use the cell at `addr`, which another
+    /// loader made and which outlives this table's code.
+    pub fn share(&mut self, key: SlotKey, addr: usize) {
+        self.shared.insert(key, addr);
+    }
+
     fn assign(&mut self, key: SlotKey) -> usize {
+        if self.shared.contains_key(&key) {
+            return usize::MAX;
+        }
         let next = self.index.len();
         let index = *self.index.entry(key).or_insert(next);
         if index == next && next == self.chunks.len() * CELL_CHUNK {
@@ -173,6 +185,9 @@ impl CellTable {
 
     /// The address of a key's cell, if it has one.
     pub fn address(&self, key: SlotKey) -> Option<usize> {
+        if let Some(&addr) = self.shared.get(&key) {
+            return Some(addr);
+        }
         Some(self.cell(*self.index.get(&key)?).as_ptr() as usize)
     }
 
@@ -269,6 +284,10 @@ impl SymbolTable {
 
     pub fn cells(&self) -> &CellTable {
         &self.cells
+    }
+
+    pub fn cells_mut(&mut self) -> &mut CellTable {
+        &mut self.cells
     }
 }
 
@@ -409,6 +428,11 @@ impl CodeArena {
             regions: HashMap::new(),
             objects: HashMap::new(),
         })
+    }
+
+    /// The address range the arena reserved: where its code lies.
+    pub fn range(&self) -> (usize, usize) {
+        (self.base, self.base + self.reserved)
     }
 
     /// Bytes in regions that hold loaded code.

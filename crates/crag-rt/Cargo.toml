@@ -11,11 +11,19 @@ license.workspace = true
 workspace = true
 
 # The archive defines the C `main`, which a test harness would define too.
+# `crag-rt-receive` takes it as a library, with the receiver of code.
 [lib]
-crate-type = ["staticlib"]
+crate-type = ["staticlib", "rlib"]
 test = false
 doctest = false
 
+[features]
+# The receiver of code, for programs that run received code
+# (Implementation Plan §11.10.9): the compiler's front end and code
+# generator.
+receive = ["dep:crag-receive"]
+
 [dependencies]
 crag-abi = { path = "../crag-abi" }
+crag-receive = { path = "../crag-receive", optional = true }
 crag-runtime = { path = "../crag-runtime" }

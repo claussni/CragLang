@@ -32,6 +32,8 @@
 
 use std::fmt::Write;
 
+use crag_hir::ExprId;
+
 use crag_backend::tree::{Name, TREE_VERSION, Value, decode_tree, encode_tree, expr_tree_value};
 use crag_db::{RootDatabase, Setter};
 use crag_hir::{
@@ -40,7 +42,7 @@ use crag_hir::{
 };
 use crag_types::ErrorKind;
 
-use crate::diagnostics::{lower_error, name_error};
+use crag_hir::{lower_message as lower_error, name_message as name_error};
 
 /// The path of the module a received tree is written to.
 pub const RECEIVED: &str = "received$";
@@ -79,6 +81,8 @@ pub enum Rejection {
 pub struct Checked {
     pub program: Program,
     pub module: ModuleId,
+    /// The root closure in the body of `ROOT`.
+    pub closure: ExprId,
     pub source: String,
     /// The references accepted although the callee's body differs from
     /// the sender's, which the receiver signals (§18.7).
@@ -134,6 +138,7 @@ pub fn check_received(
     Ok(Checked {
         program: received,
         module,
+        closure,
         source,
         divergent,
     })
@@ -156,8 +161,12 @@ fn add_module(db: &mut RootDatabase, program: Program, source: &str) -> (Program
     modules.push(module);
     let resources = program.resources(db).clone();
     let packages = program.packages(db).clone();
+    let indices = program.type_indices(db).clone();
     let received = Program::new(db, modules, resources);
     received.set_packages(db).to(packages);
+    if !indices.is_empty() {
+        received.set_type_indices(db).to(indices);
+    }
     (received, module)
 }
 

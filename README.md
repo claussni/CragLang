@@ -27,12 +27,14 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-backend` | Code generation from MIR (M1); code trees, the code an `Expr` carries as data (M7) |
 | `crates/crag-aot` | Release builds: the AOT object writer, which puts release code in an ELF object file, finding the runtime archive, and linking with lld (M7) |
 | `crates/crag-rt` | The runtime archive: the runtime and the start of a release executable, as a static library for musl (M7) |
+| `crates/crag-rt-receive` | The runtime archive with the receiver of code, for release executables that run received code (M7) |
+| `crates/crag-receive` | Receiving code: checking a tree again, compiling it metered against the program's own types and cells, and running it under the policy's limits (M7) |
 | `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1); `build`, the release executable (M7); the UI with the built-in editor, the app image, hot reload, the debugger, the language server `crag lsp` and the debug adapter `crag dap` (M5) |
 | `crates/crag-session` | Session manager: image processes and their supervision (M3) |
 | `crates/crag-eval` | Compile-time evaluation of constants, `embed`s among them, in the metered tier (M3) |
 | `crates/crag-fmt` | The formatter: the canonical layout of source files (M5) |
 | `crates/crag-package` | Packages: manifests, versions, folder registries, resolution and the SBOM (M6) |
-| `std` | The standard library: the prelude `std.core` with its functions on text, bytes and collections, `std.time`, `std.task`, `std.stream`, `std.io`, `std.env`, `std.test` and `std.transport`, which declares `Expr` |
+| `std` | The standard library: the prelude `std.core` with its functions on text, bytes and collections, `std.time`, `std.task`, `std.stream`, `std.io`, `std.env`, `std.test` and `std.transport`, which declares `Expr` and runs received code with `run` |
 | `examples` | Small programs to run and explore: hello world, reading a file, loading a web page |
 
 ## Build
@@ -80,6 +82,12 @@ Rust toolchain's lld. The tests of `crag-aot` build the archive first;
 by hand:
 
     ./cargo build -p crag-rt --release --target x86_64-unknown-linux-musl
+
+A program that runs received code with `run` of `std.transport` links
+with the archive that also holds the receiver, the compiler's front end
+and code generator, built by itself so that its features stay its own:
+
+    ./cargo build -p crag-rt-receive --release --target x86_64-unknown-linux-musl
 
 The `crag` command works on the project in the current directory, a
 directory with a `package.crag` naming the package and its `main` module:

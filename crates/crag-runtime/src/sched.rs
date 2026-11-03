@@ -82,6 +82,8 @@ pub enum WaitReason {
     Lazy,
     /// The debugger, which stopped it at a step (§11.8.6).
     Debug,
+    /// Received code it runs as a task of its own (§11.10.9).
+    Received,
 }
 
 /// How a scheduler runs.
@@ -138,6 +140,9 @@ pub(crate) struct Shared {
     epoch: AtomicU64,
     /// For each worker, the epoch of the tables it uses.
     adopted: Vec<AtomicU64>,
+    /// The receiver of code its fibers' program has, if it can receive
+    /// code (Plan §11.10.9).
+    pub(crate) receiver: OnceLock<Arc<dyn crate::transport::Receive>>,
 }
 
 // SAFETY: the fibers behind the words in the queues are owned by the
@@ -326,6 +331,13 @@ impl Scheduler {
         }
     }
 
+    /// Gives the program's fibers its receiver of code, which
+    /// `std.transport.run` asks (Plan §11.10.9); once. False when it has
+    /// one already.
+    pub fn set_receiver(&self, receiver: Arc<dyn crate::transport::Receive>) -> bool {
+        self.shared.receiver.set(receiver).is_ok()
+    }
+
     /// How many deferred dispose handlers trapped so far.
     pub fn deferred_traps(&self) -> u64 {
         self.shared.deferred_traps.load(Ordering::Relaxed)
@@ -414,6 +426,7 @@ impl Shared {
             tables: Mutex::new(None),
             epoch: AtomicU64::new(0),
             adopted: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            receiver: OnceLock::new(),
         }
     }
 
@@ -670,6 +683,13 @@ fn worker_main(mut local: Local, types: Arc<Types>, code: Arc<CodeMap>) {
                 drop(fiber);
                 shared.retire();
             }
+            // Received code goes back to its caller.
+            FiberState::Finished | FiberState::Trapped if fiber.received.is_some() => {
+                // SAFETY: as above; no queue holds the fiber any more.
+                let fiber = unsafe { Box::from_raw(ptr as *mut Fiber) };
+                crate::transport::finished(fiber);
+                shared.retire();
+            }
             // A task goes to its scope.
             FiberState::Finished | FiberState::Trapped if fiber.task.is_some() => {
                 // SAFETY: as above; no queue holds the fiber any more.
@@ -798,6 +818,15 @@ fn ticker_main(shared: &Shared, slice: Duration) {
 pub struct FiberRef {
     fiber: *mut Fiber,
     shared: Option<Arc<Shared>>,
+}
+
+impl FiberRef {
+    /// The task context of the fiber, which waits.
+    pub(crate) fn ctx(&self) -> &TaskContext {
+        // SAFETY: a fiber with a `FiberRef` stays allocated until it is
+        // woken, and its context with it.
+        unsafe { &(*self.fiber).ctx }
+    }
 }
 
 // SAFETY: the fiber does not run while suspended, and a wake hands it to

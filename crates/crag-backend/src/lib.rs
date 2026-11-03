@@ -42,6 +42,7 @@ extern crate crag_db as salsa;
 
 mod boxes;
 pub mod flat;
+mod indices;
 mod layout;
 mod lower;
 mod shape;
@@ -60,6 +61,7 @@ use crag_mir::{Entry, InstanceKey, Tier, mir};
 use crag_types::{Builtin, Ty, TyKind};
 
 pub use boxes::{BoxForm, box_form, field_words};
+pub use indices::program_indices;
 pub use layout::{
     FieldSlot, Layout, element_layout, layout, record_layout, type_descriptor, type_index,
 };

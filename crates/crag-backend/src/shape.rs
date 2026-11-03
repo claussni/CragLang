@@ -102,7 +102,7 @@ impl<'db> Builder<'db> {
                 members: self
                     .canonical(members.clone())
                     .into_iter()
-                    .map(|m| (type_index(m) as u32, self.shape(m)))
+                    .map(|m| (type_index(db, program, m) as u32, self.shape(m)))
                     .collect(),
                 words: l.words() as u32,
             },
@@ -132,13 +132,17 @@ impl<'db> Builder<'db> {
             _ => None,
         };
         if let Some(size) = size {
-            self.shapes.boxes.push((index, type_index(ty) as u32, size));
+            self.shapes
+                .boxes
+                .push((index, type_index(db, program, ty) as u32, size));
         }
         self.shapes.shapes[index as usize] = shape;
         if let TyKind::Named(..) = ty.kind(db)
             && matches!(self.shapes.shapes[index as usize], Shape::Record { .. })
         {
-            self.shapes.records.push((type_index(ty) as u32, index));
+            self.shapes
+                .records
+                .push((type_index(db, program, ty) as u32, index));
             let identity = type_hash(db, program, ty).0;
             self.shapes.identities.push((index, identity));
             // A value may be of a subtype, which its box says.
@@ -205,7 +209,12 @@ impl<'db> Builder<'db> {
             members.sort_by_key(|(m, _)| type_hash(db, self.program, *m));
             let members = members
                 .iter()
-                .map(|(m, inner)| (type_index(*m) as u32, self.inline(*m, inner)))
+                .map(|(m, inner)| {
+                    (
+                        type_index(db, self.program, *m) as u32,
+                        self.inline(*m, inner),
+                    )
+                })
                 .collect();
             self.shapes.shapes[index as usize] = Shape::Variant {
                 members,

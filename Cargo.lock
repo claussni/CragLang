@@ -138,6 +138,7 @@ dependencies = [
  "crag-driver",
  "crag-hir",
  "crag-mir",
+ "crag-receive",
  "object",
 ]
 
@@ -178,6 +179,7 @@ dependencies = [
 name = "crag-driver"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "crag-abi",
  "crag-aot",
  "crag-backend",
@@ -189,6 +191,7 @@ dependencies = [
  "crag-loader",
  "crag-mir",
  "crag-package",
+ "crag-receive",
  "crag-runtime",
  "crag-session",
  "crag-store",
@@ -260,11 +263,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "crag-receive"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "crag-abi",
+ "crag-backend",
+ "crag-codegen",
+ "crag-db",
+ "crag-hir",
+ "crag-loader",
+ "crag-mir",
+ "crag-runtime",
+ "crag-types",
+]
+
+[[package]]
 name = "crag-rt"
 version = "0.0.0"
 dependencies = [
  "crag-abi",
+ "crag-receive",
  "crag-runtime",
+]
+
+[[package]]
+name = "crag-rt-receive"
+version = "0.0.0"
+dependencies = [
+ "crag-rt",
 ]
 
 [[package]]
@@ -285,6 +312,7 @@ dependencies = [
  "blake3",
  "crag-abi",
  "crag-loader",
+ "crag-receive",
  "crag-runtime",
  "libc",
 ]

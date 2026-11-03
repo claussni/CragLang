@@ -64,7 +64,17 @@ impl Types {
         types
     }
 
+    /// The descriptor of a type, or the one received code gave it when
+    /// these have none (Plan §11.10.9).
     pub fn get(&self, index: u32) -> Option<&TypeDescriptor> {
+        match self.get_own(index) {
+            Some(descriptor) => Some(descriptor),
+            None => crate::transport::received_type(index),
+        }
+    }
+
+    /// The descriptor of a type, if these have it.
+    pub fn get_own(&self, index: u32) -> Option<&TypeDescriptor> {
         self.descriptors.get(index as usize)?.as_ref()
     }
 

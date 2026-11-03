@@ -526,6 +526,12 @@ pub enum Intrinsic<'db> {
     /// decoded: `std.transport.treeHash` and `tree` (Plan §11.10.13).
     ExprTreeHash,
     ExprTree,
+    /// Runs an `Expr`'s code as received code (Plan §11.10.9): the `Expr`,
+    /// the input, `Accept` as a number, the steps and the bytes of memory;
+    /// the status of `crag_abi::RuntimeFn::TransportRun`.
+    TransportRun,
+    /// The result of the code `TransportRun` ran, of the call's type.
+    TransportResult,
     /// The number of elements of a list, map or set.
     CollCount,
     /// The list with an element replaced, which consumes the list and the

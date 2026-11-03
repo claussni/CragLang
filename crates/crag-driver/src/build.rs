@@ -21,13 +21,15 @@
 //! does; a failing test builds nothing, unless `--skip-tests` (`:build
 //! skip-tests` in the REPL) leaves the tests out. It then compiles what
 //! `main` reaches in the release tier into an object (Implementation Plan
-//! §11.10.3) and links it with the runtime archive (§11.10.4, §11.10.5).
+//! §11.10.3) and links it with the runtime archive (§11.10.4, §11.10.5),
+//! the one with the receiver of code for a program that runs received
+//! code (§11.10.9).
 //! The object is written to a directory of its own, which goes again.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crag_aot::{MAIN, Target, emit_object, link, runtime_archive};
+use crag_aot::{MAIN, Target, emit_object, link, receiving_archive, runtime_archive};
 
 use crate::commands::{Args, Spec};
 use crate::{checked, main_instance, main_result, run_tests};
@@ -74,7 +76,13 @@ fn build(root: &Path, args: &Args, out: &mut dyn Write) -> Result<u8, String> {
     }
     let emitted = emit_object(&project.db, project.program, &[(key, MAIN)])?;
     let target = Target::host();
-    let archive = runtime_archive(target).map_err(|e| e.to_string())?;
+    // A program that runs received code links with its receiver
+    // (Implementation Plan §11.10.9).
+    let archive = match emitted.receives {
+        true => receiving_archive(target),
+        false => runtime_archive(target),
+    }
+    .map_err(|e| e.to_string())?;
     let dist = root.join(DIST);
     std::fs::create_dir_all(&dist).map_err(|e| format!("cannot create {}: {e}", dist.display()))?;
     let exe = dist.join(&project.package);

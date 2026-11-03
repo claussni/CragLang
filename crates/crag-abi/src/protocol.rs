@@ -34,7 +34,7 @@ use crate::{
 
 /// The version of the protocol, raised whenever a message changes, or
 /// the values a message may carry, such as the kinds of traps.
-pub const PROTOCOL_VERSION: u32 = 36;
+pub const PROTOCOL_VERSION: u32 = 37;
 
 /// The longest body a frame may have; a longer length means the stream is
 /// corrupt.
@@ -148,6 +148,11 @@ pub enum Message {
     /// From the image: the functions whose slots now hold the optimized
     /// code; the others stay baseline.
     Optimized(Vec<FuncId>),
+    /// From the host: the bundle of the program whose code the image runs,
+    /// from which it checks and compiles the code that program receives
+    /// (Implementation Plan §11.10.9), replacing the one before. The image
+    /// answers `Done`.
+    Receive(Vec<u8>),
 }
 
 /// A task stopped at a step: the task, the function and step, and the
@@ -223,6 +228,7 @@ const PROFILE: u8 = 26;
 const HOT: u8 = 27;
 const OPTIMIZE: u8 = 28;
 const OPTIMIZED: u8 = 29;
+const RECEIVE: u8 = 30;
 
 impl Message {
     /// The body of the message's frame.
@@ -381,6 +387,10 @@ impl Message {
                 w.u8(OPTIMIZED);
                 w.seq(funcs, |w, f| w.u32(f.0));
             }
+            Message::Receive(bundle) => {
+                w.u8(RECEIVE);
+                w.seq(bundle, |w, b| w.u8(*b));
+            }
         }
         w.0
     }
@@ -500,6 +510,7 @@ impl Message {
                 functions: r.seq(Reader::function)?,
             },
             OPTIMIZED => Message::Optimized(r.seq(|r| Ok(FuncId(r.u32()?)))?),
+            RECEIVE => Message::Receive(r.seq(Reader::u8)?),
             tag => return Err(invalid(format!("a message with the unknown tag {tag}"))),
         };
         match r.0.len() {
@@ -1223,6 +1234,7 @@ mod tests {
                 functions: Vec::new(),
             },
             Message::Optimized(vec![FuncId(9)]),
+            Message::Receive(vec![1, 0, 0, 0, 7]),
             Message::Texts(vec!["1".into(), "Point(x: 1)".into()]),
             Message::Finished(vec![0, u64::MAX]),
             Message::Trapped {

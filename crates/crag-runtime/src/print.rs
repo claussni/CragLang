@@ -459,6 +459,27 @@ pub unsafe fn release_value(
     shapes: &Shapes,
     shape: u32,
 ) {
+    owned_boxes(words, shapes, shape, &mut |ptr| {
+        // SAFETY: as the caller promises.
+        unsafe { drop_box(heap, types, ptr as *mut u8) };
+    });
+}
+
+/// Adds a reference for each that a value's words hold, so that the
+/// caller owns the value once more.
+///
+/// # Safety
+///
+/// The caller holds the value, of the shape.
+pub unsafe fn retain_value(words: &[u64], shapes: &Shapes, shape: u32) {
+    owned_boxes(words, shapes, shape, &mut |ptr| {
+        // SAFETY: as the caller promises.
+        unsafe { crate::rc::retain(ptr as *mut u8) };
+    });
+}
+
+/// Calls `f` with each box whose reference a value's words hold.
+fn owned_boxes(words: &[u64], shapes: &Shapes, shape: u32, f: &mut dyn FnMut(u64)) {
     let boxed = |s: u32| {
         matches!(
             shapes.shapes[s as usize],
@@ -471,17 +492,18 @@ pub unsafe fn release_value(
         Shape::Variant { members, .. } => {
             if let Some(&(_, m)) = members.iter().find(|m| u64::from(m.0) == words[0]) {
                 let n = shapes.shapes[m as usize].words() as usize;
-                // SAFETY: as the caller promises, for the member's words.
-                unsafe { release_value(heap, types, &words[1..1 + n], shapes, m) };
+                owned_boxes(&words[1..1 + n], shapes, m, f);
             }
             0
         }
         // Each field of a split record holds its own.
         Shape::Inline { fields, .. } => {
-            for f in fields {
-                let (at, n) = (f.offset as usize, shapes.shapes[f.shape as usize].words());
-                // SAFETY: as the caller promises, for the field's words.
-                unsafe { release_value(heap, types, &words[at..at + n as usize], shapes, f.shape) };
+            for field in fields {
+                let (at, n) = (
+                    field.offset as usize,
+                    shapes.shapes[field.shape as usize].words(),
+                );
+                owned_boxes(&words[at..at + n as usize], shapes, field.shape, f);
             }
             0
         }
@@ -499,7 +521,6 @@ pub unsafe fn release_value(
         _ => 0,
     };
     if ptr != 0 {
-        // SAFETY: as the caller promises.
-        unsafe { drop_box(heap, types, ptr as *mut u8) };
+        f(ptr);
     }
 }

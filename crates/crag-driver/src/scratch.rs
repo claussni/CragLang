@@ -27,10 +27,14 @@ use crag_backend::{func_id, shapes};
 use crag_codegen::{CodeObject, CodegenSettings, compile_entry_stub};
 use crag_mir::InstanceKey;
 use crag_runtime::Trap;
-use crag_session::{ImageCommand, ImageKind, RunResult, Session, ShippedFunction, Stub, TierUp};
+use crag_session::{
+    ImageCommand, ImageKind, Message, RunResult, Session, ShippedFunction, Stub, TierUp,
+};
 use crag_types::Ty;
 
-use crate::exec::{Compiled, Function, Sources, compile, constants, report, stub_settings};
+use crate::exec::{
+    Compiled, Function, Sources, bundle, compile, constants, receives, report, stub_settings,
+};
 use crate::project::Project;
 use crate::tier::{Hot, tiers_up};
 
@@ -49,6 +53,9 @@ pub(crate) struct Shipped {
     /// Whether the code differs from what the image runs, which keeps the
     /// image from tiering up until code is shipped again.
     pub stale: bool,
+    /// The image process that got a bundle for its receiver of code
+    /// (Implementation Plan §11.10.9), and the hash of the bundle.
+    pub bundle: Option<(u32, [u8; 32])>,
 }
 
 /// What a shipment did.
@@ -212,6 +219,29 @@ impl Scratch {
         shipped.functions.extend(compiled.functions.clone());
         shipped.values.extend(values);
         self.constants += fills.len();
+        // Code that runs received code needs the program's receiver, made
+        // again whenever the program changed.
+        if receives(project, &compiled.instances) {
+            let bytes = bundle(project, &compiled.instances, &compiled.values).encode();
+            let hash = *blake3::hash(&bytes).as_bytes();
+            let pid = match kind {
+                ImageKind::Scratch => Some(self.session.scratch().pid()),
+                ImageKind::App => self.session.app().map(|a| a.pid()),
+            };
+            if pid.is_none_or(|pid| shipped.bundle != Some((pid, hash))) {
+                match self.session.request_to(kind, &Message::Receive(bytes)) {
+                    Ok(Message::Done) => {}
+                    Ok(Message::Failed(why)) => return Err(why),
+                    Ok(other) => return Err(format!("the image answered {other:?}")),
+                    Err(e) => return Err(e.to_string()),
+                }
+                let shipped = match kind {
+                    ImageKind::Scratch => &mut self.scratch,
+                    ImageKind::App => &mut self.app,
+                };
+                shipped.bundle = pid.map(|pid| (pid, hash));
+            }
+        }
         Ok(Shipment {
             functions: sent,
             values: reset.len(),

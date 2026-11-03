@@ -977,6 +977,22 @@ pub enum RuntimeFn {
     /// word and a handle of `ValueShapes`, built on the heap: the tree of
     /// an `Expr`, which the compiler wrote (Plan §11.10.11).
     ValueDecode = 113,
+
+    /// `rt_transport_run(ctx, scratch, x0, x1, i0, i1) -> status`.
+    ///
+    /// Runs the code of an `Expr` as received code (Plan §11.10.9): the
+    /// program checks and compiles its tree again, then runs it as a
+    /// metered task of its own on the input `i0`, `i1`, which the call
+    /// takes, and waits for it. `scratch[3]` is the `Expr`'s environment,
+    /// which it borrows; `scratch[0..3]` the policy: `Accept` as 0
+    /// `Exact`, 1 `SameMajor` or 2 `Signature`, the steps and the bytes of
+    /// memory. `x0`, `x1` are the bytes of the function type the code is
+    /// expected to have, an `FnType` (Plan §11.10.11). The status is 0
+    /// when it ran, with its result in `scratch[0..2]`; 1 to 3 when it was
+    /// not accepted, as `Unresolved`, `IllTyped` or `Impure`, with the
+    /// reason as a `Str` there; 4 or 5 when it ran out of steps or memory,
+    /// with nothing there. A trap of the code is the call's.
+    TransportRun = 114,
 }
 
 /// The kinds of C values of a [`RuntimeFn::CCall`] descriptor.
@@ -1198,7 +1214,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 114] = [
+    pub const ALL: [RuntimeFn; 115] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -1313,6 +1329,7 @@ impl RuntimeFn {
         RuntimeFn::CCall,
         RuntimeFn::CStrOf,
         RuntimeFn::ValueDecode,
+        RuntimeFn::TransportRun,
     ];
 
     /// The symbol the loader looks up.
@@ -1432,6 +1449,7 @@ impl RuntimeFn {
             RuntimeFn::CCall => "rt_c_call",
             RuntimeFn::CStrOf => "rt_c_str_of",
             RuntimeFn::ValueDecode => "rt_value_decode",
+            RuntimeFn::TransportRun => "rt_transport_run",
         }
     }
 

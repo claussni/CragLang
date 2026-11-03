@@ -14,12 +14,75 @@
 // You should have received a copy of the GNU General Public License along with
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
-// Code transport (Specification §18.6), as far as M7 reaches. An
-// `Expr[F]` is a closure of the `is Pure` function type `F` that a closure
-// literal or a `pub` function becomes where the context asks for one; it
-// is usable anywhere an `F` is (Implementation Plan §11.10.13).
+// Code transport (Specification §18.6 and §18.7), as far as M7 reaches.
+// An `Expr[F]` is a closure of the `is Pure` function type `F` that a
+// closure literal or a `pub` function becomes where the context asks for
+// one; it is usable anywhere an `F` is (Implementation Plan §11.10.13).
+// `run` runs one as received code (§11.10.9).
 
 pub type Expr[F]
+
+// Which references received code may resolve to (§18.7): only to a
+// callee whose body is the sender's, to one of the same major version of
+// its package, or to one of the same module, name and signature.
+pub type Accept = Exact | SameMajor | Signature
+pub type Exact
+pub type SameMajor
+pub type Signature
+
+// What a receiver accepts, and the steps and bytes of memory received
+// code may take, receiving it included (§18.7).
+pub type Policy(accept: Accept = Exact, steps: Int = 100000000, memory: Int = 268435456)
+
+// Why received code did not run: a reference the receiver cannot resolve
+// as the policy asks, code that does not check against the type the
+// receiver expects, or code that is not `is Pure`.
+pub type Unresolved(..Error, message: Str)
+pub type IllTyped(..Error, message: Str)
+pub type Impure(..Error, message: Str)
+
+// Received code ran out of steps or memory, receiving it included.
+pub type StepLimit(..Error)
+pub type MemoryLimit(..Error)
+
+// Runs the code of `e` on `input` as received code (§18.7): the program
+// checks its tree again as the policy says, compiles it against itself
+// and runs it next to its own data, the input and the result passing as
+// they are, under the policy's limits. A trap of the code is the caller's.
+pub fn run[A, B](
+  e: Expr[((A) -> B is Pure)],
+  input: A,
+  policy: Policy,
+) -> B | Unresolved | IllTyped | Impure | StepLimit | MemoryLimit
+  where B is Solid {
+  let accept = case policy.accept {
+    Exact -> 0
+    SameMajor -> 1
+    Signature -> 2
+  }
+  case transportRun(e, input, accept, policy.steps, policy.memory) {
+    0 -> transportResult(e)
+    1 -> Unresolved(message: transportMessage())
+    2 -> IllTyped(message: transportMessage())
+    3 -> Impure(message: transportMessage())
+    4 -> StepLimit()
+    _ -> MemoryLimit()
+  }
+}
+
+// The runtime's side of `run`: the status, 0 when the code ran, 1 to 3
+// when it was not accepted, 4 and 5 for the limits; then the result, or
+// why it was not accepted.
+fn transportRun[A, B](
+  e: Expr[((A) -> B is Pure)],
+  input: A,
+  accept: Int,
+  steps: Int,
+  memory: Int,
+) -> Int
+
+fn transportResult[A, B](e: Expr[((A) -> B is Pure)]) -> B
+fn transportMessage() -> Str
 
 // The tree of an `Expr`'s code, decoded from the bytes the compiler wrote.
 pub fn tree[F](e: Expr[F]) -> Tree

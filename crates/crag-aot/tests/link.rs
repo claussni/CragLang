@@ -24,7 +24,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use crag_aot::{MAIN, Target, emit_object, link, runtime_archive};
+use crag_aot::{MAIN, Target, emit_object, link, receiving_archive, runtime_archive};
 use crag_driver::{Project, check, main_instance};
 
 /// How long a build of the archive, or a run of an executable, may take.
@@ -76,23 +76,38 @@ fn main() {
 fn archive() -> PathBuf {
     static BUILT: OnceLock<PathBuf> = OnceLock::new();
     BUILT
-        .get_or_init(|| {
-            let target = Target::host();
-            let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-            let mut cargo = Command::new(env!("CARGO"));
-            cargo
-                .args(["build", "--quiet", "-p", "crag-rt", "--release", "--target"])
-                .arg(target.triple())
-                .current_dir(workspace);
-            let out = run(cargo, BUILD_LIMIT);
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            runtime_archive(target).unwrap()
-        })
+        .get_or_init(|| build_archive("crag-rt", runtime_archive))
         .clone()
+}
+
+/// The runtime archive with the receiver of code, built once.
+fn receiving() -> PathBuf {
+    static BUILT: OnceLock<PathBuf> = OnceLock::new();
+    BUILT
+        .get_or_init(|| build_archive("crag-rt-receive", receiving_archive))
+        .clone()
+}
+
+/// Builds the archive of a package for the host's target, by itself, so
+/// that no other package's features join its own.
+fn build_archive(
+    package: &str,
+    find: fn(Target) -> Result<PathBuf, crag_aot::LinkError>,
+) -> PathBuf {
+    let target = Target::host();
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut cargo = Command::new(env!("CARGO"));
+    cargo
+        .args(["build", "--quiet", "-p", package, "--release", "--target"])
+        .arg(target.triple())
+        .current_dir(workspace);
+    let out = run(cargo, BUILD_LIMIT);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    find(target).unwrap()
 }
 
 /// Runs a command to its end within `limit`, killing it after.
@@ -156,7 +171,11 @@ fn build(dir: &Path, source: &str, out: &str) -> PathBuf {
     let object = dir.join(format!("{out}.o"));
     fs::write(&object, &emitted.bytes).unwrap();
     let exe = dir.join(out);
-    link(&[object], &[archive()], Target::host(), &exe).unwrap();
+    let archive = match emitted.receives {
+        true => receiving(),
+        false => archive(),
+    };
+    link(&[object], &[archive], Target::host(), &exe).unwrap();
     exe
 }
 
@@ -199,4 +218,56 @@ fn the_same_inputs_link_to_the_same_executable() {
     let _ = fs::remove_dir_all(&one);
     let _ = fs::remove_dir_all(&two);
     assert!(a == b, "two links of the same inputs differ");
+}
+
+const RECEIVES: &str = r#"import std.io
+import std.transport
+
+let table = [10, 20, 30]
+
+pub fn lookup(i: Int) -> Int { table[i] }
+
+pub fn spin(n: Int) -> Int {
+  var total = 0
+  for i in 0..n {
+    total = total + i % 7
+  }
+  total
+}
+
+fn report(r: Int | Unresolved | IllTyped | Impure | StepLimit | MemoryLimit) -> Str {
+  case r {
+    n: Int -> "ran {n}"
+    e: Unresolved -> "unresolved: {e.message}"
+    e: IllTyped -> "ill-typed: {e.message}"
+    e: Impure -> "impure: {e.message}"
+    StepLimit -> "step limit"
+    MemoryLimit -> "memory limit"
+  }
+}
+
+fn main() {
+  let k = 7
+  printLine(report(run({ x -> x * k + lookup(1) }, 6, Policy())))
+  printLine(report(run({ n -> spin(n) }, 1000000000, Policy(steps: 100000))))
+  printLine(report(run({ n -> spin(n) }, 10, Policy(steps: 3))))
+}
+"#;
+
+#[test]
+fn a_release_executable_runs_received_code_under_limits() {
+    // Implementation Plan §11.10.9: the executable carries the receiver,
+    // which checks and compiles the code again inside it, against the
+    // program's types and cells, and runs it under the policy's limits.
+    let dir = scratch("receives");
+    let exe = build(&dir, RECEIVES, "receives");
+    let out = run(Command::new(&exe), RUN_LIMIT);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ran 62\nstep limit\nstep limit\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
 }

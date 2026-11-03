@@ -1,0 +1,21 @@
+[package]
+name = "crag-rt-receive"
+description = "Crag runtime archive with the receiver of code, for release executables that run received code"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# The archive defines the C `main` of `crag-rt`, which a test harness would
+# define too.
+[lib]
+crate-type = ["staticlib"]
+test = false
+doctest = false
+
+[dependencies]
+crag-rt = { path = "../crag-rt", features = ["receive"] }

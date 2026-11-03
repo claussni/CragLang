@@ -384,7 +384,7 @@ impl<'db> Evaluation<'db> {
         };
         let value = match layout(db, program, result) {
             _ if result == ty => words.clone(),
-            Some(Layout::Union) if words[0] == type_index(ty) as u64 => {
+            Some(Layout::Union) if words[0] == type_index(db, program, ty) as u64 => {
                 match layout(db, program, ty) {
                     Some(Layout::Zero) => Vec::new(),
                     Some(Layout::Imm(_) | Layout::Box) => vec![words[1]],

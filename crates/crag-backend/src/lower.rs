@@ -158,8 +158,8 @@ pub fn lower_to_lir<'db>(
         types: Vec::new(),
         tracked: Vec::new(),
         data: Vec::new(),
-        true_index: named("True").map_or(-1, type_index),
-        false_index: named("False").map_or(-1, type_index),
+        true_index: named("True").map_or(-1, |t| type_index(db, program, t)),
+        false_index: named("False").map_or(-1, |t| type_index(db, program, t)),
         cell,
         scratch: None,
         func,
@@ -819,7 +819,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 self.owned_fields(ty, &f, &words)
             }
             Operand::Const(Constant::Tag(tag)) => {
-                let mut regs = vec![self.constant(type_index(self.member_of(*tag, ty)))];
+                let mut regs = vec![self.constant(self.index(self.member_of(*tag, ty)))];
                 while regs.len() < f.words() {
                     regs.push(self.constant(0));
                 }
@@ -1038,7 +1038,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 continue;
             }
             let (hit, next) = (self.new_block(), self.new_block());
-            let index = self.constant(type_index(*m));
+            let index = self.constant(self.index(*m));
             let same = self.cmp(Cond::Eq, regs[0], index);
             let term = Term::Branch {
                 cond: same,
@@ -1100,7 +1100,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                         continue;
                     }
                     let (hit, next) = (self.new_block(), self.new_block());
-                    let index = self.constant(type_index(*m));
+                    let index = self.constant(self.index(*m));
                     let same = self.cmp(Cond::Eq, words[0], index);
                     let term = Term::Branch {
                         cond: same,
@@ -1140,7 +1140,7 @@ impl<'a, 'db> Lower<'a, 'db> {
         let b = box_form(self.db, self.program, ty).ok_or("records of this type")?;
         self.describe(ty)?;
         let regs = self.reform(ty, form, &b.form, regs)?;
-        let ptr = self.alloc(b.size, type_index(ty));
+        let ptr = self.alloc(b.size, self.index(ty));
         // A trap unwinding the frame releases it, as a boxed local's.
         self.tracked.push(ptr);
         self.store_box(&b, ptr, &regs);
@@ -1538,7 +1538,7 @@ impl<'a, 'db> Lower<'a, 'db> {
         );
         // A local of a record type may hold a subtype's larger box.
         let header = self.load(ptr, TYPE_INDEX_OFFSET);
-        let index = self.constant(type_index(ty));
+        let index = self.constant(self.index(ty));
         let exact = self.cmp(Cond::Eq, header, index);
         self.end(
             Term::Branch {
@@ -1646,7 +1646,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                         continue;
                     }
                     let (hit, next) = (self.new_block(), self.new_block());
-                    let index = self.constant(type_index(*m));
+                    let index = self.constant(self.index(*m));
                     let same = self.cmp(Cond::Eq, regs[0], index);
                     let term = Term::Branch {
                         cond: same,
@@ -2021,7 +2021,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                     }
                     let member = self.member_of(from, ty);
                     let f = form.member(member).ok_or("this conversion")?.clone();
-                    let mut values = vec![self.constant(type_index(member))];
+                    let mut values = vec![self.constant(self.index(member))];
                     values.extend(match f {
                         Form::Words(_) => self.operand(op, from)?,
                         _ => self.split_operand(op, from)?,
@@ -2151,9 +2151,9 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let ptr = match reuse {
                     Some(token) => {
                         let token = word(&self.locals[token.index()])?;
-                        self.alloc_in(token, b.size, type_index(*record))
+                        self.alloc_in(token, b.size, self.index(*record))
                     }
-                    None => self.alloc(b.size, type_index(*record)),
+                    None => self.alloc(b.size, self.index(*record)),
                 };
                 self.store_box(&b, ptr, &regs);
                 // The box holds the address of its dispose code, which the
@@ -2287,7 +2287,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                         _ => self.split_value(op, *t, f)?,
                     });
                 }
-                let index = type_index(*env);
+                let index = self.index(*env);
                 let ptr = match placement {
                     ClosurePlacement::Heap => {
                         self.describe(*env)?;
@@ -2377,7 +2377,7 @@ impl<'a, 'db> Lower<'a, 'db> {
     fn signal_info(&mut self, ty: Ty<'db>, boxed: bool) -> VReg {
         let name = ty.display(self.db);
         let mut bytes = Vec::new();
-        bytes.extend((type_index(ty) as u64).to_le_bytes());
+        bytes.extend((self.index(ty) as u64).to_le_bytes());
         bytes.extend(u64::from(boxed).to_le_bytes());
         bytes.extend((name.len() as u64).to_le_bytes());
         bytes.extend(name.as_bytes());
@@ -2497,7 +2497,7 @@ impl<'a, 'db> Lower<'a, 'db> {
     /// handle of the runtime.
     fn handle_box(&mut self, ty: Ty<'db>, handle: VReg) -> Result<Vec<VReg>, Unsupported> {
         self.describe(ty)?;
-        let ptr = self.alloc(HEADER_SIZE + 8, type_index(ty));
+        let ptr = self.alloc(HEADER_SIZE + 8, self.index(ty));
         self.push(Inst::Store {
             src: handle,
             addr: ptr,
@@ -2570,7 +2570,13 @@ impl<'a, 'db> Lower<'a, 'db> {
     fn cell_list(&mut self, value: Ty<'db>) -> Result<VReg, Unsupported> {
         let list = Ty::new(self.db, TyKind::Builtin(Builtin::List, vec![value]));
         self.describe(list)?;
-        Ok(self.constant(type_index(list)))
+        Ok(self.constant(self.index(list)))
+    }
+
+    /// The index of a type in the descriptor table, as the program the
+    /// code is for numbers it (`layout::type_index`).
+    fn index(&self, ty: Ty<'db>) -> i64 {
+        type_index(self.db, self.program, ty)
     }
 
     /// The scratch words for reads of ref cells.
@@ -2707,7 +2713,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 "NegInfinity" => f64::NEG_INFINITY,
                 _ => continue,
             };
-            let tag = self.constant(type_index(member));
+            let tag = self.constant(self.index(member));
             let is = self.cmp(Cond::Eq, *index, tag);
             let value = self.constant(value.to_bits() as i64);
             let dst = self.reg();
@@ -2736,7 +2742,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let value_ty = self.cell_value_ty(ty)?;
                 self.describe(ty)?;
                 let words = self.ref_value(value, value_ty)?;
-                let ptr = self.alloc(HEADER_SIZE + REF_CELL_SIZE as u32, type_index(ty));
+                let ptr = self.alloc(HEADER_SIZE + REF_CELL_SIZE as u32, self.index(ty));
                 let zero = self.constant(0);
                 let header = HEADER_SIZE as i32;
                 self.push(Inst::Store {
@@ -2783,7 +2789,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let value_ty = self.cell_value_ty(ty)?;
                 self.describe(ty)?;
                 let words = self.operand(value, value_ty)?;
-                let ptr = self.alloc(HEADER_SIZE + 24, type_index(ty));
+                let ptr = self.alloc(HEADER_SIZE + 24, self.index(ty));
                 let lock = self.runtime(RuntimeFn::ExtNew, Vec::new());
                 let header = HEADER_SIZE as i32;
                 self.push(Inst::Store {
@@ -2865,7 +2871,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                 };
                 let list = self.cell_list(value_ty)?;
                 let cell = self.runtime(RuntimeFn::LazyNew, vec![list]);
-                let ptr = self.alloc(HEADER_SIZE + 24, type_index(ty));
+                let ptr = self.alloc(HEADER_SIZE + 24, self.index(ty));
                 let header = HEADER_SIZE as i32;
                 for (k, src) in [cell, code, env].into_iter().enumerate() {
                     self.push(Inst::Store {
@@ -3353,6 +3359,55 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let mut args = vec![shapes];
                 args.extend(bytes);
                 Ok(vec![self.runtime(RuntimeFn::ValueDecode, args)])
+            }
+            // The policy and the environment wait in the scratch words,
+            // where the result or the reason comes back.
+            (Intrinsic::TransportRun, [e, input, accept, steps, memory]) => {
+                let e_ty = self.operand_ty(e, ty);
+                let [_, env] = self.operand(e, e_ty)?[..] else {
+                    return Err("values of this type");
+                };
+                let f = match e_ty.as_builtin(self.db) {
+                    Some((Builtin::Expr, &[f])) => f,
+                    _ => return Err("values of this type"),
+                };
+                let expected = crate::tree::type_value(self.db, self.program, f)
+                    .and_then(|v| {
+                        crate::tree::encode_transport(self.db, self.program, "FnType", &v)
+                    })
+                    .map_err(|_| "code of this type as received code")?;
+                let [x0, x1] = self.text_literal(&expected)?[..] else {
+                    return Err("code of this type as received code");
+                };
+                let input_ty = self.operand_ty(input, ty);
+                let words = self.operand(input, input_ty)?;
+                if words.len() > 2 {
+                    return Err("inputs of this type to received code");
+                }
+                let [i0, i1] = self.pad(words);
+                let scratch = self.scratch();
+                for (k, op) in [accept, steps, memory].into_iter().enumerate() {
+                    let src = word(&self.operand(op, int)?)?;
+                    self.push(Inst::Store {
+                        src,
+                        addr: scratch,
+                        offset: 8 * k as i32,
+                    });
+                }
+                self.push(Inst::Store {
+                    src: env,
+                    addr: scratch,
+                    offset: 24,
+                });
+                Ok(vec![self.runtime(
+                    RuntimeFn::TransportRun,
+                    vec![scratch, x0, x1, i0, i1],
+                )])
+            }
+            (Intrinsic::TransportResult, [_]) => {
+                let n = self.layout_of(ty)?.words();
+                let scratch = self.scratch();
+                Ok((0..n).map(|k| self.load(scratch, 8 * k as i32)).collect())
             }
             (Intrinsic::CollCount, [c]) => {
                 let c_ty = self.operand_ty(c, ty);
@@ -3936,7 +3991,11 @@ impl<'a, 'db> Lower<'a, 'db> {
                     Step::As(t) if *t == ty => (ty, form, slots),
                     Step::As(t) => {
                         let f = form.member(*t).ok_or("this conversion")?.clone();
-                        (*t, f, member_slots(&slots, *t).ok_or("this conversion")?)
+                        (
+                            *t,
+                            f,
+                            member_slots(&slots, self.index(*t)).ok_or("this conversion")?,
+                        )
                     }
                     _ => return Err("this place"),
                 };
@@ -4021,7 +4080,7 @@ impl<'a, 'db> Lower<'a, 'db> {
     /// Registers the descriptor of a record or collection type, which the
     /// runtime needs to free its boxes and to store its elements.
     fn describe(&mut self, ty: Ty<'db>) -> Result<(), Unsupported> {
-        let index = type_index(ty) as u32;
+        let index = self.index(ty) as u32;
         if self.types.iter().any(|(i, _)| *i == index) {
             return Ok(());
         }
@@ -4157,7 +4216,7 @@ impl<'a, 'db> Lower<'a, 'db> {
     /// the rest (see `crag_abi`).
     fn empty(&mut self, ty: Ty<'db>, size: u32) -> Result<VReg, Unsupported> {
         self.describe(ty)?;
-        let ptr = self.alloc(size, type_index(ty));
+        let ptr = self.alloc(size, self.index(ty));
         let zero = self.constant(0);
         for offset in (LEN_OFFSET..size as i32).step_by(8) {
             self.push(Inst::Store {
@@ -4314,7 +4373,7 @@ impl<'a, 'db> Lower<'a, 'db> {
         to: Ty<'db>,
     ) -> Result<Vec<VReg>, Unsupported> {
         let (f, t) = (self.layout_of(from)?, self.layout_of(to)?);
-        let tag = type_index(self.member_of(from, to));
+        let tag = self.index(self.member_of(from, to));
         // A conditioned alias's values and its target's are the same.
         let plain = |ty| crag_types::unrefined(self.db, self.program, ty);
         if f == t && plain(from) == plain(to) && !matches!(f, Layout::Tag | Layout::Union) {
@@ -4405,8 +4464,8 @@ impl<'a, 'db> Lower<'a, 'db> {
                 continue;
             }
             let (old, new) = (
-                self.constant(type_index(member)),
-                self.constant(type_index(target)),
+                self.constant(self.index(member)),
+                self.constant(self.index(target)),
             );
             let cond = self.cmp(Cond::Eq, tag, old);
             let dst = self.reg();
@@ -5071,7 +5130,7 @@ impl<'a, 'db> Lower<'a, 'db> {
             let exact = members.contains(&case);
             match shape {
                 Layout::Tag | Layout::Union if exact => {
-                    let index = self.constant(type_index(case));
+                    let index = self.constant(self.index(case));
                     let same = self.cmp(Cond::Eq, values[0], index);
                     let term = Term::Branch {
                         cond: same,
@@ -5088,7 +5147,7 @@ impl<'a, 'db> Lower<'a, 'db> {
                         .copied()
                         .find(|&m| crag_types::is_subtype(db, self.program, case, m))
                         .ok_or("this type test")?;
-                    let index = self.constant(type_index(member));
+                    let index = self.constant(self.index(member));
                     let same = self.cmp(Cond::Eq, values[0], index);
                     let header = self.new_block();
                     let term = Term::Branch {

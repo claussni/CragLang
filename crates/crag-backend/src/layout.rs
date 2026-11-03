@@ -32,7 +32,7 @@ use crag_db::plumbing::AsId;
 use crag_hir::{ItemKind, Name, Program, item_tree, module_index};
 use crag_types::{
     Builtin, Ty, TyKind, TypeDefKind, dispose_handler, fields_of, is_subtype, parent,
-    record_subtypes, type_def, type_header,
+    record_subtypes, type_def, type_hash, type_header,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,9 +119,20 @@ pub fn layout<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Lay
 }
 
 /// The index of a type in the descriptor table (Compiler Architecture
-/// §11.2). Types are interned, so equal types have one index.
-pub fn type_index(ty: Ty<'_>) -> i64 {
-    i64::from(ty.as_id().index())
+/// §11.2). Types are interned, so equal types have one index. Code
+/// compiled for another program takes that program's index of the type of
+/// the same canonical form, and for a type it lacks one past its own
+/// (Implementation Plan §11.10.9).
+pub fn type_index<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> i64 {
+    let own = i64::from(ty.as_id().index());
+    let indices = program.type_indices(db);
+    if indices.is_empty() {
+        return own;
+    }
+    match indices.by_hash.get(&type_hash(db, program, ty).0) {
+        Some(&index) => i64::from(index),
+        None => i64::from(indices.base) + own,
+    }
 }
 
 /// A field of a box: its name, type, layout and offset.
@@ -225,7 +236,7 @@ pub fn dispose_word<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Opti
 pub fn subtypes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Vec<i64> {
     let mut out: Vec<i64> = std::iter::once(ty)
         .chain(record_subtypes(db, program, ty))
-        .map(type_index)
+        .map(|t| type_index(db, program, t))
         .collect();
     out.sort_unstable();
     out
@@ -236,7 +247,7 @@ pub fn subtypes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Vec<i64>
 /// records and tags alike, sorted; and how many parent types `ty` has, which
 /// makes it more specific.
 pub fn signal_types<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> (Vec<u32>, u32) {
-    let mut out = vec![type_index(ty) as u32];
+    let mut out = vec![type_index(db, program, ty) as u32];
     for &module in module_index(db, program).modules.values() {
         for item in &item_tree(db, module).items {
             let id = item.id;
@@ -245,7 +256,7 @@ pub fn signal_types<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> (Vec
             }
             let candidate = Ty::new(db, TyKind::Named(id, Vec::new()));
             if candidate != ty && is_subtype(db, program, candidate, ty) {
-                out.push(type_index(candidate) as u32);
+                out.push(type_index(db, program, candidate) as u32);
             }
         }
     }
@@ -269,7 +280,7 @@ pub fn boxed_indices<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Opt
     for m in ty.members(db) {
         match layout(db, program, m)? {
             Layout::Box => out.extend(subtypes(db, program, m).into_iter().map(|i| i as u32)),
-            Layout::Pair | Layout::Closure => out.push(type_index(m) as u32),
+            Layout::Pair | Layout::Closure => out.push(type_index(db, program, m) as u32),
             _ => {}
         }
     }

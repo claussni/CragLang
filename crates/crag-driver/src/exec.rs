@@ -145,6 +145,42 @@ pub struct Compiled<'a> {
     pub instances: HashMap<FuncId, InstanceKey<'a>>,
 }
 
+/// Whether the code compiled can receive code: it reaches
+/// `std.transport.run` (Implementation Plan §11.10.9).
+pub fn receives<'a>(project: &'a Project, instances: &HashMap<FuncId, InstanceKey<'a>>) -> bool {
+    let db = &project.db;
+    instances.values().any(|i| match *i.owner(db) {
+        Owner::Item(item) => {
+            item.module(db).path(db) == "std.transport" && item.name(db).text(db) == "run"
+        }
+        Owner::Test(_) => false,
+    })
+}
+
+/// What a receiver rebuilds the program from: its sources, the type
+/// indices of the code compiled, and the cells of its values by the keys
+/// the program gave them.
+pub fn bundle<'a>(
+    project: &'a Project,
+    instances: &HashMap<FuncId, InstanceKey<'a>>,
+    values: &[(SlotKey, ItemId<'a>)],
+) -> crag_receive::Bundle {
+    let (db, program) = (&project.db, project.program);
+    let instances: Vec<InstanceKey<'a>> = instances.values().copied().collect();
+    let indices = crag_backend::program_indices(db, program, &instances, Tier::compiled());
+    let cells = values
+        .iter()
+        .map(|&(key, item)| (value_name(project, item), key))
+        .collect();
+    crag_receive::Bundle::of(db, program, indices, cells)
+}
+
+/// A module-level value as a receiver names it: `module.name`.
+pub fn value_name(project: &Project, item: ItemId<'_>) -> String {
+    let db = &project.db;
+    format!("{}.{}", item.module(db).path(db), item.name(db).text(db))
+}
+
 /// The values among those compiled that the compiler computed, ready for
 /// their cells (§11.6.8). A value that is no constant is computed when it
 /// is first read, as before.
@@ -422,6 +458,19 @@ impl<'a> Image<'a> {
             .iter()
             .filter(|(key, _)| cells.state(*key) == Some(CELL_FULL))
             .count();
+        // A program that runs received code checks and compiles it itself,
+        // sharing the cells of its values (§11.10.9).
+        if receives(project, &instances) {
+            let bundle = bundle(project, &instances, &values);
+            let addresses = bundle
+                .cells
+                .iter()
+                .filter_map(|(name, key)| Some((name.clone(), cells.address(*key)?)))
+                .collect();
+            let receiver = crag_receive::Receiver::new(bundle, addresses)
+                .map_err(|e| format!("cannot start the receiver of code: {e}"))?;
+            receiver.install(&scheduler);
+        }
         let code = objects
             .iter()
             .zip(&entries)

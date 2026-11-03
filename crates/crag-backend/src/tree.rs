@@ -111,10 +111,21 @@ pub fn transport_type<'db>(db: &'db dyn Db, program: Program, name: &str) -> Opt
 
 /// The bytes of a tree, of the shape of `Tree`.
 pub fn encode_tree(db: &dyn Db, program: Program, tree: &Value) -> Result<Vec<u8>, Untreeable> {
-    let ty = transport_type(db, program, "Tree").ok_or("a program without std.transport")?;
+    encode_transport(db, program, "Tree", tree)
+}
+
+/// The bytes of a value of the type `name` of `std.transport`, such as a
+/// `TypeNode`.
+pub fn encode_transport(
+    db: &dyn Db,
+    program: Program,
+    name: &str,
+    value: &Value,
+) -> Result<Vec<u8>, Untreeable> {
+    let ty = transport_type(db, program, name).ok_or("a program without std.transport")?;
     let (shapes, root) = shapes(db, program, ty);
     let mut out = Vec::new();
-    encode(tree, &shapes, root, &mut out)?;
+    encode(value, &shapes, root, &mut out)?;
     Ok(out)
 }
 
@@ -250,12 +261,23 @@ fn field<'v>(v: &'v Value, name: &str) -> Result<&'v Value, Untreeable> {
 /// `Tree`. The bytes are untrusted: whatever they hold, decoding ends
 /// with a value or an error.
 pub fn decode_tree(db: &dyn Db, program: Program, bytes: &[u8]) -> Result<Value, Untreeable> {
-    let ty = transport_type(db, program, "Tree").ok_or("a program without std.transport")?;
+    decode_transport(db, program, "Tree", bytes)
+}
+
+/// A value of the type `name` of `std.transport` from untrusted bytes, as
+/// `decode_tree` reads a tree.
+pub fn decode_transport(
+    db: &dyn Db,
+    program: Program,
+    name: &str,
+    bytes: &[u8],
+) -> Result<Value, Untreeable> {
+    let ty = transport_type(db, program, name).ok_or("a program without std.transport")?;
     let (shapes, root) = shapes(db, program, ty);
     let mut reader = Reader { bytes, at: 0 };
     let value = decode(&mut reader, &shapes, root, 0)?;
     if reader.at != bytes.len() {
-        return Err("bytes after the tree".into());
+        return Err(format!("bytes after the {name}"));
     }
     Ok(value)
 }
