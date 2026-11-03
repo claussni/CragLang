@@ -141,8 +141,8 @@ pub(crate) struct Shared {
     /// For each worker, the epoch of the tables it uses.
     adopted: Vec<AtomicU64>,
     /// The receiver of code its fibers' program has, if it can receive
-    /// code (Plan §11.10.9).
-    pub(crate) receiver: OnceLock<Arc<dyn crate::transport::Receive>>,
+    /// code (Plan §11.10.9), replaced when the program changes.
+    pub(crate) receiver: Mutex<Option<Arc<dyn crate::transport::Receive>>>,
 }
 
 // SAFETY: the fibers behind the words in the queues are owned by the
@@ -332,10 +332,15 @@ impl Scheduler {
     }
 
     /// Gives the program's fibers its receiver of code, which
-    /// `std.transport.run` asks (Plan §11.10.9); once. False when it has
-    /// one already.
-    pub fn set_receiver(&self, receiver: Arc<dyn crate::transport::Receive>) -> bool {
-        self.shared.receiver.set(receiver).is_ok()
+    /// `std.transport.run` asks (Plan §11.10.9), in place of the one they
+    /// had: a reload gives the running program the receiver of its new
+    /// code. A `run` that asked the old one finishes with it.
+    pub fn set_receiver(&self, receiver: Arc<dyn crate::transport::Receive>) {
+        *self
+            .shared
+            .receiver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(receiver);
     }
 
     /// How many deferred dispose handlers trapped so far.
@@ -426,7 +431,7 @@ impl Shared {
             tables: Mutex::new(None),
             epoch: AtomicU64::new(0),
             adopted: (0..n).map(|_| AtomicU64::new(0)).collect(),
-            receiver: OnceLock::new(),
+            receiver: Mutex::new(None),
         }
     }
 

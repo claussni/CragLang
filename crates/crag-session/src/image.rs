@@ -594,7 +594,8 @@ impl Image {
 
     /// Starts the app: a loaded function without parameters as the root
     /// Makes the receiver of the program the bundle holds, whose values
-    /// keep the cells the image has for them.
+    /// keep the cells the image has for them; a running app takes it in
+    /// place of the receiver of its code before the reload.
     fn receive(&mut self, bundle: &[u8]) -> Message {
         let bundle = match crag_receive::Bundle::decode(bundle) {
             Ok(bundle) => bundle,
@@ -608,7 +609,11 @@ impl Image {
             .collect();
         match crag_receive::Receiver::new(bundle, addresses) {
             Ok(receiver) => {
-                self.receiver = Some(Arc::new(receiver));
+                let receiver = Arc::new(receiver);
+                if let Some(app) = &self.app {
+                    app.scheduler.set_receiver(receiver.clone());
+                }
+                self.receiver = Some(receiver);
                 Message::Done
             }
             Err(e) => Message::Failed(format!("cannot start the receiver of code: {e}")),

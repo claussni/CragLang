@@ -80,6 +80,7 @@ pub fn use[T](r: Ext[T]) -> T
 pub fn update[T, R](r: Ext[T], f: (T) -> R) -> () | Errs[R]
 pub fn swap[T](r: Ext[T], new: T) -> T
 pub distinct type Error
+pub distinct type Signal
 pub distinct type LifecycleHandler
 pub distinct type Dispose[T](..LifecycleHandler) where HandlerForm[(T) -> ()]
 pub distinct type Embed[T](..LifecycleHandler)

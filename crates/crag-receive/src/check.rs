@@ -84,9 +84,10 @@ pub struct Checked {
     /// The root closure in the body of `ROOT`.
     pub closure: ExprId,
     pub source: String,
-    /// The references accepted although the callee's body differs from
-    /// the sender's, which the receiver signals (§18.7).
-    pub divergent: Vec<String>,
+    /// The callees accepted although their body hash differs from the
+    /// sender's, each once as its module and name, which `run` signals as
+    /// `HashMismatch` (§18.7).
+    pub mismatched: Vec<(String, String)>,
 }
 
 /// Checks the bytes of a tree against `expected`, the function type the
@@ -133,14 +134,14 @@ pub fn check_received(
     // Read back through the codec, so that both trees hold what bytes do.
     let found = encode_tree(db, received, &found).map_err(malformed)?;
     let found = normalize(decode_tree(db, received, &found).map_err(malformed)?);
-    let mut divergent = Vec::new();
-    compare(&sent, &found, accept, &mut divergent)?;
+    let mut mismatched = Vec::new();
+    compare(&sent, &found, accept, &mut mismatched)?;
     Ok(Checked {
         program: received,
         module,
         closure,
         source,
-        divergent,
+        mismatched,
     })
 }
 
@@ -257,25 +258,25 @@ fn compare(
     sent: &Value,
     found: &Value,
     accept: Accept,
-    divergent: &mut Vec<String>,
+    mismatched: &mut Vec<(String, String)>,
 ) -> Result<(), Rejection> {
     let differs = || Rejection::IllTyped("the tree does not read back as it was sent".into());
     match (sent, found) {
         (Value::Record(a, fa), Value::Record(b, fb)) if a == b && fa.len() == fb.len() => {
             if a == "FnRef" || a == "TypeRef" {
-                return reference(a, sent, found, accept, divergent);
+                return reference(a, sent, found, accept, mismatched);
             }
             for ((na, va), (nb, vb)) in fa.iter().zip(fb) {
                 if na != nb {
                     return Err(differs());
                 }
-                compare(va, vb, accept, divergent)?;
+                compare(va, vb, accept, mismatched)?;
             }
             Ok(())
         }
         (Value::List(a), Value::List(b)) if a.len() == b.len() => {
             for (va, vb) in a.iter().zip(b) {
-                compare(va, vb, accept, divergent)?;
+                compare(va, vb, accept, mismatched)?;
             }
             Ok(())
         }
@@ -291,7 +292,7 @@ fn reference(
     sent: &Value,
     found: &Value,
     accept: Accept,
-    divergent: &mut Vec<String>,
+    mismatched: &mut Vec<(String, String)>,
 ) -> Result<(), Rejection> {
     let get = |v: &Value, name: &str| field(v, name).cloned().unwrap_or(Value::List(Vec::new()));
     let same = |name: &str| get(sent, name) == get(found, name);
@@ -314,7 +315,7 @@ fn reference(
         &get(sent, structure),
         &get(found, structure),
         accept,
-        divergent,
+        mismatched,
     );
     match accept {
         Accept::Exact if !package || !same(hash) => {
@@ -333,10 +334,12 @@ fn reference(
         }
         Accept::SameMajor => {}
     }
-    if kind == "FnRef" && !same(hash) {
-        divergent.push(format!(
-            "{shown}: the receiver's body differs from the sender's"
-        ));
+    if kind == "FnRef"
+        && !same(hash)
+        && let (Value::Str(m), Value::Str(n)) = (get(sent, "module"), get(sent, "name"))
+        && !mismatched.iter().any(|(a, b)| *a == m && *b == n)
+    {
+        mismatched.push((m, n));
     }
     Ok(())
 }

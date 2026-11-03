@@ -42,10 +42,13 @@
 //! The front end recurses deeply, so the receiver works on a thread of its
 //! own with a large stack; `run` waits for it.
 //!
-//! Not built yet: the signal for a callee accepted with another body
-//! (§18.7), which `Checked::divergent` lists; a bound on the store, which
-//! keeps every function it compiled; and the received modules stay in the
-//! database after their code is loaded.
+//! A callee accepted although its body hash differs from the sender's is
+//! listed with the code, as `Checked::mismatched` lists it, also when the
+//! limits then refuse the code, so that `run` signals it (§18.7).
+//!
+//! Not built yet: a bound on the store, which keeps every function it
+//! compiled; and the received modules stay in the database after their
+//! code is loaded.
 
 extern crate crag_db as salsa;
 
@@ -141,8 +144,8 @@ impl Receiver {
 
     /// Makes this the receiver of the program the scheduler runs, which
     /// `std.transport.run` asks.
-    pub fn install(self, scheduler: &Scheduler) -> bool {
-        scheduler.set_receiver(Arc::new(self))
+    pub fn install(self, scheduler: &Scheduler) {
+        scheduler.set_receiver(Arc::new(self));
     }
 }
 
@@ -179,6 +182,7 @@ struct Accepted {
     result_words: u32,
     steps: u64,
     memory: u64,
+    mismatched: Vec<transport::Mismatch>,
 }
 
 /// The receiver's program and its store of metered code.
@@ -242,11 +246,12 @@ impl Store {
             self.accepted.insert(key.clone(), accepted);
         }
         let accepted = &self.accepted[&key];
+        let mismatched = accepted.mismatched.clone();
         if accepted.steps > job.steps {
-            return Err(Refused::StepLimit);
+            return Err(Refused::StepLimit(mismatched));
         }
         if accepted.memory > job.memory {
-            return Err(Refused::MemoryLimit);
+            return Err(Refused::MemoryLimit(mismatched));
         }
         Ok(Received {
             stub: accepted.stub,
@@ -256,6 +261,7 @@ impl Store {
             result_words: accepted.result_words,
             steps: job.steps - accepted.steps,
             memory: job.memory - accepted.memory,
+            mismatched,
         })
     }
 
@@ -269,7 +275,7 @@ impl Store {
             .map_err(|e| ill(format!("a malformed tree: {e}")))?;
         let mut steps = nodes(&tree);
         if steps > job.steps {
-            return Err(Refused::StepLimit);
+            return Err(Refused::StepLimit(Vec::new()));
         }
         let checked = check_received(&mut self.db, base, &job.tree, &expected, job.accept)
             .map_err(|r| match r {
@@ -277,6 +283,7 @@ impl Store {
                 Rejection::IllTyped(m) => Refused::IllTyped(m),
                 Rejection::Impure(m) => Refused::Impure(m),
             })?;
+        let mismatched = checked.mismatched.clone();
         let db: &RootDatabase = &self.db;
         let received = checked.program;
         let item = item_tree(db, checked.module)
@@ -309,7 +316,7 @@ impl Store {
             };
             steps += statements(body);
             if steps > job.steps {
-                return Err(Refused::StepLimit);
+                return Err(Refused::StepLimit(mismatched.clone()));
             }
             reached.push((instance, program));
             pending.extend(body.callees().into_iter().rev());
@@ -334,7 +341,7 @@ impl Store {
             fresh.push((instance, compiled));
         }
         if memory > job.memory {
-            return Err(Refused::MemoryLimit);
+            return Err(Refused::MemoryLimit(mismatched.clone()));
         }
 
         // The descriptors must agree with the program's; those it lacks
@@ -375,7 +382,7 @@ impl Store {
         let group: Vec<_> = fresh.iter().map(|(_, c)| (c.slot, &c.object)).collect();
         let entries =
             load_group(&mut self.arena, &mut self.symbols, &group).map_err(|e| match e {
-                LoadError::ArenaFull => Refused::MemoryLimit,
+                LoadError::ArenaFull => Refused::MemoryLimit(mismatched.clone()),
                 e => ill(format!("its code does not load: {e:?}")),
             })?;
         for ((_, compiled), entry) in fresh.iter().zip(&entries) {
@@ -424,6 +431,7 @@ impl Store {
             result_words: compiled.returns,
             steps,
             memory,
+            mismatched,
         })
     }
 

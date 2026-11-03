@@ -44,6 +44,12 @@
 //! Running out of steps or memory is a status, not a trap; any other trap
 //! of the received code is the caller's. The task inherits no signals,
 //! since pure code emits none.
+//!
+//! Callees accepted although their body hash differs from the sender's
+//! are signalled before the code runs (§18.7). The receiver lists them,
+//! and while the caller has not emitted their signals yet, the call gives
+//! them back instead of running the code; `run` emits a `HashMismatch`
+//! for each and calls again, which finds the code in the receiver's store.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -69,6 +75,10 @@ pub enum Accept {
     SameMajor,
     Signature,
 }
+
+/// A callee accepted although its body hash differs from the sender's:
+/// its module and its name.
+pub type Mismatch = (String, String);
 
 /// What `run` asks the receiver.
 pub struct Request<'a> {
@@ -98,6 +108,8 @@ pub struct Received {
     /// What is left of the limits once receiving took its part.
     pub steps: u64,
     pub memory: u64,
+    /// The callees accepted with another body than the sender's.
+    pub mismatched: Vec<Mismatch>,
 }
 
 /// Why received code does not run.
@@ -106,9 +118,10 @@ pub enum Refused {
     Unresolved(String),
     IllTyped(String),
     Impure(String),
-    /// Receiving took more of the limits than the policy gives.
-    StepLimit,
-    MemoryLimit,
+    /// Receiving took more of the limits than the policy gives, with the
+    /// callees accepted with another body when the tree was checked first.
+    StepLimit(Vec<Mismatch>),
+    MemoryLimit(Vec<Mismatch>),
 }
 
 /// The receiver of a program that can receive code.
@@ -190,6 +203,11 @@ const ILL_TYPED: u64 = 2;
 const IMPURE: u64 = 3;
 const STEP_LIMIT: u64 = 4;
 const MEMORY_LIMIT: u64 = 5;
+const MISMATCHED: u64 = 6;
+
+/// The bit of the policy's first word that says the caller emitted the
+/// signals of the mismatched callees.
+const EMITTED: u64 = 1 << 8;
 
 /// What makes a fiber run received code: the caller waiting for it, and
 /// where its result goes.
@@ -228,7 +246,8 @@ unsafe extern "C" fn run_entry(
     unsafe {
         let ctx = &*ctx;
         let word = |i: usize| scratch.add(i).read();
-        let accept = match word(0) {
+        let emitted = word(0) & EMITTED != 0;
+        let accept = match word(0) & !EMITTED {
             0 => Accept::Exact,
             1 => Accept::SameMajor,
             _ => Accept::Signature,
@@ -244,7 +263,12 @@ unsafe extern "C" fn run_entry(
             raise(ctx, TrapKind::Unsupported, None);
             return 0;
         };
-        let Some(receiver) = shared.receiver.get().cloned() else {
+        let receiver = shared
+            .receiver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(receiver) = receiver else {
             return refuse(
                 ctx,
                 scratch,
@@ -259,7 +283,21 @@ unsafe extern "C" fn run_entry(
             memory: word(2),
             types,
         };
-        let received = match receiver.receive(&request) {
+        let result = receiver.receive(&request);
+        let mismatched = match &result {
+            Ok(received) => &received.mismatched[..],
+            Err(Refused::StepLimit(m) | Refused::MemoryLimit(m)) => &m[..],
+            Err(_) => &[],
+        };
+        if !emitted && !mismatched.is_empty() {
+            let lines: Vec<String> = mismatched
+                .iter()
+                .map(|(m, n)| format!("{m} {n}\n"))
+                .collect();
+            give_text(ctx, scratch, &lines.concat());
+            return MISMATCHED;
+        }
+        let received = match result {
             Ok(received) => received,
             Err(refused) => return refuse(ctx, scratch, refused),
         };
@@ -298,17 +336,27 @@ unsafe fn refuse(ctx: &TaskContext, scratch: *mut u64, refused: Refused) -> u64 
         Refused::Unresolved(m) => (UNRESOLVED, m),
         Refused::IllTyped(m) => (ILL_TYPED, m),
         Refused::Impure(m) => (IMPURE, m),
-        Refused::StepLimit => return STEP_LIMIT,
-        Refused::MemoryLimit => return MEMORY_LIMIT,
+        Refused::StepLimit(_) => return STEP_LIMIT,
+        Refused::MemoryLimit(_) => return MEMORY_LIMIT,
     };
+    // SAFETY: as the caller promises.
+    unsafe { give_text(ctx, scratch, &message) };
+    status
+}
+
+/// Writes a `Str` of `text` where the caller reads it.
+///
+/// # Safety
+///
+/// As `run_entry`'s.
+unsafe fn give_text(ctx: &TaskContext, scratch: *mut u64, text: &str) {
     // SAFETY: as the caller promises.
     unsafe {
         let (heap, _) = worker_of(ctx);
-        let [w0, w1] = make_text(heap, &[message.as_bytes()]);
+        let [w0, w1] = make_text(heap, &[text.as_bytes()]);
         scratch.write(w0);
         scratch.add(1).write(w1);
     }
-    status
 }
 
 /// Takes a fiber of received code that stopped from the worker that ran

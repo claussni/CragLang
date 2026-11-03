@@ -421,3 +421,88 @@ fn the_repl_starts_reloads_and_stops_the_app() {
     assert_eq!(eval(":stop"), "the app stopped\n");
     assert_eq!(eval(":status"), "no app runs\n");
 }
+
+/// A server that keeps one `Expr` from its start and answers each
+/// connection with what running it gives, after the `HashMismatch`
+/// signals that run emits.
+const SENDING_SERVER: &str = r#"import std.io
+import std.transport
+
+pub fn triple(n: Int) -> Int { n * 3 }
+
+pub fn spin(n: Int) -> Int {
+  var total = 0
+  for i in 0..n {
+    total = total + i % 2
+  }
+  total * 0
+}
+
+fn answer(e: Expr[((Int) -> Int is Pure)], c: Connection) -> Bytes {
+  on HashMismatch { s -> let w = c.write(bytes("mismatch {s.module}.{s.name}; ")) }
+  case run(e, 2, Policy(accept: ACCEPT)) {
+    n: Int -> bytes("ran {n}")
+    StepLimit -> b"step limit"
+    _ -> b"refused"
+  }
+}
+
+fn reply(e: Expr[((Int) -> Int is Pure)], c: Connection) -> () {
+  case c.read() {
+    bytes: Bytes -> {
+      let written = c.write(answer(e, c))
+    }
+    _ -> ()
+  }
+}
+
+fn serve(e: Expr[((Int) -> Int is Pure)], l: Listener) -> () {
+  case l.accept() {
+    c: Connection -> {
+      reply(e, c)
+      serve(e, l)
+    }
+    _ -> ()
+  }
+}
+
+fn main() -> () {
+  case listen(PORT) {
+    l: Listener -> serve({ x -> triple(x) + spin(x * 1000000) }, l)
+    _ -> ()
+  }
+}
+"#;
+
+#[test]
+fn code_made_before_a_reload_signals_the_callees_that_changed() {
+    // §18.7: an `Expr` made before `triple` changed carries its old body
+    // hash. `Signature` accepts the new body and signals the mismatch
+    // before the code runs, also when the run then exceeds a limit;
+    // `Exact` refuses it.
+    for (i, (accept, before, after)) in [
+        ("Signature", "ran 6", "mismatch demo.app.triple; ran 8"),
+        ("Exact", "ran 6", "refused"),
+        (
+            "Signature, steps: 1000000",
+            "step limit",
+            "mismatch demo.app.triple; step limit",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut s = setup(&format!("mismatch-{i}"));
+        let module = s.project.module("demo.app").unwrap();
+        let app = SENDING_SERVER
+            .replace("PORT", &s.port.to_string())
+            .replace("ACCEPT", accept);
+        s.project.set_source(module, app);
+        s.scratch.start_app(&s.project).unwrap();
+        assert_eq!(ask(s.port), before, "{accept}");
+        s.edit("n * 3", "n * 4");
+        s.scratch.reload(&s.project).unwrap();
+        assert_eq!(ask(s.port), after, "{accept}");
+        assert_eq!(ask(s.port), after, "{accept}, from the receiver's store");
+    }
+}

@@ -45,10 +45,17 @@ pub type Impure(..Error, message: Str)
 pub type StepLimit(..Error)
 pub type MemoryLimit(..Error)
 
+// A callee the receiver accepted although its body hash differs from the
+// sender's, by its module and its name (§18.7). `run` emits it once for
+// each such callee, before the code runs.
+pub type HashMismatch(..Signal, module: Str, name: Str)
+
 // Runs the code of `e` on `input` as received code (§18.7): the program
 // checks its tree again as the policy says, compiles it against itself
 // and runs it next to its own data, the input and the result passing as
 // they are, under the policy's limits. A trap of the code is the caller's.
+// Each callee accepted with another body than the sender's is signalled
+// as a `HashMismatch` first.
 pub fn run[A, B](
   e: Expr[((A) -> B is Pure)],
   input: A,
@@ -60,7 +67,15 @@ pub fn run[A, B](
     SameMajor -> 1
     Signature -> 2
   }
-  case transportRun(e, input, accept, policy.steps, policy.memory) {
+  var status = transportRun(e, input, accept, policy.steps, policy.memory)
+  if status == 6 {
+    for line in lines(transportMessage()) {
+      let parts = split(line, " ")
+      emit HashMismatch(module: parts[0], name: parts[1])
+    }
+    status = transportRun(e, input, accept + 256, policy.steps, policy.memory)
+  }
+  case status {
     0 -> transportResult(e)
     1 -> Unresolved(message: transportMessage())
     2 -> IllTyped(message: transportMessage())
@@ -71,8 +86,10 @@ pub fn run[A, B](
 }
 
 // The runtime's side of `run`: the status, 0 when the code ran, 1 to 3
-// when it was not accepted, 4 and 5 for the limits; then the result, or
-// why it was not accepted.
+// when it was not accepted, 4 and 5 for the limits, 6 for callees accepted
+// with another body, one `module name` a line, while `accept` lacks 256,
+// which says that they were signalled; then the result, or why it was not
+// accepted, or those callees.
 fn transportRun[A, B](
   e: Expr[((A) -> B is Pure)],
   input: A,

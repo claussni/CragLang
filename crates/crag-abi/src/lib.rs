@@ -986,12 +986,16 @@ pub enum RuntimeFn {
     /// takes, and waits for it. `scratch[3]` is the `Expr`'s environment,
     /// which it borrows; `scratch[0..3]` the policy: `Accept` as 0
     /// `Exact`, 1 `SameMajor` or 2 `Signature`, the steps and the bytes of
-    /// memory. `x0`, `x1` are the bytes of the function type the code is
-    /// expected to have, an `FnType` (Plan §11.10.11). The status is 0
-    /// when it ran, with its result in `scratch[0..2]`; 1 to 3 when it was
-    /// not accepted, as `Unresolved`, `IllTyped` or `Impure`, with the
-    /// reason as a `Str` there; 4 or 5 when it ran out of steps or memory,
-    /// with nothing there. A trap of the code is the call's.
+    /// memory; 256 added to `scratch[0]` says that the caller signalled
+    /// the callees accepted with another body. `x0`, `x1` are the bytes of
+    /// the function type the code is expected to have, an `FnType` (Plan
+    /// §11.10.11). The status is 0 when it ran, with its result in
+    /// `scratch[0..2]`; 1 to 3 when it was not accepted, as `Unresolved`,
+    /// `IllTyped` or `Impure`, with the reason as a `Str` there; 4 or 5
+    /// when it ran out of steps or memory, with nothing there; 6 when the
+    /// caller has not signalled such callees yet, which did not run the
+    /// code, with a `Str` there of one `module name` a line. A trap of the
+    /// code is the call's.
     TransportRun = 114,
 }
 

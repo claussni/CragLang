@@ -129,7 +129,7 @@ fn received_code_reads_back_as_sent() {
         for accept in [Accept::Exact, Accept::SameMajor, Accept::Signature] {
             let checked = check(&mut project, &bytes, "send", accept)
                 .unwrap_or_else(|e| panic!("{function}: {e:?}"));
-            assert!(checked.divergent.is_empty(), "{function}");
+            assert!(checked.mismatched.is_empty(), "{function}");
         }
     }
     // A literal keeps its sign in the tree.
@@ -143,7 +143,7 @@ fn received_code_reads_back_as_sent() {
 fn a_receiver_resolves_references_as_its_policy_says() {
     // §18.7: under `Exact` a callee's body must hash as the sender's;
     // under `Signature` its module, name and signature suffice, and the
-    // divergence is signalled; a callee the receiver lacks is unresolved.
+    // mismatch is signalled; a callee the receiver lacks is unresolved.
     let sender = load("policy-sender", SENDER);
     let bytes = sent(&sender, "checked");
     let changed = SENDER.replace(
@@ -158,7 +158,10 @@ fn a_receiver_resolves_references_as_its_policy_says() {
     );
     for accept in [Accept::SameMajor, Accept::Signature] {
         let checked = check(&mut receiver, &bytes, "send", accept).unwrap();
-        assert_eq!(checked.divergent.len(), 1, "{:?}", checked.divergent);
+        assert_eq!(
+            checked.mismatched,
+            [("demo.app".to_string(), "limit".to_string())]
+        );
     }
     let retyped = SENDER.replace(
         "pub fn limit(age: Int) -> Int { age }",
