@@ -18,24 +18,17 @@
 //! in what order, and that the others and those of a task that stops are
 //! given up.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod common;
 
-use common::{Image, r};
+use common::{BOXES, INTS, Image, r, types};
 use crag_abi::{
-    CountedField, ElementLayout, REF_COMMITTED, REF_CONFLICT, RuntimeFn, SIGNAL_FAIL, SIGNAL_NONE,
-    SIGNAL_OK, SIGNAL_PLAIN, SIGNAL_RETRY, TrapKind, TypeDescriptor,
+    REF_COMMITTED, REF_CONFLICT, RuntimeFn, SIGNAL_FAIL, SIGNAL_NONE, SIGNAL_OK, SIGNAL_PLAIN,
+    SIGNAL_RETRY, TrapKind,
 };
 use crag_codegen::{Block, Inst, LirFunction, Term, VReg};
-use crag_runtime::{FiberConfig, FiberState, Types, Worker};
-
-/// The list type whose elements the signals are laid out as: one word.
-const INTS: u64 = 1;
-
-/// A list type of boxes.
-const BOXES: u64 = 2;
+use crag_runtime::{FiberConfig, FiberState, Worker};
 
 /// The signals a script can take at its end.
 const MOST: usize = 8;
@@ -177,18 +170,6 @@ fn script(steps: &[Step]) -> LirFunction {
         data: Vec::new(),
         natives: Vec::new(),
     }
-}
-
-fn types() -> Arc<Types> {
-    let list = |counted: Vec<CountedField>| TypeDescriptor::List {
-        element: ElementLayout::of_words(1, counted.clone()),
-        cell: ElementLayout::of_words(1, counted.clone()),
-        ref_cell: ElementLayout::of_words(1, counted),
-    };
-    Arc::new(Types::new([
-        (INTS as u32, list(vec![])),
-        (BOXES as u32, list(vec![CountedField::Box(0)])),
-    ]))
 }
 
 /// What a script did.

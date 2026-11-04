@@ -14,17 +14,27 @@
 // You should have received a copy of the GNU General Public License along with
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
-//! Shared by the test files: compiles and loads LIR functions and creates
-//! fibers that call them.
+//! Shared by the test files: builds LIR functions, compiles and loads them
+//! and creates fibers that call them.
 #![allow(dead_code)]
 
-use crag_abi::{FuncId, RuntimeFn, SlotKey};
+use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
+
+use crag_abi::{CountedField, ElementLayout, FuncId, RuntimeFn, SlotKey, TypeDescriptor};
 use crag_codegen::{
-    CodeObject, CodegenSettings, LirFunction, OptLevel, VReg, compile, compile_entry_stub,
-    target_for,
+    Block, CodeObject, CodegenSettings, Inst, LirFunction, OptLevel, Term, VReg, compile,
+    compile_entry_stub, target_for,
 };
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
-use crag_runtime::{CodeMap, Fiber, FiberConfig, FiberState, Worker};
+use crag_runtime::{CodeMap, Fiber, FiberConfig, FiberState, Types, Worker};
+
+/// The list type whose elements the values are laid out as: one word.
+pub const INTS: u64 = 1;
+
+/// A list type of boxes.
+pub const BOXES: u64 = 2;
 
 /// Loaded functions; `FuncId(i)` is the i-th.
 pub struct Image {
@@ -131,6 +141,86 @@ impl Image {
 
 pub fn r(i: u32) -> VReg {
     VReg(i)
+}
+
+pub fn konst(dst: VReg, value: i64) -> Inst {
+    Inst::Const { dst, value }
+}
+
+pub fn runtime(func: RuntimeFn, args: Vec<VReg>, dsts: Vec<VReg>) -> Inst {
+    Inst::CallRuntime { func, args, dsts }
+}
+
+pub fn block(insts: Vec<Inst>, term: Term) -> Block {
+    Block { insts, term }
+}
+
+pub fn lir(params: u32, returns: u32, vregs: u32, blocks: Vec<Block>) -> LirFunction {
+    LirFunction {
+        params,
+        returns,
+        vregs,
+        tracked: vec![],
+        blocks,
+        data: Vec::new(),
+        natives: Vec::new(),
+    }
+}
+
+/// A function of `params` parameters that calls runtime function `func`
+/// with them and returns its `results` results.
+pub fn calling(func: RuntimeFn, params: u32, results: u32) -> LirFunction {
+    let args = (0..params).map(r).collect();
+    let dsts: Vec<_> = (params..params + results).map(r).collect();
+    lir(
+        params,
+        results,
+        params + results,
+        vec![block(
+            vec![runtime(func, args, dsts.clone())],
+            Term::Return(dsts),
+        )],
+    )
+}
+
+/// The list types `INTS` and `BOXES`.
+pub fn types() -> Arc<Types> {
+    let list = |counted: Vec<CountedField>| TypeDescriptor::List {
+        element: ElementLayout::of_words(1, counted.clone()),
+        cell: ElementLayout::of_words(1, counted.clone()),
+        ref_cell: ElementLayout::of_words(1, counted),
+    };
+    Arc::new(Types::new([
+        (INTS as u32, list(vec![])),
+        (BOXES as u32, list(vec![CountedField::Box(0)])),
+    ]))
+}
+
+pub fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+
+/// `n` milliseconds in nanoseconds, as the runtime takes durations.
+pub fn ms_nanos(n: u64) -> u64 {
+    n * 1_000_000
+}
+
+/// Ends the test process if the test hangs, as a fiber that is never
+/// woken would leave it; dropping it stands the watchdog down.
+pub struct Watchdog(mpsc::Sender<()>);
+
+/// Starts a watchdog that aborts the process, naming `what` hung, if it
+/// is not dropped within 60 seconds.
+pub fn watchdog(what: &str) -> Watchdog {
+    let what = what.to_owned();
+    let (done, waiting) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if waiting.recv_timeout(Duration::from_secs(60)) == Err(RecvTimeoutError::Timeout) {
+            eprintln!("{what} hung for 60 seconds");
+            std::process::abort();
+        }
+    });
+    Watchdog(done)
 }
 
 /// Runs the fiber to completion on a fresh worker and returns its result.

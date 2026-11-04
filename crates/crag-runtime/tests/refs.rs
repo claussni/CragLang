@@ -26,12 +26,12 @@ use std::time::Duration;
 
 mod common;
 
-use common::{Image, r};
+use common::{BOXES, INTS, Image, block, calling, konst, lir, r, runtime, types};
 use crag_abi::{
-    CountedField, ElementLayout, REF_ADD, REF_AND, REF_COMMITTED, REF_CONFLICT, REF_MAX, REF_MIN,
-    REF_MUL, REF_OR, REF_OVERFLOW, REF_SUB, REF_UNSIGNED, REF_XOR, RuntimeFn, TypeDescriptor,
+    REF_ADD, REF_AND, REF_COMMITTED, REF_CONFLICT, REF_MAX, REF_MIN, REF_MUL, REF_OR, REF_OVERFLOW,
+    REF_SUB, REF_UNSIGNED, REF_XOR, RuntimeFn,
 };
-use crag_codegen::{BinOp, Block, BlockId, Cond, Inst, LirFunction, Term, VReg};
+use crag_codegen::{BinOp, BlockId, Cond, Inst, LirFunction, Term, VReg};
 use crag_runtime::{FiberConfig, FiberState, Scheduler, SchedulerConfig, Types, Worker};
 
 const INCREMENT: usize = 0;
@@ -44,20 +44,6 @@ const READER: usize = 6;
 const APPLY: usize = 7;
 const ADDER: usize = 8;
 
-/// The list type whose elements the values are laid out as: one word.
-const INTS: u64 = 1;
-
-/// A list type of boxes.
-const BOXES: u64 = 2;
-
-fn konst(dst: VReg, value: i64) -> Inst {
-    Inst::Const { dst, value }
-}
-
-fn runtime(func: RuntimeFn, args: Vec<VReg>, dsts: Vec<VReg>) -> Inst {
-    Inst::CallRuntime { func, args, dsts }
-}
-
 fn add(dst: VReg, a: VReg, b: VReg) -> Inst {
     Inst::Bin {
         op: BinOp::Add,
@@ -65,38 +51,6 @@ fn add(dst: VReg, a: VReg, b: VReg) -> Inst {
         a,
         b,
     }
-}
-
-fn block(insts: Vec<Inst>, term: Term) -> Block {
-    Block { insts, term }
-}
-
-fn lir(params: u32, returns: u32, vregs: u32, blocks: Vec<Block>) -> LirFunction {
-    LirFunction {
-        params,
-        returns,
-        vregs,
-        tracked: vec![],
-        blocks,
-        data: Vec::new(),
-        natives: Vec::new(),
-    }
-}
-
-/// A function of `params` parameters that calls runtime function `func`
-/// with them and returns its `results` results.
-fn calling(func: RuntimeFn, params: u32, results: u32) -> LirFunction {
-    let args = (0..params).map(r).collect();
-    let dsts: Vec<_> = (params..params + results).map(r).collect();
-    lir(
-        params,
-        results,
-        params + results,
-        vec![block(
-            vec![runtime(func, args, dsts.clone())],
-            Term::Return(dsts),
-        )],
-    )
 }
 
 /// `increment(cell, n, out) = conflicts`: adds one to the ref `n` times,
@@ -282,18 +236,6 @@ fn adder() -> LirFunction {
         ],
         r(1),
     )
-}
-
-fn types() -> Arc<Types> {
-    let list = |counted: Vec<CountedField>| TypeDescriptor::List {
-        element: ElementLayout::of_words(1, counted.clone()),
-        cell: ElementLayout::of_words(1, counted.clone()),
-        ref_cell: ElementLayout::of_words(1, counted),
-    };
-    Arc::new(Types::new([
-        (INTS as u32, list(vec![])),
-        (BOXES as u32, list(vec![CountedField::Box(0)])),
-    ]))
 }
 
 /// The epoch is the process's: the tests that watch releases must not

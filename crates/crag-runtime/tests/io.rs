@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-use common::{Image, r};
+use common::{Image, ms, r};
 use crag_abi::RuntimeFn;
 use crag_codegen::{BinOp, Block, BlockId, Cond, Inst, LirFunction, Term};
 use crag_runtime::{Fiber, FiberConfig, FiberState, Scheduler, SchedulerConfig, Types, Worker};
@@ -162,10 +162,6 @@ fn scheduler(image: &mut Image, workers: usize) -> Scheduler {
         Arc::new(Types::default()),
         code,
     )
-}
-
-fn ms(n: u64) -> Duration {
-    Duration::from_millis(n)
 }
 
 fn sleeping(image: &mut Image, d: Duration, id: u64) -> Box<Fiber> {

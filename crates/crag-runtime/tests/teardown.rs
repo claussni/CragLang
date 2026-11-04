@@ -21,14 +21,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 mod common;
 
-use common::{Image, r};
+use common::{Image, block, konst, r, watchdog};
 use crag_abi::{CountedField, RuntimeFn, TrapKind, TypeDescriptor};
-use crag_codegen::{BinOp, Block, BlockId, Cond, Inst, LirFunction, Term, VReg};
+use crag_codegen::{BinOp, BlockId, Cond, Inst, LirFunction, Term, VReg};
 use crag_runtime::teardown::BUDGET;
 use crag_runtime::{FiberConfig, FiberState, Scheduler, SchedulerConfig, Types, Worker};
 
@@ -43,10 +42,6 @@ const NODE: i64 = 3;
 /// The tail of a chain: a box with a dispose handler, whose word of the
 /// handler's code is at 16, and the address of a counter at 24.
 const HANDLED: i64 = 4;
-
-fn konst(dst: VReg, value: i64) -> Inst {
-    Inst::Const { dst, value }
-}
 
 fn call(func: RuntimeFn, args: Vec<VReg>, dsts: Vec<VReg>) -> Inst {
     Inst::CallRuntime { func, args, dsts }
@@ -80,10 +75,6 @@ fn eq(dst: VReg, a: VReg, b: VReg) -> Inst {
         a,
         b,
     }
-}
-
-fn block(insts: Vec<Inst>, term: Term) -> Block {
-    Block { insts, term }
 }
 
 /// `dropper(n, code, counter) = (handled, disposal)`: builds a chain of `n`
@@ -253,21 +244,6 @@ fn types() -> Arc<Types> {
     ]))
 }
 
-/// Ends the test process if the test hangs, as a teardown that never ends
-/// would keep the scheduler waiting.
-struct Watchdog(#[allow(dead_code)] mpsc::Sender<()>);
-
-fn watchdog() -> Watchdog {
-    let (done, waiting) = mpsc::channel::<()>();
-    std::thread::spawn(move || {
-        if waiting.recv_timeout(Duration::from_secs(60)) == Err(RecvTimeoutError::Timeout) {
-            eprintln!("a teardown test hung for 60 seconds");
-            std::process::abort();
-        }
-    });
-    Watchdog(done)
-}
-
 fn image() -> Image {
     let mut image = Image::new(&[
         dropper(RuntimeFn::ReleaseDeferred),
@@ -320,7 +296,7 @@ fn drop_on_scheduler(n: u64, handler: usize) -> (u64, u64, u64, u64) {
 
 #[test]
 fn a_large_drop_leaves_the_rest_to_the_workers_which_run_its_handlers_as_tasks() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("a teardown test");
     let (before, disposal, after, traps) = drop_on_scheduler(200 * BUDGET as u64, HANDLER);
     // The drop returned before the end of the chain was reached, and its
     // handler was not queued for the task.
@@ -331,7 +307,7 @@ fn a_large_drop_leaves_the_rest_to_the_workers_which_run_its_handlers_as_tasks()
 
 #[test]
 fn a_small_drop_runs_its_handlers_through_the_tasks_queue() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("a teardown test");
     let (before, disposal, after, _) = drop_on_scheduler(10, HANDLER);
     assert_eq!(before, 0);
     assert_ne!(disposal, 0);
@@ -341,14 +317,14 @@ fn a_small_drop_runs_its_handlers_through_the_tasks_queue() {
 
 #[test]
 fn a_deferred_handler_that_traps_is_reported_and_no_one_waits_for_it() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("a teardown test");
     let (_, disposal, after, traps) = drop_on_scheduler(5 * BUDGET as u64, TRAPPING);
     assert_eq!((disposal, after, traps), (0, 0, 1));
 }
 
 #[test]
 fn without_a_scheduler_a_deferred_release_frees_everything_at_once() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("a teardown test");
     for release in [DEFERRED, PLAIN] {
         let counter = Box::new(AtomicU64::new(0));
         let mut image = image();

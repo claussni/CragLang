@@ -27,9 +27,9 @@ use std::time::Duration;
 
 mod common;
 
-use common::{Image, r};
-use crag_abi::{CountedField, ElementLayout, RuntimeFn, TX_CONFLICT, TX_OK, TypeDescriptor};
-use crag_codegen::{BinOp, Block, BlockId, Cond, Inst, LirFunction, Term, VReg};
+use common::{BOXES, INTS, Image, block, konst, lir, r, runtime, types};
+use crag_abi::{RuntimeFn, TX_CONFLICT, TX_OK};
+use crag_codegen::{BinOp, BlockId, Cond, Inst, LirFunction, Term, VReg};
 use crag_runtime::sentinel::StopReason;
 use crag_runtime::{FiberConfig, FiberState, Scheduler, SchedulerConfig, Types, Worker};
 
@@ -47,20 +47,6 @@ const BUSY_ALONE: usize = 10;
 
 /// The reruns after which a block runs alone, as the runtime has it.
 const ALONE_AFTER: usize = 8;
-
-/// The list type whose elements the values are laid out as: one word.
-const INTS: i64 = 1;
-
-/// A list type of boxes.
-const BOXES: i64 = 2;
-
-fn konst(dst: VReg, value: i64) -> Inst {
-    Inst::Const { dst, value }
-}
-
-fn runtime(func: RuntimeFn, args: Vec<VReg>, dsts: Vec<VReg>) -> Inst {
-    Inst::CallRuntime { func, args, dsts }
-}
 
 fn bin(op: BinOp, dst: VReg, a: VReg, b: VReg) -> Inst {
     Inst::Bin { op, dst, a, b }
@@ -88,22 +74,6 @@ fn branch(cond: VReg, then: u32, otherwise: u32) -> Term {
         cond,
         then: BlockId(then),
         otherwise: BlockId(otherwise),
-    }
-}
-
-fn block(insts: Vec<Inst>, term: Term) -> Block {
-    Block { insts, term }
-}
-
-fn lir(params: u32, returns: u32, vregs: u32, blocks: Vec<Block>) -> LirFunction {
-    LirFunction {
-        params,
-        returns,
-        vregs,
-        tracked: vec![],
-        blocks,
-        data: Vec::new(),
-        natives: Vec::new(),
     }
 }
 
@@ -145,7 +115,7 @@ fn transfer() -> LirFunction {
                     konst(i, 0),
                     konst(one, 1),
                     konst(zero, 0),
-                    konst(list, INTS),
+                    konst(list, INTS as i64),
                     konst(conflicts, 0),
                 ],
                 Term::Jump(BlockId(1)),
@@ -294,7 +264,7 @@ fn commit_late() -> LirFunction {
         3,
         8,
         vec![
-            konst(list, INTS),
+            konst(list, INTS as i64),
             konst(nine, 9),
             konst(zero, 0),
             begin(),
@@ -315,7 +285,7 @@ fn nested() -> LirFunction {
         4,
         7,
         vec![
-            konst(list, BOXES),
+            konst(list, BOXES as i64),
             konst(zero, 0),
             begin(),
             runtime(RuntimeFn::TxWrite, vec![a, list, x, zero], vec![]),
@@ -335,7 +305,7 @@ fn own_write() -> LirFunction {
         2,
         8,
         vec![
-            konst(list, INTS),
+            konst(list, INTS as i64),
             konst(five, 5),
             konst(zero, 0),
             begin(),
@@ -355,7 +325,7 @@ fn unchanged() -> LirFunction {
         2,
         7,
         vec![
-            konst(list, INTS),
+            konst(list, INTS as i64),
             konst(zero, 0),
             begin(),
             runtime(RuntimeFn::TxRead, vec![a, out], vec![s]),
@@ -371,7 +341,12 @@ fn unchanged() -> LirFunction {
 /// `a` and commits.
 fn alone() -> LirFunction {
     let (a, c, list, one, zero) = (r(0), r(1), r(2), r(3), r(4));
-    let mut insts = vec![konst(list, INTS), konst(one, 1), konst(zero, 0), begin()];
+    let mut insts = vec![
+        konst(list, INTS as i64),
+        konst(one, 1),
+        konst(zero, 0),
+        begin(),
+    ];
     insts.extend(retries(ALONE_AFTER));
     insts.extend([
         yields(),
@@ -385,7 +360,7 @@ fn alone() -> LirFunction {
 /// ending the block.
 fn abandon() -> LirFunction {
     let (a, x, list, zero) = (r(0), r(1), r(2), r(3));
-    let mut insts = vec![konst(list, BOXES), konst(zero, 0), begin()];
+    let mut insts = vec![konst(list, BOXES as i64), konst(zero, 0), begin()];
     insts.extend(retries(ALONE_AFTER));
     insts.push(runtime(RuntimeFn::TxWrite, vec![a, list, x, zero], vec![]));
     straight(2, 4, insts, vec![zero])
@@ -423,18 +398,6 @@ fn busy_alone() -> LirFunction {
             ),
         ],
     )
-}
-
-fn types() -> Arc<Types> {
-    let list = |counted: Vec<CountedField>| TypeDescriptor::List {
-        element: ElementLayout::of_words(1, counted.clone()),
-        cell: ElementLayout::of_words(1, counted.clone()),
-        ref_cell: ElementLayout::of_words(1, counted),
-    };
-    Arc::new(Types::new([
-        (INTS as u32, list(vec![])),
-        (BOXES as u32, list(vec![CountedField::Box(0)])),
-    ]))
 }
 
 /// The clock and its bit for a block that runs alone are the process's.
@@ -591,7 +554,7 @@ fn a_read_after_another_write_conflicts() {
     let mut out = [0u64; 2];
     let mut tx = setup.fiber(READ_LATE, &[addr(&*a), out.as_mut_ptr() as u64], 1);
     assert_eq!(setup.worker.resume(&mut tx), FiberState::Runnable);
-    setup.call(SWAP, &[addr(&*a), INTS as u64, 2, 0], 2);
+    setup.call(SWAP, &[addr(&*a), INTS, 2, 0], 2);
     assert_eq!(setup.worker.resume(&mut tx), FiberState::Finished);
     assert_eq!(tx.results().unwrap()[0], TX_CONFLICT);
 }
@@ -605,7 +568,7 @@ fn a_commit_after_another_write_conflicts() {
     let args = [addr(&*a), addr(&*b), out.as_mut_ptr() as u64];
     let mut tx = setup.fiber(COMMIT_LATE, &args, 2);
     assert_eq!(setup.worker.resume(&mut tx), FiberState::Runnable);
-    setup.call(SWAP, &[addr(&*a), INTS as u64, 2, 0], 2);
+    setup.call(SWAP, &[addr(&*a), INTS, 2, 0], 2);
     assert_eq!(setup.worker.resume(&mut tx), FiberState::Finished);
     assert_eq!(tx.results().unwrap(), [TX_OK, TX_CONFLICT]);
     assert_eq!(value(&b), 0);
@@ -681,7 +644,7 @@ fn a_block_that_runs_alone_holds_other_writes_off() {
     let mut tx = setup.fiber(ALONE, &[addr(&*a)], 1);
     assert_eq!(setup.worker.resume(&mut tx), FiberState::Runnable);
     // A swap on another thread waits for the block.
-    let swap = Moved(setup.fiber(SWAP, &[addr(&*a), INTS as u64, 2, 0], 2));
+    let swap = Moved(setup.fiber(SWAP, &[addr(&*a), INTS, 2, 0], 2));
     let types = setup.types.clone();
     let done = Arc::new(AtomicBool::new(false));
     let swapped = {
@@ -714,7 +677,7 @@ fn a_task_that_stops_in_a_block_gives_its_writes_up() {
     assert_eq!(x.count(), 1_000);
     assert_eq!(value(&a), 0);
     // It runs alone no more: this write would wait forever.
-    setup.call(SWAP, &[addr(&*a), INTS as u64, 2, 0], 2);
+    setup.call(SWAP, &[addr(&*a), INTS, 2, 0], 2);
     assert_eq!(value(&a), 2);
 }
 

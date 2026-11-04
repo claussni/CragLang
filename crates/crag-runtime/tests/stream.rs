@@ -24,12 +24,12 @@ use std::time::Duration;
 
 mod common;
 
-use common::{Image, r};
+use common::{BOXES, INTS, Image, block, calling, konst, lir, ms, r, runtime, types};
 use crag_abi::{
-    CountedField, ElementLayout, HUB_BROADCAST, HUB_FAN_OUT, RuntimeFn, STREAM_ABANDONED,
-    STREAM_CLOSED, STREAM_FULL, STREAM_OK, TrapKind, TypeDescriptor,
+    HUB_BROADCAST, HUB_FAN_OUT, RuntimeFn, STREAM_ABANDONED, STREAM_CLOSED, STREAM_FULL, STREAM_OK,
+    TrapKind,
 };
-use crag_codegen::{BinOp, Block, BlockId, Cond, Inst, LirFunction, Term, VReg};
+use crag_codegen::{BinOp, BlockId, Cond, Inst, LirFunction, Term, VReg};
 use crag_runtime::{Fiber, FiberConfig, FiberState, Scheduler, SchedulerConfig, Types, Worker};
 
 const PRODUCER: usize = 0;
@@ -45,22 +45,8 @@ const TRY_PUTS: usize = 9;
 const CLOSE: usize = 10;
 const DISPOSE: usize = 11;
 
-/// The list type whose elements the values are laid out as: one word.
-const INTS: u64 = 1;
-
-/// A list type of boxes.
-const BOXES: u64 = 2;
-
 /// A consumer that takes every value.
 const ALL: u64 = u64::MAX;
-
-fn konst(dst: VReg, value: i64) -> Inst {
-    Inst::Const { dst, value }
-}
-
-fn runtime(func: RuntimeFn, args: Vec<VReg>, dsts: Vec<VReg>) -> Inst {
-    Inst::CallRuntime { func, args, dsts }
-}
 
 fn cmp(cond: Cond, dst: VReg, a: VReg, b: VReg) -> Inst {
     Inst::Cmp { cond, dst, a, b }
@@ -72,38 +58,6 @@ fn branch(cond: VReg, then: u32, otherwise: u32) -> Term {
         then: BlockId(then),
         otherwise: BlockId(otherwise),
     }
-}
-
-fn block(insts: Vec<Inst>, term: Term) -> Block {
-    Block { insts, term }
-}
-
-fn lir(params: u32, returns: u32, vregs: u32, blocks: Vec<Block>) -> LirFunction {
-    LirFunction {
-        params,
-        returns,
-        vregs,
-        tracked: vec![],
-        blocks,
-        data: Vec::new(),
-        natives: Vec::new(),
-    }
-}
-
-/// A function of `params` parameters that calls runtime function `func`
-/// with them and returns its `results` results.
-fn calling(func: RuntimeFn, params: u32, results: u32) -> LirFunction {
-    let args = (0..params).map(r).collect();
-    let dsts: Vec<_> = (params..params + results).map(r).collect();
-    lir(
-        params,
-        results,
-        params + results,
-        vec![block(
-            vec![runtime(func, args, dsts.clone())],
-            Term::Return(dsts),
-        )],
-    )
 }
 
 /// `producer(sink, n, close, fixed) = (sent, status)`: puts 1 to `n`, or
@@ -268,18 +222,6 @@ fn try_puts() -> LirFunction {
     )
 }
 
-fn types() -> Arc<Types> {
-    let list = |counted: Vec<CountedField>| TypeDescriptor::List {
-        element: ElementLayout::of_words(1, counted.clone()),
-        cell: ElementLayout::of_words(1, counted.clone()),
-        ref_cell: ElementLayout::of_words(1, counted),
-    };
-    Arc::new(Types::new([
-        (INTS as u32, list(vec![])),
-        (BOXES as u32, list(vec![CountedField::Box(0)])),
-    ]))
-}
-
 struct Setup {
     image: Image,
     types: Arc<Types>,
@@ -418,10 +360,6 @@ fn results(fiber: &Fiber) -> [u64; 2] {
 fn kind(fiber: &Fiber) -> TrapKind {
     assert_eq!(fiber.state(), FiberState::Trapped);
     fiber.trap().unwrap().kind
-}
-
-fn ms(n: u64) -> Duration {
-    Duration::from_millis(n)
 }
 
 fn one_to(n: u64) -> Vec<u64> {

@@ -21,17 +21,15 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 mod common;
 
-use common::{Image, r};
-use crag_abi::{
-    CountedField, ElementLayout, LAZY_DONE, LAZY_RUN, LAZY_TRAPPED, RuntimeFn, TrapKind,
-    TypeDescriptor,
+use common::{
+    BOXES, INTS, Image, block, calling, konst, lir, ms_nanos, r, runtime, types, watchdog,
 };
-use crag_codegen::{Block, BlockId, Cond, Inst, LirFunction, Term, VReg};
+use crag_abi::{LAZY_DONE, LAZY_RUN, LAZY_TRAPPED, RuntimeFn, TrapKind};
+use crag_codegen::{Block, BlockId, Cond, Inst, LirFunction, Term};
 use crag_runtime::{Fiber, FiberConfig, FiberState, Scheduler, SchedulerConfig, Types, Worker};
 
 const LAZY_NEW: usize = 0;
@@ -39,50 +37,6 @@ const LAZY_FREE: usize = 1;
 const READER: usize = 2;
 const TRAPPER: usize = 3;
 const SELF_READER: usize = 4;
-
-/// The list type whose elements the values are laid out as: one word.
-const INTS: u64 = 1;
-
-/// A list type of boxes.
-const BOXES: u64 = 2;
-
-fn konst(dst: VReg, value: i64) -> Inst {
-    Inst::Const { dst, value }
-}
-
-fn runtime(func: RuntimeFn, args: Vec<VReg>, dsts: Vec<VReg>) -> Inst {
-    Inst::CallRuntime { func, args, dsts }
-}
-
-fn block(insts: Vec<Inst>, term: Term) -> Block {
-    Block { insts, term }
-}
-
-fn lir(params: u32, returns: u32, vregs: u32, blocks: Vec<Block>) -> LirFunction {
-    LirFunction {
-        params,
-        returns,
-        vregs,
-        tracked: vec![],
-        blocks,
-        data: Vec::new(),
-        natives: Vec::new(),
-    }
-}
-
-fn calling(func: RuntimeFn, params: u32, results: u32) -> LirFunction {
-    let args = (0..params).map(r).collect();
-    let dsts: Vec<_> = (params..params + results).map(r).collect();
-    lir(
-        params,
-        results,
-        params + results,
-        vec![block(
-            vec![runtime(func, args, dsts.clone())],
-            Term::Return(dsts),
-        )],
-    )
-}
 
 /// The first block of a reader: reads the cell, and goes on to block 1
 /// if it must compute the value, else to block 2. Registers 0 and 1 are
@@ -176,33 +130,6 @@ fn self_reader() -> LirFunction {
     )
 }
 
-fn types() -> Arc<Types> {
-    let list = |counted: Vec<CountedField>| TypeDescriptor::List {
-        element: ElementLayout::of_words(1, counted.clone()),
-        cell: ElementLayout::of_words(1, counted.clone()),
-        ref_cell: ElementLayout::of_words(1, counted),
-    };
-    Arc::new(Types::new([
-        (INTS as u32, list(vec![])),
-        (BOXES as u32, list(vec![CountedField::Box(0)])),
-    ]))
-}
-
-/// Ends the test process if the test hangs, as reads that are never
-/// woken would.
-struct Watchdog(#[allow(dead_code)] mpsc::Sender<()>);
-
-fn watchdog() -> Watchdog {
-    let (done, waiting) = mpsc::channel::<()>();
-    std::thread::spawn(move || {
-        if waiting.recv_timeout(Duration::from_secs(60)) == Err(RecvTimeoutError::Timeout) {
-            eprintln!("a lazy test hung for 60 seconds");
-            std::process::abort();
-        }
-    });
-    Watchdog(done)
-}
-
 struct Setup {
     image: Image,
     types: Arc<Types>,
@@ -287,10 +214,6 @@ impl Setup {
     }
 }
 
-fn ms(n: u64) -> u64 {
-    n * 1_000_000
-}
-
 fn pause(n: u64) {
     std::thread::sleep(Duration::from_millis(n));
 }
@@ -319,7 +242,7 @@ fn status(fiber: &Fiber) -> u64 {
 
 #[test]
 fn the_first_read_computes_the_value_and_the_others_wait_for_it() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("a lazy test");
     const READERS: u64 = 8;
     let mut setup = Setup::new();
     let lazy = setup.lazy(INTS);
@@ -327,7 +250,7 @@ fn the_first_read_computes_the_value_and_the_others_wait_for_it() {
     let fibers: Vec<_> = outs
         .iter_mut()
         .enumerate()
-        .map(|(i, out)| setup.fiber(READER, lazy, out, 100 + i as u64, ms(20)))
+        .map(|(i, out)| setup.fiber(READER, lazy, out, 100 + i as u64, ms_nanos(20)))
         .collect();
     let scheduler = setup.scheduler(4);
     scheduler.spawn_all(fibers);
@@ -347,11 +270,11 @@ fn the_first_read_computes_the_value_and_the_others_wait_for_it() {
 
 #[test]
 fn a_trap_in_the_computation_traps_every_read() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("a lazy test");
     let mut setup = Setup::new();
     let lazy = setup.lazy(INTS);
     let (mut a, mut b) = (Box::new([0; 2]), Box::new([0; 2]));
-    let computing = setup.fiber(TRAPPER, lazy, &mut a, 0, ms(30));
+    let computing = setup.fiber(TRAPPER, lazy, &mut a, 0, ms_nanos(30));
     let waiting = setup.fiber(READER, lazy, &mut b, 7, 0);
     let order = [&raw const *computing, &raw const *waiting];
     let scheduler = setup.scheduler(2);
@@ -369,11 +292,11 @@ fn a_trap_in_the_computation_traps_every_read() {
 
 #[test]
 fn a_cancelled_computation_passes_to_a_waiting_read() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("a lazy test");
     let mut setup = Setup::new();
     let lazy = setup.lazy(INTS);
     let (mut a, mut b) = (Box::new([0; 2]), Box::new([0; 2]));
-    let computing = setup.fiber(READER, lazy, &mut a, 1, ms(10_000));
+    let computing = setup.fiber(READER, lazy, &mut a, 1, ms_nanos(10_000));
     let handle = computing.cancel_handle();
     let waiting = setup.fiber(READER, lazy, &mut b, 2, 0);
     let order = [&raw const *computing, &raw const *waiting];
@@ -393,11 +316,11 @@ fn a_cancelled_computation_passes_to_a_waiting_read() {
 
 #[test]
 fn a_cancelled_computation_with_no_one_waiting_leaves_the_cell_unstarted() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("a lazy test");
     let mut setup = Setup::new();
     let lazy = setup.lazy(INTS);
     let mut a = Box::new([0; 2]);
-    let computing = setup.fiber(READER, lazy, &mut a, 1, ms(10_000));
+    let computing = setup.fiber(READER, lazy, &mut a, 1, ms_nanos(10_000));
     let handle = computing.cancel_handle();
     let scheduler = setup.scheduler(1);
     scheduler.spawn(computing);
@@ -414,7 +337,7 @@ fn a_cancelled_computation_with_no_one_waiting_leaves_the_cell_unstarted() {
 
 #[test]
 fn a_computation_that_reads_its_own_value_traps_with_cycle() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("a lazy test");
     let mut setup = Setup::new();
     let lazy = setup.lazy(INTS);
     let mut a = Box::new([0; 2]);
@@ -428,7 +351,7 @@ fn a_computation_that_reads_its_own_value_traps_with_cycle() {
 
 #[test]
 fn reads_get_references_of_their_own_and_the_cell_releases_its() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("a lazy test");
     let x = Box::new([AtomicU64::new(1_000), AtomicU64::new(0)]);
     let address = std::ptr::from_ref(&*x) as u64;
     let mut setup = Setup::new();
@@ -448,7 +371,7 @@ fn reads_get_references_of_their_own_and_the_cell_releases_its() {
 
 #[test]
 fn without_a_scheduler_a_read_that_would_wait_is_unsupported() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("a lazy test");
     let mut setup = Setup::new();
     let lazy = setup.lazy(INTS);
     let (mut a, mut b) = (Box::new([0; 2]), Box::new([0; 2]));

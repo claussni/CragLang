@@ -20,14 +20,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 mod common;
 
-use common::{Image, r};
+use common::{Image, block, calling, konst, lir, ms_nanos, r, runtime, watchdog};
 use crag_abi::{RuntimeFn, TrapKind};
-use crag_codegen::{BinOp, Block, BlockId, Cond, Inst, LirFunction, Term, VReg};
+use crag_codegen::{BinOp, BlockId, Cond, Inst, LirFunction, Term};
 use crag_runtime::{Fiber, FiberConfig, FiberState, Scheduler, SchedulerConfig, Types, Worker};
 
 const EXT_NEW: usize = 0;
@@ -36,44 +35,6 @@ const TURNS: usize = 2;
 const HOLD: usize = 3;
 const ONCE: usize = 4;
 const TRAP_HOLDING: usize = 5;
-
-fn konst(dst: VReg, value: i64) -> Inst {
-    Inst::Const { dst, value }
-}
-
-fn runtime(func: RuntimeFn, args: Vec<VReg>, dsts: Vec<VReg>) -> Inst {
-    Inst::CallRuntime { func, args, dsts }
-}
-
-fn block(insts: Vec<Inst>, term: Term) -> Block {
-    Block { insts, term }
-}
-
-fn lir(params: u32, returns: u32, vregs: u32, blocks: Vec<Block>) -> LirFunction {
-    LirFunction {
-        params,
-        returns,
-        vregs,
-        tracked: vec![],
-        blocks,
-        data: Vec::new(),
-        natives: Vec::new(),
-    }
-}
-
-fn calling(func: RuntimeFn, params: u32, results: u32) -> LirFunction {
-    let args = (0..params).map(r).collect();
-    let dsts: Vec<_> = (params..params + results).map(r).collect();
-    lir(
-        params,
-        results,
-        params + results,
-        vec![block(
-            vec![runtime(func, args, dsts.clone())],
-            Term::Return(dsts),
-        )],
-    )
-}
 
 /// `turns(ext, counter, n) = n`: `n` times, adds one to the word at
 /// `counter` while it holds the lock, yielding between the load and the
@@ -187,21 +148,6 @@ fn trap_holding() -> LirFunction {
     )
 }
 
-/// Ends the test process if the test hangs, as a lock that is never given
-/// up leaves its waiters.
-struct Watchdog(#[allow(dead_code)] mpsc::Sender<()>);
-
-fn watchdog() -> Watchdog {
-    let (done, waiting) = mpsc::channel::<()>();
-    std::thread::spawn(move || {
-        if waiting.recv_timeout(Duration::from_secs(60)) == Err(RecvTimeoutError::Timeout) {
-            eprintln!("an ext test hung for 60 seconds");
-            std::process::abort();
-        }
-    });
-    Watchdog(done)
-}
-
 struct Setup {
     image: Image,
     types: Arc<Types>,
@@ -265,10 +211,6 @@ impl Setup {
     }
 }
 
-fn ms(n: u64) -> u64 {
-    n * 1_000_000
-}
-
 fn kind(fiber: &Fiber) -> TrapKind {
     assert_eq!(fiber.state(), FiberState::Trapped);
     fiber.trap().unwrap().kind
@@ -276,7 +218,7 @@ fn kind(fiber: &Fiber) -> TrapKind {
 
 #[test]
 fn tasks_take_turns_at_the_lock_while_they_suspend_holding_it() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("an ext test");
     const TASKS: u64 = 8;
     const EACH: u64 = 500;
     let mut setup = Setup::new();
@@ -298,10 +240,10 @@ fn tasks_take_turns_at_the_lock_while_they_suspend_holding_it() {
 
 #[test]
 fn a_task_cancelled_while_it_waits_for_the_lock_leaves_the_queue() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("an ext test");
     let mut setup = Setup::new();
     let ext = setup.ext();
-    let holder = setup.fiber(HOLD, &[ext, ms(100)]);
+    let holder = setup.fiber(HOLD, &[ext, ms_nanos(100)]);
     let waiter = setup.fiber(ONCE, &[ext]);
     let handle = waiter.cancel_handle();
     let later = setup.fiber(ONCE, &[ext]);
@@ -333,7 +275,7 @@ fn a_task_cancelled_while_it_waits_for_the_lock_leaves_the_queue() {
 
 #[test]
 fn a_task_that_traps_holding_the_lock_gives_it_up() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("an ext test");
     let mut setup = Setup::new();
     let ext = setup.ext();
     let fiber = setup.resume(TRAP_HOLDING, &[ext], 1);
@@ -345,10 +287,10 @@ fn a_task_that_traps_holding_the_lock_gives_it_up() {
 
 #[test]
 fn a_task_that_traps_holding_the_lock_hands_it_to_a_waiter() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("an ext test");
     let mut setup = Setup::new();
     let ext = setup.ext();
-    let holder = setup.fiber(HOLD, &[ext, ms(50)]);
+    let holder = setup.fiber(HOLD, &[ext, ms_nanos(50)]);
     let handle = holder.cancel_handle();
     let waiter = setup.fiber(ONCE, &[ext]);
     let scheduler = setup.scheduler(2);
@@ -368,7 +310,7 @@ fn a_task_that_traps_holding_the_lock_hands_it_to_a_waiter() {
 
 #[test]
 fn without_a_scheduler_a_lock_that_would_wait_is_unsupported() {
-    let _watchdog = watchdog();
+    let _watchdog = watchdog("an ext test");
     let mut setup = Setup::new();
     let ext = setup.ext();
     let counter = Box::new(AtomicU64::new(0));

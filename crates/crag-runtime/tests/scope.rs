@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-use common::{Image, r};
+use common::{Image, block, konst, ms, r, runtime};
 use crag_abi::{
     FuncId, RuntimeFn, SCOPE_DONE, START_EXEMPT, TASK_CANCELLED, TASK_RETURNED, TASK_TRAPPED,
     TrapKind,
@@ -47,20 +47,8 @@ const CANCEL_AFTER_FIRST: u64 = 1;
 /// scope as its environment, as a group's body is started.
 const AS_BODY: u64 = 2;
 
-fn konst(dst: VReg, value: i64) -> Inst {
-    Inst::Const { dst, value }
-}
-
 fn bin(op: BinOp, dst: VReg, a: VReg, b: VReg) -> Inst {
     Inst::Bin { op, dst, a, b }
-}
-
-fn runtime(func: RuntimeFn, args: Vec<VReg>, dsts: Vec<VReg>) -> Inst {
-    Inst::CallRuntime { func, args, dsts }
-}
-
-fn block(insts: Vec<Inst>, term: Term) -> Block {
-    Block { insts, term }
 }
 
 fn function(params: u32, vregs: u32, blocks: Vec<Block>) -> LirFunction {
@@ -413,10 +401,6 @@ impl Run {
     fn taken(&self, n: usize) -> &[[u64; 3]] {
         &self.out[..n]
     }
-}
-
-fn ms(n: u64) -> Duration {
-    Duration::from_millis(n)
 }
 
 fn kind(fiber: &Fiber) -> TrapKind {
