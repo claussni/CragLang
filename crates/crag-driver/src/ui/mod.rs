@@ -32,8 +32,8 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, Event, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -55,7 +55,12 @@ fn restore(enhanced: bool) {
     if enhanced {
         let _ = execute!(out, PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(out, LeaveAlternateScreen, crossterm::cursor::Show);
+    let _ = execute!(
+        out,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
     let _ = disable_raw_mode();
 }
 
@@ -63,7 +68,8 @@ fn restore(enhanced: bool) {
 pub fn run(mut ui: Ui) -> io::Result<u8> {
     enable_raw_mode()?;
     let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen)?;
+    // A paste arrives whole, not as keys that would run line by line.
+    execute!(out, EnterAlternateScreen, EnableBracketedPaste)?;
     // Every modifier combination, where the terminal can tell them apart.
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);
     if enhanced {
