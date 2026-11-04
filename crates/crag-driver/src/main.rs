@@ -66,6 +66,10 @@ fn main() -> ExitCode {
             ExitCode::from(crag_driver::crag_ui(root))
         }
         [] => ExitCode::from(crag_repl(root)),
+        ["run", "--budgets"] => {
+            eprintln!("error: `--budgets` needs a directory");
+            ExitCode::from(1)
+        }
         ["run", ref rest @ ..] => {
             // The budget directory, else `CRAG_BUDGETS` (§18.7).
             let (budgets, rest) = match rest {

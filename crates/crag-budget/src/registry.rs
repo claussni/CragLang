@@ -97,6 +97,8 @@ struct Enforced {
     steps: u64,
     memory: u64,
     runs: u64,
+    /// The steps granted to the runs not yet stopped, which a reset keeps.
+    held: u64,
     /// The number of the last stamp admitted.
     last: u64,
 }
@@ -171,6 +173,7 @@ impl Registry {
                                 steps: 0,
                                 memory: 0,
                                 runs: 0,
+                                held: 0,
                                 last: 0,
                             }),
                         }));
@@ -273,13 +276,14 @@ impl Registry {
         }
     }
 
-    /// Gives back what a budget has taken: its steps and runs.
+    /// Gives back what a budget has taken: its runs and the steps of the
+    /// runs that stopped. Runs still going keep their steps and memory.
     pub fn reset(&self, side: Side, index: usize) -> bool {
         match side {
             Side::Receiving => match self.receiving.get(index) {
                 Some(b) => {
                     let mut s = lock(&b.state);
-                    s.steps = 0;
+                    s.steps = s.held;
                     s.runs = 0;
                     true
                 }
@@ -372,6 +376,7 @@ impl Registry {
         let granted_steps = steps_left.map_or(steps, |l| l.min(steps));
         let granted_memory = memory_left.map_or(memory, |l| l.min(memory));
         s.steps += granted_steps;
+        s.held += granted_steps;
         s.memory += granted_memory;
         Ok(Grant {
             budget: budget.clone(),
@@ -407,9 +412,9 @@ impl Grant {
 
     fn give_back(&self, steps: u64) {
         let mut s = lock(&self.budget.state);
-        // A reset since may have given the steps back already.
-        s.steps = s.steps.saturating_sub(steps);
-        s.memory = s.memory.saturating_sub(self.memory);
+        s.held -= self.steps;
+        s.steps -= steps;
+        s.memory -= self.memory;
     }
 }
 
@@ -516,6 +521,37 @@ mod tests {
             r.admit(Some(&s), b"t", b"e"),
             Err(Refusal::Limit { .. })
         ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reset_keeps_held_memory_and_the_last_number() {
+        let dir = directory("reset");
+        let r = Registry::load(&dir).unwrap();
+        let stamp = r.stamp(0, b"t", b"e").unwrap();
+        r.admit(Some(&stamp), b"t", b"e").unwrap();
+        r.reserve(0, 300, 1).unwrap().settle(0);
+        let running = r.reserve(0, 100, 3000).unwrap();
+        assert!(r.reset(Side::Receiving, 0));
+        assert!(r.reset(Side::Sending, 0));
+        let used = r.usage(Side::Receiving, 0).unwrap();
+        assert_eq!(
+            (used.steps, used.memory, used.runs),
+            (Some(100), Some(3000), 0)
+        );
+        assert_eq!(r.usage(Side::Sending, 0).unwrap().runs, 0);
+        // The running run's memory is still held, so a second run gets
+        // only what is left.
+        assert_eq!(r.reserve(0, 1, 3000).unwrap().memory, 1096);
+        // What it leaves of its steps goes back when it ends.
+        running.settle(60);
+        assert_eq!(r.usage(Side::Receiving, 0).unwrap().steps, Some(40));
+        assert!(r.reset(Side::Receiving, 0));
+        assert_eq!(r.usage(Side::Receiving, 0).unwrap().steps, Some(0));
+        // A replay stays refused.
+        let again = r.admit(Some(&stamp), b"t", b"e");
+        assert!(matches!(again, Err(Refusal::Unbudgeted(m)) if m.contains("already")));
+        assert!(!r.reset(Side::Receiving, 9));
         let _ = std::fs::remove_dir_all(dir);
     }
 

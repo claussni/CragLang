@@ -37,6 +37,12 @@ fn run(name: &str, app: &str) -> (i32, String) {
 
 /// What `run` gives, with these variables set for the program.
 fn run_with(name: &str, app: &str, vars: &[(&str, &str)]) -> (i32, String) {
+    run_args(name, app, &[], vars)
+}
+
+/// What `run` gives, with these arguments to `crag run` and these
+/// variables set.
+fn run_args(name: &str, app: &str, args: &[&str], vars: &[(&str, &str)]) -> (i32, String) {
     let root = std::env::temp_dir().join(format!("crag-transport-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
@@ -44,6 +50,7 @@ fn run_with(name: &str, app: &str, vars: &[(&str, &str)]) -> (i32, String) {
     fs::write(root.join("app.crag"), app).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_crag"))
         .arg("run")
+        .args(args)
         .envs(vars.iter().copied())
         .current_dir(&root)
         .stdout(Stdio::piped())
@@ -454,6 +461,60 @@ fn main() -> () {
     let (status, out) = run_budgeted("bad-dir", "fn main() -> () {}\n", &dir.join("missing"));
     assert_ne!(status, 0, "{out}");
     assert!(out.contains("budget directory"), "{out}");
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_budget_directory_may_be_given_to_crag_run() {
+    // The flag wins over the variable.
+    let dir = budget_dir("flag", BUDGETS);
+    let app = "import std.io\nimport std.transport\n\
+               fn main() -> () {\n  let b = list()\n  \
+               printLine(\"{b.receiving.count()} {b.sending.count()}\")\n}\n";
+    let flag = dir.to_string_lossy().into_owned();
+    let missing = dir.join("missing").to_string_lossy().into_owned();
+    let (status, out) = run_args(
+        "flag",
+        app,
+        &["--budgets", &flag],
+        &[("CRAG_BUDGETS", &missing)],
+    );
+    assert_eq!(status, 0, "{out}");
+    assert_eq!(out, "2 2\n");
+    let (status, out) = run_args("flag-missing", app, &["--budgets", &missing], &[]);
+    assert_ne!(status, 0, "{out}");
+    assert!(out.contains("budget directory"), "{out}");
+    let (status, out) = run_args("flag-bare", app, &["--budgets"], &[]);
+    assert_ne!(status, 0, "{out}");
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_reset_gives_back_steps_and_runs_but_admits_no_replay() {
+    let dir = budget_dir("reset", BUDGETS);
+    let send = "let a = send(to, list().sending[0], { n: Int -> spin(n) })";
+    let arrived = "case decoded(bytes) {\n    \
+                   e: Code -> {\n      \
+                   let acme = list().receiving[0]\n      \
+                   printLine(report(run(e, 1000000000, Policy())))\n      \
+                   printLine(report(run(e, 6, Policy())))\n      \
+                   reset(acme)\n      \
+                   printLine(\"{usage(acme)}\")\n      \
+                   printLine(report(run(e, 6, Policy())))\n    }\n    \
+                   why: Str -> printLine(why)\n  }\n  \
+                   case decoded(bytes) {\n    \
+                   e: Code -> printLine(\"replayed\")\n    \
+                   why: Str -> printLine(why)\n  }";
+    let (status, out) = run_budgeted("reset", &loopback(send, arrived, 1), &dir);
+    assert_eq!(status, 0, "{out}");
+    assert_eq!(
+        out,
+        "budget limit: partners/acme\n\
+         budget limit: partners/acme\n\
+         Usage(steps: 0, memory: 0, runs: 0)\n\
+         ran 21\n\
+         unbudgeted: budget `acme` admitted this stamp's number already\n"
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
