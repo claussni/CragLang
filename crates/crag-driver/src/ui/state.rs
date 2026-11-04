@@ -19,7 +19,6 @@
 //! and ticks, and `view` draws it.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -2125,9 +2124,4 @@ fn move_or_edit(b: &mut Buffer, command: Command, page: usize, clipboard: &mut S
     } else if line >= b.scroll + page.max(1) {
         b.scroll = line + 1 - page.max(1);
     }
-}
-
-/// The paths of files the UI may open, for tests.
-pub fn project_path(ui: &Ui, file: &str) -> Option<PathBuf> {
-    ui.repl.project().root.as_ref().map(|r| r.join(file))
 }

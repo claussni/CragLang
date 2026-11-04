@@ -29,7 +29,6 @@
 use crag_db::Db;
 use crag_hir::{BindingId, Name, Owner, PatId, Program, hir_body};
 
-use crate::body_types;
 use crate::case::{Checker, Ctor, ListLen, Pattern, Value, domain};
 use crate::ty::{Builtin, Ty};
 
@@ -111,24 +110,10 @@ pub enum DecisionTree<'db> {
     },
 }
 
-/// The decision tree of patterns of a body matched against a value of
-/// `subject`, one arm per pattern, with whether the arm has a guard. None
-/// when a pattern did not type.
-pub fn decision_tree<'db>(
-    db: &'db dyn Db,
-    program: Program,
-    owner: Owner<'db>,
-    subject: Ty<'db>,
-    arms: &[(PatId, bool)],
-) -> Option<DecisionTree<'db>> {
-    let pats = &body_types(db, program, owner).pats;
-    decision_tree_with(db, program, owner, pats, subject, arms)
-}
-
 /// The decision tree with the patterns of the body typed by `pats`, one
 /// type per pattern: those of an instance of a generic function, whose
 /// type parameters are replaced (§11.5.10).
-pub fn decision_tree_with<'db>(
+pub fn decision_tree<'db>(
     db: &'db dyn Db,
     program: Program,
     owner: Owner<'db>,

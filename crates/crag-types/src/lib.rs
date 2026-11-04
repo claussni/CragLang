@@ -53,7 +53,7 @@ use crag_hir::{ItemKind, ModuleId, Owner, Program, owners};
 
 pub use canonical::{TypeHash, type_hash};
 pub use case::{ListLen, Value};
-pub use decision::{Bindings, DecisionTree, Position, Step, decision_tree, decision_tree_with};
+pub use decision::{Bindings, DecisionTree, Position, Step, decision_tree};
 pub use def::{
     FieldDef, HeaderKind, SigParam, Signature, TypeDef, TypeDefKind, TypeHeader, alias_target,
     c_out, c_signature, is_cstr, is_public, place_positional, prelude_item, signature,

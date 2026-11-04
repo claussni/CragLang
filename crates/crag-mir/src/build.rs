@@ -43,9 +43,9 @@ use crag_hir::{
 use crag_types::{
     Builtin, CForm, Callee, DecisionTree, Dispatch, EscapeLevel, Filling, Handler, HandlerCode,
     InferenceResult, Instance, Iteration, ListLen, Position, SigParam, Signature, Step, Ty, TyKind,
-    TypeDefKind, Value, body_types, decision_tree_with, declared_fields, derived_op,
-    dispose_handler, fields_of, is_text, lifecycle_handler, literal_value, prelude_item,
-    result_type, signature, subst, type_def, type_header, value_type,
+    TypeDefKind, Value, body_types, decision_tree, declared_fields, derived_op, dispose_handler,
+    fields_of, is_text, lifecycle_handler, literal_value, prelude_item, result_type, signature,
+    subst, type_def, type_header, value_type,
 };
 
 use crate::ir::{
@@ -5195,7 +5195,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
             _ => {}
         }
         let subject = self.materialize(op, ty);
-        let Some(tree) = decision_tree_with(
+        let Some(tree) = decision_tree(
             self.db,
             self.program,
             self.owner,
@@ -5622,8 +5622,7 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let local = self.place_of(subject);
         let ty = self.ty(subject);
         let spec: Vec<(PatId, bool)> = arms.iter().map(|a| (a.pat, a.guard.is_some())).collect();
-        let Some(tree) =
-            decision_tree_with(self.db, self.program, self.owner, &self.pats, ty, &spec)
+        let Some(tree) = decision_tree(self.db, self.program, self.owner, &self.pats, ty, &spec)
         else {
             self.trap(TrapKind::Error, Some(expr));
             return;

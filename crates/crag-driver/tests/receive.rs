@@ -22,8 +22,8 @@ use std::path::PathBuf;
 
 use crag_backend::tree::{Value, decode_tree, encode_tree, expr_tree, type_value};
 use crag_driver::project::Project;
-use crag_driver::receive::{Accept, Checked, Rejection, Slot, check_received};
 use crag_hir::{Owner, item_tree, owners};
+use crag_receive::{Accept, Checked, Rejection, Slot, check_received};
 use crag_types::{TyKind, body_types, signature};
 
 const MANIFEST: &str = "package demo 0.1\nruntime 0.0\nmain demo.app\n";
