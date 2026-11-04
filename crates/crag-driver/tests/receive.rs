@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use crag_backend::tree::{Value, decode_tree, encode_tree, expr_tree, type_value};
 use crag_driver::project::Project;
-use crag_driver::receive::{Accept, Checked, Rejection, check_received};
+use crag_driver::receive::{Accept, Checked, Rejection, Slot, check_received};
 use crag_hir::{Owner, item_tree, owners};
 use crag_types::{TyKind, body_types, signature};
 
@@ -76,14 +76,26 @@ fn expected(project: &Project, function: &str) -> Value {
     type_value(db, program, args[0]).unwrap()
 }
 
+/// Checks a tree in a slot of its own.
 fn check(
     receiver: &mut Project,
     bytes: &[u8],
     function: &str,
     accept: Accept,
 ) -> Result<Checked, Rejection> {
+    let mut slot = Slot::new(&mut receiver.db, receiver.program);
+    check_in(receiver, &mut slot, bytes, function, accept)
+}
+
+fn check_in(
+    receiver: &mut Project,
+    slot: &mut Slot,
+    bytes: &[u8],
+    function: &str,
+    accept: Accept,
+) -> Result<Checked, Rejection> {
     let expected = expected(receiver, function);
-    check_received(&mut receiver.db, receiver.program, bytes, &expected, accept)
+    check_received(&mut receiver.db, slot, bytes, &expected, accept)
 }
 
 /// The sender's function that sends a closure calling `limit`.
@@ -122,21 +134,29 @@ fn rich(k: Int) -> Int {
 fn received_code_reads_back_as_sent() {
     // Loopback: the sender's own program accepts each of its trees under
     // every policy, closures with captures and helpers and a named `pub`
-    // function alike, and nothing diverges.
+    // function alike, and nothing diverges. All trees take turns in the
+    // one received module, each under names of its own.
     let mut project = load("loopback", SENDER);
+    let mut slot = Slot::new(&mut project.db, project.program);
+    let mut roots = Vec::new();
     for function in ["named", "simple", "checked", "rich"] {
         let bytes = sent(&project, function);
         for accept in [Accept::Exact, Accept::SameMajor, Accept::Signature] {
-            let checked = check(&mut project, &bytes, "send", accept)
+            let checked = check_in(&mut project, &mut slot, &bytes, "send", accept)
                 .unwrap_or_else(|e| panic!("{function}: {e:?}"));
             assert!(checked.mismatched.is_empty(), "{function}");
+            assert_eq!(checked.program, slot.program(), "{function}");
+            roots.push(checked.root);
         }
     }
+    roots.dedup();
+    assert_eq!(roots.len(), 12, "{roots:?}");
     // A literal keeps its sign in the tree.
     let bytes = sent(&project, "simple");
-    let simple = check(&mut project, &bytes, "send", Accept::Exact).unwrap();
+    let simple = check_in(&mut project, &mut slot, &bytes, "send", Accept::Exact).unwrap();
     assert!(simple.source.contains("(-1)"), "{}", simple.source);
-    assert!(simple.source.contains("fn h0("), "{}", simple.source);
+    assert!(simple.source.contains("fn h12_0("), "{}", simple.source);
+    assert!(simple.source.contains("fn received12("), "{}", simple.source);
 }
 
 #[test]

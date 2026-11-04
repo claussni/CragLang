@@ -102,23 +102,27 @@ pub fn grow(n: Int) -> Int {
 }
 
 fn twice(n: Int) -> Int { n + n }
+
+fn plus(n: Int) -> Int { n + 1 }
 "#;
 
 #[test]
 fn received_code_runs_next_to_the_programs_data() {
     // The closure's captures, the program's `pub` functions, a helper it
     // bundles and a module value they read all reach the code the program
-    // compiled again; the result comes back as it is.
+    // compiled again; the result comes back as it is. Trees that bundle
+    // different helpers each run their own.
     let app = format!(
         "{REPORT}\nfn main() -> () {{\n  let k = 7\n  \
          go({{ x -> x * k }}, 6, Policy())\n  \
          go({{ x -> triple(x) + twice(x) }}, 2, Policy())\n  \
          go({{ x -> lookup(x) }}, 2, Policy(accept: Signature))\n  \
-         go(triple, 5, Policy())\n}}\n"
+         go(triple, 5, Policy())\n  \
+         go({{ x -> plus(x) }}, 2, Policy())\n}}\n"
     );
     let (status, out) = run("runs", &app);
     assert_eq!(status, 0, "{out}");
-    assert_eq!(out, "ran 42\nran 10\nran 30\nran 15\n");
+    assert_eq!(out, "ran 42\nran 10\nran 30\nran 15\nran 3\n");
 }
 
 #[test]

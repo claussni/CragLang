@@ -47,7 +47,8 @@ use crag_hir::{lower_message as lower_error, name_message as name_error};
 /// The path of the module a received tree is written to.
 pub const RECEIVED: &str = "received$";
 
-/// The function of that module that returns the received code.
+/// The function of that module that returns the received code, the
+/// tree's number following it.
 pub const ROOT: &str = "received";
 
 /// Which references a receiver accepts (§18.7): the callee's body as the
@@ -74,14 +75,70 @@ pub enum Rejection {
     Impure(String),
 }
 
+/// Where a receiver checks the trees it receives: a program of the
+/// receiver's modules and the module `RECEIVED`, whose source each tree
+/// replaces.
+///
+/// Keeping one module frees what the database held for the trees before:
+/// the queries of the module, and of the program as a whole, run again on
+/// the new source, and the results for the items it no longer declares
+/// are collected with those items once a few revisions passed without
+/// reading them. A tree's items have names of their own, `received{n}`
+/// and `h{n}_{i}` for the `n`th tree, so their instances, and with them
+/// the code a receiver keeps by instance, never stand for another tree's.
+pub struct Slot {
+    base: Program,
+    program: Program,
+    module: ModuleId,
+    file: SourceFile,
+    trees: u64,
+}
+
+impl Slot {
+    /// The slot of `base`'s modules and an empty received one.
+    pub fn new(db: &mut RootDatabase, base: Program) -> Slot {
+        let file = SourceFile::new(db, String::new());
+        let module = ModuleId::new(db, RECEIVED.to_string(), file);
+        let mut modules: Vec<ModuleId> = base
+            .modules(db)
+            .iter()
+            .copied()
+            .filter(|m| m.path(db) != RECEIVED)
+            .collect();
+        modules.push(module);
+        let resources = base.resources(db).clone();
+        let packages = base.packages(db).clone();
+        let indices = base.type_indices(db).clone();
+        let program = Program::new(db, modules, resources);
+        program.set_packages(db).to(packages);
+        if !indices.is_empty() {
+            program.set_type_indices(db).to(indices);
+        }
+        Slot {
+            base,
+            program,
+            module,
+            file,
+            trees: 0,
+        }
+    }
+
+    /// The program the received code is checked in.
+    pub fn program(&self) -> Program {
+        self.program
+    }
+}
+
 /// Received code that passed the check: the program with the module that
-/// holds it, whose function `ROOT` takes the captures and returns the
+/// holds it, whose function `root` takes the captures and returns the
 /// code.
 #[derive(Clone, Debug)]
 pub struct Checked {
     pub program: Program,
     pub module: ModuleId,
-    /// The root closure in the body of `ROOT`.
+    /// The name of the function that returns the code.
+    pub root: String,
+    /// The root closure in the body of `root`.
     pub closure: ExprId,
     pub source: String,
     /// The callees accepted although their body hash differs from the
@@ -91,17 +148,17 @@ pub struct Checked {
 }
 
 /// Checks the bytes of a tree against `expected`, the function type the
-/// receiver expects spelled out as a `TypeNode`, in a program made of
-/// `program`'s modules and the received one.
+/// receiver expects spelled out as a `TypeNode`, in the slot's program,
+/// whose received module then holds the tree.
 pub fn check_received(
     db: &mut RootDatabase,
-    program: Program,
+    slot: &mut Slot,
     bytes: &[u8],
     expected: &Value,
     accept: Accept,
 ) -> Result<Checked, Rejection> {
     let malformed = |why: String| Rejection::IllTyped(format!("a malformed tree: {why}"));
-    let sent = decode_tree(db, program, bytes).map_err(malformed)?;
+    let sent = decode_tree(db, slot.base, bytes).map_err(malformed)?;
     let sent = normalize(sent);
     match field(&sent, "version") {
         Ok(Value::Int(TREE_VERSION)) => {}
@@ -111,14 +168,18 @@ pub fn check_received(
             )));
         }
     }
-    let source = print(&sent, expected).map_err(malformed)?;
-    let (received, module) = add_module(db, program, &source);
+    let tree = slot.trees;
+    let source = print(&sent, expected, tree).map_err(malformed)?;
+    slot.trees += 1;
+    slot.file.set_text(db).to(source.clone());
+    let (received, module) = (slot.program, slot.module);
+    let root = format!("{ROOT}{tree}");
     let db: &RootDatabase = db;
     errors(db, received, module)?;
     let item = item_tree(db, module)
         .items
         .iter()
-        .find(|i| *i.id.kind(db) == ItemKind::Function && i.id.name(db).text(db) == ROOT)
+        .find(|i| *i.id.kind(db) == ItemKind::Function && *i.id.name(db).text(db) == root)
         .map(|i| i.id)
         .ok_or_else(|| malformed("no root".into()))?;
     let owner = Owner::Item(item);
@@ -139,36 +200,11 @@ pub fn check_received(
     Ok(Checked {
         program: received,
         module,
+        root,
         closure,
         source,
         mismatched,
     })
-}
-
-/// A program of `program`'s modules, its packages and the module of the
-/// source.
-fn add_module(db: &mut RootDatabase, program: Program, source: &str) -> (Program, ModuleId) {
-    let module = ModuleId::new(
-        db,
-        RECEIVED.to_string(),
-        SourceFile::new(db, source.to_string()),
-    );
-    let mut modules: Vec<ModuleId> = program
-        .modules(db)
-        .iter()
-        .copied()
-        .filter(|m| m.path(db) != RECEIVED)
-        .collect();
-    modules.push(module);
-    let resources = program.resources(db).clone();
-    let packages = program.packages(db).clone();
-    let indices = program.type_indices(db).clone();
-    let received = Program::new(db, modules, resources);
-    received.set_packages(db).to(packages);
-    if !indices.is_empty() {
-        received.set_type_indices(db).to(indices);
-    }
-    (received, module)
 }
 
 /// The errors of the received module, the first one sorted by kind.
@@ -355,11 +391,12 @@ fn field<'v>(v: &'v Value, name: &str) -> Result<&'v Value, String> {
     }
 }
 
-/// The source of the module that holds a tree.
-fn print(tree: &Value, expected: &Value) -> Result<String, String> {
+/// The source of the module that holds a tree, the `n`th it received.
+fn print(tree: &Value, expected: &Value, n: u64) -> Result<String, String> {
     let mut p = Printer {
         imports: Vec::new(),
         helpers: list(field(tree, "helpers")?)?.len(),
+        tree: n,
     };
     let mut items = String::new();
     for (i, helper) in list(field(tree, "helpers")?)?.iter().enumerate() {
@@ -368,7 +405,7 @@ fn print(tree: &Value, expected: &Value) -> Result<String, String> {
         if !(0..=64).contains(&count) {
             return Err("a helper with too many type parameters".into());
         }
-        let _ = write!(items, "fn h{i}");
+        let _ = write!(items, "fn h{n}_{i}");
         if count > 0 {
             let names: Vec<String> = (0..count).map(|k| format!("P{k}")).collect();
             let _ = write!(items, "[{}]", names.join(", "));
@@ -388,7 +425,7 @@ fn print(tree: &Value, expected: &Value) -> Result<String, String> {
     let root = p.closure(field(tree, "root")?, 1)?;
     let _ = write!(
         items,
-        "fn {ROOT}({}) -> {expr}[{expected}] {{\n  {root}\n}}\n",
+        "fn {ROOT}{n}({}) -> {expr}[{expected}] {{\n  {root}\n}}\n",
         captures.join(", ")
     );
     let mut out = String::new();
@@ -506,6 +543,8 @@ struct Printer {
     /// each is imported as.
     imports: Vec<(String, String, String)>,
     helpers: usize,
+    /// The tree's number, which its helpers' names carry.
+    tree: u64,
 }
 
 impl Printer {
@@ -813,7 +852,7 @@ impl Printer {
                 if i >= self.helpers {
                     return Err("a helper the tree does not bundle".into());
                 }
-                format!("h{i}")
+                format!("h{}_{i}", self.tree)
             }
             "Function" => {
                 let r = field(v, "target")?;

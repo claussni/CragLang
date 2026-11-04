@@ -46,9 +46,12 @@
 //! listed with the code, as `Checked::mismatched` lists it, also when the
 //! limits then refuse the code, so that `run` signals it (§18.7).
 //!
+//! Every tree is checked in one received module, whose source the next
+//! tree replaces (`Slot`), so the database holds what one tree needs and
+//! not what every tree did. Code the store loaded stays, by instance.
+//!
 //! Not built yet: a bound on the store, which keeps every function it
-//! compiled; and the received modules stay in the database after their
-//! code is loaded.
+//! compiled.
 
 extern crate crag_db as salsa;
 
@@ -71,7 +74,7 @@ use crag_runtime::transport::{self, Received, Refused, Request};
 use crag_runtime::{CodeMap, Scheduler, Types};
 
 pub use bundle::Bundle;
-pub use check::{Accept, Checked, RECEIVED, ROOT, Rejection, check_received};
+pub use check::{Accept, Checked, RECEIVED, ROOT, Rejection, Slot, check_received};
 
 /// The bytes of address space the store reserves for code.
 const ARENA: usize = 1 << 30;
@@ -189,6 +192,8 @@ struct Accepted {
 struct Store {
     db: RootDatabase,
     program: Program,
+    /// The received module every tree is checked in.
+    slot: Slot,
     arena: CodeArena,
     symbols: SymbolTable,
     /// The bytes of each function's code in the store.
@@ -213,7 +218,8 @@ fn host() -> &'static Target {
 
 impl Store {
     fn new(bundle: &Bundle, cells: HashMap<String, usize>) -> io::Result<Store> {
-        let (db, program) = bundle.open();
+        let (mut db, program) = bundle.open();
+        let slot = Slot::new(&mut db, program);
         let arena = CodeArena::new(ARENA)?;
         let mut symbols = SymbolTable::new();
         for func in RuntimeFn::ALL {
@@ -222,6 +228,7 @@ impl Store {
         Ok(Store {
             db,
             program,
+            slot,
             arena,
             symbols,
             sizes: HashMap::new(),
@@ -277,7 +284,7 @@ impl Store {
         if steps > job.steps {
             return Err(Refused::StepLimit(Vec::new()));
         }
-        let checked = check_received(&mut self.db, base, &job.tree, &expected, job.accept)
+        let checked = check_received(&mut self.db, &mut self.slot, &job.tree, &expected, job.accept)
             .map_err(|r| match r {
                 Rejection::Unresolved(m) => Refused::Unresolved(m),
                 Rejection::IllTyped(m) => Refused::IllTyped(m),
@@ -289,7 +296,7 @@ impl Store {
         let item = item_tree(db, checked.module)
             .items
             .iter()
-            .find(|i| *i.id.kind(db) == ItemKind::Function && i.id.name(db).text(db) == ROOT)
+            .find(|i| *i.id.kind(db) == ItemKind::Function && *i.id.name(db).text(db) == checked.root)
             .map(|i| i.id)
             .ok_or_else(|| ill("no root".into()))?;
         let root = InstanceKey::body(db, Owner::Item(item))
