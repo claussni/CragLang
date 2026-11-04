@@ -20,8 +20,9 @@
 use std::collections::HashMap;
 use std::fs;
 
-use crag_abi::{CodeObject, FuncId, RelocTarget};
-use crag_aot::{MAIN, emit_object, read_object, read_table};
+use crag_abi::release::Table;
+use crag_abi::{CodeObject, FuncId, Reloc, RelocKind, RelocTarget, RuntimeFn, SlotKey};
+use crag_aot::{CODE_SECTION, MAIN, emit_object};
 use crag_backend::{code, func_id};
 use crag_driver::{Project, main_instance};
 use crag_mir::Tier;
@@ -145,4 +146,123 @@ fn the_same_sources_give_the_same_bytes() {
     let root = std::env::temp_dir();
     let root = root.to_string_lossy();
     assert!(!bytes.windows(root.len()).any(|w| w == root.as_bytes()));
+}
+
+/// A function read back from an object file crag-aot wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReadFunction {
+    name: String,
+    /// Its code object, naming functions by their places.
+    object: CodeObject,
+}
+
+/// Reads the table back from an object file crag-aot wrote, its
+/// addresses offsets in `.text`.
+fn read_table(bytes: &[u8]) -> Result<Table, String> {
+    use object::read::{Object as _, ObjectSection as _};
+    let file = object::File::parse(bytes).map_err(|e| e.to_string())?;
+    let section = file
+        .section_by_name(CODE_SECTION)
+        .ok_or_else(|| format!("no {CODE_SECTION} section"))?;
+    let mut table = section.data().map_err(|e| e.to_string())?.to_vec();
+    // The addresses are written by relocations.
+    for (offset, reloc) in section.relocations() {
+        let at = offset as usize;
+        table
+            .get_mut(at..at + 8)
+            .ok_or("a relocation outside the table")?
+            .copy_from_slice(&(reloc.addend() as u64).to_le_bytes());
+    }
+    Table::decode(&table)
+}
+
+/// Reads the functions back from an object file crag-aot wrote, in
+/// their places: the code objects as they were written, but that a local
+/// relocation's addend is part of its offset.
+fn read_object(bytes: &[u8]) -> Result<Vec<ReadFunction>, String> {
+    use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _, RelocationTarget};
+    let file = object::File::parse(bytes).map_err(|e| e.to_string())?;
+    let text = file.section_by_name(".text").ok_or("no .text section")?;
+    let code = text.data().map_err(|e| e.to_string())?;
+    let table = read_table(bytes)?;
+    let mut functions = Vec::with_capacity(table.functions.len());
+    let mut ranges = Vec::with_capacity(table.functions.len());
+    for f in table.functions {
+        let (start, end) = (f.start, f.start + u64::from(f.len));
+        let mut object = f.object;
+        object.code = code
+            .get(start as usize..end as usize)
+            .ok_or("code outside .text")?
+            .to_vec();
+        ranges.push((start, end));
+        functions.push(ReadFunction {
+            name: f.name,
+            object,
+        });
+    }
+    let symbol_place = |index| -> Result<ReadTarget, String> {
+        let symbol = file.symbol_by_index(index).map_err(|e| e.to_string())?;
+        let name = symbol.name().map_err(|e| e.to_string())?;
+        if symbol.kind() == object::SymbolKind::Section {
+            return Ok(ReadTarget::Text);
+        }
+        if let Some(rest) = name.strip_prefix("crag.cell.") {
+            let (func, signature) = rest.split_once('.').ok_or("a cell without its key")?;
+            let parse = |s: &str| s.parse::<u32>().map_err(|e| e.to_string());
+            return Ok(ReadTarget::Exact(RelocTarget::Cell(SlotKey {
+                func: FuncId(parse(func)?),
+                signature: parse(signature)?,
+            })));
+        }
+        if let Some(rest) = name.strip_prefix("crag.")
+            && rest.starts_with(|c: char| c.is_ascii_digit())
+        {
+            let n = rest.split('.').next().unwrap_or_default();
+            let n = n.parse::<u32>().map_err(|e| e.to_string())?;
+            return Ok(ReadTarget::Exact(RelocTarget::Function(FuncId(n))));
+        }
+        RuntimeFn::ALL
+            .iter()
+            .find(|f| f.symbol() == name)
+            .map(|&f| ReadTarget::Exact(RelocTarget::Runtime(f)))
+            .ok_or_else(|| format!("a relocation of the unknown symbol {name}"))
+    };
+    let mut relocs: Vec<(u64, object::read::Relocation)> = text.relocations().collect();
+    relocs.sort_by_key(|&(offset, _)| offset);
+    for (offset, reloc) in relocs {
+        // The stubs come after the functions.
+        let Some(n) = ranges
+            .iter()
+            .position(|&(start, end)| (start..end).contains(&offset))
+        else {
+            continue;
+        };
+        let start = ranges[n].0;
+        let RelocationTarget::Symbol(index) = reloc.target() else {
+            return Err("a relocation without its symbol".into());
+        };
+        let (target, addend) = match symbol_place(index)? {
+            ReadTarget::Exact(target) => (target, reloc.addend()),
+            // A place in the function's own code, its addend included.
+            ReadTarget::Text => {
+                let at = u32::try_from(reloc.addend() - start as i64)
+                    .map_err(|_| "a local relocation outside its function")?;
+                (RelocTarget::Local(at), 0)
+            }
+        };
+        functions[n].object.relocs.push(Reloc {
+            offset: (offset - start) as u32,
+            kind: RelocKind::Abs64,
+            target,
+            addend,
+        });
+    }
+    Ok(functions)
+}
+
+/// Where a relocation read back points.
+enum ReadTarget {
+    Exact(RelocTarget),
+    /// Into `.text`, by the addend.
+    Text,
 }
