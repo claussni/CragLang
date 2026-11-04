@@ -52,9 +52,7 @@ use crag_types::{
 };
 
 use crate::build::counted;
-use crate::ir::{
-    BlockId, Intrinsic, Local, LocalDecl, MirBody, Place, Rvalue, Statement, Terminator,
-};
+use crate::ir::{BlockId, Local, LocalDecl, MirBody, Place, Rvalue, Statement, Terminator};
 use crate::liveness::holds;
 
 /// Turns the releases of records into reclaims, with the fields they keep
@@ -519,27 +517,7 @@ fn arrange<'db>(
 /// that moving it past a release could show, such as a dispose handler.
 fn pure(statement: &Statement<'_>) -> bool {
     match statement {
-        Statement::Assign(_, Rvalue::Intrinsic(intrinsic, _)) => matches!(
-            intrinsic,
-            Intrinsic::ListAppend
-                | Intrinsic::ListSet
-                | Intrinsic::ListConcat
-                | Intrinsic::ListSlice
-                | Intrinsic::MapInsert
-                | Intrinsic::SetInsert
-                | Intrinsic::MapRemove
-                | Intrinsic::SetContains
-                | Intrinsic::MapKeys
-                | Intrinsic::MapValues
-                | Intrinsic::CollCount
-                | Intrinsic::TextMeasure(_)
-                | Intrinsic::TextAt(_)
-                | Intrinsic::TextFind(_)
-                | Intrinsic::TextMap(_)
-                | Intrinsic::TextSlice
-                | Intrinsic::CodePointOp(_)
-                | Intrinsic::Word
-        ),
+        Statement::Assign(_, Rvalue::Intrinsic(intrinsic, _)) => intrinsic.is_pure(),
         Statement::Assign(..) | Statement::Retain(_) | Statement::Step { .. } => true,
         _ => false,
     }

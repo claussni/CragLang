@@ -618,6 +618,247 @@ impl Intrinsic<'_> {
             _ => false,
         }
     }
+
+    /// Whether the operation reads or changes what the frame keeps: its
+    /// transaction, trap, side-stack, scope and signal state. Code with one
+    /// cannot be inlined into another frame (§11.5.11).
+    pub fn keeps_frame_state(self) -> bool {
+        match self {
+            Intrinsic::TxBegin
+            | Intrinsic::TxDepth
+            | Intrinsic::TxUnwind
+            | Intrinsic::TxCommit
+            | Intrinsic::TxAbort
+            | Intrinsic::TxRetry
+            | Intrinsic::TxThrow
+            | Intrinsic::TxConflicted
+            | Intrinsic::TrapCaught(_)
+            | Intrinsic::TrapCaughtText(_)
+            | Intrinsic::SidePtr
+            | Intrinsic::SideEnd
+            | Intrinsic::SideReset
+            | Intrinsic::ScopeNew
+            | Intrinsic::ScopeStart
+            | Intrinsic::ScopeNext
+            | Intrinsic::ScopeResult
+            | Intrinsic::ScopeCancel
+            | Intrinsic::ScopeEnd
+            | Intrinsic::SignalDrain
+            | Intrinsic::SignalMark
+            | Intrinsic::SignalOn
+            | Intrinsic::SignalReset
+            | Intrinsic::TestFailure
+            | Intrinsic::Site(_) => true,
+            Intrinsic::Sleep
+            | Intrinsic::RefNew
+            | Intrinsic::RefRead
+            | Intrinsic::RefValue
+            | Intrinsic::RefDone
+            | Intrinsic::RefCommit
+            | Intrinsic::RefSwap
+            | Intrinsic::RefApply { .. }
+            | Intrinsic::ExtNew
+            | Intrinsic::ExtLock
+            | Intrinsic::ExtUnlock
+            | Intrinsic::ExtValue
+            | Intrinsic::ExtStore
+            | Intrinsic::LazyNew
+            | Intrinsic::LazyGet
+            | Intrinsic::LazyValue
+            | Intrinsic::LazyCode
+            | Intrinsic::LazySet
+            | Intrinsic::LazyTrap
+            | Intrinsic::StreamNew { .. }
+            | Intrinsic::StreamPeer
+            | Intrinsic::StreamPut { .. }
+            | Intrinsic::StreamNext
+            | Intrinsic::StreamValue
+            | Intrinsic::StreamClose
+            | Intrinsic::HubNew { .. }
+            | Intrinsic::HubSink
+            | Intrinsic::HubSource
+            | Intrinsic::HubSeal
+            | Intrinsic::HubRelease
+            | Intrinsic::IoListen
+            | Intrinsic::IoAccept
+            | Intrinsic::IoSocket
+            | Intrinsic::IoOwn
+            | Intrinsic::IoPort
+            | Intrinsic::IoConnect
+            | Intrinsic::IoRead
+            | Intrinsic::IoReadBytes
+            | Intrinsic::IoWrite
+            | Intrinsic::IoPrint
+            | Intrinsic::IoFault
+            | Intrinsic::IoReadFile
+            | Intrinsic::IoSocketAny
+            | Intrinsic::IoConnectHost
+            | Intrinsic::TextUtf8
+            | Intrinsic::TextCast
+            | Intrinsic::TextMeasure(_)
+            | Intrinsic::TextAt(_)
+            | Intrinsic::TextFind(_)
+            | Intrinsic::TextMap(_)
+            | Intrinsic::TextSlice
+            | Intrinsic::CodePointOp(_)
+            | Intrinsic::TextParse(_)
+            | Intrinsic::TextParsed
+            | Intrinsic::Word
+            | Intrinsic::ListAppend
+            | Intrinsic::TrapWith(_)
+            | Intrinsic::BytesRead
+            | Intrinsic::BytesWrite
+            | Intrinsic::BytesOfList
+            | Intrinsic::EnvArgs
+            | Intrinsic::EnvVar
+            | Intrinsic::EnvVars
+            | Intrinsic::EnvPlatform
+            | Intrinsic::CCall(_)
+            | Intrinsic::COut(_)
+            | Intrinsic::CClass
+            | Intrinsic::CStrOf { .. }
+            | Intrinsic::ExprTreeHash
+            | Intrinsic::ExprTree
+            | Intrinsic::TransportRun
+            | Intrinsic::TransportResult
+            | Intrinsic::TransportEncode
+            | Intrinsic::TransportDecode { .. }
+            | Intrinsic::BudgetOp
+            | Intrinsic::CollCount
+            | Intrinsic::ListSet
+            | Intrinsic::ListConcat
+            | Intrinsic::ListSlice
+            | Intrinsic::MapInsert
+            | Intrinsic::SetInsert
+            | Intrinsic::MapRemove
+            | Intrinsic::SetContains
+            | Intrinsic::MapKeys
+            | Intrinsic::MapValues
+            | Intrinsic::ValueOp { .. }
+            | Intrinsic::ValueShow { .. }
+            | Intrinsic::SignalEmit { .. } => false,
+        }
+    }
+
+    /// Whether the operation only computes its result, with no effect that
+    /// moving it past a release could show, such as a dispose handler.
+    pub fn is_pure(self) -> bool {
+        match self {
+            Intrinsic::ListAppend
+            | Intrinsic::ListSet
+            | Intrinsic::ListConcat
+            | Intrinsic::ListSlice
+            | Intrinsic::MapInsert
+            | Intrinsic::SetInsert
+            | Intrinsic::MapRemove
+            | Intrinsic::SetContains
+            | Intrinsic::MapKeys
+            | Intrinsic::MapValues
+            | Intrinsic::CollCount
+            | Intrinsic::TextMeasure(_)
+            | Intrinsic::TextAt(_)
+            | Intrinsic::TextFind(_)
+            | Intrinsic::TextMap(_)
+            | Intrinsic::TextSlice
+            | Intrinsic::CodePointOp(_)
+            | Intrinsic::Word => true,
+            Intrinsic::Sleep
+            | Intrinsic::RefNew
+            | Intrinsic::RefRead
+            | Intrinsic::RefValue
+            | Intrinsic::RefDone
+            | Intrinsic::RefCommit
+            | Intrinsic::RefSwap
+            | Intrinsic::RefApply { .. }
+            | Intrinsic::TxBegin
+            | Intrinsic::TxDepth
+            | Intrinsic::TxUnwind
+            | Intrinsic::TrapCaught(_)
+            | Intrinsic::TrapCaughtText(_)
+            | Intrinsic::TxCommit
+            | Intrinsic::TxAbort
+            | Intrinsic::TxRetry
+            | Intrinsic::TxThrow
+            | Intrinsic::TxConflicted
+            | Intrinsic::SidePtr
+            | Intrinsic::SideEnd
+            | Intrinsic::SideReset
+            | Intrinsic::ScopeNew
+            | Intrinsic::ScopeStart
+            | Intrinsic::ScopeNext
+            | Intrinsic::ScopeResult
+            | Intrinsic::ScopeCancel
+            | Intrinsic::ScopeEnd
+            | Intrinsic::ExtNew
+            | Intrinsic::ExtLock
+            | Intrinsic::ExtUnlock
+            | Intrinsic::ExtValue
+            | Intrinsic::ExtStore
+            | Intrinsic::LazyNew
+            | Intrinsic::LazyGet
+            | Intrinsic::LazyValue
+            | Intrinsic::LazyCode
+            | Intrinsic::LazySet
+            | Intrinsic::LazyTrap
+            | Intrinsic::StreamNew { .. }
+            | Intrinsic::StreamPeer
+            | Intrinsic::StreamPut { .. }
+            | Intrinsic::StreamNext
+            | Intrinsic::StreamValue
+            | Intrinsic::StreamClose
+            | Intrinsic::HubNew { .. }
+            | Intrinsic::HubSink
+            | Intrinsic::HubSource
+            | Intrinsic::HubSeal
+            | Intrinsic::HubRelease
+            | Intrinsic::IoListen
+            | Intrinsic::IoAccept
+            | Intrinsic::IoSocket
+            | Intrinsic::IoOwn
+            | Intrinsic::IoPort
+            | Intrinsic::IoConnect
+            | Intrinsic::IoRead
+            | Intrinsic::IoReadBytes
+            | Intrinsic::IoWrite
+            | Intrinsic::IoPrint
+            | Intrinsic::IoFault
+            | Intrinsic::IoReadFile
+            | Intrinsic::IoSocketAny
+            | Intrinsic::IoConnectHost
+            | Intrinsic::TextUtf8
+            | Intrinsic::TextCast
+            | Intrinsic::TextParse(_)
+            | Intrinsic::TextParsed
+            | Intrinsic::TrapWith(_)
+            | Intrinsic::TestFailure
+            | Intrinsic::Site(_)
+            | Intrinsic::BytesRead
+            | Intrinsic::BytesWrite
+            | Intrinsic::BytesOfList
+            | Intrinsic::EnvArgs
+            | Intrinsic::EnvVar
+            | Intrinsic::EnvVars
+            | Intrinsic::EnvPlatform
+            | Intrinsic::CCall(_)
+            | Intrinsic::COut(_)
+            | Intrinsic::CClass
+            | Intrinsic::CStrOf { .. }
+            | Intrinsic::ExprTreeHash
+            | Intrinsic::ExprTree
+            | Intrinsic::TransportRun
+            | Intrinsic::TransportResult
+            | Intrinsic::TransportEncode
+            | Intrinsic::TransportDecode { .. }
+            | Intrinsic::BudgetOp
+            | Intrinsic::ValueOp { .. }
+            | Intrinsic::ValueShow { .. }
+            | Intrinsic::SignalEmit { .. }
+            | Intrinsic::SignalDrain
+            | Intrinsic::SignalMark
+            | Intrinsic::SignalOn
+            | Intrinsic::SignalReset => false,
+        }
+    }
 }
 
 /// Where a closure's environment lives, by its escape level (§11.5.8).

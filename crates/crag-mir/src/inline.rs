@@ -52,8 +52,8 @@ use crag_types::{Step, Ty, fields_of};
 
 use crate::borrow::assigned;
 use crate::ir::{
-    Block, BlockId, ClosurePlacement, Inlined, Intrinsic, Local, LocalDecl, MirBody, Operand,
-    Place, Rvalue, Statement, Terminator, TrapKind,
+    Block, BlockId, ClosurePlacement, Inlined, Local, LocalDecl, MirBody, Operand, Place, Rvalue,
+    Statement, Terminator, TrapKind,
 };
 use crate::{Entry, InstanceKey, built};
 
@@ -518,34 +518,7 @@ fn keeps_no_state(body: &MirBody<'_>) -> bool {
                     ..
                 },
             ) => false,
-            Statement::Assign(_, Rvalue::Intrinsic(intrinsic, _)) => !matches!(
-                intrinsic,
-                Intrinsic::TxBegin
-                    | Intrinsic::TxDepth
-                    | Intrinsic::TxUnwind
-                    | Intrinsic::TxCommit
-                    | Intrinsic::TxAbort
-                    | Intrinsic::TxRetry
-                    | Intrinsic::TxThrow
-                    | Intrinsic::TxConflicted
-                    | Intrinsic::TrapCaught(_)
-                    | Intrinsic::TrapCaughtText(_)
-                    | Intrinsic::SidePtr
-                    | Intrinsic::SideEnd
-                    | Intrinsic::SideReset
-                    | Intrinsic::ScopeNew
-                    | Intrinsic::ScopeStart
-                    | Intrinsic::ScopeNext
-                    | Intrinsic::ScopeResult
-                    | Intrinsic::ScopeCancel
-                    | Intrinsic::ScopeEnd
-                    | Intrinsic::SignalDrain
-                    | Intrinsic::SignalMark
-                    | Intrinsic::SignalOn
-                    | Intrinsic::SignalReset
-                    | Intrinsic::TestFailure
-                    | Intrinsic::Site(_)
-            ),
+            Statement::Assign(_, Rvalue::Intrinsic(intrinsic, _)) => !intrinsic.keeps_frame_state(),
             _ => true,
         });
         let terminator = match &block.terminator {
