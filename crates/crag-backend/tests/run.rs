@@ -52,6 +52,15 @@ use crag_runtime::{
 };
 use crag_types::{Ty, TyKind, prelude_item, signature};
 
+/// What std.transport uses of std.io.
+const IO: &str = r#"import std.stream
+
+pub type IoError(code: Int)
+pub type Connection
+pub fn read(c: Connection, max: Int) -> Bytes | Closed | IoError
+pub fn write(c: Connection, bytes: Bytes) -> () | IoError
+"#;
+
 const PRELUDE: &str = r#"pub type Int
 pub type Int8
 pub type UInt8
@@ -107,6 +116,16 @@ pub fn lessThan(a: Int, b: Int) -> Bool
 pub fn lessThan(a: Float, b: Float) -> Bool
 pub fn equals(a: Str, b: Str) -> Bool
 pub fn equals(a: Bytes, b: Bytes) -> Bool
+pub fn add(a: Bytes, b: Bytes) -> Bytes
+pub fn count(b: Bytes) -> Int
+pub fn append[T](xs: List[T], x: T) -> List[T]
+pub fn bytes(s: Str) -> Bytes
+pub fn greaterOrEqual(a: Int, b: Int) -> Bool
+pub type Big
+pub type Little
+pub type Endian = Big | Little
+pub fn readInt64(b: Bytes, at: Int, endian: Endian) -> Option[Int]
+pub fn writeInt64(b: Bytes, at: Int, value: Int, endian: Endian) -> Bytes
 pub fn listAppend[T](xs: List[T], x: T) -> List[T]
 pub fn split(s: Str, separator: Str) -> List[Str]
 pub fn lines(s: Str) -> List[Str]
@@ -305,7 +324,18 @@ impl Module {
             "std.transport".to_string(),
             SourceFile::new(&db, include_str!("../../../std/transport.crag").to_string()),
         );
-        let mut modules = vec![core, module, transport];
+        // What std.transport uses of std.io and std.stream.
+        let io = ModuleId::new(
+            &db,
+            "std.io".to_string(),
+            SourceFile::new(&db, IO.to_string()),
+        );
+        let stream = ModuleId::new(
+            &db,
+            "std.stream".to_string(),
+            SourceFile::new(&db, "pub distinct type Closed\n".to_string()),
+        );
+        let mut modules = vec![core, module, transport, io, stream];
         if let Some(library) = library {
             let file = SourceFile::new(&db, library.to_string());
             modules.push(ModuleId::new(&db, "lib".to_string(), file));

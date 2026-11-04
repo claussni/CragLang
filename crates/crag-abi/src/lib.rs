@@ -995,8 +995,54 @@ pub enum RuntimeFn {
     /// when it ran out of steps or memory, with nothing there; 6 when the
     /// caller has not signalled such callees yet, which did not run the
     /// code, with a `Str` there of one `module name` a line. A trap of the
-    /// code is the call's.
+    /// code is the call's. 7 when the `Expr` arrived under a budget that
+    /// cannot run it, or 8 when the budget ran out while it ran, with the
+    /// budget's index in `scratch[0]` (Specification §18.7).
     TransportRun = 114,
+    /// `rt_transport_encode(ctx, scratch, env, stamp) -> status`: the bytes
+    /// that send the `Expr` of the environment `env` (Plan §11.10.9),
+    /// stamped with the process's sending budget `stamp`, or none when it
+    /// is negative. The status is 0 with the `Bytes` in `scratch[0..2]`,
+    /// or 1 with why it cannot be sent, a `Str`, there.
+    TransportEncode = 115,
+    /// `rt_transport_decode(ctx, scratch, x0, x1, b0, b1) -> status`: the
+    /// `Expr` that the bytes `b0`, `b1` send, checked against the function
+    /// type `x0`, `x1` as `TransportRun` checks code, under the policy in
+    /// `scratch[0..3]` as there. The status is 0 with the `Expr` in
+    /// `scratch[0..2]`; 1 to 5 as for `TransportRun`; 7 when its stamp is
+    /// missing or not valid, with why as a `Str` there; 8 when its budget
+    /// is used up, with the budget's index there; 9 when the bytes are not
+    /// code, with why as a `Str` there.
+    TransportDecode = 116,
+    /// `rt_budget_op(ctx, scratch, op, side, index) -> value`: an
+    /// operation on the process's budgets (`budget_op`), on side 0, those
+    /// it enforces, or 1, those it sends under.
+    BudgetOp = 117,
+}
+
+/// The operations of [`RuntimeFn::BudgetOp`]. Counts and numbers come
+/// back as the value, -1 for a limit that is not set; text comes in the
+/// scratch words, with 0 for done and -1 for no such budget.
+pub mod budget_op {
+    /// The budgets of the side.
+    pub const COUNT: u64 = 0;
+    /// The document's name, date and issuer, and the budget's name.
+    pub const DOCUMENT: u64 = 1;
+    pub const DATE: u64 = 2;
+    pub const ISSUER: u64 = 3;
+    pub const NAME: u64 = 4;
+    /// The limits.
+    pub const LIMIT_STEPS: u64 = 5;
+    pub const LIMIT_MEMORY: u64 = 6;
+    pub const LIMIT_RUNS: u64 = 7;
+    /// What it has taken: steps, memory held, runs.
+    pub const USED_STEPS: u64 = 8;
+    pub const USED_MEMORY: u64 = 9;
+    pub const USED_RUNS: u64 = 10;
+    /// 0 when it read its files again, else 1 with why as a `Str`.
+    pub const RENEW: u64 = 11;
+    /// 0 when it gave back what it had taken.
+    pub const RESET: u64 = 12;
 }
 
 /// The kinds of C values of a [`RuntimeFn::CCall`] descriptor.
@@ -1218,7 +1264,7 @@ pub const TASK_TRAPPED: u64 = 2;
 
 impl RuntimeFn {
     /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 115] = [
+    pub const ALL: [RuntimeFn; 118] = [
         RuntimeFn::Morestack,
         RuntimeFn::SideGrow,
         RuntimeFn::Trap,
@@ -1334,6 +1380,9 @@ impl RuntimeFn {
         RuntimeFn::CStrOf,
         RuntimeFn::ValueDecode,
         RuntimeFn::TransportRun,
+        RuntimeFn::TransportEncode,
+        RuntimeFn::TransportDecode,
+        RuntimeFn::BudgetOp,
     ];
 
     /// The symbol the loader looks up.
@@ -1454,6 +1503,9 @@ impl RuntimeFn {
             RuntimeFn::CStrOf => "rt_c_str_of",
             RuntimeFn::ValueDecode => "rt_value_decode",
             RuntimeFn::TransportRun => "rt_transport_run",
+            RuntimeFn::TransportEncode => "rt_transport_encode",
+            RuntimeFn::TransportDecode => "rt_transport_decode",
+            RuntimeFn::BudgetOp => "rt_budget_op",
         }
     }
 

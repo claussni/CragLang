@@ -61,6 +61,12 @@
 //! stays all code that code reaches through its relocations, so nothing
 //! loaded calls code unloaded. The bound is soft: the store unloads only
 //! before a tree, and keeps what it must.
+//!
+//! Code that arrives as bytes (§18.7) is checked and compiled as code to
+//! run is, and its code stays loaded for good, since the `Expr` that
+//! `decode` builds of it may be called any time (`Store::decode`). The
+//! receiver gives the shapes of the root closure's environment, into which
+//! the runtime decodes the environment that arrived.
 
 extern crate crag_db as salsa;
 
@@ -79,7 +85,7 @@ use crag_db::RootDatabase;
 use crag_hir::{ItemKind, Owner, Program, item_tree};
 use crag_loader::{CodeArena, LoadError, SymbolTable, load, load_group, unload};
 use crag_mir::{Entry, InstanceKey, MirBody, Tier, mir};
-use crag_runtime::transport::{self, Received, Refused, Request};
+use crag_runtime::transport::{self, Decoded, Received, Refused, Request};
 use crag_runtime::{CodeMap, Scheduler, Types};
 
 pub use bundle::Bundle;
@@ -115,8 +121,16 @@ struct Job {
     accept: Accept,
     steps: u64,
     memory: u64,
+    /// Whether the code arrived as bytes, for `decode`, or is to run.
+    decode: bool,
     types: TypesRef,
-    answer: mpsc::Sender<Result<Received, Refused>>,
+    answer: mpsc::Sender<Result<Answer, Refused>>,
+}
+
+/// The receiver's answer to a job.
+enum Answer {
+    Run(Received),
+    Decode(Decoded),
 }
 
 /// The program's descriptors, which the caller holds while it waits.
@@ -157,7 +171,10 @@ impl Receiver {
                 for job in queue {
                     // SAFETY: as `TypesRef` says.
                     let types = unsafe { &*job.types.0 };
-                    let answer = store.receive(&job, types);
+                    let answer = match job.decode {
+                        true => store.decode(&job, types).map(Answer::Decode),
+                        false => store.receive(&job, types).map(Answer::Run),
+                    };
                     let _ = job.answer.send(answer);
                 }
             })?;
@@ -171,10 +188,9 @@ impl Receiver {
     pub fn install(self, scheduler: &Scheduler) {
         scheduler.set_receiver(Arc::new(self));
     }
-}
 
-impl transport::Receive for Receiver {
-    fn receive(&self, request: &Request<'_>) -> Result<Received, Refused> {
+    /// Asks the receiver's thread.
+    fn ask(&self, request: &Request<'_>, decode: bool) -> Result<Answer, Refused> {
         let (answer, answered) = mpsc::channel();
         let job = Job {
             tree: request.tree.to_vec(),
@@ -186,6 +202,7 @@ impl transport::Receive for Receiver {
             },
             steps: request.steps,
             memory: request.memory,
+            decode,
             types: TypesRef(request.types),
             answer,
         };
@@ -194,6 +211,22 @@ impl transport::Receive for Receiver {
             return Err(failed());
         }
         answered.recv().unwrap_or_else(|_| Err(failed()))
+    }
+}
+
+impl transport::Receive for Receiver {
+    fn receive(&self, request: &Request<'_>) -> Result<Received, Refused> {
+        match self.ask(request, false)? {
+            Answer::Run(received) => Ok(received),
+            Answer::Decode(_) => unreachable!("asked to run"),
+        }
+    }
+
+    fn decode(&self, request: &Request<'_>) -> Result<Decoded, Refused> {
+        match self.ask(request, true)? {
+            Answer::Decode(decoded) => Ok(decoded),
+            Answer::Run(_) => unreachable!("asked to decode"),
+        }
     }
 }
 
@@ -209,6 +242,9 @@ struct Accepted {
     mismatched: Vec<transport::Mismatch>,
     /// The functions the code reaches, which a run holds.
     reached: Arc<[FuncId]>,
+    /// The shapes of the root closure's environment, and as bytes.
+    env: (Shapes, u32),
+    wire: Vec<u8>,
 }
 
 /// The runs that hold each function of the store.
@@ -314,9 +350,9 @@ impl Store {
         })
     }
 
-    /// Receives the code of a job: what it accepted before, or the tree
-    /// checked, counted, compiled and published.
-    fn receive(&mut self, job: &Job, types: &Types) -> Result<Received, Refused> {
+    /// The code of a job, within its limits: what it accepted before, or
+    /// the tree checked, counted, compiled and published.
+    fn accepted(&mut self, job: &Job, types: &Types) -> Result<&Accepted, Refused> {
         let key = (
             *blake3::hash(&job.tree).as_bytes(),
             job.expected.clone(),
@@ -327,13 +363,30 @@ impl Store {
             self.accepted.insert(key.clone(), accepted);
         }
         let accepted = &self.accepted[&key];
-        let mismatched = accepted.mismatched.clone();
         if accepted.steps > job.steps {
-            return Err(Refused::StepLimit(mismatched));
+            return Err(Refused::StepLimit(accepted.mismatched.clone()));
         }
         if accepted.memory > job.memory {
-            return Err(Refused::MemoryLimit(mismatched));
+            return Err(Refused::MemoryLimit(accepted.mismatched.clone()));
         }
+        Ok(accepted)
+    }
+
+    /// Code that arrived as bytes: its `Expr` may call its code any time,
+    /// so all of it stays loaded.
+    fn decode(&mut self, job: &Job, types: &Types) -> Result<Decoded, Refused> {
+        let accepted = self.accepted(job, types)?;
+        let (entry, env, wire) = (accepted.entry, accepted.env.clone(), accepted.wire.clone());
+        let reached = accepted.reached.clone();
+        self.pinned.extend(reached.iter().copied());
+        Ok(Decoded { entry, env, wire })
+    }
+
+    /// Receives the code of a job to run it.
+    fn receive(&mut self, job: &Job, types: &Types) -> Result<Received, Refused> {
+        let held = self.held.clone();
+        let accepted = self.accepted(job, types)?;
+        let mismatched = accepted.mismatched.clone();
         Ok(Received {
             stub: accepted.stub,
             entry: accepted.entry,
@@ -343,7 +396,7 @@ impl Store {
             steps: job.steps - accepted.steps,
             memory: job.memory - accepted.memory,
             mismatched,
-            hold: Box::new(Hold::new(&self.held, &accepted.reached)),
+            hold: Box::new(Hold::new(&held, &accepted.reached)),
         })
     }
 
@@ -553,6 +606,11 @@ impl Store {
             self.pinned.extend(reached.iter().copied());
         }
         let (input_shapes, input_root) = shapes(db, received, input_ty);
+        // The environment arrives in the sender's bytes, and is decoded
+        // into the receiver's layout of it.
+        let (env_shapes, env_root) = shapes(db, received, body.locals[0].ty);
+        let mut wire = env_root.to_le_bytes().to_vec();
+        wire.extend(env_shapes.encode());
         let input_words = input_shapes.shapes[input_root as usize].words();
         if compiled.params != input_words + 1 || compiled.returns > 2 || input_words > 2 {
             return Err(ill("received code of this form cannot run yet".into()));
@@ -580,6 +638,8 @@ impl Store {
             memory,
             mismatched,
             reached,
+            env: (env_shapes, env_root),
+            wire,
         })
     }
 

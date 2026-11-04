@@ -158,6 +158,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "crag-budget"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "serde_json",
+]
+
+[[package]]
 name = "crag-codegen"
 version = "0.0.0"
 dependencies = [
@@ -183,6 +191,7 @@ dependencies = [
  "crag-abi",
  "crag-aot",
  "crag-backend",
+ "crag-budget",
  "crag-codegen",
  "crag-db",
  "crag-eval",
@@ -299,6 +308,7 @@ name = "crag-runtime"
 version = "0.0.0"
 dependencies = [
  "crag-abi",
+ "crag-budget",
  "crag-codegen",
  "crag-loader",
  "libc",

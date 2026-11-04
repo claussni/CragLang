@@ -243,6 +243,16 @@ pub fn intrinsic_effects<'db>(
     if matches!(function.module(db).path(db).as_str(), "std.io" | "std.env") {
         return Some(EffectSet::io());
     }
+    // The process's budgets, which encoding and decoding code change too
+    // (§18.7).
+    if function.module(db).path(db) == "std.transport"
+        && matches!(
+            function.name(db).text(db).as_str(),
+            "budgetOp" | "transportEncode" | "transportDecode"
+        )
+    {
+        return Some(EffectSet::io());
+    }
     let params = &signature(db, program, function).params;
     let mut effects = EffectSet::NONE;
     for (i, p) in params.iter().enumerate() {

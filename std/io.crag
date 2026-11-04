@@ -110,6 +110,18 @@ pub fn read(c: Connection) -> Bytes | Closed | IoError {
   IoError(code: 0 - n)
 }
 
+// At most `max` of the next bytes the peer sent, waiting until there
+// are some, or `Closed` once the peer closed the connection (§15.2).
+pub fn read(c: Connection, max: Int) -> Bytes | Closed | IoError {
+  let n = ioRead(c.socket, max)
+  if n > 0 {
+    let bytes: Bytes = ioReadBytes()
+    return bytes
+  }
+  if n == 0 { return Closed }
+  IoError(code: 0 - n)
+}
+
 // Writes all the bytes.
 pub fn write(c: Connection, bytes: Bytes) -> () | IoError { writeRest(c.socket, bytes, -1) }
 

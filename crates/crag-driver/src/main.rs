@@ -29,9 +29,10 @@ use crag_driver::{crag_fmt, crag_repl, crag_run, crag_test};
 
 const USAGE: &str = "usage: crag
        crag build [--skip-tests]
-       crag run [argument...]
+       crag run [--budgets <dir>] [argument...]
        crag test [filter]
        crag fmt [--check] [all | - | file...]
+       crag lmt new <document>
        crag package new <name> [--lib]
        crag package add <package> [version]
        crag package remove <package>
@@ -66,13 +67,31 @@ fn main() -> ExitCode {
         }
         [] => ExitCode::from(crag_repl(root)),
         ["run", ref rest @ ..] => {
-            // The program sees what follows `run` as its arguments (§19.7).
-            crag_runtime::set_program_args(rest.iter().map(|a| a.as_bytes().to_vec()).collect());
-            ExitCode::from(crag_run(root, &mut std::io::stderr()))
+            // The budget directory, else `CRAG_BUDGETS` (§18.7).
+            let (budgets, rest) = match rest {
+                ["--budgets", dir, rest @ ..] => (Some(std::path::Path::new(*dir)), rest),
+                rest => (None, rest),
+            };
+            match crag_runtime::budgets::init(budgets) {
+                Err(why) => {
+                    eprintln!("error: {why}");
+                    ExitCode::from(1)
+                }
+                Ok(()) => {
+                    // The program sees what follows as its arguments (§19.7).
+                    let args = rest.iter().map(|a| a.as_bytes().to_vec()).collect();
+                    crag_runtime::set_program_args(args);
+                    ExitCode::from(crag_run(root, &mut std::io::stderr()))
+                }
+            }
         }
         ["build", ref rest @ ..] => build(root, rest),
         ["test"] => test(root, None),
         ["test", filter] => test(root, Some(filter)),
+        ["lmt", "new", document] => ExitCode::from(crag_driver::lmt::crag_lmt_new(
+            std::path::Path::new(document),
+            &mut std::io::stderr(),
+        )),
         ["fmt", ref rest @ ..] => ExitCode::from(crag_fmt(root, rest, &mut std::io::stderr())),
         ["package", command, ref rest @ ..]
             if crag_driver::packages::is_package_command(command) =>

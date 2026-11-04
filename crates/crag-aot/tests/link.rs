@@ -235,7 +235,7 @@ pub fn spin(n: Int) -> Int {
   total
 }
 
-fn report(r: Int | Unresolved | IllTyped | Impure | StepLimit | MemoryLimit) -> Str {
+fn report(r: Int | Unresolved | IllTyped | Impure | StepLimit | MemoryLimit | Unbudgeted | BudgetLimit) -> Str {
   case r {
     n: Int -> "ran {n}"
     e: Unresolved -> "unresolved: {e.message}"
@@ -243,6 +243,8 @@ fn report(r: Int | Unresolved | IllTyped | Impure | StepLimit | MemoryLimit) -> 
     e: Impure -> "impure: {e.message}"
     StepLimit -> "step limit"
     MemoryLimit -> "memory limit"
+    e: Unbudgeted -> "unbudgeted: {e.message}"
+    e: BudgetLimit -> "budget limit: {e.budget.name}"
   }
 }
 

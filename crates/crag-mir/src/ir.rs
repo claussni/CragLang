@@ -151,6 +151,10 @@ pub enum Constant<'db> {
         expr: ExprId,
         hash: bool,
     },
+    /// The `Bytes` of the shapes of an `Expr`'s environment, of this type,
+    /// by which the runtime encodes it to send it (Plan §11.10.9): the
+    /// root's index, four bytes, then the shapes.
+    Wire(Ty<'db>),
 }
 
 /// The fields of the environment of an `Expr` that hold its tree's
@@ -158,6 +162,11 @@ pub enum Constant<'db> {
 /// digits that name captures, so they lie right after the box's header.
 pub const TREE_HASH: &str = "$hash";
 pub const TREE: &str = "$tree";
+/// The fields after them: the shapes the environment travels by
+/// (`Constant::Wire`), and the receiving budget of an `Expr` that arrived,
+/// one more than its index, or 0 (Specification §18.7).
+pub const WIRE: &str = "$wire";
+pub const BUDGET: &str = "$xbudget";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
 pub enum BinOp {
@@ -532,6 +541,19 @@ pub enum Intrinsic<'db> {
     TransportRun,
     /// The result of the code `TransportRun` ran, of the call's type.
     TransportResult,
+    /// An `Expr` and the index of a sending budget, or -1: the status of
+    /// `crag_abi::RuntimeFn::TransportEncode`, with the bytes or why not
+    /// for `IoReadBytes`.
+    TransportEncode,
+    /// Bytes, `Accept` as a number, the steps and the bytes of memory: the
+    /// status of `crag_abi::RuntimeFn::TransportDecode`, which decodes a
+    /// `value`, an `Expr`; `TransportResult` gives it.
+    TransportDecode {
+        value: Ty<'db>,
+    },
+    /// An operation, a side and an index: the value of
+    /// `crag_abi::RuntimeFn::BudgetOp`, with text for `IoReadBytes`.
+    BudgetOp,
     /// The number of elements of a list, map or set.
     CollCount,
     /// The list with an element replaced, which consumes the list and the
@@ -1277,6 +1299,7 @@ fn operand_text<'db>(db: &'db dyn Db, operand: &Operand<'db>) -> String {
                 true => format!("tree_hash#{}", expr.index()),
                 false => format!("tree#{}", expr.index()),
             },
+            Constant::Wire(ty) => format!("wire({})", ty.display(db)),
         },
     }
 }

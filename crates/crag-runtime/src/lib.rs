@@ -47,6 +47,7 @@ compile_error!("the runtime is written for x86-64 Linux only: its context switch
 mod system;
 
 mod assertions;
+pub mod budgets;
 
 mod cancel;
 pub mod codec;
@@ -225,6 +226,9 @@ pub fn runtime_fn_addr(func: RuntimeFn) -> usize {
         RuntimeFn::CStrOf => ffi::rt_c_str_of as *const () as usize,
         RuntimeFn::ValueDecode => values::rt_value_decode as *const () as usize,
         RuntimeFn::TransportRun => transport::rt_transport_run as *const () as usize,
+        RuntimeFn::TransportEncode => transport::rt_transport_encode as *const () as usize,
+        RuntimeFn::TransportDecode => transport::rt_transport_decode as *const () as usize,
+        RuntimeFn::BudgetOp => budgets::rt_budget_op as *const () as usize,
     }
 }
 

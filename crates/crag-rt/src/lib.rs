@@ -109,6 +109,8 @@ fn run() -> Result<c_int, String> {
     }
     // SAFETY: the stubs are part of the executable.
     unsafe { map.set_task_entries(table.task_entries.map(|e| e as usize)) };
+    // The budgets of code transport, from `CRAG_BUDGETS` (§18.7).
+    crag_runtime::budgets::init(None)?;
     let types = Arc::new(Types::new(table.types.iter().cloned()));
     let scheduler = Scheduler::new(SchedulerConfig::default(), types, Arc::new(map));
     if let Some(receiving) = &table.receiving {

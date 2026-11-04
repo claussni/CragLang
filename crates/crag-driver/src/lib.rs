@@ -30,6 +30,7 @@ pub mod diagnostics;
 pub mod exec;
 pub mod fmt;
 pub mod line;
+pub mod lmt;
 pub mod lsp;
 pub mod packages;
 pub mod persist;

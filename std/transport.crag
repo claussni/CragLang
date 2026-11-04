@@ -18,7 +18,11 @@
 // An `Expr[F]` is a closure of the `is Pure` function type `F` that a
 // closure literal or a `pub` function becomes where the context asks for
 // one; it is usable anywhere an `F` is (Implementation Plan §11.10.13).
-// `run` runs one as received code (§11.10.9).
+// `run` runs one as received code (§11.10.9). `send` sends one to a peer
+// under a budget, and `decode` takes one that arrived (§18.7).
+
+import std.io
+import std.stream
 
 pub type Expr[F]
 
@@ -45,6 +49,16 @@ pub type Impure(..Error, message: Str)
 pub type StepLimit(..Error)
 pub type MemoryLimit(..Error)
 
+// Code that arrived carries no stamp of a budget the receiver enforces,
+// or one it cannot verify; or the budget it arrived under is used up
+// (§18.7).
+pub type Unbudgeted(..Error, message: Str)
+pub type BudgetLimit(..Error, budget: BudgetOrigin)
+
+// Bytes that are not code; code whose captures cannot be sent.
+pub type DecodeError(..Error, message: Str)
+pub type Unsendable(..Error, message: Str)
+
 // A callee the receiver accepted although its body hash differs from the
 // sender's, by its module and its name (§18.7). `run` emits it once for
 // each such callee, before the code runs.
@@ -55,12 +69,13 @@ pub type HashMismatch(..Signal, module: Str, name: Str)
 // and runs it next to its own data, the input and the result passing as
 // they are, under the policy's limits. A trap of the code is the caller's.
 // Each callee accepted with another body than the sender's is signalled
-// as a `HashMismatch` first.
+// as a `HashMismatch` first. Code that arrived under a budget runs under
+// that budget too.
 pub fn run[A, B](
   e: Expr[((A) -> B is Pure)],
   input: A,
   policy: Policy,
-) -> B | Unresolved | IllTyped | Impure | StepLimit | MemoryLimit
+) -> B | Unresolved | IllTyped | Impure | StepLimit | MemoryLimit | Unbudgeted | BudgetLimit
   where B is Solid {
   let accept = case policy.accept {
     Exact -> 0
@@ -81,15 +96,207 @@ pub fn run[A, B](
     2 -> IllTyped(message: transportMessage())
     3 -> Impure(message: transportMessage())
     4 -> StepLimit()
-    _ -> MemoryLimit()
+    5 -> MemoryLimit()
+    7 -> Unbudgeted(message: transportMessage())
+    _ -> BudgetLimit(budget: budgetOrigin(0, transportWord(status)))
   }
+}
+
+// ---- Code on the wire (§18.7) ----
+
+// A connection to a peer that code travels over, one message at a time.
+pub opaque type Peer(connection: Connection)
+
+pub fn peer(c: Connection) -> Peer { Peer(connection: c) }
+
+// Sends code to a peer, stamped with a budget the process sends under:
+// the next sequence number and the MAC over the tree and its captures.
+pub fn send[A, B](
+  to: Peer,
+  stamp: Stamp,
+  code: Expr[((A) -> B is Pure)],
+) -> () | Unsendable | IoError { sendStamped(to, stamp.index, code) }
+
+// Sends code to a peer without a stamp, which a receiver that enforces
+// budgets does not admit.
+pub fn send[A, B](to: Peer, code: Expr[((A) -> B is Pure)]) -> () | Unsendable | IoError {
+  sendStamped(to, -1, code)
+}
+
+fn sendStamped[F](to: Peer, stamp: Int, code: Expr[F]) -> () | Unsendable | IoError {
+  if transportEncode(code, stamp) != 0 { return Unsendable(message: transportMessage()) }
+  let message: Bytes = transportBytes()
+  let header = bytes("        ").writeInt64(0, message.count(), Big)
+  to.connection.write(header + message)
+}
+
+// The bytes of the next code the peer sent, for `decode`.
+pub fn read(from: Peer) -> Bytes | Closed | IoError {
+  case readExactly(from.connection, 8, b"") {
+    header: Bytes -> case header.readInt64(0, Big) {
+      n: Int -> readExactly(from.connection, n, b"")
+      _ -> b""
+    }
+    Closed -> Closed
+    e: IoError -> e
+  }
+}
+
+fn readExactly(c: Connection, n: Int, have: Bytes) -> Bytes | Closed | IoError {
+  if have.count() >= n { return have }
+  case c.read(n - have.count()) {
+    more: Bytes -> readExactly(c, n, have + more)
+    Closed -> Closed
+    e: IoError -> e
+  }
+}
+
+// The code the bytes hold, checked as `run` checks code, under the
+// policy's limits, and admitted under the process's budgets: when it
+// enforces any, the code must carry a valid stamp of one of them, with a
+// number past the last that budget admitted, and the budget must have a
+// run left. The `Expr` runs under that budget's limits too. Only `Expr`
+// values decode so far.
+pub fn decode[T](
+  bytes: Bytes,
+  policy: Policy,
+) -> T | Unresolved | IllTyped | Impure | StepLimit | MemoryLimit | Unbudgeted | BudgetLimit | DecodeError {
+  let accept = case policy.accept {
+    Exact -> 0
+    SameMajor -> 1
+    Signature -> 2
+  }
+  let status = transportDecode[T](bytes, accept, policy.steps, policy.memory)
+  case status {
+    0 -> transportDecoded[T](bytes)
+    1 -> Unresolved(message: transportMessage())
+    2 -> IllTyped(message: transportMessage())
+    3 -> Impure(message: transportMessage())
+    4 -> StepLimit()
+    5 -> MemoryLimit()
+    7 -> Unbudgeted(message: transportMessage())
+    8 -> BudgetLimit(budget: budgetOrigin(0, transportWord(status)))
+    _ -> DecodeError(message: transportMessage())
+  }
+}
+
+// ---- Budgets (§18.7) ----
+
+// The limits a budget document sets; none is not checked.
+pub type Limits(steps: Option[Int], memory: Option[Int], runs: Option[Int])
+
+// What a budget has taken: the steps and runs since it was last reset,
+// and the memory its runs hold now. A sender knows only its runs.
+pub type Usage(steps: Option[Int], memory: Option[Int], runs: Int)
+
+// Where a budget comes from: its document's management fields and its
+// own name.
+pub type BudgetOrigin(document: Str, date: Str, issuer: Str, name: Str)
+
+pub type RenewError(..Error, message: Str)
+
+// What a budget says about itself, and what can be done with it.
+pub form Described[B] {
+  origin(b: B) -> BudgetOrigin
+  limits(b: B) -> Limits
+}
+
+pub form Metered[B] where Described[B] {
+  usage(b: B) -> Usage
+}
+
+pub form Renewable[B] where Metered[B] {
+  renew(b: B) -> () | RenewError
+  reset(b: B) -> ()
+}
+
+// A budget the process enforces as a receiver.
+pub opaque type Budget(index: Int) is Secret
+
+// A budget the process sends under: it holds the budget's token.
+pub opaque type Stamp(index: Int) is Secret
+
+pub type Budgets(receiving: List[Budget], sending: List[Stamp])
+
+// The budgets the runtime read from the process's budget directory at
+// startup.
+pub final fn list() -> Budgets {
+  var receiving: List[Budget] = []
+  for i in 0..budgetOp(0, 0, 0) - 1 { receiving = receiving.append(Budget(index: i)) }
+  var sending: List[Stamp] = []
+  for i in 0..budgetOp(0, 1, 0) - 1 { sending = sending.append(Stamp(index: i)) }
+  Budgets(receiving: receiving, sending: sending)
+}
+
+// A budget's origin and limits, from its document or token file.
+pub final fn origin(b: Budget) -> BudgetOrigin { budgetOrigin(0, b.index) }
+pub final fn origin(s: Stamp) -> BudgetOrigin { budgetOrigin(1, s.index) }
+pub final fn limits(b: Budget) -> Limits { budgetLimits(0, b.index) }
+pub final fn limits(s: Stamp) -> Limits { budgetLimits(1, s.index) }
+
+// What it has taken.
+pub final fn usage(b: Budget) -> Usage { budgetUsage(0, b.index) }
+pub final fn usage(s: Stamp) -> Usage { budgetUsage(1, s.index) }
+
+// Reads its files again and takes their limits, and with them its new
+// token; what it has taken stays.
+pub final fn renew(b: Budget) -> () | RenewError { budgetRenew(0, b.index) }
+pub final fn renew(s: Stamp) -> () | RenewError { budgetRenew(1, s.index) }
+
+// Gives back what it has taken: its steps and runs. The memory runs hold
+// now stays theirs, and no stamp it admitted is admitted again.
+pub final fn reset(b: Budget) -> () { budgetReset(0, b.index) }
+pub final fn reset(s: Stamp) -> () { budgetReset(1, s.index) }
+
+fn budgetOrigin(side: Int, index: Int) -> BudgetOrigin {
+  BudgetOrigin(
+    document: budgetText(1, side, index),
+    date: budgetText(2, side, index),
+    issuer: budgetText(3, side, index),
+    name: budgetText(4, side, index),
+  )
+}
+
+fn budgetLimits(side: Int, index: Int) -> Limits {
+  Limits(
+    steps: budgetLimit(5, side, index),
+    memory: budgetLimit(6, side, index),
+    runs: budgetLimit(7, side, index),
+  )
+}
+
+fn budgetUsage(side: Int, index: Int) -> Usage {
+  Usage(
+    steps: budgetLimit(8, side, index),
+    memory: budgetLimit(9, side, index),
+    runs: budgetOp(10, side, index),
+  )
+}
+
+fn budgetRenew(side: Int, index: Int) -> () | RenewError {
+  if budgetOp(11, side, index) != 0 { return RenewError(message: transportMessage()) }
+}
+
+fn budgetReset(side: Int, index: Int) -> () { let done = budgetOp(12, side, index) }
+
+fn budgetLimit(op: Int, side: Int, index: Int) -> Option[Int] {
+  let n = budgetOp(op, side, index)
+  if n < 0 { return Empty }
+  n
+}
+
+// Text of a budget, which its renewal alone changes.
+fn budgetText(op: Int, side: Int, index: Int) -> Str {
+  if budgetInfo(op, side, index) != 0 { return "" }
+  transportMessage()
 }
 
 // The runtime's side of `run`: the status, 0 when the code ran, 1 to 3
 // when it was not accepted, 4 and 5 for the limits, 6 for callees accepted
 // with another body, one `module name` a line, while `accept` lacks 256,
-// which says that they were signalled; then the result, or why it was not
-// accepted, or those callees.
+// which says that they were signalled, 7 when no budget admits the code
+// and 8 when its budget is used up; then the result, or why it was not
+// accepted, or those callees, or the budget's name.
 fn transportRun[A, B](
   e: Expr[((A) -> B is Pure)],
   input: A,
@@ -100,6 +307,28 @@ fn transportRun[A, B](
 
 fn transportResult[A, B](e: Expr[((A) -> B is Pure)]) -> B
 fn transportMessage() -> Str
+
+// The word the last status left: the index of the budget it names.
+fn transportWord(status: Int) -> Int
+
+// The runtime's side of `send`: 0 with the bytes for `transportBytes`, or
+// 1 with why not for `transportMessage`. `stamp` is the index of a
+// sending budget, or -1 for none.
+fn transportEncode[F](e: Expr[F], stamp: Int) -> Int
+fn transportBytes() -> Bytes
+
+// The runtime's side of `decode`: the status as `transportRun` gives it,
+// 7 when no budget admits the code, 8 when its budget is used up, with
+// the budget's index for `transportWord`, and 9 when the bytes are not
+// code; then the value, or why not.
+fn transportDecode[T](bytes: Bytes, accept: Int, steps: Int, memory: Int) -> Int
+fn transportDecoded[T](bytes: Bytes) -> T
+
+// The runtime's budgets: an operation of `crag_abi::budget_op` on side 0,
+// those the process enforces, or 1, those it sends under. `budgetInfo`
+// reads only a budget's origin.
+fn budgetOp(op: Int, side: Int, index: Int) -> Int
+fn budgetInfo(op: Int, side: Int, index: Int) -> Int
 
 // The tree of an `Expr`'s code, decoded from the bytes the compiler wrote.
 pub fn tree[F](e: Expr[F]) -> Tree

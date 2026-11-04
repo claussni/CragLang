@@ -49,8 +49,9 @@ use crag_types::{
 };
 
 use crate::ir::{
-    BinOp, Block, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Intrinsic, Local, LocalDecl,
-    MirBody, Operand, Place, Rvalue, Statement, TREE, TREE_HASH, Terminator, TrapKind,
+    BUDGET, BinOp, Block, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Intrinsic, Local,
+    LocalDecl, MirBody, Operand, Place, Rvalue, Statement, TREE, TREE_HASH, Terminator, TrapKind,
+    WIRE,
 };
 use crate::{Entry, InstanceKey};
 
@@ -1363,7 +1364,9 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
 
     /// The environment of a closure or function value that becomes an
     /// `Expr`, with its tree's hash and bytes before the captures, which
-    /// `e.treeHash` and `e.tree` read (Plan §11.10.13); any other as it is.
+    /// `e.treeHash` and `e.tree` read (Plan §11.10.13), then the shapes it
+    /// travels by and its budget, none (Plan §11.10.9); any other as it
+    /// is.
     fn with_tree(
         &self,
         expr: ExprId,
@@ -1376,8 +1379,12 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         }
         let bytes = Ty::builtin(db, Builtin::Bytes);
         let mut fields = fields_of(db, self.program, env).unwrap_or_default();
+        let int = Ty::builtin(db, Builtin::Int);
         fields.push((Name::new(db, TREE_HASH.to_string()), bytes));
         fields.push((Name::new(db, TREE.to_string()), bytes));
+        fields.push((Name::new(db, WIRE.to_string()), bytes));
+        fields.push((Name::new(db, BUDGET.to_string()), int));
+        let env = Ty::record(db, fields, false);
         let tree = |hash| {
             Operand::Const(Constant::Tree {
                 owner: self.owner,
@@ -1385,8 +1392,14 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 hash,
             })
         };
-        let ops = [tree(true), tree(false)].into_iter().chain(ops).collect();
-        (Ty::record(db, fields, false), ops)
+        let hidden = [
+            tree(true),
+            tree(false),
+            Operand::Const(Constant::Wire(env)),
+            Operand::Const(Constant::Int(0)),
+        ];
+        let ops = hidden.into_iter().chain(ops).collect();
+        (env, ops)
     }
 
     fn closure_code(&self, frame: ExprId) -> InstanceKey<'db> {
@@ -2351,7 +2364,14 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                 ("std.transport", "tree") => Intrinsic::ExprTree,
                 ("std.transport", "transportRun") => Intrinsic::TransportRun,
                 ("std.transport", "transportResult") => Intrinsic::TransportResult,
-                ("std.transport", "transportMessage") => Intrinsic::IoReadBytes,
+                ("std.transport", "transportMessage" | "transportBytes") => Intrinsic::IoReadBytes,
+                ("std.transport", "transportDecoded") => Intrinsic::TransportResult,
+                ("std.transport", "transportEncode") => Intrinsic::TransportEncode,
+                ("std.transport", "transportDecode") => Intrinsic::TransportDecode {
+                    value: *instance.args.first()?,
+                },
+                ("std.transport", "budgetOp" | "budgetInfo") => Intrinsic::BudgetOp,
+                ("std.transport", "transportWord") => Intrinsic::TransportResult,
                 ("std.task", "scopeNew") => Intrinsic::ScopeNew,
                 ("std.task", "scopeStart") => Intrinsic::ScopeStart,
                 ("std.task", "scopeNext") => Intrinsic::ScopeNext,

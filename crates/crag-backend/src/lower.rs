@@ -56,9 +56,9 @@ use crag_db::Db;
 use crag_db::plumbing::AsId;
 use crag_hir::{ExprId, ItemId, Name, Owner, Program, Threading, hir_body, lower_body};
 use crag_mir::{
-    BinOp, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Entry, InstanceKey, Intrinsic,
-    Local, LocalDecl, MirBody, Operand, Place, Rvalue, Statement, TREE, TREE_HASH, Terminator,
-    Tier, TrapKind,
+    BUDGET, BinOp, BlockId, CastOp, ClosurePlacement, CmpOp, Constant, Entry, InstanceKey,
+    Intrinsic, Local, LocalDecl, MirBody, Operand, Place, Rvalue, Statement, TREE, TREE_HASH,
+    Terminator, Tier, TrapKind, WIRE,
 };
 use crag_types::{Builtin, CForm, Step, Ty, TyKind, prelude_item, signature};
 
@@ -1282,6 +1282,12 @@ impl<'a, 'db> Lower<'a, 'db> {
                     false => self.text_literal(&bytes)?,
                 }
             }
+            Constant::Wire(env) => {
+                let (shapes, root) = crate::shape::shapes(self.db, self.program, *env);
+                let mut bytes = root.to_le_bytes().to_vec();
+                bytes.extend(shapes.encode());
+                self.text_literal(&bytes)?
+            }
         })
     }
 
@@ -1320,7 +1326,9 @@ impl<'a, 'db> Lower<'a, 'db> {
             Operand::Local(l) => self.local_ty(*l),
             Operand::Const(Constant::Tag(ty)) => *ty,
             Operand::Const(Constant::Unit) => Ty::unit(self.db),
-            Operand::Const(Constant::Tree { .. }) => Ty::builtin(self.db, Builtin::Bytes),
+            Operand::Const(Constant::Tree { .. } | Constant::Wire(_)) => {
+                Ty::builtin(self.db, Builtin::Bytes)
+            }
             Operand::Const(_) => otherwise,
         }
     }
@@ -2270,6 +2278,8 @@ impl<'a, 'db> Lower<'a, 'db> {
                     let i = match name.text(self.db).as_str() {
                         TREE_HASH => 0,
                         TREE => 1,
+                        WIRE => 2,
+                        BUDGET => 3,
                         n => n.parse::<usize>().map_err(|_| "captures of this type")? + tree,
                     };
                     let op = captures.get(i).ok_or("captures of this type")?;
@@ -3408,6 +3418,59 @@ impl<'a, 'db> Lower<'a, 'db> {
                 let n = self.layout_of(ty)?.words();
                 let scratch = self.scratch();
                 Ok((0..n).map(|k| self.load(scratch, 8 * k as i32)).collect())
+            }
+            // The bytes, or why not, wait in the scratch words.
+            (Intrinsic::TransportEncode, [e, stamp]) => {
+                let e_ty = self.operand_ty(e, ty);
+                let [_, env] = self.operand(e, e_ty)?[..] else {
+                    return Err("values of this type");
+                };
+                let stamp = word(&self.operand(stamp, int)?)?;
+                let scratch = self.scratch();
+                Ok(vec![self.runtime(
+                    RuntimeFn::TransportEncode,
+                    vec![scratch, env, stamp],
+                )])
+            }
+            // The policy waits in the scratch words, where the `Expr` or
+            // the reason comes back.
+            (Intrinsic::TransportDecode { value }, [bytes, accept, steps, memory]) => {
+                let f = match value.as_builtin(self.db) {
+                    Some((Builtin::Expr, &[f])) => f,
+                    _ => return Err("decoding values of this type"),
+                };
+                let expected = crate::tree::type_value(self.db, self.program, f)
+                    .and_then(|v| {
+                        crate::tree::encode_transport(self.db, self.program, "FnType", &v)
+                    })
+                    .map_err(|_| "code of this type as received code")?;
+                let [x0, x1] = self.text_literal(&expected)?[..] else {
+                    return Err("code of this type as received code");
+                };
+                let [b0, b1] = self.text_words(bytes, ty)?;
+                let scratch = self.scratch();
+                for (k, op) in [accept, steps, memory].into_iter().enumerate() {
+                    let src = word(&self.operand(op, int)?)?;
+                    self.push(Inst::Store {
+                        src,
+                        addr: scratch,
+                        offset: 8 * k as i32,
+                    });
+                }
+                Ok(vec![self.runtime(
+                    RuntimeFn::TransportDecode,
+                    vec![scratch, x0, x1, b0, b1],
+                )])
+            }
+            (Intrinsic::BudgetOp, [op, side, index]) => {
+                let op = word(&self.operand(op, int)?)?;
+                let side = word(&self.operand(side, int)?)?;
+                let index = word(&self.operand(index, int)?)?;
+                let scratch = self.scratch();
+                Ok(vec![self.runtime(
+                    RuntimeFn::BudgetOp,
+                    vec![scratch, op, side, index],
+                )])
             }
             (Intrinsic::CollCount, [c]) => {
                 let c_ty = self.operand_ty(c, ty);
