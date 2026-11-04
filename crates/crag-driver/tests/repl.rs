@@ -17,18 +17,12 @@
 //! The REPL's inputs: definitions, expressions run in the scratch image,
 //! `:rebind` and the other commands.
 
+mod common;
+
 use crag_driver::repl::{is_complete, is_definition};
 use crag_driver::{EvalOutput, Project, Repl, Scratch};
-use crag_session::ImageCommand;
 
-fn repl() -> Repl {
-    let scratch = Scratch::start(ImageCommand {
-        program: env!("CARGO_BIN_EXE_crag").into(),
-        args: vec!["__image".into()],
-    })
-    .unwrap();
-    Repl::new(Project::bare(), scratch)
-}
+use common::repl;
 
 /// What the REPL prints for an input, errors included.
 fn eval(r: &mut Repl, text: &str) -> String {
@@ -125,15 +119,9 @@ fn strings_run_and_show_as_literals() {
 
 #[test]
 fn embeds_read_their_files_again_when_they_change() {
-    let dir = std::env::temp_dir().join(format!("crag-repl-embed-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::project("repl-embed", &[("note.txt", "first")]);
     let note = dir.join("note.txt");
-    std::fs::write(&note, "first").unwrap();
-    let scratch = Scratch::start(ImageCommand {
-        program: env!("CARGO_BIN_EXE_crag").into(),
-        args: vec!["__image".into()],
-    })
-    .unwrap();
+    let scratch = Scratch::start(common::image_command()).unwrap();
     let mut project = Project::bare();
     project.root = Some(dir.clone());
     let mut r = Repl::new(project, scratch);
@@ -359,8 +347,7 @@ fn crag_without_arguments_reads_inputs_from_its_input() {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let dir = std::env::temp_dir().join(format!("crag-repl-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::project("repl", &[]);
     let mut child = Command::new(env!("CARGO_BIN_EXE_crag"))
         .current_dir(&dir)
         .stdin(Stdio::piped())

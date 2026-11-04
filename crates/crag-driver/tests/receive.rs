@@ -17,6 +17,8 @@
 //! Receiving code (Implementation Plan §11.10.8, Specification §18.7): a
 //! tree is checked again by the receiver against the type it expects.
 
+mod common;
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -30,11 +32,10 @@ const MANIFEST: &str = "package demo 0.1\nruntime 0.0\nmain demo.app\n";
 
 /// A project of the app module's text, loaded.
 fn load(name: &str, app: &str) -> Project {
-    let root = std::env::temp_dir().join(format!("crag-receive-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
-    fs::write(root.join("package.crag"), MANIFEST).unwrap();
-    fs::write(root.join("app.crag"), app).unwrap();
+    let root = common::project(
+        &format!("receive-{name}"),
+        &[("package.crag", MANIFEST), ("app.crag", app)],
+    );
     let project = Project::load(&root);
     let _ = fs::remove_dir_all(PathBuf::from(&root));
     let project = project.unwrap();

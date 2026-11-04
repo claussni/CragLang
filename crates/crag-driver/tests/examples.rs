@@ -19,21 +19,14 @@
 //! web example's test serves its page from a local server, so no test
 //! needs the network.
 
+mod common;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Once;
-use std::time::Duration;
 
 fn watchdog() {
-    static START: Once = Once::new();
-    START.call_once(|| {
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_secs(120));
-            eprintln!("the example tests hung");
-            std::process::abort();
-        });
-    });
+    common::watchdog(120, "the example tests hung");
 }
 
 fn example(name: &str) -> PathBuf {

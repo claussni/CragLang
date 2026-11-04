@@ -18,27 +18,17 @@
 //! the real binary. Every wait has a bound, and a watchdog ends the process
 //! if a test hangs.
 
+mod common;
+
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::Once;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-
-fn watchdog() {
-    static START: Once = Once::new();
-    START.call_once(|| {
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_secs(90));
-            eprintln!("the debug adapter tests hung");
-            std::process::abort();
-        });
-    });
-}
 
 const SERVER: &str = r#"import std.io
 
@@ -83,7 +73,7 @@ struct Client {
 
 impl Client {
     fn start() -> Client {
-        watchdog();
+        common::watchdog(90, "the debug adapter tests hung");
         let mut child = Command::new(env!("CARGO_BIN_EXE_crag"))
             .arg("dap")
             .stdin(Stdio::piped())
@@ -216,14 +206,13 @@ fn ask(port: u16) -> String {
 
 #[test]
 fn an_editor_debugs_the_app_through_the_adapter() {
-    let root = std::env::temp_dir().join(format!("crag-dap-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
-    fs::write(
-        root.join("package.crag"),
-        "package demo 0.1\nruntime 0.0\nmain demo.app\n",
-    )
-    .unwrap();
+    let root = common::project(
+        "dap",
+        &[(
+            "package.crag",
+            "package demo 0.1\nruntime 0.0\nmain demo.app\n",
+        )],
+    );
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()

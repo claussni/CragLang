@@ -18,13 +18,14 @@
 //! §18.7): `std.transport.run` checks and compiles an `Expr`'s tree again
 //! and runs it under the policy's limits, next to the program's data.
 
+mod common;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crag_driver::{EXIT_TRAP, Project, Repl, Scratch};
-use crag_session::ImageCommand;
+use crag_driver::EXIT_TRAP;
 
 const MANIFEST: &str = "package demo 0.1\nruntime 0.0\nmain demo.app\n";
 
@@ -43,11 +44,10 @@ fn run_with(name: &str, app: &str, vars: &[(&str, &str)]) -> (i32, String) {
 /// What `run` gives, with these arguments to `crag run` and these
 /// variables set.
 fn run_args(name: &str, app: &str, args: &[&str], vars: &[(&str, &str)]) -> (i32, String) {
-    let root = std::env::temp_dir().join(format!("crag-transport-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
-    fs::write(root.join("package.crag"), MANIFEST).unwrap();
-    fs::write(root.join("app.crag"), app).unwrap();
+    let root = common::project(
+        &format!("transport-{name}"),
+        &[("package.crag", MANIFEST), ("app.crag", app)],
+    );
     let mut child = Command::new(env!("CARGO_BIN_EXE_crag"))
         .arg("run")
         .args(args)
@@ -235,12 +235,7 @@ fn the_repl_runs_received_code_in_its_image() {
     // The host sends the scratch image the program's bundle, from which
     // the image's receiver checks and compiles the code itself, again
     // whenever the session changed.
-    let scratch = Scratch::start(ImageCommand {
-        program: env!("CARGO_BIN_EXE_crag").into(),
-        args: vec!["__image".into()],
-    })
-    .unwrap();
-    let mut r = Repl::new(Project::bare(), scratch);
+    let mut r = common::repl();
     let mut eval = |text: &str| match r.eval_input(text) {
         Ok(output) => output.render(),
         Err(errors) => errors,
@@ -272,10 +267,7 @@ const BUDGETS: &str = r#"{
 /// Runs `crag lmt new` on the document in a folder of its own, which then
 /// holds the document, its salt and a token file for each budget.
 fn budget_dir(name: &str, document: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("crag-lmt-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("partners.json"), document).unwrap();
+    let dir = common::project(&format!("lmt-{name}"), &[("partners.json", document)]);
     let output = Command::new(env!("CARGO_BIN_EXE_crag"))
         .args(["lmt", "new", "partners.json"])
         .current_dir(&dir)

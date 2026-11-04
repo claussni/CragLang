@@ -16,6 +16,8 @@
 
 //! Code compiled on the host, shipped to the scratch image and run there.
 
+mod common;
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,7 +28,7 @@ use crag_backend::{func_id, shapes, slot_key};
 use crag_driver::{Image, Project, Scratch};
 use crag_hir::{ItemKind, Owner, item_tree};
 use crag_mir::InstanceKey;
-use crag_session::{Fill, ImageCommand, RunResult};
+use crag_session::{Fill, RunResult};
 
 const APP: &str = r#"type Point(x: Int, y: Int)
 
@@ -100,15 +102,16 @@ fn loops() -> Int {
 
 /// A project of one module, `demo.app`, loaded.
 fn project(name: &str, app: &str) -> Project {
-    let root = std::env::temp_dir().join(format!("crag-scratch-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
-    fs::write(
-        root.join("package.crag"),
-        "package demo 0.1\nruntime 0.0\nmain demo.app\n",
-    )
-    .unwrap();
-    fs::write(root.join("app.crag"), app).unwrap();
+    let root = common::project(
+        &format!("scratch-{name}"),
+        &[
+            (
+                "package.crag",
+                "package demo 0.1\nruntime 0.0\nmain demo.app\n",
+            ),
+            ("app.crag", app),
+        ],
+    );
     let project = Project::load(&root).unwrap();
     let _ = fs::remove_dir_all(PathBuf::from(&root));
     project
@@ -128,11 +131,7 @@ fn function<'a>(project: &'a Project, name: &str) -> InstanceKey<'a> {
 }
 
 fn scratch() -> Scratch {
-    Scratch::start(ImageCommand {
-        program: env!("CARGO_BIN_EXE_crag").into(),
-        args: vec!["__image".into()],
-    })
-    .unwrap()
+    Scratch::start(common::image_command()).unwrap()
 }
 
 #[test]

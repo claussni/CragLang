@@ -17,6 +17,8 @@
 //! The built-in editor (Specification §20.8), driven by its commands and
 //! drawn on a test terminal.
 
+mod common;
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -25,7 +27,6 @@ use crag_driver::ui::keys::Command;
 use crag_driver::ui::state::{Focus, Overlay};
 use crag_driver::ui::{Colours, Theme, Ui, draw};
 use crag_driver::{Project, Repl, Scratch};
-use crag_session::ImageCommand;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -35,25 +36,21 @@ const APP: &str =
     "import demo.geo.shape\n\nfn main() -> Int {\n  let p = Point(x: 2, y: 3)\n  area(p)\n}\n";
 
 fn project(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("crag-ui-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(root.join("geo")).unwrap();
-    fs::write(
-        root.join("package.crag"),
-        "package demo 0.1\nruntime 0.0\nmain demo.app\n",
+    common::project(
+        &format!("ui-{name}"),
+        &[
+            (
+                "package.crag",
+                "package demo 0.1\nruntime 0.0\nmain demo.app\n",
+            ),
+            ("geo/shape.crag", SHAPE),
+            ("app.crag", APP),
+        ],
     )
-    .unwrap();
-    fs::write(root.join("geo/shape.crag"), SHAPE).unwrap();
-    fs::write(root.join("app.crag"), APP).unwrap();
-    root
 }
 
 fn ui(root: &std::path::Path) -> Ui {
-    let scratch = Scratch::start(ImageCommand {
-        program: env!("CARGO_BIN_EXE_crag").into(),
-        args: vec!["__image".into()],
-    })
-    .unwrap();
+    let scratch = Scratch::start(common::image_command()).unwrap();
     Ui::new(Repl::new(Project::load(root).unwrap(), scratch))
 }
 
@@ -532,19 +529,16 @@ fn a_breakpoint_takes_the_ui_to_the_stopped_line() {
 #[test]
 fn cd_opens_the_project_in_another_directory() {
     let root = project("cd-from");
-    let other = std::env::temp_dir().join(format!("crag-ui-cd-to-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&other);
-    fs::create_dir_all(&other).unwrap();
-    fs::write(
-        other.join("package.crag"),
-        "package other 0.1\nruntime 0.0\nmain other.start\n",
-    )
-    .unwrap();
-    fs::write(
-        other.join("start.crag"),
-        "pub fn twice(n: Int) -> Int { n * 2 }\n",
-    )
-    .unwrap();
+    let other = common::project(
+        "ui-cd-to",
+        &[
+            (
+                "package.crag",
+                "package other 0.1\nruntime 0.0\nmain other.start\n",
+            ),
+            ("start.crag", "pub fn twice(n: Int) -> Int { n * 2 }\n"),
+        ],
+    );
     let mut ui = ui(&root);
     assert_eq!(ui.buffer().name, "app.crag");
     // An edit of the project left behind is saved.

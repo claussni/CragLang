@@ -18,17 +18,11 @@
 //! the examples of Compiler Architecture §A11.4.1 to §A11.4.6 have the
 //! sizes stated there.
 
-use crag_driver::{Project, Repl, Scratch};
-use crag_session::ImageCommand;
+mod common;
 
-fn repl() -> Repl {
-    let scratch = Scratch::start(ImageCommand {
-        program: env!("CARGO_BIN_EXE_crag").into(),
-        args: vec!["__image".into()],
-    })
-    .unwrap();
-    Repl::new(Project::bare(), scratch)
-}
+use crag_driver::Repl;
+
+use common::repl;
 
 fn eval(r: &mut Repl, text: &str) -> String {
     match r.eval_input(text) {

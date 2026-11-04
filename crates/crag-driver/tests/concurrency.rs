@@ -18,42 +18,27 @@
 //! projects compiled and run on the scheduler. A watchdog ends the process
 //! if a test hangs.
 
+mod common;
+
 use std::fs;
-use std::path::PathBuf;
-use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use crag_driver::{EXIT_TRAP, crag_run};
 
-/// Ends the test process if the tests take longer than a minute.
-fn watchdog() {
-    static START: Once = Once::new();
-    START.call_once(|| {
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_secs(60));
-            eprintln!("the concurrency tests hung");
-            std::process::abort();
-        });
-    });
-}
-
-fn project(name: &str, app: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("crag-conc-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
-    fs::write(
-        root.join("package.crag"),
-        "package demo 0.1\nruntime 0.0\nmain demo.app\n",
-    )
-    .unwrap();
-    fs::write(root.join("app.crag"), app).unwrap();
-    root
-}
-
-/// Runs the project's `main`: its exit status and what it printed.
+/// Runs the project's `main`: its exit status and what it printed. The
+/// test process ends if the tests take longer than a minute.
 fn run(name: &str, app: &str) -> (u8, String) {
-    watchdog();
-    let root = project(name, app);
+    common::watchdog(60, "the concurrency tests hung");
+    let root = common::project(
+        &format!("conc-{name}"),
+        &[
+            (
+                "package.crag",
+                "package demo 0.1\nruntime 0.0\nmain demo.app\n",
+            ),
+            ("app.crag", app),
+        ],
+    );
     let mut out = Vec::new();
     let code = crag_run(&root, &mut out);
     let _ = fs::remove_dir_all(&root);

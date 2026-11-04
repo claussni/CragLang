@@ -16,14 +16,11 @@
 
 //! The session manager with the real image, `crag __image`.
 
-use crag_session::{ImageCommand, ImageState, Message, Session, SessionError, describe};
+mod common;
 
-fn command() -> ImageCommand {
-    ImageCommand {
-        program: env!("CARGO_BIN_EXE_crag").into(),
-        args: vec!["__image".into()],
-    }
-}
+use crag_session::{ImageState, Message, Session, SessionError, describe};
+
+use common::image_command;
 
 /// Whether a process exists; a reaped one does not.
 fn exists(pid: u32) -> bool {
@@ -50,7 +47,7 @@ fn kill_with(pid: u32, signal: i32) {
 
 #[test]
 fn the_scratch_image_answers_and_shuts_down() {
-    let mut session = Session::start(command()).unwrap();
+    let mut session = Session::start(image_command()).unwrap();
     let pid = session.scratch().pid();
     assert_ne!(pid, std::process::id());
     assert_eq!(session.scratch().state(), ImageState::Running);
@@ -72,8 +69,7 @@ fn the_scratch_image_answers_and_shuts_down() {
 
 #[test]
 fn an_image_ends_when_the_host_goes_away() {
-    let dir = std::env::temp_dir().join(format!("crag-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = common::project("session", &[]);
     let path = dir.join("host-gone.sock");
     let _ = std::fs::remove_file(&path);
     let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -94,7 +90,7 @@ fn an_image_ends_when_the_host_goes_away() {
 
 #[test]
 fn a_crashed_image_is_replaced() {
-    let mut session = Session::start(command()).unwrap();
+    let mut session = Session::start(image_command()).unwrap();
     let old = session.scratch().pid();
     // An image's panic aborts (Architecture §2.1). A SIGSEGV sent from
     // outside would not do: the standard library's handler, which tells
@@ -123,7 +119,7 @@ fn a_crashed_image_is_replaced() {
 
 #[test]
 fn a_runaway_image_is_restarted() {
-    let mut session = Session::start(command()).unwrap();
+    let mut session = Session::start(image_command()).unwrap();
     let old = session.scratch().pid();
     let exit = session.restart().unwrap();
     assert_eq!(exit.pid, old);

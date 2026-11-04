@@ -17,23 +17,15 @@
 //! `crag run`, `crag test` and `crag fmt` on small multi-module projects on
 //! disk.
 
+mod common;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
 use crag_driver::{EXIT_TRAP, crag_fmt, crag_run, crag_test};
 
-/// A fresh project directory holding the files.
-fn project(name: &str, files: &[(&str, &str)]) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("crag-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    for (path, text) in files {
-        let path = root.join(path);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, text).unwrap();
-    }
-    root
-}
+use common::project;
 
 const MANIFEST: &str = "package demo 0.1\nruntime 0.0\nmain demo.app\n";
 

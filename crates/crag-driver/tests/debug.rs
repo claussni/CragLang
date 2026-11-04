@@ -18,27 +18,16 @@
 //! stops at a breakpoint, shows where and its locals, steps and goes on.
 //! Every wait has a bound, and a watchdog ends the process if a test hangs.
 
+mod common;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use crag_driver::debug::{Pause, Resume};
 use crag_driver::{Project, Scratch};
-use crag_session::ImageCommand;
-
-fn watchdog() {
-    static START: Once = Once::new();
-    START.call_once(|| {
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_secs(90));
-            eprintln!("the debugger tests hung");
-            std::process::abort();
-        });
-    });
-}
 
 const SERVER: &str = r#"import std.io
 
@@ -122,31 +111,24 @@ fn setup(name: &str) -> Setup {
 }
 
 fn setup_with(name: &str, source: &str) -> Setup {
-    watchdog();
-    let root = std::env::temp_dir().join(format!("crag-debug-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
-    fs::write(
-        root.join("package.crag"),
-        "package demo 0.1\nruntime 0.0\nmain demo.app\n",
-    )
-    .unwrap();
+    common::watchdog(90, "the debugger tests hung");
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port();
-    fs::write(
-        root.join("app.crag"),
-        source.replace("PORT", &port.to_string()),
-    )
-    .unwrap();
+    let root = common::project(
+        &format!("debug-{name}"),
+        &[
+            (
+                "package.crag",
+                "package demo 0.1\nruntime 0.0\nmain demo.app\n",
+            ),
+            ("app.crag", &source.replace("PORT", &port.to_string())),
+        ],
+    );
     let project = Project::load(&root).unwrap();
-    let scratch = Scratch::start(ImageCommand {
-        program: env!("CARGO_BIN_EXE_crag").into(),
-        args: vec!["__image".into()],
-    })
-    .unwrap();
+    let scratch = Scratch::start(common::image_command()).unwrap();
     Setup {
         root,
         project,
@@ -290,11 +272,7 @@ fn the_repl_debugs_the_app() {
     use crag_driver::Repl;
 
     let s = setup("repl");
-    let scratch = Scratch::start(ImageCommand {
-        program: env!("CARGO_BIN_EXE_crag").into(),
-        args: vec!["__image".into()],
-    })
-    .unwrap();
+    let scratch = Scratch::start(common::image_command()).unwrap();
     let mut repl = Repl::new(Project::load(&s.root).unwrap(), scratch);
     let mut eval = |text: &str| match repl.eval_input(text) {
         Ok(output) => output.render(),

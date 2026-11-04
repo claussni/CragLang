@@ -18,26 +18,15 @@
 //! running server is edited, and new connections see the new code while
 //! the server keeps running. A watchdog ends the process if a test hangs.
 
+mod common;
+
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use crag_driver::{Project, Scratch};
-use crag_session::ImageCommand;
-
-fn watchdog() {
-    static START: Once = Once::new();
-    START.call_once(|| {
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_secs(90));
-            eprintln!("the reload tests hung");
-            std::process::abort();
-        });
-    });
-}
 
 /// A server that answers each connection with `answer()` and then waits
 /// for the next one, in a loop written as a tail call.
@@ -142,27 +131,20 @@ struct Setup {
 }
 
 fn setup(name: &str) -> Setup {
-    watchdog();
-    let root = std::env::temp_dir().join(format!("crag-reload-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).unwrap();
-    fs::write(
-        root.join("package.crag"),
-        "package demo 0.1\nruntime 0.0\nmain demo.app\n",
-    )
-    .unwrap();
+    common::watchdog(90, "the reload tests hung");
     let port = free_port();
-    fs::write(
-        root.join("app.crag"),
-        SERVER.replace("PORT", &port.to_string()),
-    )
-    .unwrap();
+    let root = common::project(
+        &format!("reload-{name}"),
+        &[
+            (
+                "package.crag",
+                "package demo 0.1\nruntime 0.0\nmain demo.app\n",
+            ),
+            ("app.crag", &SERVER.replace("PORT", &port.to_string())),
+        ],
+    );
     let project = Project::load(&root).unwrap();
-    let scratch = Scratch::start(ImageCommand {
-        program: env!("CARGO_BIN_EXE_crag").into(),
-        args: vec!["__image".into()],
-    })
-    .unwrap();
+    let scratch = Scratch::start(common::image_command()).unwrap();
     Setup {
         root,
         project,
@@ -389,11 +371,7 @@ fn the_repl_starts_reloads_and_stops_the_app() {
 
     let s = setup("repl");
     let Setup { root, port, .. } = &s;
-    let scratch = Scratch::start(ImageCommand {
-        program: env!("CARGO_BIN_EXE_crag").into(),
-        args: vec!["__image".into()],
-    })
-    .unwrap();
+    let scratch = Scratch::start(common::image_command()).unwrap();
     let mut repl = Repl::new(Project::load(root).unwrap(), scratch);
     let mut eval = |text: &str| match repl.eval_input(text) {
         Ok(output) => output.render(),

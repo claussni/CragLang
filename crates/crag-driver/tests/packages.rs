@@ -18,30 +18,20 @@
 //! (Specification §14.5, §20.4, §20.6). Each test has a settings directory
 //! of its own, named by `CRAG_HOME`.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::Once;
-use std::time::Duration;
 
 use crag_package::{Registry, Version};
 
 fn watchdog() {
-    static START: Once = Once::new();
-    START.call_once(|| {
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_secs(120));
-            eprintln!("the package tests hung");
-            std::process::abort();
-        });
-    });
+    common::watchdog(120, "the package tests hung");
 }
 
 fn temp(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("crag-packages-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
+    common::project(&format!("packages-{name}"), &[])
 }
 
 /// A settings directory with the registry `team`.

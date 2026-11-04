@@ -17,27 +17,17 @@
 //! `crag lsp`: the language server driven over pipes as an editor would.
 //! Every wait has a bound, and a watchdog ends the process if a test hangs.
 
+mod common;
+
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Once;
 use std::sync::mpsc::{self, Receiver};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-
-fn watchdog() {
-    static START: Once = Once::new();
-    START.call_once(|| {
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_secs(60));
-            eprintln!("the language server tests hung");
-            std::process::abort();
-        });
-    });
-}
 
 const MANIFEST: &str = "package demo 0.1\nruntime 0.0\nmain demo.app\n";
 
@@ -56,13 +46,14 @@ fn main() -> Int {
 ";
 
 fn project(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("crag-lsp-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(root.join("geo")).unwrap();
-    fs::write(root.join("package.crag"), MANIFEST).unwrap();
-    fs::write(root.join("geo/shape.crag"), SHAPE).unwrap();
-    fs::write(root.join("app.crag"), APP).unwrap();
-    root
+    common::project(
+        &format!("lsp-{name}"),
+        &[
+            ("package.crag", MANIFEST),
+            ("geo/shape.crag", SHAPE),
+            ("app.crag", APP),
+        ],
+    )
 }
 
 fn uri(path: &Path) -> String {
@@ -82,7 +73,7 @@ const WAIT: Duration = Duration::from_secs(20);
 
 impl Client {
     fn start() -> Client {
-        watchdog();
+        common::watchdog(60, "the language server tests hung");
         let (server_in, input) = std::io::pipe().unwrap();
         let (output, server_out) = std::io::pipe().unwrap();
         let server = std::thread::spawn(move || crag_driver::lsp::serve(server_in, server_out));

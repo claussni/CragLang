@@ -17,6 +17,8 @@
 //! `crag build` and `:build`: the project's tests, then its release
 //! executable in `dist/`.
 
+mod common;
+
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -25,7 +27,6 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crag_driver::{EvalOutput, Repl, Scratch};
-use crag_session::ImageCommand;
 
 /// How long a build of the runtime archive, and a build or run of a
 /// project, may take.
@@ -116,13 +117,14 @@ fn run(mut command: Command, limit: Duration) -> Output {
 
 /// A fresh project with the app and the test module.
 fn project(name: &str, test: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("crag-build-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(root.join("test")).unwrap();
-    fs::write(root.join("package.crag"), MANIFEST).unwrap();
-    fs::write(root.join("app.crag"), APP).unwrap();
-    fs::write(root.join("test/app_test.crag"), test).unwrap();
-    root
+    common::project(
+        &format!("build-{name}"),
+        &[
+            ("package.crag", MANIFEST),
+            ("app.crag", APP),
+            ("test/app_test.crag", test),
+        ],
+    )
 }
 
 /// `crag build` with the arguments in the project.
@@ -178,11 +180,7 @@ fn build_refuses_what_it_does_not_take() {
 fn the_repl_builds_as_the_shell_does() {
     archive();
     let root = project("repl", FAILS);
-    let scratch = Scratch::start(ImageCommand {
-        program: env!("CARGO_BIN_EXE_crag").into(),
-        args: vec!["__image".into()],
-    })
-    .unwrap();
+    let scratch = Scratch::start(common::image_command()).unwrap();
     let mut repl = Repl::new(crag_driver::project::Project::load(&root).unwrap(), scratch);
     let refused = repl.run_command("build");
     let built = repl.run_command("build skip-tests");

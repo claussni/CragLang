@@ -18,17 +18,9 @@
 //! (Specification §19.10, §19.11), each input with what the REPL shows for
 //! it.
 
-use crag_driver::{Project, Repl, Scratch};
-use crag_session::ImageCommand;
+mod common;
 
-fn repl() -> Repl {
-    let scratch = Scratch::start(ImageCommand {
-        program: env!("CARGO_BIN_EXE_crag").into(),
-        args: vec!["__image".into()],
-    })
-    .unwrap();
-    Repl::new(Project::bare(), scratch)
-}
+use common::repl;
 
 /// Runs each input and compares what the REPL shows, without its newline.
 fn check(cases: &[(&str, &str)]) {
