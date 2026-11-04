@@ -35,7 +35,6 @@ pub mod lsp;
 pub mod packages;
 pub mod persist;
 pub mod project;
-pub use crag_receive as receive;
 pub mod repl;
 pub mod scratch;
 pub mod tier;
@@ -279,12 +278,12 @@ pub fn crag_repl(root: &Path) -> u8 {
         }
     };
     let mut repl = Repl::new(project, scratch);
-    let mut editor = line::LineEditor::new();
+    let mut input = std::io::stdin().lock();
     loop {
         // What the app printed while the prompt waited.
         print!("{}", repl.take_printed());
         let _ = std::io::stdout().flush();
-        let Some(input) = line::read_input(&mut editor, &|prefix| repl.completions(prefix)) else {
+        let Some(input) = line::read_input(&mut input) else {
             break;
         };
         let result = repl.eval_input(&input);
