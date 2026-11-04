@@ -30,7 +30,7 @@
 use std::collections::BTreeSet;
 
 use crag_db::Setter;
-use crag_hir::{ItemKind, ModuleId, Owner, SESSION, SourceFile, item_tree, module_scope};
+use crag_hir::{ItemKind, ModuleId, Owner, SESSION, item_tree, module_scope};
 use crag_mir::{InstanceKey, Tier, mir};
 use crag_session::RunResult;
 use crag_syntax::{TokenKind, lex};
@@ -837,7 +837,7 @@ impl Repl {
         }
         let db = &self.project.db;
         let items = |text: &str| {
-            let alone = ModuleId::new(db, SESSION.into(), SourceFile::new(db, text.into()));
+            let alone = ModuleId::of(db, SESSION, text);
             item_tree(db, alone)
                 .items
                 .iter()
@@ -866,7 +866,7 @@ impl Repl {
         }
         // A module of its own, which no program has, says what it declares.
         let db = &self.project.db;
-        let alone = ModuleId::new(db, SESSION.into(), SourceFile::new(db, text.into()));
+        let alone = ModuleId::of(db, SESSION, text);
         let mut names = Vec::new();
         for item in &item_tree(db, alone).items {
             let name = item.id.name(db).text(db);

@@ -15,22 +15,14 @@
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
 use crag_db::RootDatabase;
-use crag_hir::{ModuleId, Previous, Program, SourceFile, check_shadowing};
+use crag_hir::{ModuleId, Previous, Program, check_shadowing};
 
 /// Each redeclared name with the line of the redeclaration and of what
 /// had the name first.
 fn redeclarations(text: &str) -> Vec<String> {
     let db = RootDatabase::new();
-    let core = ModuleId::new(
-        &db,
-        "std.core".to_string(),
-        SourceFile::new(&db, "pub type Int\npub fn print(s: Str) {}".to_string()),
-    );
-    let module = ModuleId::new(
-        &db,
-        "app".to_string(),
-        SourceFile::new(&db, text.to_string()),
-    );
+    let core = ModuleId::of(&db, "std.core", "pub type Int\npub fn print(s: Str) {}");
+    let module = ModuleId::of(&db, "app", text);
     let program = Program::new(&db, vec![core, module], Vec::new());
     let line = |offset: u32| text[..offset as usize].matches('\n').count() + 1;
     check_shadowing(&db, program, module)

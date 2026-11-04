@@ -39,6 +39,13 @@ pub struct ModuleId {
     pub file: SourceFile,
 }
 
+impl ModuleId {
+    /// A module at `path` with `text` as its source.
+    pub fn of(db: &dyn crag_db::Db, path: &str, text: &str) -> ModuleId {
+        ModuleId::new(db, path.to_string(), SourceFile::new(db, text.to_string()))
+    }
+}
+
 /// The modules of a program: an application with its dependencies, or a
 /// REPL session. Paths are unique; of two modules with one path, the first
 /// counts.

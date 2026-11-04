@@ -302,16 +302,8 @@ impl Module {
 
     fn build(text: &str, tier: Tier, resources: &[(&str, &[u8])], library: Option<&str>) -> Module {
         let db = RootDatabase::new();
-        let core = ModuleId::new(
-            &db,
-            "std.core".to_string(),
-            SourceFile::new(&db, PRELUDE.to_string()),
-        );
-        let module = ModuleId::new(
-            &db,
-            "app".to_string(),
-            SourceFile::new(&db, text.to_string()),
-        );
+        let core = ModuleId::of(&db, "std.core", PRELUDE);
+        let module = ModuleId::of(&db, "app", text);
         let resources = resources
             .iter()
             .map(|(source, bytes)| {
@@ -319,22 +311,14 @@ impl Module {
                 (module, source.to_string(), Resource::new(&db, content))
             })
             .collect();
-        let transport = ModuleId::new(
+        let transport = ModuleId::of(
             &db,
-            "std.transport".to_string(),
-            SourceFile::new(&db, include_str!("../../../std/transport.crag").to_string()),
+            "std.transport",
+            include_str!("../../../std/transport.crag"),
         );
         // What std.transport uses of std.io and std.stream.
-        let io = ModuleId::new(
-            &db,
-            "std.io".to_string(),
-            SourceFile::new(&db, IO.to_string()),
-        );
-        let stream = ModuleId::new(
-            &db,
-            "std.stream".to_string(),
-            SourceFile::new(&db, "pub distinct type Closed\n".to_string()),
-        );
+        let io = ModuleId::of(&db, "std.io", IO);
+        let stream = ModuleId::of(&db, "std.stream", "pub distinct type Closed\n");
         let mut modules = vec![core, module, transport, io, stream];
         if let Some(library) = library {
             let file = SourceFile::new(&db, library.to_string());

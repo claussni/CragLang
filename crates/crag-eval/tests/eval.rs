@@ -68,11 +68,7 @@ impl Project {
     /// A project whose `embed`s may name the resources.
     fn with(text: &str, resources: &[(&str, &[u8])]) -> Project {
         let db = RootDatabase::new();
-        let core = ModuleId::new(
-            &db,
-            "std.core".to_string(),
-            SourceFile::new(&db, PRELUDE.to_string()),
-        );
+        let core = ModuleId::of(&db, "std.core", PRELUDE);
         let file = SourceFile::new(&db, text.to_string());
         let module = ModuleId::new(&db, "app".to_string(), file);
         let resources = resources

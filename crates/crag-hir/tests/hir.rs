@@ -19,9 +19,7 @@ extern crate crag_db as salsa;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crag_db::{Db, RootDatabase, Setter};
-use crag_hir::{
-    LowerError, ModuleId, Owner, Program, SourceFile, hir_body, lower_body, owners, pretty,
-};
+use crag_hir::{LowerError, ModuleId, Owner, Program, hir_body, lower_body, owners, pretty};
 
 const PRELUDE: &str = r#"pub type Int
 pub type Str
@@ -45,12 +43,8 @@ pub fn expect[X](x: X) -> X prefix "!!"
 "#;
 
 fn setup(db: &RootDatabase, text: &str) -> (Program, ModuleId) {
-    let core = ModuleId::new(
-        db,
-        "std.core".to_string(),
-        SourceFile::new(db, PRELUDE.to_string()),
-    );
-    let module = ModuleId::new(db, "app".to_string(), SourceFile::new(db, text.to_string()));
+    let core = ModuleId::of(db, "std.core", PRELUDE);
+    let module = ModuleId::of(db, "app", text);
     (Program::new(db, vec![core, module], Vec::new()), module)
 }
 
@@ -262,11 +256,7 @@ type Moved(x: Int, ..Point, ..Point)"#;
 #[test]
 fn operators_need_their_functions() {
     let db = RootDatabase::new();
-    let module = ModuleId::new(
-        &db,
-        "alone".to_string(),
-        SourceFile::new(&db, "fn f(a: Int) { a + 1 }".to_string()),
-    );
+    let module = ModuleId::of(&db, "alone", "fn f(a: Int) { a + 1 }");
     let program = Program::new(&db, vec![module], Vec::new());
     let owner = owners(&db, module)[0];
     let errors: Vec<String> = lower_body(&db, program, owner)

@@ -59,16 +59,8 @@ fn mir_of(text: &str, steps: bool) -> String {
 /// As `mir_of`, in a tier.
 fn mir_in(text: &str, steps: bool, tier: Tier) -> String {
     let db = RootDatabase::new();
-    let core = ModuleId::new(
-        &db,
-        "std.core".to_string(),
-        SourceFile::new(&db, PRELUDE.to_string()),
-    );
-    let module = ModuleId::new(
-        &db,
-        "app".to_string(),
-        SourceFile::new(&db, text.to_string()),
-    );
+    let core = ModuleId::of(&db, "std.core", PRELUDE);
+    let module = ModuleId::of(&db, "app", text);
     let program = Program::new(&db, vec![core, module], Vec::new());
     let mut out = String::new();
     let mut printed = std::collections::HashSet::new();
@@ -1333,11 +1325,7 @@ fn instance_and_type_ids_are_never_reused() {
     // when old values go unread for revisions. Both are interned inside
     // queries, where salsa would otherwise reuse stale ones.
     let mut db = RootDatabase::new();
-    let core = ModuleId::new(
-        &db,
-        "std.core".to_string(),
-        SourceFile::new(&db, PRELUDE.to_string()),
-    );
+    let core = ModuleId::of(&db, "std.core", PRELUDE);
     let file = SourceFile::new(&db, String::new());
     let module = ModuleId::new(&db, "app".to_string(), file);
     let program = Program::new(&db, vec![core, module], Vec::new());

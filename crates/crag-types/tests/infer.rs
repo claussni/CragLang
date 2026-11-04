@@ -19,7 +19,7 @@ extern crate crag_db as salsa;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crag_db::{Db, RootDatabase, Setter};
-use crag_hir::{ItemKind, ModuleId, Owner, Program, SourceFile, lower_body, owners};
+use crag_hir::{ItemKind, ModuleId, Owner, Program, lower_body, owners};
 use crag_types::{body_types, final_errors, module_type_errors};
 
 const PRELUDE: &str = r#"pub type Int
@@ -95,20 +95,13 @@ struct Checked {
 }
 
 fn setup(db: &RootDatabase, text: &str) -> (Program, ModuleId, ModuleId) {
-    let core = ModuleId::new(
+    let core = ModuleId::of(db, "std.core", PRELUDE);
+    let transport = ModuleId::of(
         db,
-        "std.core".to_string(),
-        SourceFile::new(db, PRELUDE.to_string()),
+        "std.transport",
+        "pub type Expr[F]\npub fn treeHash[F](e: Expr[F]) -> Bytes\n",
     );
-    let transport = ModuleId::new(
-        db,
-        "std.transport".to_string(),
-        SourceFile::new(
-            db,
-            "pub type Expr[F]\npub fn treeHash[F](e: Expr[F]) -> Bytes\n".to_string(),
-        ),
-    );
-    let module = ModuleId::new(db, "app".to_string(), SourceFile::new(db, text.to_string()));
+    let module = ModuleId::of(db, "app", text);
     (
         Program::new(db, vec![core, transport, module], Vec::new()),
         core,

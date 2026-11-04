@@ -215,11 +215,7 @@ impl Project {
         let files: Vec<ModuleFile> = STD
             .iter()
             .map(|(name, text)| ModuleFile {
-                module: ModuleId::new(
-                    &db,
-                    name.to_string(),
-                    SourceFile::new(&db, text.to_string()),
-                ),
+                module: ModuleId::of(&db, name, text),
                 shown: format!("{name} (bundled)"),
                 dir: PathBuf::new(),
                 dependency: None,
@@ -243,7 +239,7 @@ impl Project {
     /// Adds a module that no file holds, such as the REPL's session, shown
     /// as `shown`.
     pub fn add_module(&mut self, path: &str, shown: &str, text: String) -> ModuleId {
-        let module = ModuleId::new(&self.db, path.to_string(), SourceFile::new(&self.db, text));
+        let module = ModuleId::of(&self.db, path, &text);
         self.files.push(ModuleFile {
             module,
             shown: shown.to_string(),

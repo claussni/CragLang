@@ -28,7 +28,7 @@
 
 use crag_abi::{FuncId, SlotKey};
 use crag_db::{Db, RootDatabase, Setter};
-use crag_hir::{ModuleId, PackageScope, Packages, Program, Resource, SourceFile, TypeIndices};
+use crag_hir::{ModuleId, PackageScope, Packages, Program, Resource, TypeIndices};
 
 /// The version of the bundle's layout.
 const VERSION: u32 = 1;
@@ -90,9 +90,7 @@ impl Bundle {
         let modules: Vec<ModuleId> = self
             .modules
             .iter()
-            .map(|(path, text)| {
-                ModuleId::new(&db, path.clone(), SourceFile::new(&db, text.clone()))
-            })
+            .map(|(path, text)| ModuleId::of(&db, path, text))
             .collect();
         let resources = self
             .resources
