@@ -332,7 +332,6 @@ name = "crag-store"
 version = "0.0.0"
 dependencies = [
  "blake3",
- "libc",
 ]
 
 [[package]]

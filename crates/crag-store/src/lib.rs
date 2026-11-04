@@ -246,27 +246,17 @@ impl Store {
             .truncate(false)
             .write(true)
             .open(self.dir.join("lock"))?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            let mut op = match mode {
-                LockMode::Shared => libc::LOCK_SH,
-                LockMode::Exclusive => libc::LOCK_EX,
-            };
-            if !wait {
-                op |= libc::LOCK_NB;
-            }
-            // SAFETY: flock on a descriptor this function owns.
-            if unsafe { libc::flock(file.as_raw_fd(), op) } != 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    return Ok(None);
-                }
-                return Err(error);
-            }
+        let locked = match (mode, wait) {
+            (LockMode::Shared, true) => file.lock_shared().map_err(fs::TryLockError::Error),
+            (LockMode::Exclusive, true) => file.lock().map_err(fs::TryLockError::Error),
+            (LockMode::Shared, false) => file.try_lock_shared(),
+            (LockMode::Exclusive, false) => file.try_lock(),
+        };
+        match locked {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(fs::TryLockError::Error(error)) => return Err(error),
         }
-        #[cfg(not(unix))]
-        let _ = (mode, wait);
         Ok(Some(StoreGuard { _file: file }))
     }
 
