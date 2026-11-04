@@ -15,7 +15,7 @@
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
 use crag_syntax::TokenKind::*;
-use crag_syntax::{TextEdit, Token, TokenKind, TriviaKind, lex, relex};
+use crag_syntax::{TokenKind, TriviaKind, lex};
 
 const PROGRAM: &str = r#"// A point on the drawing canvas.
 type Point(x: Int, y: Int)
@@ -285,92 +285,4 @@ fn newlines_end_statements_except_where_lines_continue() {
     );
     // A field named like an operator keyword does not continue the line.
     assert_eq!(kinds("x.and\ny"), [Ident, Dot, Ident, Newline, Ident, Eof]);
-}
-
-/// A small deterministic generator, so failures reproduce.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-}
-
-const FRAGMENTS: &[&str] = &[
-    "\"", "\"\"\"", "{", "}", "(", ")", "[", "]", "/*", "*/", "//", "\n", "\n\n", ".", "..", "?.",
-    "?", "else", "x", " ", "+", "-", "->", ",", "1", "2.5", "e", "b", "'", "\\", "{{", "and", "_",
-    "ü", "\r\n",
-];
-
-fn char_boundary(text: &str, rng: &mut Rng) -> usize {
-    let mut pos = rng.below(text.len() + 1);
-    while !text.is_char_boundary(pos) {
-        pos -= 1;
-    }
-    pos
-}
-
-#[test]
-fn relexing_after_an_edit_equals_lexing_from_scratch() {
-    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-    for round in 0..40 {
-        let mut text = PROGRAM.to_string();
-        let mut old: Vec<Token> = lex(&text);
-        for step in 0..100 {
-            let start = char_boundary(&text, &mut rng);
-            let mut end = (start + rng.below(6)).min(text.len());
-            while !text.is_char_boundary(end) {
-                end += 1;
-            }
-            let insert: String = (0..rng.below(3))
-                .map(|_| FRAGMENTS[rng.below(FRAGMENTS.len())])
-                .collect();
-            let edit = TextEdit {
-                start: start as u32,
-                end: end as u32,
-                insert,
-            };
-            let new_text = edit.apply(&text);
-            let relexed = relex(&new_text, &old, &edit);
-            let lexed = lex(&new_text);
-            assert!(
-                relexed == lexed,
-                "round {round}, step {step}: {edit:?} on {text:?}"
-            );
-            text = new_text;
-            old = relexed;
-        }
-    }
-}
-
-/// Edits that change a token ending before them, which only lookahead saw.
-#[test]
-fn relexing_reaches_back_over_lookahead() {
-    for (text, at, insert) in [
-        ("x = 1.", 6, "5"),
-        ("??", 2, "?"),
-        ("a\n\n\nb", 4, "."),
-        ("a\n// c\n\nb", 8, "?."),
-        ("let a = 1\nlet b = 2\n", 9, "2"),
-    ] {
-        let old = lex(text);
-        let edit = TextEdit {
-            start: at,
-            end: at,
-            insert: insert.into(),
-        };
-        let new_text = edit.apply(text);
-        assert_eq!(
-            relex(&new_text, &old, &edit),
-            lex(&new_text),
-            "{new_text:?}"
-        );
-    }
 }

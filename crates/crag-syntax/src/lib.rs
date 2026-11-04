@@ -23,8 +23,7 @@
 //! The parser turns the tokens into a concrete syntax tree, lossless as
 //! well: its leaves, trivia included, spell out the source exactly. A green
 //! tree holds the shape and the text; a red tree over it adds parents and
-//! positions while walking. After an edit, `reparse` parses again only the
-//! block the edit falls into, where it can.
+//! positions while walking.
 
 mod grammar;
 mod green;
@@ -32,13 +31,11 @@ mod kind;
 mod lexer;
 mod parser;
 mod red;
-mod reparse;
 mod token;
 
 pub use green::{GreenElement, GreenNode, GreenToken};
 pub use kind::{LeafKind, SyntaxKind};
-pub use lexer::{lex, relex};
+pub use lexer::lex;
 pub use parser::{ParseError, parse};
 pub use red::{SyntaxElement, SyntaxNode, SyntaxToken};
-pub use reparse::reparse;
-pub use token::{TextEdit, Token, TokenKind, Trivia, TriviaKind};
+pub use token::{Token, TokenKind, Trivia, TriviaKind};

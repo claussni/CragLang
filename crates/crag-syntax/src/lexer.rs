@@ -29,9 +29,9 @@
 //!
 //! The state changes only through `State::advance`, by the kind of each
 //! token. Replaying the kinds of a token list therefore recovers the state
-//! at any token, which is what lets `relex` start in the middle of a file.
+//! at any token.
 
-use crate::token::{TextEdit, Token, TokenKind};
+use crate::token::{Token, TokenKind};
 
 /// Cuts `text` into tokens. The last token is always `Eof`.
 pub fn lex(text: &str) -> Vec<Token> {
@@ -42,104 +42,6 @@ pub fn lex(text: &str) -> Vec<Token> {
         tokens.push(token);
         if token.kind == TokenKind::Eof {
             return tokens;
-        }
-    }
-}
-
-/// Lexes `text` as one block `{ … }` for the incremental reparse, or `None`
-/// if it is not one: the `{` at its start must be closed by the last token,
-/// and every closer in between must close the innermost open bracket or
-/// interpolation. Then the lexer never looks past the block's own `{` into
-/// its state, so the tokens are those the block would get in any file.
-pub(crate) fn lex_block(text: &str) -> Option<Vec<Token>> {
-    use TokenKind::*;
-    let tokens = lex(text);
-    let (eof, body) = tokens.split_last()?;
-    if body.first()?.trivia_start != 0 || eof.trivia_start != eof.end {
-        return None;
-    }
-    let mut open = Vec::new();
-    for (i, token) in body.iter().enumerate() {
-        if i > 0 && open.is_empty() {
-            return None;
-        }
-        let closes = match token.kind {
-            LParen | LBracket | LBrace | StrStart | TripleStrStart => {
-                open.push(token.kind);
-                continue;
-            }
-            RParen => LParen,
-            RBracket => LBracket,
-            RBrace => LBrace,
-            StrMid | StrEnd => match open.last() {
-                Some(StrStart | TripleStrStart) => {
-                    if token.kind == StrEnd {
-                        open.pop();
-                    }
-                    continue;
-                }
-                _ => return None,
-            },
-            _ => continue,
-        };
-        if open.pop() != Some(closes) {
-            return None;
-        }
-    }
-    (body[0].kind == LBrace && open.is_empty()).then_some(tokens)
-}
-
-/// How far past its end the lexer may look to decide a token, in bytes:
-/// `1..` needs two to tell a range from `1.5`, `???` two to tell it from `?`.
-const LOOKAHEAD: usize = 2;
-
-/// Relexes after an edit. `text` is the new text, `old` the tokens of the
-/// text before `edit`. The result equals `lex(text)`.
-///
-/// Lexing restarts at the last token no lookahead from before the edit could
-/// see, backing up over newline tokens, whose meaning depends on the next
-/// line. It stops once a token after the edit starts where an old token
-/// started, shifted by the edit, in the same state: from there on the old
-/// tokens are reused with shifted offsets.
-pub fn relex(text: &str, old: &[Token], edit: &TextEdit) -> Vec<Token> {
-    let edit_start = edit.start as usize;
-    let edit_end = edit_start + edit.insert.len();
-    let delta = edit.delta();
-
-    let first = old.partition_point(|t| t.end as usize + LOOKAHEAD < edit_start);
-    let mut restart = first.min(old.len() - 1).saturating_sub(1);
-    while restart > 0 && old[restart - 1].kind == TokenKind::Newline {
-        restart -= 1;
-    }
-
-    let mut state = State::default();
-    for token in &old[..restart] {
-        state.advance(token.kind);
-    }
-    let mut out = old[..restart].to_vec();
-    // `old_state` is the state in front of `old[next_old]`.
-    let mut old_state = state.clone();
-    let mut next_old = restart;
-    let mut lexer = Lexer::new(text, old[restart].trivia_start as usize, state);
-    loop {
-        let pos = lexer.pos as i64;
-        if lexer.pos >= edit_end {
-            while next_old < old.len() && old[next_old].trivia_start as i64 + delta < pos {
-                old_state.advance(old[next_old].kind);
-                next_old += 1;
-            }
-            if next_old < old.len()
-                && old[next_old].trivia_start as i64 + delta == pos
-                && old_state == lexer.state
-            {
-                out.extend(old[next_old..].iter().map(|t| t.shifted(delta)));
-                return out;
-            }
-        }
-        let token = lexer.next_token();
-        out.push(token);
-        if token.kind == TokenKind::Eof {
-            return out;
         }
     }
 }

@@ -226,16 +226,6 @@ impl Token {
             pos: self.trivia_start as usize,
         }
     }
-
-    pub(crate) fn shifted(self, delta: i64) -> Token {
-        let shift = |offset: u32| (offset as i64 + delta) as u32;
-        Token {
-            kind: self.kind,
-            trivia_start: shift(self.trivia_start),
-            start: shift(self.start),
-            end: shift(self.end),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -289,29 +279,5 @@ impl Iterator for Trivia<'_> {
             }
         };
         Some((kind, start..self.pos))
-    }
-}
-
-/// A change to a source text: the bytes `start..end` of the old text are
-/// replaced by `insert`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TextEdit {
-    pub start: u32,
-    pub end: u32,
-    pub insert: String,
-}
-
-impl TextEdit {
-    pub fn apply(&self, text: &str) -> String {
-        let mut out = String::with_capacity(text.len() + self.insert.len());
-        out.push_str(&text[..self.start as usize]);
-        out.push_str(&self.insert);
-        out.push_str(&text[self.end as usize..]);
-        out
-    }
-
-    /// How much longer the text gets, in bytes.
-    pub fn delta(&self) -> i64 {
-        self.insert.len() as i64 - (self.end - self.start) as i64
     }
 }
