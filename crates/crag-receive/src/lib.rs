@@ -266,10 +266,11 @@ struct Store {
     pinned: HashSet<FuncId>,
     /// The functions runs hold.
     held: Held,
-    /// What the overlay describes: each function's entry and object, and
-    /// the descriptors the program has none for.
+    /// What the code map describes: each function's entry and object.
     objects: Vec<(FuncId, usize, CodeObject)>,
-    types: BTreeMap<u32, TypeDescriptor>,
+    /// The descriptors the program has none for that the next publish
+    /// adds; the runtime keeps those published.
+    unpublished: BTreeMap<u32, TypeDescriptor>,
     stubs: HashMap<(u32, u32), usize>,
     /// The code accepted so far, by the hash of its tree, the expected
     /// type and the policy's `Accept`.
@@ -306,7 +307,7 @@ impl Store {
             pinned: HashSet::new(),
             held: Held::default(),
             objects: Vec::new(),
-            types: BTreeMap::new(),
+            unpublished: BTreeMap::new(),
             stubs: HashMap::new(),
             accepted: HashMap::new(),
             cells,
@@ -480,13 +481,14 @@ impl Store {
         }
 
         // The descriptors must agree with the program's; those it lacks
-        // join the overlay.
+        // are published with the code.
         let mut added = BTreeMap::new();
         for (_, compiled) in &fresh {
             for (index, descriptor) in &compiled.types {
                 let known = types
                     .get_own(*index)
                     .or_else(|| transport::received_type(*index))
+                    .or_else(|| self.unpublished.get(index))
                     .or_else(|| added.get(index));
                 match known {
                     Some(d) if d != descriptor => {
@@ -530,7 +532,7 @@ impl Store {
             self.objects
                 .push((compiled.func, entry.addr(), compiled.object.clone()));
         }
-        self.types.extend(added);
+        self.unpublished.extend(added);
 
         // The root closure takes its environment and the input.
         let Some(Ok(compiled)) = code(db, received, root, Tier::Metered) else {
@@ -566,13 +568,14 @@ impl Store {
             &mut self.stubs,
             (compiled.params, compiled.returns),
         )?;
+        let result_words = compiled.returns;
         self.publish();
         Ok(Accepted {
             stub,
             entry,
             input: (input_shapes, input_root),
             input_words,
-            result_words: compiled.returns,
+            result_words,
             steps,
             memory,
             mismatched,
@@ -580,15 +583,15 @@ impl Store {
         })
     }
 
-    /// Publishes the store's code and descriptors, before anything runs
-    /// what was just loaded.
-    fn publish(&self) {
+    /// Publishes the store's code and the descriptors it adds, before
+    /// anything runs what was just loaded.
+    fn publish(&mut self) {
         let mut code = CodeMap::new();
         for (func, entry, object) in &self.objects {
             code.add(*func, *entry, object);
         }
         let (start, end) = self.arena.range();
-        transport::publish(start, end, code, self.types.clone());
+        transport::publish(start, end, code, std::mem::take(&mut self.unpublished));
     }
 }
 

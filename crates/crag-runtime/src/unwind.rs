@@ -158,7 +158,8 @@ impl CodeMap {
     /// The module, line and column of a position in the code that holds
     /// `pc`, and what the position word's upper half names.
     pub fn origin(&self, pc: usize, position: u64) -> Option<(String, u32, u32, String)> {
-        let origins = self.code_at(pc)?.3.as_ref();
+        let code = self.code_at(pc)?;
+        let origins = code.3.as_ref();
         let at = origins.at(position)?;
         let detail = (position >> 32) as usize;
         let detail = detail
@@ -192,10 +193,14 @@ impl CodeMap {
         self.task_entries
     }
 
-    /// The map that describes the code at `pc`: the overlay of received
-    /// code for an address in its arena, else this one (Plan §11.10.9).
-    fn pick(&self, pc: usize) -> &CodeMap {
-        crate::transport::code_at(pc).unwrap_or(self)
+    /// The map that describes the code at `pc`: the map a receiver
+    /// published for an address in its arena, held while it is read, else
+    /// this one (Plan §11.10.9).
+    fn pick(&self, pc: usize) -> Picked<'_> {
+        match crate::transport::code_at(pc) {
+            Some(map) => Picked::Received(map),
+            None => Picked::Own(self),
+        }
     }
 
     /// The function whose code holds `pc`.
@@ -203,20 +208,38 @@ impl CodeMap {
         Some(self.code_at(pc)?.2)
     }
 
-    fn code_at(&self, pc: usize) -> Option<&(usize, usize, FuncId, Arc<Origins>)> {
+    fn code_at(&self, pc: usize) -> Option<(usize, usize, FuncId, Arc<Origins>)> {
         let map = self.pick(pc);
         let i = map.functions.partition_point(|f| f.0 <= pc);
         let code = map.functions.get(i.checked_sub(1)?)?;
-        (code.0..code.1).contains(&pc).then_some(code)
+        (code.0..code.1).contains(&pc).then(|| code.clone())
     }
 
     /// The slots of the call returning to `ret`; none for a call that holds
     /// no box across it, or for code not in the map.
-    fn slots(&self, ret: usize) -> &[u32] {
+    fn slots(&self, ret: usize) -> Box<[u32]> {
         let map = self.pick(ret - 1);
         match map.safepoints.binary_search_by_key(&ret, |s| s.0) {
-            Ok(i) => &map.safepoints[i].1,
-            Err(_) => &[],
+            Ok(i) => map.safepoints[i].1.clone(),
+            Err(_) => Box::default(),
+        }
+    }
+}
+
+/// A code map that `CodeMap::pick` found: the map itself, or one a
+/// receiver published, which stays while this holds it.
+enum Picked<'a> {
+    Own(&'a CodeMap),
+    Received(Arc<CodeMap>),
+}
+
+impl std::ops::Deref for Picked<'_> {
+    type Target = CodeMap;
+
+    fn deref(&self) -> &CodeMap {
+        match self {
+            Picked::Own(map) => map,
+            Picked::Received(map) => map,
         }
     }
 }
@@ -383,7 +406,7 @@ unsafe fn unwind(
             }
             let sp = ret as usize + 8;
             code.frames_at(at, stack);
-            for &offset in code.slots(at) {
+            for &offset in code.slots(at).iter() {
                 // A function value's environment may be null, and the
                 // first word of an inline string no pointer.
                 let ptr = ((sp + offset as usize) as *const *mut u8).read();
@@ -477,7 +500,7 @@ unsafe extern "C" fn throw_entry(
                 land(fp - offset as usize, fp, handler);
             }
             let sp = ret as usize + 8;
-            for &offset in code.slots(at) {
+            for &offset in code.slots(at).iter() {
                 let ptr = ((sp + offset as usize) as *const *mut u8).read();
                 if holds_box(ptr) {
                     drop_box(heap, types, ptr);

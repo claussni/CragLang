@@ -30,13 +30,14 @@
 //!
 //! The receiver loads its code into an arena of its own and publishes
 //! what unwinding and freeing need of it, the code map of the arena and
-//! the descriptors of the types the program has none for, to an overlay
-//! for the process ([`publish`]): a code map looks there for an address
-//! in a receiver's arena, and descriptors for an index they lack. Nothing
-//! else changes, so a reload that gives the workers new tables keeps the
-//! received code reachable. What is published stays. A receiver numbers
-//! the types it adds from a range of its own ([`fresh_types`]), so the
-//! descriptors of several programs in one process never meet.
+//! the descriptors of the types the program has none for, to the process
+//! ([`publish`]): a code map looks there for an address in a receiver's
+//! arena, and descriptors for an index they lack. Nothing else changes,
+//! so a reload that gives the workers new tables keeps the received code
+//! reachable. A publish replaces the arena's code map, which is freed once
+//! no stack walk holds it; each descriptor is published once and stays. A receiver numbers the types it adds from a
+//! range of its own ([`fresh_types`]), so the descriptors of several
+//! programs in one process never meet.
 //!
 //! The caller waits while the receiver works, on its worker, as a host's
 //! name is looked up (§11.7.13); the code itself runs as a task on the
@@ -56,8 +57,8 @@
 //! on its code ([`Received::hold`]) until it stopped.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use crag_abi::{HEADER_SIZE, Shapes, TrapKind, TypeDescriptor};
 
@@ -138,38 +139,47 @@ pub trait Receive: Send + Sync {
     fn receive(&self, request: &Request<'_>) -> Result<Received, Refused>;
 }
 
-/// The received code of the process: the code map of each receiver's
-/// arena, from its start to its end, and the descriptors received code
-/// added.
-struct Overlay {
-    arenas: Vec<(usize, usize, &'static CodeMap)>,
-    types: BTreeMap<u32, TypeDescriptor>,
-}
+/// The code map of each receiver's arena, from its start to its end. A
+/// stack walk holds a map while it reads it, so the map a publish
+/// replaces is freed once the last walk that read it is done.
+static ARENAS: RwLock<Vec<(usize, usize, Arc<CodeMap>)>> = RwLock::new(Vec::new());
 
-static OVERLAY: AtomicPtr<Overlay> = AtomicPtr::new(std::ptr::null_mut());
-static PUBLISHING: Mutex<()> = Mutex::new(());
+/// Whether any receiver published code: until one did, no address is
+/// received code's, and a walk takes no lock.
+static ANY_ARENA: AtomicBool = AtomicBool::new(false);
+
+/// The descriptors received code added, each published once and kept: a
+/// box of the type may live as long as the process.
+static TYPES: RwLock<BTreeMap<u32, &'static TypeDescriptor>> = RwLock::new(BTreeMap::new());
+
+static ANY_TYPE: AtomicBool = AtomicBool::new(false);
 
 /// Publishes a receiver's code, before anything runs it: the code map of
-/// its arena, which holds everything loaded there so far, and the
+/// its arena, which describes everything loaded there now, and the
 /// descriptors it adds.
 pub fn publish(start: usize, end: usize, code: CodeMap, types: BTreeMap<u32, TypeDescriptor>) {
-    let _publishing = PUBLISHING.lock().unwrap_or_else(|e| e.into_inner());
-    let code: &'static CodeMap = Box::leak(Box::new(code));
-    let mut next = match overlay() {
-        Some(o) => Overlay {
-            arenas: o.arenas.clone(),
-            types: o.types.clone(),
-        },
-        None => Overlay {
-            arenas: Vec::new(),
-            types: BTreeMap::new(),
-        },
+    if !types.is_empty() {
+        let mut known = TYPES.write().unwrap_or_else(PoisonError::into_inner);
+        for (index, descriptor) in types {
+            known
+                .entry(index)
+                .or_insert_with(|| Box::leak(Box::new(descriptor)));
+        }
+        ANY_TYPE.store(true, Ordering::Release);
+    }
+    let code = Arc::new(code);
+    let old = {
+        let mut arenas = ARENAS.write().unwrap_or_else(PoisonError::into_inner);
+        let old = arenas
+            .iter()
+            .position(|a| a.0 == start)
+            .map(|i| arenas.swap_remove(i));
+        arenas.push((start, end, code));
+        old
     };
-    next.arenas.retain(|a| a.0 != start);
-    next.arenas.push((start, end, code));
-    next.types.extend(types);
-    // The overlay before stays: a reader may hold it.
-    OVERLAY.store(Box::into_raw(Box::new(next)), Ordering::Release);
+    ANY_ARENA.store(true, Ordering::Release);
+    // The map before goes once no walk holds it, outside the lock.
+    drop(old);
 }
 
 /// The type indices one receiver numbers the types it adds in.
@@ -182,25 +192,30 @@ pub fn fresh_types() -> u32 {
     FRESH_SPAN.saturating_mul(NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-fn overlay() -> Option<&'static Overlay> {
-    let overlay = OVERLAY.load(Ordering::Acquire);
-    // SAFETY: a published overlay is never freed.
-    unsafe { overlay.as_ref() }
-}
-
 /// The code map of received code that holds `pc`, if received code does.
-pub(crate) fn code_at(pc: usize) -> Option<&'static CodeMap> {
-    overlay()?
-        .arenas
+pub(crate) fn code_at(pc: usize) -> Option<Arc<CodeMap>> {
+    if !ANY_ARENA.load(Ordering::Acquire) {
+        return None;
+    }
+    ARENAS
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
         .iter()
         .find(|a| (a.0..a.1).contains(&pc))
-        .map(|a| a.2)
+        .map(|a| a.2.clone())
 }
 
 /// The descriptor received code gave a type, which a receiver checks its
 /// own against, and descriptors that lack it fall back to.
 pub fn received_type(index: u32) -> Option<&'static TypeDescriptor> {
-    overlay()?.types.get(&index)
+    if !ANY_TYPE.load(Ordering::Acquire) {
+        return None;
+    }
+    TYPES
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&index)
+        .copied()
 }
 
 /// The statuses of `rt_transport_run`.
@@ -402,4 +417,27 @@ pub(crate) fn finished(mut fiber: Box<Fiber>) {
     drop(fiber);
     drop(hold);
     wake(caller, [status, 0]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_code_map_goes_once_replaced_and_no_walk_holds_it() {
+        // An address range no other test publishes.
+        let (start, end) = (0x7e00_0000_0000, 0x7e00_0010_0000);
+        publish(start, end, CodeMap::new(), BTreeMap::new());
+        let first = Arc::downgrade(&code_at(start + 8).unwrap());
+        publish(start, end, CodeMap::new(), BTreeMap::new());
+        assert!(first.upgrade().is_none(), "the replaced map stays");
+        // A walk that holds the map keeps it until it is done.
+        let held = code_at(start + 8).unwrap();
+        let second = Arc::downgrade(&held);
+        publish(start, end, CodeMap::new(), BTreeMap::new());
+        assert!(second.upgrade().is_some());
+        drop(held);
+        assert!(second.upgrade().is_none(), "the replaced map stays");
+        assert!(code_at(end).is_none());
+    }
 }
