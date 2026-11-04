@@ -410,9 +410,28 @@ fn normalized<'db>(db: &'db dyn Db, program: Program, members: Ty<'db>) -> Ty<'d
 
 /// The record types of the program without type parameters that are
 /// subtypes of `ty`, other than `ty`; none when `ty` is not a named type
-/// without arguments.
+/// without arguments. A record whose chain of parents does not resolve is
+/// left out: the error type fits every type, so it would count as a
+/// subtype of every record, and such a program never reaches code anyway.
 pub fn record_subtypes<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Vec<Ty<'db>> {
     subtypes_of(db, program, ty).clone()
+}
+
+/// Whether a parent in the chain of parents of `ty` is the error type.
+fn unresolved_parent<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
+    let mut seen = vec![ty];
+    let mut ty = ty;
+    while let Some(p) = parent(db, program, ty) {
+        if p.is_error(db) {
+            return true;
+        }
+        if seen.contains(&p) {
+            return false;
+        }
+        seen.push(p);
+        ty = p;
+    }
+    false
 }
 
 /// `record_subtypes`, kept: layouts ask for it at every step of their
@@ -432,6 +451,7 @@ fn subtypes_of<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Vec<Ty<'d
             let candidate = Ty::new(db, TyKind::Named(id, Vec::new()));
             if candidate != ty
                 && matches!(type_def(db, program, id).kind, TypeDefKind::Record { .. })
+                && !unresolved_parent(db, program, candidate)
                 && is_subtype(db, program, candidate, ty)
             {
                 out.push(candidate);

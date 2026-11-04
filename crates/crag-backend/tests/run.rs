@@ -108,6 +108,8 @@ pub fn lessThan(a: Float, b: Float) -> Bool
 pub fn equals(a: Str, b: Str) -> Bool
 pub fn equals(a: Bytes, b: Bytes) -> Bool
 pub fn listAppend[T](xs: List[T], x: T) -> List[T]
+pub fn split(s: Str, separator: Str) -> List[Str]
+pub fn lines(s: Str) -> List[Str]
 "#;
 
 thread_local! {
@@ -308,23 +310,28 @@ impl Module {
             let file = SourceFile::new(&db, library.to_string());
             modules.push(ModuleId::new(&db, "lib".to_string(), file));
         }
-        let program = Program::new(&db, modules, resources);
-        let syntax = &crag_hir::parse(&db, *module.file(&db)).errors;
-        assert!(syntax.is_empty(), "{syntax:?}");
-        let lowering: Vec<_> = owners(&db, module)
-            .into_iter()
-            .flat_map(|owner| lower_body(&db, program, owner).errors.clone())
-            .collect();
-        assert!(lowering.is_empty(), "{lowering:?}");
-        let errors = crag_types::module_type_errors(&db, program, module);
-        assert!(
-            errors.is_empty(),
-            "{:?}",
-            errors
-                .iter()
-                .map(|(_, e)| e.kind.message(&db))
-                .collect::<Vec<_>>()
-        );
+        let program = Program::new(&db, modules.clone(), resources);
+        // Every module, the prelude and std.transport too: an error in one
+        // of them would reach code generation unreported.
+        for &checked in &modules {
+            let name = checked.path(&db);
+            let syntax = &crag_hir::parse(&db, *checked.file(&db)).errors;
+            assert!(syntax.is_empty(), "{name}: {syntax:?}");
+            let lowering: Vec<_> = owners(&db, checked)
+                .into_iter()
+                .flat_map(|owner| lower_body(&db, program, owner).errors.clone())
+                .collect();
+            assert!(lowering.is_empty(), "{name}: {lowering:?}");
+            let errors = crag_types::module_type_errors(&db, program, checked);
+            assert!(
+                errors.is_empty(),
+                "{name}: {:?}",
+                errors
+                    .iter()
+                    .map(|(_, e)| e.kind.message(&db))
+                    .collect::<Vec<_>>()
+            );
+        }
         let mut objects: Vec<(SlotKey, CodeObject)> = Vec::new();
         let mut names = Vec::new();
         let mut unsupported = Vec::new();
