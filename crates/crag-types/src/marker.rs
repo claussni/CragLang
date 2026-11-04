@@ -344,6 +344,53 @@ fn secret_path<'db>(
     found
 }
 
+/// Whether a value of a type may hold a function value, in any part or
+/// any subtype of one: a type parameter, a cell or a lazy value may.
+pub fn holds_function<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
+    function_in(db, program, ty, &mut Vec::new())
+}
+
+fn function_in<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    ty: Ty<'db>,
+    seen: &mut Vec<Ty<'db>>,
+) -> bool {
+    if seen.contains(&ty) {
+        return false;
+    }
+    seen.push(ty);
+    let any = |parts: Vec<Ty<'db>>, seen: &mut Vec<Ty<'db>>| {
+        parts.into_iter().any(|t| function_in(db, program, t, seen))
+    };
+    let found = match ty.kind(db) {
+        TyKind::Error => false,
+        TyKind::Fn { .. } | TyKind::Param(..) => true,
+        TyKind::Union(members) => any(members.clone(), seen),
+        TyKind::Record { fields, .. } => any(fields.iter().map(|(_, t)| *t).collect(), seen),
+        TyKind::Builtin(builtin, args) => match builtin {
+            Builtin::List | Builtin::Map | Builtin::Set => any(args.clone(), seen),
+            Builtin::Lazy | Builtin::Ref | Builtin::Ext => true,
+            _ => false,
+        },
+        TyKind::Named(item, args) => match &type_def(db, program, *item).kind {
+            TypeDefKind::Alias(target) | TypeDefKind::Refined(target) => {
+                let target = subst(db, program, *target, *item, args);
+                any(vec![target], seen)
+            }
+            TypeDefKind::Record { .. } => {
+                let fields = fields_of(db, program, ty)
+                    .map(|f| f.into_iter().map(|(_, t)| t).collect())
+                    .unwrap_or_default();
+                any(fields, seen) || any(record_subtypes(db, program, ty), seen)
+            }
+            TypeDefKind::Builtin(_) | TypeDefKind::Tag | TypeDefKind::Form => false,
+        },
+    };
+    seen.pop();
+    found
+}
+
 /// Whether a declared type, or a parent it spreads, is `is Secret`.
 fn is_secret(db: &dyn Db, program: Program, ty: Ty<'_>) -> bool {
     declares(db, program, ty, Marker::Secret)

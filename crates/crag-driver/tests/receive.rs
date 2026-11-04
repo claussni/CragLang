@@ -156,7 +156,11 @@ fn received_code_reads_back_as_sent() {
     let simple = check_in(&mut project, &mut slot, &bytes, "send", Accept::Exact).unwrap();
     assert!(simple.source.contains("(-1)"), "{}", simple.source);
     assert!(simple.source.contains("fn h12_0("), "{}", simple.source);
-    assert!(simple.source.contains("fn received12("), "{}", simple.source);
+    assert!(
+        simple.source.contains("fn received12("),
+        "{}",
+        simple.source
+    );
 }
 
 #[test]

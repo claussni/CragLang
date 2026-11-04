@@ -74,7 +74,7 @@ pub use handler::{
     Handler, HandlerCode, Handlers, dispose_handler, lifecycle_handler, type_handlers,
 };
 pub use infer::{constant as literal_value, is_source, is_text};
-pub use marker::{NotSolid, SolidStep, Why, carries, holds_secret, solid};
+pub use marker::{NotSolid, SolidStep, Why, carries, holds_function, holds_secret, solid};
 pub use overload::{
     FinalError, Ranked, Specificity, compare_param, final_errors, most_specific, overload_errors,
 };

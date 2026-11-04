@@ -48,10 +48,19 @@
 //!
 //! Every tree is checked in one received module, whose source the next
 //! tree replaces (`Slot`), so the database holds what one tree needs and
-//! not what every tree did. Code the store loaded stays, by instance.
+//! not what every tree did. Code the store loaded stays, by instance,
+//! until the store holds more than its bound.
 //!
-//! Not built yet: a bound on the store, which keeps every function it
-//! compiled.
+//! The bound is on the bytes of code the store holds, [`BOUND`] or
+//! `CRAG_RECEIVED_CODE`. Once they exceed it, the next tree first unloads
+//! all code the store may unload, which it compiles again when a tree
+//! reaches it. It keeps code a run holds (`Received::hold`), until the run
+//! stopped, and code a value may reach after its run: the code of the
+//! program's module-level values, which their cells may keep functions
+//! of, and all code of a tree whose result may hold a function. With it
+//! stays all code that code reaches through its relocations, so nothing
+//! loaded calls code unloaded. The bound is soft: the store unloads only
+//! before a tree, and keeps what it must.
 
 extern crate crag_db as salsa;
 
@@ -60,15 +69,15 @@ mod check;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 
-use crag_abi::{CodeObject, FuncId, RuntimeFn, Shapes, TypeDescriptor};
+use crag_abi::{CodeObject, FuncId, RelocTarget, RuntimeFn, Shapes, TypeDescriptor};
 use crag_backend::tree::decode_transport;
 use crag_backend::{code, func_id, shapes};
 use crag_codegen::{CodegenSettings, OptLevel, Target, compile_entry_stub, target_for};
 use crag_db::RootDatabase;
 use crag_hir::{ItemKind, Owner, Program, item_tree};
-use crag_loader::{CodeArena, LoadError, SymbolTable, load, load_group};
+use crag_loader::{CodeArena, LoadError, SymbolTable, load, load_group, unload};
 use crag_mir::{Entry, InstanceKey, MirBody, Tier, mir};
 use crag_runtime::transport::{self, Received, Refused, Request};
 use crag_runtime::{CodeMap, Scheduler, Types};
@@ -78,6 +87,18 @@ pub use check::{Accept, Checked, RECEIVED, ROOT, Rejection, Slot, check_received
 
 /// The bytes of address space the store reserves for code.
 const ARENA: usize = 1 << 30;
+
+/// The bytes of code past which the store unloads what it may, unless
+/// `CRAG_RECEIVED_CODE` gives another bound.
+pub const BOUND: u64 = 32 << 20;
+
+/// The bound on the store's code, from `CRAG_RECEIVED_CODE` or [`BOUND`].
+fn bound() -> u64 {
+    std::env::var("CRAG_RECEIVED_CODE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(BOUND)
+}
 
 /// The stack of the receiver's thread.
 const STACK: usize = 256 << 20;
@@ -186,6 +207,44 @@ struct Accepted {
     steps: u64,
     memory: u64,
     mismatched: Vec<transport::Mismatch>,
+    /// The functions the code reaches, which a run holds.
+    reached: Arc<[FuncId]>,
+}
+
+/// The runs that hold each function of the store.
+type Held = Arc<Mutex<HashMap<FuncId, usize>>>;
+
+/// A run's hold on the functions its code reaches, until it is dropped.
+struct Hold {
+    held: Held,
+    reached: Arc<[FuncId]>,
+}
+
+impl Hold {
+    fn new(held: &Held, reached: &Arc<[FuncId]>) -> Hold {
+        let mut counts = held.lock().unwrap_or_else(PoisonError::into_inner);
+        for func in reached.iter() {
+            *counts.entry(*func).or_default() += 1;
+        }
+        Hold {
+            held: held.clone(),
+            reached: reached.clone(),
+        }
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let mut counts = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        for func in self.reached.iter() {
+            if let Some(n) = counts.get_mut(func) {
+                *n -= 1;
+                if *n == 0 {
+                    counts.remove(func);
+                }
+            }
+        }
+    }
 }
 
 /// The receiver's program and its store of metered code.
@@ -196,8 +255,17 @@ struct Store {
     slot: Slot,
     arena: CodeArena,
     symbols: SymbolTable,
-    /// The bytes of each function's code in the store.
+    /// The bytes of each function's code in the store, and of all.
     sizes: HashMap<FuncId, u64>,
+    loaded: u64,
+    /// The bytes past which the store unloads what it may.
+    bound: u64,
+    /// The functions each function's code refers to.
+    refers: HashMap<FuncId, Vec<FuncId>>,
+    /// The functions a value may reach after their run, which stay.
+    pinned: HashSet<FuncId>,
+    /// The functions runs hold.
+    held: Held,
     /// What the overlay describes: each function's entry and object, and
     /// the descriptors the program has none for.
     objects: Vec<(FuncId, usize, CodeObject)>,
@@ -232,6 +300,11 @@ impl Store {
             arena,
             symbols,
             sizes: HashMap::new(),
+            loaded: 0,
+            bound: bound(),
+            refers: HashMap::new(),
+            pinned: HashSet::new(),
+            held: Held::default(),
             objects: Vec::new(),
             types: BTreeMap::new(),
             stubs: HashMap::new(),
@@ -269,7 +342,51 @@ impl Store {
             steps: job.steps - accepted.steps,
             memory: job.memory - accepted.memory,
             mismatched,
+            hold: Box::new(Hold::new(&self.held, &accepted.reached)),
         })
+    }
+
+    /// Unloads the functions no run holds and no value may reach, with
+    /// the code accepted that reaches them.
+    fn evict(&mut self) {
+        let mut keep: HashSet<FuncId> = self.pinned.clone();
+        keep.extend(
+            self.held
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .keys()
+                .copied(),
+        );
+        let mut pending: Vec<FuncId> = keep.iter().copied().collect();
+        while let Some(func) = pending.pop() {
+            for callee in self.refers.get(&func).into_iter().flatten() {
+                if keep.insert(*callee) {
+                    pending.push(*callee);
+                }
+            }
+        }
+        let gone: HashSet<FuncId> = self
+            .sizes
+            .keys()
+            .filter(|f| !keep.contains(f))
+            .copied()
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        for func in &gone {
+            if let Some(entry) = self.symbols.function(*func) {
+                // SAFETY: no run holds the code, so no frame of it is on a
+                // stack, and no value reaches it. All code that refers to
+                // it goes with it: what stays is closed under `refers`.
+                let _ = unsafe { unload(&mut self.arena, &mut self.symbols, entry) };
+            }
+            self.loaded -= self.sizes.remove(func).unwrap_or(0);
+            self.refers.remove(func);
+        }
+        self.objects.retain(|(func, ..)| !gone.contains(func));
+        self.accepted
+            .retain(|_, a| !a.reached.iter().any(|f| gone.contains(f)));
     }
 
     fn accept(&mut self, job: &Job, types: &Types) -> Result<Accepted, Refused> {
@@ -284,19 +401,30 @@ impl Store {
         if steps > job.steps {
             return Err(Refused::StepLimit(Vec::new()));
         }
-        let checked = check_received(&mut self.db, &mut self.slot, &job.tree, &expected, job.accept)
-            .map_err(|r| match r {
-                Rejection::Unresolved(m) => Refused::Unresolved(m),
-                Rejection::IllTyped(m) => Refused::IllTyped(m),
-                Rejection::Impure(m) => Refused::Impure(m),
-            })?;
+        if self.loaded > self.bound {
+            self.evict();
+        }
+        let checked = check_received(
+            &mut self.db,
+            &mut self.slot,
+            &job.tree,
+            &expected,
+            job.accept,
+        )
+        .map_err(|r| match r {
+            Rejection::Unresolved(m) => Refused::Unresolved(m),
+            Rejection::IllTyped(m) => Refused::IllTyped(m),
+            Rejection::Impure(m) => Refused::Impure(m),
+        })?;
         let mismatched = checked.mismatched.clone();
         let db: &RootDatabase = &self.db;
         let received = checked.program;
         let item = item_tree(db, checked.module)
             .items
             .iter()
-            .find(|i| *i.id.kind(db) == ItemKind::Function && *i.id.name(db).text(db) == checked.root)
+            .find(|i| {
+                *i.id.kind(db) == ItemKind::Function && *i.id.name(db).text(db) == checked.root
+            })
             .map(|i| i.id)
             .ok_or_else(|| ill("no root".into()))?;
         let root = InstanceKey::body(db, Owner::Item(item))
@@ -374,7 +502,8 @@ impl Store {
             }
         }
 
-        // A value the program computes keeps the program's cell.
+        // A value the program computes keeps the program's cell, and the
+        // functions its value may hold stay.
         for (instance, compiled) in &fresh {
             if let (Owner::Item(item), Entry::Body) = (*instance.owner(db), instance.entry(db))
                 && item.kind(db).is_value()
@@ -383,6 +512,7 @@ impl Store {
                 if let Some(&addr) = self.cells.get(&name) {
                     self.symbols.cells_mut().share(compiled.slot, addr);
                 }
+                self.pinned.insert(compiled.func);
             }
         }
 
@@ -393,8 +523,10 @@ impl Store {
                 e => ill(format!("its code does not load: {e:?}")),
             })?;
         for ((_, compiled), entry) in fresh.iter().zip(&entries) {
-            self.sizes
-                .insert(compiled.func, compiled.object.code.len() as u64);
+            let size = compiled.object.code.len() as u64;
+            self.sizes.insert(compiled.func, size);
+            self.loaded += size;
+            self.refers.insert(compiled.func, refers(&compiled.object));
             self.objects
                 .push((compiled.func, entry.addr(), compiled.object.clone()));
         }
@@ -413,6 +545,11 @@ impl Store {
             .filter(|_| body.params == 2)
             .ok_or_else(|| ill("the root closure takes other than one input".into()))?
             .ty;
+        let reached: Arc<[FuncId]> = reached.iter().map(|&(i, _)| func_id(i)).collect();
+        // A result that may hold a function may keep any of the code.
+        if crag_types::holds_function(db, received, body.result) {
+            self.pinned.extend(reached.iter().copied());
+        }
         let (input_shapes, input_root) = shapes(db, received, input_ty);
         let input_words = input_shapes.shapes[input_root as usize].words();
         if compiled.params != input_words + 1 || compiled.returns > 2 || input_words > 2 {
@@ -439,6 +576,7 @@ impl Store {
             steps,
             memory,
             mismatched,
+            reached,
         })
     }
 
@@ -479,6 +617,23 @@ fn stub(
         .addr();
     stubs.insert(words, stub);
     Ok(stub)
+}
+
+/// The functions a code object refers to: those it calls or takes the
+/// address of, directly or through their slots, and those that compute
+/// the cells it reads.
+fn refers(object: &CodeObject) -> Vec<FuncId> {
+    let mut seen = HashSet::new();
+    object
+        .relocs
+        .iter()
+        .filter_map(|r| match r.target {
+            RelocTarget::Function(f) => Some(f),
+            RelocTarget::Slot(k) | RelocTarget::Cell(k) => Some(k.func),
+            _ => None,
+        })
+        .filter(|f| seen.insert(*f))
+        .collect()
 }
 
 /// The nodes of a tree: its records and lists.

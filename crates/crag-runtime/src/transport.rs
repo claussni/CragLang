@@ -50,6 +50,10 @@
 //! and while the caller has not emitted their signals yet, the call gives
 //! them back instead of running the code; `run` emits a `HashMismatch`
 //! for each and calls again, which finds the code in the receiver's store.
+//!
+//! The receiver may unload code it holds no run of and that no value can
+//! reach (Implementation Plan §11.10.9): a run keeps the receiver's hold
+//! on its code ([`Received::hold`]) until it stopped.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -110,6 +114,9 @@ pub struct Received {
     pub memory: u64,
     /// The callees accepted with another body than the sender's.
     pub mismatched: Vec<Mismatch>,
+    /// What keeps the code loaded while it runs: the run drops it once
+    /// the code stopped.
+    pub hold: Box<dyn Send>,
 }
 
 /// Why received code does not run.
@@ -214,6 +221,8 @@ const EMITTED: u64 = 1 << 8;
 pub(crate) struct Waiter {
     caller: FiberRef,
     scratch: *mut u64,
+    /// The receiver's hold on the code, until it stopped.
+    hold: Box<dyn Send>,
 }
 
 // SAFETY: the scratch words lie on the side stack of the caller, which is
@@ -318,7 +327,11 @@ unsafe extern "C" fn run_entry(
             memory: received.memory as usize,
         });
         let caller = suspend(ctx, WaitReason::Received);
-        fiber.received = Some(Box::new(Waiter { caller, scratch }));
+        fiber.received = Some(Box::new(Waiter {
+            caller,
+            scratch,
+            hold: received.hold,
+        }));
         shared.launch(fiber, local_of(ctx));
         // The wake gives the status.
         0
@@ -363,7 +376,11 @@ unsafe fn give_text(ctx: &TaskContext, scratch: *mut u64, text: &str) {
 /// it, and wakes its caller with the status, the result in its scratch
 /// words, or the trap raised.
 pub(crate) fn finished(mut fiber: Box<Fiber>) {
-    let Waiter { caller, scratch } = *fiber.received.take().expect("received code");
+    let Waiter {
+        caller,
+        scratch,
+        hold,
+    } = *fiber.received.take().expect("received code");
     let status = match (fiber.results(), fiber.trap()) {
         (Some(words), _) => {
             // SAFETY: the caller is suspended, and its scratch words wait.
@@ -381,6 +398,8 @@ pub(crate) fn finished(mut fiber: Box<Fiber>) {
             RAN
         }
     };
+    // No frame of the code is left: the receiver may unload it.
     drop(fiber);
+    drop(hold);
     wake(caller, [status, 0]);
 }

@@ -32,6 +32,11 @@ const MANIFEST: &str = "package demo 0.1\nruntime 0.0\nmain demo.app\n";
 /// status. The program runs in a process of its own, killed after a
 /// minute.
 fn run(name: &str, app: &str) -> (i32, String) {
+    run_with(name, app, &[])
+}
+
+/// What `run` gives, with these variables set for the program.
+fn run_with(name: &str, app: &str, vars: &[(&str, &str)]) -> (i32, String) {
     let root = std::env::temp_dir().join(format!("crag-transport-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).unwrap();
@@ -39,6 +44,7 @@ fn run(name: &str, app: &str) -> (i32, String) {
     fs::write(root.join("app.crag"), app).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_crag"))
         .arg("run")
+        .envs(vars.iter().copied())
         .current_dir(&root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -180,6 +186,30 @@ fn main() -> () {
         out,
         "two: 2 products, the last 12\nagain: 2 products, the last 12\na=5, b=6\n"
     );
+}
+
+#[test]
+fn received_code_runs_again_once_unloaded() {
+    // With a bound of one byte, each tree first unloads what the store may
+    // (Implementation Plan §11.10.9): later rounds compile the code
+    // again. A function the result holds, and the code of a module value,
+    // stay loaded and still run.
+    let app = format!(
+        "{REPORT}\ntype Add = ((Int) -> Int is Pure)\n\nfn adder(n: Int) -> Add | Unresolved | IllTyped | Impure | StepLimit | MemoryLimit {{\n  \
+         let e: Expr[((Int) -> ((Int) -> Int is Pure) is Pure)] = {{ k -> {{ m -> m + k + triple(1) }} }}\n  run(e, n, Policy())\n}}\n\
+         fn main() -> () {{\n  \
+         let f = case adder(4) {{\n    g: Add -> g\n    _ -> {{ m: Int -> 0 }}\n  }}\n  \
+         for round in 0..2 {{\n    \
+         go({{ x -> x * 7 }}, 6, Policy())\n    \
+         go({{ x -> triple(x) + twice(x) }}, 2, Policy())\n    \
+         go({{ x -> lookup(x) }}, 2, Policy())\n    \
+         go({{ x -> spin(x) }}, 10, Policy())\n    \
+         printLine(\"f {{f(round)}}\")\n  }}\n}}\n"
+    );
+    let (status, out) = run_with("unload", &app, &[("CRAG_RECEIVED_CODE", "1")]);
+    assert_eq!(status, 0, "{out}");
+    let round = "ran 42\nran 10\nran 30\nran 27\n";
+    assert_eq!(out, format!("{round}f 7\n{round}f 8\n{round}f 9\n"));
 }
 
 #[test]
