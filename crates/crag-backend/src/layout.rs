@@ -25,11 +25,11 @@
 //! two words in a member box, whose pointer is the payload (`crag_abi`).
 
 use crate::flat;
-use crate::split::{element_storage, flat_layouts, ref_storage};
+use crate::split::{element_storage, ref_storage};
 use crag_abi::{CountedField, ElementLayout, FieldGuard, HEADER_SIZE, TypeDescriptor};
 use crag_db::Db;
 use crag_db::plumbing::AsId;
-use crag_hir::{ItemKind, Name, Program, item_tree, module_index};
+use crag_hir::{ItemKind, Program, item_tree, module_index};
 use crag_types::{
     Builtin, Ty, TyKind, TypeDefKind, dispose_handler, fields_of, is_subtype, parent,
     record_subtypes, type_def, type_hash, type_header,
@@ -135,99 +135,12 @@ pub fn type_index<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> i64 {
     }
 }
 
-/// A field of a box: its name, type, layout and offset.
-#[derive(Clone, Copy, Debug)]
-pub struct FieldSlot<'db> {
-    pub name: Name<'db>,
-    pub ty: Ty<'db>,
-    pub layout: Layout,
-    pub offset: u32,
-}
-
-/// The fields of a record type at their offsets, and the box's size. A type
-/// lays out its parent's fields first, at the same offsets, then its own
-/// by name (Compiler Architecture §11.1); every field is word-aligned. The
-/// first type with a dispose handler among a type and those it spreads has
-/// a word of its own before its fields, `dispose_word`.
-pub fn record_layout<'db>(
-    db: &'db dyn Db,
-    program: Program,
-    ty: Ty<'db>,
-) -> Option<(Vec<FieldSlot<'db>>, u32)> {
-    let all = fields_of(db, program, ty)?;
-    let mut slots: Vec<FieldSlot<'db>> = Vec::new();
-    let (inherited, mut end) = inherited_layout(db, program, ty)?;
-    if let Some(inherited) = inherited {
-        slots = inherited;
-    }
-    if own_dispose_word(db, program, ty) {
-        end += 8;
-    }
-    let mut own: Vec<(Name<'db>, Ty<'db>)> = Vec::new();
-    for (name, field_ty) in all {
-        match slots.iter_mut().find(|s| s.name == name) {
-            // An amended field keeps its parent's place, so it must keep
-            // its size too.
-            Some(slot) => {
-                let layout = layout(db, program, field_ty)?;
-                if layout.words() != slot.layout.words() {
-                    return None;
-                }
-                slot.ty = field_ty;
-                slot.layout = layout;
-            }
-            None => own.push((name, field_ty)),
-        }
-    }
-    own.sort_by(|a, b| a.0.text(db).cmp(b.0.text(db)));
-    for (name, field_ty) in own {
-        let layout = layout(db, program, field_ty)?;
-        slots.push(FieldSlot {
-            name,
-            ty: field_ty,
-            layout,
-            offset: end,
-        });
-        end += 8 * layout.words() as u32;
-    }
-    Some((slots, end))
-}
-
-/// A named type's parent's slots and size, or the header's size alone.
-#[allow(clippy::type_complexity)]
-fn inherited_layout<'db>(
-    db: &'db dyn Db,
-    program: Program,
-    ty: Ty<'db>,
-) -> Option<(Option<Vec<FieldSlot<'db>>>, u32)> {
-    if let TyKind::Named(..) = ty.kind(db)
-        && let Some(p) = parent(db, program, ty)
-    {
-        let (slots, size) = record_layout(db, program, p)?;
-        return Some((Some(slots), size));
-    }
-    Some((None, HEADER_SIZE))
-}
-
 /// Whether a type has a dispose handler that none of the types it spreads
 /// has, so its boxes need a word for the address of their dispose code.
 pub(crate) fn own_dispose_word<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
     matches!(ty.kind(db), TyKind::Named(..))
         && dispose_handler(db, program, ty).is_some()
         && parent(db, program, ty).is_none_or(|p| dispose_handler(db, program, p).is_none())
-}
-
-/// The offset of the word that holds the address of a box's dispose code,
-/// for a type with a dispose handler: after the fields of the parents
-/// without one.
-pub fn dispose_word<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<u32> {
-    if !matches!(ty.kind(db), TyKind::Named(..)) || dispose_handler(db, program, ty).is_none() {
-        return None;
-    }
-    if own_dispose_word(db, program, ty) {
-        return Some(inherited_layout(db, program, ty)?.1);
-    }
-    dispose_word(db, program, parent(db, program, ty)?)
 }
 
 /// The indices of the types known to fit `ty` that a value of it may have
@@ -485,40 +398,15 @@ pub fn type_descriptor<'db>(
     }
     // A box stores its record flat: its pointer map says where the
     // references are, and when a union's member holds one.
-    if flat_layouts() {
-        let l = flat::box_layout(db, program, ty).as_ref()?;
-        let counted = l
-            .pointers
-            .iter()
-            .map(|p| counted_pointer(p, HEADER_SIZE))
-            .collect();
-        return Some(TypeDescriptor::Record {
-            counted,
-            dispose: l.dispose.map(|d| HEADER_SIZE + d),
-        });
-    }
-    let (slots, _) = record_layout(db, program, ty)?;
-    let mut counted = Vec::new();
-    for slot in slots {
-        match slot.layout {
-            Layout::Box => counted.push(CountedField::Box(slot.offset)),
-            Layout::Union => {
-                let boxed = boxed_indices(db, program, slot.ty)?;
-                if !boxed.is_empty() {
-                    counted.push(CountedField::Union {
-                        offset: slot.offset,
-                        boxed,
-                    });
-                }
-            }
-            Layout::Closure => counted.push(CountedField::Box(slot.offset + 8)),
-            Layout::Pair => counted.push(CountedField::Box(slot.offset)),
-            Layout::Zero | Layout::Imm(_) | Layout::Tag => {}
-        }
-    }
+    let l = flat::box_layout(db, program, ty).as_ref()?;
+    let counted = l
+        .pointers
+        .iter()
+        .map(|p| counted_pointer(p, HEADER_SIZE))
+        .collect();
     Some(TypeDescriptor::Record {
         counted,
-        dispose: dispose_word(db, program, ty),
+        dispose: l.dispose.map(|d| HEADER_SIZE + d),
     })
 }
 

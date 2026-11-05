@@ -56,11 +56,6 @@
 //! `T | Empty` the niche of `T`, and the member's storage form. The
 //! values of the code that function values, the runtime and the host call
 //! still pass in their box.
-//!
-//! With `CRAG_FLAT=0` in the environment no local is split and every
-//! record passes in its box.
-
-use std::sync::OnceLock;
 
 use crag_db::Db;
 use crag_hir::{ItemKind, Name, Owner, Program, c_function};
@@ -73,12 +68,6 @@ use crag_types::{Builtin, Step, Ty, TyKind, TypeDefKind, lifecycle_handler, type
 use crate::boxes::stored_form;
 use crate::flat::{self, LayoutClass, NicheKind, TagPlace};
 use crate::layout::{self, Layout, type_index};
-
-/// Whether flat layouts are on: unless `CRAG_FLAT` is `0`, read once.
-pub fn flat_layouts() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("CRAG_FLAT").map_or(true, |v| v != "0"))
-}
 
 /// The register form of a value.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -283,9 +272,6 @@ pub fn scalar_replace<'db>(
     instance: InstanceKey<'db>,
     body: &mut MirBody<'db>,
 ) {
-    if !flat_layouts() {
-        return;
-    }
     // A parameter is split when it passes by value.
     let params = flat_params(db, program, instance);
     let first = body.params.max(usize::from(body.env));
@@ -743,15 +729,12 @@ pub fn storage<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<(u
 /// flat, as an element, a key or a value (Compiler Architecture §A11.3,
 /// §A11.4.2–§A11.4.5): that of a flat record or union that passes by
 /// value, or of a sized integer, a code point or a union of tags in fewer
-/// bytes than its word. None without flat layouts.
+/// bytes than its word.
 pub fn element_storage<'db>(
     db: &'db dyn Db,
     program: Program,
     ty: Ty<'db>,
 ) -> Option<(u32, Vec<Slot>)> {
-    if !flat_layouts() {
-        return None;
-    }
     if let Some(stored) = storage(db, program, ty) {
         return Some(stored);
     }
@@ -777,15 +760,12 @@ pub fn element_storage<'db>(
 /// beside its version (Compiler Architecture §A11.4.1, §A11.4.6): that of
 /// a flat record or union that passes by value and takes at most the
 /// cell's two words. An integer keeps its word, which `RefApply` works
-/// on. None without flat layouts.
+/// on.
 pub fn ref_storage<'db>(
     db: &'db dyn Db,
     program: Program,
     ty: Ty<'db>,
 ) -> Option<(u32, Vec<Slot>)> {
-    if !flat_layouts() {
-        return None;
-    }
     storage(db, program, ty).filter(|&(size, _)| size <= 16)
 }
 
@@ -974,7 +954,7 @@ fn by_value<'db>(db: &'db dyn Db, instance: InstanceKey<'db>) -> bool {
         return false;
     };
     let function = *item.kind(db) == ItemKind::Function && c_function(db, item).is_none();
-    flat_layouts() && function && *instance.entry(db) == Entry::Body
+    function && *instance.entry(db) == Entry::Body
 }
 
 /// Which parameters of an instance pass by value in storage form: those

@@ -59,11 +59,6 @@ under every interleaving that matters:
     RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom \
         ./cargo test -p crag-runtime --release --lib loom_model
 
-`CRAG_FLAT=0` turns flat layouts off, so every record is boxed; the
-tests pass either way:
-
-    CRAG_FLAT=0 ./cargo test
-
 `CRAG_OPT=1` compiles in the optimizing tier, with the MIR optimizer's
 passes and Cranelift's speed setting:
 

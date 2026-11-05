@@ -34,7 +34,7 @@ use crag_abi::{
     Frame, FuncId, HEADER_SIZE, HEAP_OFFSET, Number, RuntimeFn, SIDE_END_OFFSET, SIDE_PTR_OFFSET,
     Shapes, TrapKind, inline_text,
 };
-use crag_backend::{code, flat_layouts, flat_params, func_id, scalar_replace, shapes, type_index};
+use crag_backend::{code, flat_params, func_id, scalar_replace, shapes, type_index};
 use crag_codegen::{
     CodeObject, CodegenSettings, OptLevel, SlotKey, compile_entry_stub, target_for,
 };
@@ -997,21 +997,13 @@ fn escapes(a: Int) -> Point {
 }
 "#,
     );
-    let split = |name| match flat_layouts() {
-        true => m.split(name),
-        false => Vec::new(),
-    };
-    let on = |names: &[&str]| match flat_layouts() {
-        true => names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
-        false => Vec::new(),
-    };
-    assert_eq!(split("lines"), on(&["p", "q", "l", "r"]));
-    assert_eq!(split("label"), on(&["n", "m"]));
+    assert_eq!(m.split("lines"), ["p", "q", "l", "r"]);
+    assert_eq!(m.split("label"), ["n", "m"]);
     // `tail` is boxed where it goes into a field that holds a box, and
     // `n` loaded from it.
-    assert_eq!(split("node"), on(&["tail", "head", "n"]));
+    assert_eq!(m.split("node"), ["tail", "head", "n"]);
     // A returned record is boxed where it is returned.
-    assert_eq!(split("escapes"), on(&["p", "kept"]));
+    assert_eq!(m.split("escapes"), ["p", "kept"]);
     RELEASED.set(0);
     assert_eq!(m.int("lines", &[3, 4]), 3443);
     assert_eq!(m.int("node", &[5]), 6);
@@ -1071,24 +1063,16 @@ fn zeroNamed() -> List[Int] {
 }
 "#,
     );
-    let split = |name| match flat_layouts() {
-        true => m.split(name),
-        false => Vec::new(),
-    };
-    let on = |names: &[&str]| match flat_layouts() {
-        true => names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
-        false => Vec::new(),
-    };
     // Boxed where it is returned, the points within it too.
-    assert_eq!(split("line"), on(&["p", "l"]));
+    assert_eq!(m.split("line"), ["p", "l"]);
     // Given by value, through a buffer on the side stack.
-    assert_eq!(split("ends"), on(&["l", "from", "to"]));
-    assert_eq!(split("passed"), on(&["l", "from"]));
+    assert_eq!(m.split("ends"), ["l", "from", "to"]);
+    assert_eq!(m.split("passed"), ["l", "from"]);
     // Used twice where it must be in a box: one box, shared.
-    assert_eq!(split("listed"), on(&[]));
+    assert_eq!(m.split("listed"), Vec::<String>::new());
     // An element is loaded from its list.
-    assert_eq!(split("first"), on(&["p"]));
-    assert_eq!(split("named"), on(&["n", "m"]));
+    assert_eq!(m.split("first"), ["p"]);
+    assert_eq!(m.split("named"), ["n", "m"]);
     assert_eq!(m.int("ends", &[7]), 7 * 100 + 7 * 10 + 1);
     assert_eq!(m.int("first", &[4]), 8);
     assert_eq!(m.int("passed", &[3]), 3 * 100 + 3 * 10 + 1);
@@ -1127,15 +1111,11 @@ fn run(n: Int) -> Int {
 }
 "#,
     );
-    let on = |flags: &[bool]| match flat_layouts() {
-        true => flags.to_vec(),
-        false => Vec::new(),
-    };
-    assert_eq!(m.flat("tile"), on(&[true, false]));
+    assert_eq!(m.flat("tile"), [true, false]);
     // A union field with a record member is stored in its place, but a
     // record too large to be flat keeps its box.
-    assert_eq!(m.flat("spot"), on(&[true]));
-    assert_eq!(m.flat("wide"), on(&[false]));
+    assert_eq!(m.flat("spot"), [true]);
+    assert_eq!(m.flat("wide"), [false]);
     assert_eq!(m.int("run", &[3]), 2301);
     assert_eq!(m.heap.live_blocks(), 0);
 }
@@ -1160,13 +1140,9 @@ fn run(n: Int) -> Int {
 }
 "#,
     );
-    let on = |flags: &[bool]| match flat_layouts() {
-        true => flags.to_vec(),
-        false => Vec::new(),
-    };
     // The union is its member's type index and the string's two words,
     // with no member box.
-    assert_eq!(m.flat("named"), on(&[true]));
+    assert_eq!(m.flat("named"), [true]);
     assert_eq!(m.int("run", &[3]), 130_000 + 2_300 + 3);
     assert_eq!(m.heap.live_blocks(), 0);
 }
@@ -1213,8 +1189,7 @@ fn run(a: Int) -> Int { length(line(a)) * 1000 + size(row(a)) }
     // The points are in the line's box, which is all that is made: the
     // label is a literal, in static data.
     let words = m.call("three", &[]);
-    let boxes = if flat_layouts() { 1 } else { 3 };
-    assert_eq!(m.heap.live_blocks(), boxes);
+    assert_eq!(m.heap.live_blocks(), 1);
     let (shapes, root) = m.result_shapes("three");
     // SAFETY: the words are the function's result, of the shape.
     unsafe { release_value(&mut m.heap, &m.types, &words, &shapes, root) };
@@ -1298,8 +1273,7 @@ fn maybes() -> List[Option[Point]] { maybe(1) }
     assert_eq!(m.heap.live_blocks(), 0);
     // The points take no box of their own: the list's box and its leaf.
     let words = m.call("points", &[]);
-    let boxes = if flat_layouts() { 2 } else { 5 };
-    assert_eq!(m.heap.live_blocks(), boxes);
+    assert_eq!(m.heap.live_blocks(), 2);
     let (shapes, root) = m.result_shapes("points");
     // SAFETY: the words are the function's result, of the shape.
     unsafe { release_value(&mut m.heap, &m.types, &words, &shapes, root) };
@@ -1374,8 +1348,7 @@ fn smallAt(k: Int8) -> Int {{
     assert_eq!(m.int("smallAt", &[4]), 0);
     assert_eq!(m.heap.live_blocks(), 0);
     let words = m.call("tiles", &[]);
-    let boxes = if flat_layouts() { 4 } else { 2 + 1 + 5 + 1 };
-    assert_eq!(m.heap.live_blocks(), boxes);
+    assert_eq!(m.heap.live_blocks(), 4);
     let (shapes, root) = m.result_shapes("tiles");
     // SAFETY: the words are the function's result, of the shape.
     unsafe { release_value(&mut m.heap, &m.types, &words, &shapes, root) };
@@ -1424,15 +1397,11 @@ fn run(a: Int) -> Int {
 fn zeroLine() -> Line { walk(line(1), 2) }
 "#,
     );
-    let on = |r: Option<u32>| match flat_layouts() {
-        true => r,
-        false => None,
-    };
     let size = |name: &str| m.flat_result(name);
-    assert_eq!(size("point"), on(Some(16)));
-    assert_eq!(size("line"), on(Some(32)));
+    assert_eq!(size("point"), Some(16));
+    assert_eq!(size("line"), Some(32));
     // A tag byte, then the point.
-    assert_eq!(size("found"), on(Some(24)));
+    assert_eq!(size("found"), Some(24));
     // The host runs a function without parameters as a root.
     assert_eq!(size("origin"), None);
     assert_eq!(
@@ -1506,19 +1475,11 @@ fn chain(k: Int) -> Int {
 fn listed() -> List[Option[Point]] { kept(3) }
 "#,
     );
-    let split = |name| match flat_layouts() {
-        true => m.split(name),
-        false => Vec::new(),
-    };
-    let on = |names: &[&str]| match flat_layouts() {
-        true => names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
-        false => Vec::new(),
-    };
-    assert_eq!(split("pick"), on(&["o", "p"]));
-    assert_eq!(split("spot"), on(&["s", "t", "u", "p"]));
-    assert_eq!(split("named"), on(&["n", "m", "p", "p"]));
+    assert_eq!(m.split("pick"), ["o", "p"]);
+    assert_eq!(m.split("spot"), ["s", "t", "u", "p"]);
+    assert_eq!(m.split("named"), ["n", "m", "p", "p"]);
     // Boxed where it goes into the list.
-    assert_eq!(split("kept"), on(&["o"]));
+    assert_eq!(m.split("kept"), ["o"]);
     assert_eq!(m.int("pick", &[4]), 5);
     assert_eq!(m.int("pick", &[0]), -1);
     assert_eq!(m.int("spot", &[3]), 26);
@@ -1577,10 +1538,8 @@ fn shared(x: Int) -> Int {
     RELEASED.set(0);
     assert_eq!(m.int("twice", &[n]), n * (n + 1));
     // The second walk owns the list and frees each cell as it passes it.
-    // With flat layouts `build` returns the first cell by value, so it
-    // has no box.
-    let boxes = n as usize - usize::from(flat_layouts());
-    assert_eq!(RELEASED.get(), boxes);
+    // `build` returns the first cell by value, so it has no box.
+    assert_eq!(RELEASED.get(), n as usize - 1);
     assert_eq!(m.heap.live_blocks(), 0);
     // A list nothing reads goes with its first cell, in one call of the
     // runtime.
@@ -1616,14 +1575,9 @@ fn total(n: Int) -> Int {
     assert_eq!(m.int("total", &[10_000]), 10_000 * 10_001 / 2 + 10_000);
     // Each point, too large to be flat, is freed before the next is made,
     // and the next takes its block from the free list inline. Only the
-    // first point finds the heap's page for its class empty, and so does
-    // the range when it is boxed, with flat layouts off.
-    let range = usize::from(!flat_layouts());
-    assert_eq!(
-        (SLOW_ALLOCS.get(), RELEASED.get()),
-        (1 + range, 10_000 + range)
-    );
-    assert_eq!(m.heap.pages_in_use(), 1 + range);
+    // first point finds the heap's page for its class empty.
+    assert_eq!((SLOW_ALLOCS.get(), RELEASED.get()), (1, 10_000));
+    assert_eq!(m.heap.pages_in_use(), 1);
     assert_eq!(m.heap.live_blocks(), 0);
 }
 
@@ -2461,7 +2415,7 @@ fn depth(n: Int) -> Int {
         assert_eq!(m.worker.heap().live_blocks(), 0);
         result
     };
-    let fit = if flat_layouts() { 8 * 128 + 1 } else { 7 * 102 };
+    let fit = 8 * 128 + 1;
     assert_eq!(fresh(fit), Ok(vec![fit as u64]));
     assert_eq!(fresh(fit + 1), Ok(vec![fit as u64 + 1]));
     let trap = fresh(fit + 2).unwrap_err();

@@ -17,8 +17,8 @@
 //! Flat fields (Implementation Plan §11.10.10, Compiler Architecture
 //! §A11.4.4): how a record's box holds its fields.
 //!
-//! With flat layouts a box holds its record's storage form after the
-//! header (`flat::box_layout`): a field of a flat record type is inline,
+//! A box holds its record's storage form after the header
+//! (`flat::box_layout`): a field of a flat record type is inline,
 //! split into its fields' places, a union keeps a local tag or a niche,
 //! integers a `where` condition bounds are narrowed and `Bool`s are bits.
 //! Code sees each field in the register form a split value gives it
@@ -28,9 +28,6 @@
 //! loading the words that hold it and unpacking its registers. A record
 //! or union stored inline is a value of its own once read out of the box:
 //! it is loaded into a split local, or boxed where a box is needed.
-//!
-//! Without flat layouts every field is a word or two at a word offset, as
-//! `layout::record_layout` places it.
 
 use crag_abi::{HEADER_SIZE, StoredKind, StoredSlot, StoredTag, widen};
 use crag_db::Db;
@@ -38,10 +35,8 @@ use crag_hir::Program;
 use crag_types::{Builtin, Step, Ty};
 
 use crate::flat;
-use crate::layout;
 use crate::split::{
     Form, NicheTest, Slot, SlotKind, UnionTag, element_storage, fields_form, fields_slots,
-    flat_layouts,
 };
 
 /// A record's box as code makes and reads it.
@@ -60,32 +55,6 @@ pub struct BoxForm<'db> {
 /// How a box of a record type holds its fields (see the module's
 /// comment); none for a type without a layout.
 pub fn box_form<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<BoxForm<'db>> {
-    if !flat_layouts() {
-        let (fields, size) = layout::record_layout(db, program, ty)?;
-        let mut places = Vec::new();
-        let mut slots = Vec::new();
-        let mut at = 0;
-        for f in fields {
-            let n = f.layout.words();
-            places.push((f.name, f.ty, Form::Words(f.layout)));
-            if n > 0 {
-                slots.push(Slot {
-                    at,
-                    offset: f.offset,
-                    size: 8 * n as u32,
-                    bits: None,
-                    kind: SlotKind::Words,
-                });
-            }
-            at += n;
-        }
-        return Some(BoxForm {
-            size,
-            form: Form::Fields(places),
-            slots,
-            dispose: layout::dispose_word(db, program, ty),
-        });
-    }
     let l = flat::box_layout(db, program, ty).as_ref()?;
     let form = fields_form(db, program, &l.fields)?;
     let Form::Fields(fields) = &form else {

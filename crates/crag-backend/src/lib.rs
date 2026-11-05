@@ -62,12 +62,10 @@ use crag_types::{Builtin, Ty, TyKind};
 
 pub use boxes::{BoxForm, box_form, field_words};
 pub use indices::program_indices;
-pub use layout::{
-    FieldSlot, Layout, element_layout, layout, record_layout, type_descriptor, type_index,
-};
+pub use layout::{Layout, element_layout, layout, type_descriptor, type_index};
 pub use lower::{Lowered, StepInfo, func_id, lower_to_lir};
 pub use shape::{shapes, split_shapes};
-pub use split::{flat_layouts, flat_params, flat_result, scalar_replace};
+pub use split::{flat_params, flat_result, scalar_replace};
 
 /// The code of an instance, ready for the loader.
 #[derive(Clone, Debug, PartialEq, Eq, crag_db::SalsaValue)]
