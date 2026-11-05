@@ -20,7 +20,8 @@
 
 mod common;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read as _, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -35,14 +36,30 @@ struct Client {
     input: Option<ChildStdin>,
     messages: Receiver<Value>,
     id: i64,
+    /// How to answer an elicitation, for a client that declared the
+    /// capability, and the questions asked so far.
+    elicit_answer: Option<Value>,
+    asked: Vec<Value>,
 }
 
 impl Client {
     fn start(dir: &Path, args: &[&str]) -> Client {
+        Client::start_with(dir, args, &[], None)
+    }
+
+    /// A client that answers every elicitation with `elicit_answer`, and
+    /// extra environment for the server.
+    fn start_with(
+        dir: &Path,
+        args: &[&str],
+        envs: &[(&str, &str)],
+        elicit_answer: Option<Value>,
+    ) -> Client {
         common::watchdog(240, "the agent server tests hung");
         let mut child = Command::new(env!("CARGO_BIN_EXE_crag"))
             .arg("mcp")
             .args(args)
+            .envs(envs.iter().map(|(k, v)| (k.to_string(), v.to_string())))
             .current_dir(dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -60,17 +77,23 @@ impl Client {
                 }
             }
         });
+        let capabilities = match elicit_answer {
+            Some(_) => json!({"elicitation": {}}),
+            None => json!({}),
+        };
         let mut client = Client {
             child,
             input: Some(input),
             messages,
             id: 0,
+            elicit_answer,
+            asked: Vec::new(),
         };
         let init = client.request(
             "initialize",
             json!({
                 "protocolVersion": "2025-06-18",
-                "capabilities": {},
+                "capabilities": capabilities,
                 "clientInfo": {"name": "test", "version": "0"},
             }),
         );
@@ -94,6 +117,20 @@ impl Client {
                 .messages
                 .recv_timeout(WAIT)
                 .unwrap_or_else(|_| panic!("no answer to {method}"));
+            // The server may ask the user before it answers.
+            if message["method"] == "elicitation/create" {
+                self.asked.push(message["params"].clone());
+                let answer = self
+                    .elicit_answer
+                    .clone()
+                    .unwrap_or_else(|| json!({"action": "decline"}));
+                self.send(json!({
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "result": answer,
+                }));
+                continue;
+            }
             if message["id"] == id {
                 return message;
             }
@@ -153,7 +190,10 @@ fn lists_the_tools() {
             "searchStd",
             "explain",
             "eval",
-            "test"
+            "test",
+            "fmt",
+            "refactor",
+            "reload"
         ]
     );
     client.finish();
@@ -449,5 +489,327 @@ fn serves_the_knowledge_resources() {
 
     let missing = client.request("resources/read", json!({"uri": "crag://spec/99"}));
     assert!(missing["error"].is_object(), "{missing}");
+    client.finish();
+}
+
+const UNFORMATTED: &str = "pub fn greeting(name: Str) -> Str  {  \"Hello, {name}!\" }\n";
+
+#[test]
+fn writing_tools_ask_the_user() {
+    let dir = common::project(
+        "mcp-write",
+        &[
+            ("package.crag", "package demo 0.1\nruntime 0.0\n"),
+            ("main.crag", UNFORMATTED),
+            ("test/main_test.crag", MAIN_TEST),
+        ],
+    );
+    // A client that cannot be asked gets no change.
+    let mut blind = Client::start(&dir, &[]);
+    let (failed, answer) = blind.call("fmt", json!({}));
+    assert!(failed);
+    assert!(
+        answer["error"].as_str().unwrap().contains("cannot ask"),
+        "{answer}"
+    );
+    blind.finish();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("main.crag")).unwrap(),
+        UNFORMATTED
+    );
+
+    // A decline leaves the files alone.
+    let mut client = Client::start_with(&dir, &[], &[], Some(json!({"action": "decline"})));
+    let (failed, answer) = client.call("fmt", json!({}));
+    assert!(failed);
+    assert_eq!(answer["applied"], false, "{answer}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("main.crag")).unwrap(),
+        UNFORMATTED
+    );
+    client.finish();
+
+    // An accept formats, and the question names the file.
+    let mut client = Client::start_with(
+        &dir,
+        &[],
+        &[],
+        Some(json!({"action": "accept", "content": {}})),
+    );
+    let (failed, answer) = client.call("fmt", json!({}));
+    assert!(!failed, "{answer}");
+    assert_eq!(answer["formatted"], json!(["main.crag"]));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("main.crag")).unwrap(),
+        MAIN
+    );
+    let question = client.asked.last().unwrap()["message"].as_str().unwrap();
+    assert!(question.contains("main.crag"), "{question}");
+    // Nothing to format the second time, so nothing is asked.
+    let asked = client.asked.len();
+    let (_, answer) = client.call("fmt", json!({}));
+    assert_eq!(answer["formatted"], json!([]));
+    assert_eq!(client.asked.len(), asked);
+
+    // A rename changes the declaration and the uses, after the question.
+    let (failed, answer) = client.call(
+        "refactor",
+        json!({"kind": "rename", "file": "main.crag", "line": 1, "column": 8, "to": "welcome"}),
+    );
+    assert!(!failed, "{answer}");
+    assert_eq!(answer["renamed"], "greeting");
+    assert_eq!(answer["places"], 3, "{answer}");
+    let main = std::fs::read_to_string(dir.join("main.crag")).unwrap();
+    assert!(main.contains("pub fn welcome"), "{main}");
+    let tests = std::fs::read_to_string(dir.join("test/main_test.crag")).unwrap();
+    assert!(!tests.contains("greeting("), "{tests}");
+    assert_eq!(tests.matches("welcome(").count(), 2, "{tests}");
+    let (_, answer) = client.call("check", json!({}));
+    assert_eq!(answer["ok"], true, "{answer}");
+
+    // A name declared in std cannot change: `Str` at column 22.
+    let asked = client.asked.len();
+    let (failed, answer) = client.call(
+        "refactor",
+        json!({"kind": "rename", "file": "main.crag", "line": 1, "column": 22, "to": "Text"}),
+    );
+    assert!(failed);
+    assert!(
+        answer["error"].as_str().unwrap().contains("cannot change"),
+        "{answer}"
+    );
+    assert_eq!(client.asked.len(), asked, "refused before asking");
+    client.finish();
+}
+
+#[test]
+fn yes_to_all_covers_the_session() {
+    let dir = common::project(
+        "mcp-yes",
+        &[
+            ("package.crag", "package demo 0.1\nruntime 0.0\n"),
+            ("main.crag", UNFORMATTED),
+            ("extra.crag", "pub fn extra() -> Int  { 1 }\n"),
+        ],
+    );
+    let mut client = Client::start_with(
+        &dir,
+        &[],
+        &[],
+        Some(json!({"action": "accept", "content": {"always": true}})),
+    );
+    let (failed, answer) = client.call("fmt", json!({"file": "main.crag"}));
+    assert!(!failed, "{answer}");
+    assert_eq!(client.asked.len(), 1);
+    // The grant holds: the next change applies without a question.
+    let (failed, answer) = client.call("fmt", json!({"file": "extra.crag"}));
+    assert!(!failed, "{answer}");
+    assert_eq!(answer["formatted"], json!(["extra.crag"]));
+    assert_eq!(client.asked.len(), 1);
+    client.finish();
+}
+
+#[test]
+fn the_io_grant_comes_from_the_user() {
+    let dir = common::project("mcp-io-grant", &[]);
+    // Declined: refused, and the question was put.
+    let mut client = Client::start_with(&dir, &[], &[], Some(json!({"action": "decline"})));
+    client.call("eval", json!({"code": "import std.io"}));
+    let (failed, answer) = client.call("eval", json!({"code": "printLine(\"hi\")"}));
+    assert!(failed);
+    assert_eq!(answer["outcome"], "refused", "{answer}");
+    assert!(
+        client.asked.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("io"),
+    );
+    client.finish();
+
+    // Accepted: the grant holds for the session, with one question.
+    let mut client = Client::start_with(
+        &dir,
+        &[],
+        &[],
+        Some(json!({"action": "accept", "content": {}})),
+    );
+    client.call("eval", json!({"code": "import std.io"}));
+    let (failed, answer) = client.call("eval", json!({"code": "printLine(\"hi\")"}));
+    assert!(!failed, "{answer}");
+    assert_eq!(answer["printed"], "hi\n");
+    let (failed, _) = client.call("eval", json!({"code": "printLine(\"again\")"}));
+    assert!(!failed);
+    assert_eq!(client.asked.len(), 1);
+    client.finish();
+}
+
+#[test]
+fn serves_the_prompts() {
+    let dir = common::project("mcp-prompts", &[]);
+    let mut client = Client::start(&dir, &[]);
+    let listed = client.request("prompts/list", json!({}));
+    let names: Vec<&str> = listed["result"]["prompts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "crag-principles",
+            "crag-write-module",
+            "crag-fix-diagnostics"
+        ]
+    );
+
+    let prompt = client.request(
+        "prompts/get",
+        json!({"name": "crag-write-module", "arguments": {"module": "demo.parser"}}),
+    );
+    let text = prompt["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("demo.parser"), "{text}");
+    assert!(text.contains("crag://primer"), "{text}");
+
+    let missing = client.request("prompts/get", json!({"name": "crag-write-module"}));
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("`module` is missing")
+    );
+
+    let prompt = client.request("prompts/get", json!({"name": "crag-fix-diagnostics"}));
+    let text = prompt["result"]["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("the project"), "{text}");
+    client.finish();
+}
+
+#[test]
+fn counts_the_codes_agents_hit() {
+    let dir = common::project("mcp-stats", &[]);
+    let home = common::project("mcp-stats-home", &[]);
+    let mut client = Client::start_with(
+        &dir,
+        &[],
+        &[
+            ("CRAG_AGENT_STATS", "1"),
+            ("CRAG_HOME", home.to_str().unwrap()),
+        ],
+        None,
+    );
+    client.call(
+        "check",
+        json!({"code": "fn double(x: Int) -> Int { x * \"a\" }"}),
+    );
+    client.call(
+        "check",
+        json!({"code": "fn triple(x: Int) -> Int { x * \"a\" }"}),
+    );
+    client.finish();
+    let stats = std::fs::read_to_string(home.join("agent-stats")).unwrap();
+    let line = stats.lines().find(|l| l.contains("E0303")).unwrap();
+    assert!(line.ends_with(" E0303 2"), "{stats}");
+}
+
+/// The reload test's app: a server that answers each connection and waits
+/// for the next, as crates/crag-driver/tests/reload.rs runs it.
+const APP: &str = r#"import std.io
+
+fn answer() -> Bytes { b"v1" }
+
+fn reply(c: Connection) -> () {
+  case c.read() {
+    bytes: Bytes -> {
+      let written = c.write(answer())
+    }
+    _ -> ()
+  }
+}
+
+fn serve(l: Listener) -> () {
+  case l.accept() {
+    c: Connection -> {
+      reply(c)
+      serve(l)
+    }
+    _ -> ()
+  }
+}
+
+fn main() -> () {
+  case listen(PORT) {
+    l: Listener -> serve(l)
+    _ -> ()
+  }
+}
+"#;
+
+/// What the app answers a new connection.
+fn ask(port: u16) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut stream = loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(e) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the app never listened: {e}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    stream.write_all(b"hello").unwrap();
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).unwrap();
+    answer
+}
+
+#[test]
+fn reload_starts_the_app_and_swaps_its_code() {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let app = APP.replace("PORT", &port.to_string());
+    let dir = common::project(
+        "mcp-reload",
+        &[
+            (
+                "package.crag",
+                "package demo 0.1\nruntime 0.0\nmain demo.app\n",
+            ),
+            ("app.crag", &app),
+        ],
+    );
+    let mut client = Client::start_with(
+        &dir,
+        &[],
+        &[],
+        Some(json!({"action": "accept", "content": {}})),
+    );
+    let (failed, answer) = client.call("reload", json!({}));
+    assert!(!failed, "{answer}");
+    assert_eq!(answer["started"], true);
+    assert_eq!(ask(port), "v1");
+
+    std::fs::write(dir.join("app.crag"), app.replace("v1", "v2")).unwrap();
+    let (failed, answer) = client.call("reload", json!({}));
+    assert!(!failed, "{answer}");
+    assert_eq!(answer["started"], false);
+    assert!(
+        answer["report"].as_str().unwrap().contains("reloaded"),
+        "{answer}"
+    );
+    assert_eq!(ask(port), "v2");
     client.finish();
 }

@@ -18,19 +18,20 @@
 //! each takes and answers, as JSON.
 
 use std::io::Read;
+use std::ops::Range;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use crag_hir::{ItemKind, item_tree};
-use crag_mcp::{CallError, Outcome, ToolSpec};
+use crag_hir::{ItemKind, ModuleId, item_tree};
+use crag_mcp::{CallError, Confirm, Decision, Outcome, ToolSpec};
 use serde_json::{Map, Value, json};
 
-use super::AgentServer;
+use super::{AgentServer, stats};
 use crate::diagnostics::{Located, check, locate_error};
-use crate::lsp::analysis::{documentation, signature_text};
+use crate::lsp::analysis::{self, documentation, signature_text};
 use crate::repl::{EvalOutput, is_definition};
 
 /// How long `eval` may run, unless the call says otherwise, and at most.
@@ -182,6 +183,49 @@ pub fn specs() -> Vec<ToolSpec> {
             }),
             destructive: false,
         },
+        ToolSpec {
+            name: "fmt",
+            title: "Format files",
+            description: "Formats the project's modules in place, to the canonical layout                           `crag fmt` writes. The user confirms the change unless they granted                           `yes` for the session.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "One file to format, relative to                              the project's root; without it, every module."},
+                    "project": project_arg(),
+                },
+            }),
+            destructive: true,
+        },
+        ToolSpec {
+            name: "refactor",
+            title: "Rename a declaration",
+            description: "Renames the name at a position everywhere it is used, as the                           language server does (§20.8.4): give the file, the 1-based line                           and column of the name, and the new name. The user confirms the                           change. Other refactorings come later.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["rename"], "description": "What to do; only `rename` so far."},
+                    "file": {"type": "string", "description": "The file with the name, relative to the project's root."},
+                    "line": {"type": "integer", "minimum": 1},
+                    "column": {"type": "integer", "minimum": 1},
+                    "to": {"type": "string", "description": "The new name."},
+                    "project": project_arg(),
+                },
+                "required": ["kind", "file", "line", "column", "to"],
+            }),
+            destructive: true,
+        },
+        ToolSpec {
+            name: "reload",
+            title: "Run or reload the app",
+            description: "Starts the project's app in the server's image, or, when it                           already runs, swaps the changed code into it while it keeps its                           state and connections (§20.2). The user confirms it.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "project": project_arg(),
+                },
+            }),
+            destructive: true,
+        },
     ]
 }
 
@@ -190,6 +234,7 @@ pub fn call(
     server: &mut AgentServer,
     tool: &str,
     args: &Map<String, Value>,
+    confirm: &Confirm,
 ) -> Result<Outcome, CallError> {
     let project = text_arg(args, "project")?;
     let project = project.as_deref();
@@ -211,12 +256,28 @@ pub fn call(
         "explain" => explain(&required(args, "code")?),
         "eval" => {
             let wall = seconds(args, EVAL_WALL, EVAL_WALL_MAX)?;
-            eval(server, project, &required(args, "code")?, wall)
+            eval(server, project, &required(args, "code")?, wall, confirm)
         }
         "test" => {
             let wall = seconds(args, TEST_WALL, TEST_WALL_MAX)?;
             test(server, project, text_arg(args, "filter")?, wall)
         }
+        "fmt" => fmt(server, project, text_arg(args, "file")?, confirm),
+        "refactor" => {
+            let kind = required(args, "kind")?;
+            if kind != "rename" {
+                return Err(CallError::InvalidArguments(format!(
+                    "`{kind}` is not a refactoring; only `rename` is, so far"
+                )));
+            }
+            let place = (
+                required(args, "file")?,
+                position(args, "line")?,
+                position(args, "column")?,
+            );
+            rename(server, project, place, &required(args, "to")?, confirm)
+        }
+        "reload" => reload(server, project, confirm),
         _ => return Err(CallError::UnknownTool(tool.into())),
     };
     Ok(match answer {
@@ -252,6 +313,16 @@ fn text_arg(args: &Map<String, Value>, name: &str) -> Result<Option<String>, Cal
 
 fn required(args: &Map<String, Value>, name: &str) -> Result<String, CallError> {
     text_arg(args, name)?.ok_or_else(|| CallError::InvalidArguments(format!("`{name}` is missing")))
+}
+
+/// A 1-based line or column argument.
+fn position(args: &Map<String, Value>, name: &str) -> Result<usize, CallError> {
+    match args.get(name).and_then(Value::as_u64) {
+        Some(n) if n >= 1 => Ok(n as usize),
+        _ => Err(CallError::InvalidArguments(format!(
+            "`{name}` must be a whole number from 1"
+        ))),
+    }
 }
 
 fn seconds(args: &Map<String, Value>, default: u64, max: u64) -> Result<Duration, CallError> {
@@ -296,6 +367,7 @@ fn explain(code: &str) -> Answer {
 }
 
 fn located_json(found: &[Located]) -> Value {
+    stats::count(found.iter().filter_map(|l| l.code));
     let diagnostics: Vec<Value> = found
         .iter()
         .map(|l| {
@@ -483,10 +555,13 @@ impl Watchdog {
     }
 }
 
-fn eval(server: &mut AgentServer, project: Option<&str>, code: &str, wall: Duration) -> Answer {
-    let io_eval = server.grants.io_eval;
-    let context = server.context(project)?;
-    let repl = &mut context.repl;
+fn eval(
+    server: &mut AgentServer,
+    project: Option<&str>,
+    code: &str,
+    wall: Duration,
+    confirm: &Confirm,
+) -> Answer {
     let code = code.trim();
     if code.starts_with(':') {
         return Err("eval takes Crag code; REPL commands are not available"
@@ -495,17 +570,41 @@ fn eval(server: &mut AgentServer, project: Option<&str>, code: &str, wall: Durat
     }
     let mut ty = None;
     if !is_definition(code) {
-        let (shown, effects) = repl.type_of(code).map_err(|e| errors(&e))?;
-        if effects.has_io() && !io_eval {
-            return Err(Failure::Answer(json!({
-                "outcome": "refused",
-                "effect": "io",
-                "error": "the code has the io effect, which eval runs only when the user \
-                          starts the server with --allow-io",
-            })));
+        let (shown, effects) = server
+            .context(project)?
+            .repl
+            .type_of(code)
+            .map_err(|e| errors(&e))?;
+        // Only the user grants io, for the session: on the command line,
+        // or by answering the server's question here (§20.10).
+        if effects.has_io() && !server.grants.io_eval {
+            let refused = |how: &str| {
+                Err(Failure::Answer(json!({
+                    "outcome": "refused",
+                    "effect": "io",
+                    "error": format!("the code has the io effect, which eval runs only when \
+                                      the user grants it for the session; {how}"),
+                })))
+            };
+            match confirm.ask(
+                "The agent wants to evaluate code with the `io` effect: it may read and \
+                 write files, talk to the network or run processes. Allow io in eval for \
+                 the rest of this session?",
+                false,
+            ) {
+                Decision::Yes | Decision::YesToAll => server.grants.io_eval = true,
+                Decision::No => return refused("they declined"),
+                Decision::CannotAsk => {
+                    return refused(
+                        "this client cannot ask them, so start the server with --allow-io",
+                    );
+                }
+            }
         }
         ty = Some(shown);
     }
+    let context = server.context(project)?;
+    let repl = &mut context.repl;
     // What ran before belongs to no call.
     let _ = repl.take_printed();
     let pid = repl.scratch().session().scratch().pid();
@@ -677,6 +776,273 @@ fn parse_test_output(output: &str) -> TestLines {
         lines.failed.push((name.clone(), report));
     }
     lines
+}
+
+/// Puts a change to the user, honoring the session-wide `yes`
+/// (Implementation Plan §11.12.8). `Err` carries what the tool answers
+/// when it may not apply.
+fn confirmed(server: &mut AgentServer, confirm: &Confirm, summary: &str) -> Result<(), Failure> {
+    if server.grants.yes {
+        return Ok(());
+    }
+    match confirm.ask(summary, true) {
+        Decision::Yes => Ok(()),
+        Decision::YesToAll => {
+            server.grants.yes = true;
+            Ok(())
+        }
+        Decision::No => Err(Failure::Answer(json!({
+            "applied": false,
+            "error": "the user declined the change",
+        }))),
+        Decision::CannotAsk => Err(Failure::Message(
+            "this client cannot ask the user to confirm a change; edit the files directly, \
+             or use the crag command"
+                .into(),
+        )),
+    }
+}
+
+/// `fmt`: rewrites modules to the canonical layout, with the user's
+/// consent, as `crag fmt` does (§20.9).
+fn fmt(
+    server: &mut AgentServer,
+    project: Option<&str>,
+    file: Option<String>,
+    confirm: &Confirm,
+) -> Answer {
+    let (root, package, sources) = {
+        let project = server.context(project)?.repl.project();
+        let Some(root) = project.root.clone() else {
+            return Err("fmt needs a project; the server runs with std alone"
+                .to_string()
+                .into());
+        };
+        let sources: Vec<(String, String)> = project
+            .own()
+            .iter()
+            .filter(|f| file.as_ref().is_none_or(|name| f.shown == *name))
+            .map(|f| (f.shown.clone(), project.source(f.module).to_string()))
+            .collect();
+        (root, project.package.clone(), sources)
+    };
+    if sources.is_empty()
+        && let Some(name) = &file
+    {
+        return Err(format!("the project has no module file {name}").into());
+    }
+    let mut changes = Vec::new();
+    let mut skipped = Vec::new();
+    for (shown, text) in sources {
+        match crag_fmt::format(&text, Some(&package)) {
+            Ok(formatted) if formatted == text => {}
+            Ok(formatted) => changes.push((shown, formatted)),
+            Err(crag_fmt::FormatError::Syntax(_)) => {
+                skipped.push(json!({"file": shown, "why": "it does not parse"}));
+            }
+            Err(crag_fmt::FormatError::Changed) => {
+                skipped.push(json!({
+                    "file": shown,
+                    "why": "the formatter would change what it means",
+                }));
+            }
+        }
+    }
+    let files: Vec<String> = changes.iter().map(|(shown, _)| shown.clone()).collect();
+    if changes.is_empty() {
+        return Ok(json!({"applied": true, "formatted": files, "skipped": skipped}));
+    }
+    let s = if files.len() == 1 { "" } else { "s" };
+    confirmed(
+        server,
+        confirm,
+        &format!(
+            "The agent wants to format {} file{s} in place: {}. Apply?",
+            files.len(),
+            files.join(", ")
+        ),
+    )?;
+    for (shown, formatted) in &changes {
+        std::fs::write(root.join(shown), formatted)
+            .map_err(|e| format!("cannot write {shown}: {e}"))?;
+    }
+    Ok(json!({"applied": true, "formatted": files, "skipped": skipped}))
+}
+
+/// The byte offset of a 1-based line and column, counting characters as
+/// diagnostics do.
+fn offset_at(source: &str, line: usize, column: usize) -> Option<u32> {
+    let (mut l, mut c) = (1, 1);
+    for (at, ch) in source.char_indices() {
+        if l == line && c == column {
+            return Some(at as u32);
+        }
+        if ch == '\n' {
+            if l == line {
+                return None;
+            }
+            l += 1;
+            c = 1;
+        } else {
+            c += 1;
+        }
+    }
+    (l == line && c == column).then_some(source.len() as u32)
+}
+
+/// `refactor` with `kind: rename`: the name at a position changes
+/// everywhere it is used, as the language server renames (§20.8.4).
+fn rename(
+    server: &mut AgentServer,
+    project: Option<&str>,
+    (file, line, column): (String, usize, usize),
+    to: &str,
+    confirm: &Confirm,
+) -> Answer {
+    if !analysis::valid_name(to) {
+        return Err(format!("`{to}` is not a name").into());
+    }
+    // One edit per module, applied only once the user agrees.
+    struct Edit {
+        shown: String,
+        text: String,
+        ranges: Vec<Range<u32>>,
+    }
+    let (root, old, mut edits) = {
+        let project = server.context(project)?.repl.project();
+        let Some(root) = project.root.clone() else {
+            return Err("refactor needs a project; the server runs with std alone"
+                .to_string()
+                .into());
+        };
+        let (db, program) = (&project.db as &dyn crag_db::Db, project.program);
+        let own: Vec<ModuleId> = project.own().iter().map(|f| f.module).collect();
+        let Some(entry) = project.own().iter().find(|f| f.shown == file) else {
+            return Err(format!("the project has no module file {file}").into());
+        };
+        let module = entry.module;
+        let Some(offset) = offset_at(project.source(module), line, column) else {
+            return Err(format!("{file} has no line {line}, column {column}").into());
+        };
+        let Some((target, _)) = analysis::target_at(db, program, module, offset) else {
+            return Err("there is no name at this position to rename"
+                .to_string()
+                .into());
+        };
+        let files = analysis::Files {
+            entries: project
+                .files
+                .iter()
+                .map(|f| analysis::FileEntry {
+                    module: f.module,
+                    uri: f.shown.clone(),
+                    editable: own.contains(&f.module),
+                })
+                .collect(),
+            package: Some(project.package.clone()),
+        };
+        let places = analysis::references(db, program, &files, target, true);
+        let foreign = places.iter().find(|p| !own.contains(&p.module));
+        if let Some(place) = foreign {
+            return Err(format!(
+                "the name is declared or used in `{}`, which cannot change",
+                place.module.path(db)
+            )
+            .into());
+        }
+        let Some(first) = places.first() else {
+            return Err("nothing uses this name".to_string().into());
+        };
+        let source = project.source(first.module);
+        let old = source[first.range.start as usize..first.range.end as usize].to_string();
+        let mut edits: Vec<Edit> = Vec::new();
+        for place in places {
+            let shown = &project.file(place.module).shown;
+            let edit = match edits.iter_mut().find(|e| e.shown == *shown) {
+                Some(edit) => edit,
+                None => {
+                    edits.push(Edit {
+                        shown: shown.clone(),
+                        text: project.source(place.module).to_string(),
+                        ranges: Vec::new(),
+                    });
+                    edits.last_mut().expect("just pushed")
+                }
+            };
+            edit.ranges.push(place.range);
+        }
+        (root, old, edits)
+    };
+    if old == to {
+        return Err(format!("`{to}` is the name it has already").into());
+    }
+    let places: usize = edits.iter().map(|e| e.ranges.len()).sum();
+    let list: Vec<String> = edits
+        .iter()
+        .map(|e| format!("{} ({})", e.shown, e.ranges.len()))
+        .collect();
+    let s = if edits.len() == 1 { "" } else { "s" };
+    confirmed(
+        server,
+        confirm,
+        &format!(
+            "The agent wants to rename `{old}` to `{to}`: {places} places in {} file{s}: {}. \
+             Apply?",
+            edits.len(),
+            list.join(", ")
+        ),
+    )?;
+    let mut files = Vec::new();
+    for edit in &mut edits {
+        edit.ranges.sort_by_key(|r| std::cmp::Reverse(r.start));
+        for range in &edit.ranges {
+            edit.text
+                .replace_range(range.start as usize..range.end as usize, to);
+        }
+        std::fs::write(root.join(&edit.shown), &edit.text)
+            .map_err(|e| format!("cannot write {}: {e}", edit.shown))?;
+        files.push(edit.shown.clone());
+    }
+    Ok(json!({
+        "applied": true,
+        "renamed": old,
+        "to": to,
+        "places": places,
+        "files": files,
+    }))
+}
+
+/// `reload`: starts the project's app in the server's image, or swaps the
+/// changed code into it (§20.2), with the user's consent.
+fn reload(server: &mut AgentServer, project: Option<&str>, confirm: &Confirm) -> Answer {
+    let running = {
+        let context = server.context(project)?;
+        if context.root.is_none() {
+            return Err("reload needs a project; the server runs with std alone"
+                .to_string()
+                .into());
+        }
+        context.repl.app_running()
+    };
+    let question = match running {
+        true => "The agent wants to reload the changed code into the running app. Apply?",
+        false => "The agent wants to start the project's app in the server's image. Start it?",
+    };
+    confirmed(server, confirm, question)?;
+    let repl = &mut server.context(project)?.repl;
+    let output = match running {
+        true => repl.reload(),
+        false => repl.start_app(),
+    };
+    match output {
+        Ok(EvalOutput::Text(report)) => Ok(json!({
+            "applied": true,
+            "started": !running,
+            "report": report.trim(),
+        })),
+        Ok(_) => Ok(json!({"applied": true, "started": !running})),
+        Err(e) => Err(e.trim().trim_start_matches("error: ").to_string().into()),
+    }
 }
 
 #[cfg(test)]

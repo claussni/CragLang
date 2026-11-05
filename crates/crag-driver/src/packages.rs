@@ -162,6 +162,8 @@ pub fn crag_new(dir: &Path, args: &Args, out: &mut dyn Write) -> u8 {
     let written = (|| -> std::io::Result<()> {
         fs::create_dir_all(root.join("test"))?;
         fs::write(root.join("package.crag"), manifest)?;
+        // How agents work here: read the primer first (§20.10).
+        fs::write(root.join("AGENTS.md"), crag_knowledge::agents_md())?;
         for (file, text) in files {
             fs::write(root.join(file), text)?;
         }

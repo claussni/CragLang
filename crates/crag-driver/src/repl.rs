@@ -75,6 +75,8 @@ Enter a definition to add it to the session, or an expression to run it.
   :registry new <name> <folder> | add <name> <folder> | list | remove <name>
                         manage the registries of the settings
   :build [skip-tests]   test the project and build its executable in dist/
+  :agent-stats          the diagnostic codes agent sessions hit most, when
+                        counting is on (CRAG_AGENT_STATS=1)
   :cd [directory]       go to another directory and the project in it, with
                         a fresh session; alone, show where the session runs
   :help                 show this
@@ -416,6 +418,7 @@ impl Repl {
             "cd" => self.change_dir(rest.trim()),
             "reload" => self.reload(),
             "status" => self.status(),
+            "agent-stats" => Ok(EvalOutput::Text(crate::agent::stats::report())),
             "layout" => self.show_layout(rest.trim()),
             "break" => self.breakpoint(rest.trim()),
             "clear" => {
@@ -688,7 +691,12 @@ impl Repl {
         Ok(EvalOutput::Text(text))
     }
 
-    fn start_app(&mut self) -> Result<EvalOutput, String> {
+    /// Whether this session started the app and has not stopped it.
+    pub(crate) fn app_running(&self) -> bool {
+        self.app.is_some()
+    }
+
+    pub(crate) fn start_app(&mut self) -> Result<EvalOutput, String> {
         if self.project.root.is_none() {
             return Err("error: the REPL runs outside a project, which has no app\n".into());
         }
@@ -704,7 +712,7 @@ impl Repl {
         )))
     }
 
-    fn reload(&mut self) -> Result<EvalOutput, String> {
+    pub(crate) fn reload(&mut self) -> Result<EvalOutput, String> {
         let files = self.project.refresh();
         let shipment = self
             .scratch

@@ -25,12 +25,14 @@
 //! defined until the context changes. Before each call the context reads
 //! the project's files again, so the answers follow the agent's edits.
 
+mod prompts;
 mod resources;
+pub(crate) mod stats;
 mod tools;
 
 use std::path::{Path, PathBuf};
 
-use crag_mcp::{CallError, Catalog, Handler, Info, Outcome};
+use crag_mcp::{CallError, Catalog, Confirm, Handler, Info, Outcome};
 use crag_session::ImageCommand;
 use serde_json::{Map, Value};
 
@@ -38,11 +40,16 @@ use crate::project::Project;
 use crate::repl::Repl;
 use crate::scratch::Scratch;
 
-/// What the user allowed the agent's code, for the session.
+/// What the user allowed the agent's code, for the session. Each grant
+/// is set from the command line or from the user's answer to the
+/// server's confirmation, never from a tool argument (Implementation
+/// Plan §11.12.8).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Grants {
     /// Whether `eval` runs code with the `io` effect (§20.10).
     pub io_eval: bool,
+    /// Whether the writing tools apply without asking again.
+    pub yes: bool,
 }
 
 /// A project's REPL session, with what its files were when it was loaded.
@@ -149,8 +156,13 @@ impl AgentServer {
 }
 
 impl Handler for AgentServer {
-    fn call(&mut self, tool: &str, args: &Map<String, Value>) -> Result<Outcome, CallError> {
-        tools::call(self, tool, args)
+    fn call(
+        &mut self,
+        tool: &str,
+        args: &Map<String, Value>,
+        confirm: &Confirm,
+    ) -> Result<Outcome, CallError> {
+        tools::call(self, tool, args, confirm)
     }
 
     fn read(&mut self, uri: &str) -> Result<Option<String>, String> {
@@ -165,6 +177,7 @@ fn catalog() -> Catalog {
         tools: tools::specs(),
         resources,
         templates,
+        prompts: prompts::specs(),
     }
 }
 

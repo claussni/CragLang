@@ -167,7 +167,10 @@ fn mcp(io_eval: bool) -> ExitCode {
     let Some((protocol, command)) = protocol_output("mcp") else {
         return ExitCode::from(1);
     };
-    let grants = crag_driver::agent::Grants { io_eval };
+    let grants = crag_driver::agent::Grants {
+        io_eval,
+        yes: false,
+    };
     ExitCode::from(crag_driver::agent::serve(protocol, command, grants))
 }
 

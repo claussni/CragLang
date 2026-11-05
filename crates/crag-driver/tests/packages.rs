@@ -302,6 +302,9 @@ fn new_projects_build_run_and_test() {
         let out = crag(&home, &root, args);
         assert_eq!(out.status.code(), Some(0), "{}", text(&out));
         let dir = root.join(name);
+        // A fresh project points agents at the server and the primer.
+        let agents = fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(agents.contains("crag mcp") && agents.contains("crag://primer"));
         let out = crag(&home, &dir, &["test"]);
         assert_eq!(out.status.code(), Some(0), "{name}: {}", text(&out));
         assert!(text(&out).contains("... ok"), "{name}: {}", text(&out));

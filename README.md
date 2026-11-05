@@ -194,8 +194,20 @@ find functions, `eval` runs code in the scratch image under a time limit,
 `test` runs the project's tests, and `explain` tells what a diagnostic
 code means. Each tool takes an optional `project` directory; without it
 the server works in the project it was started in, or with `std` alone.
-`eval` refuses code with the `io` effect unless the server was started
-with `--allow-io`. The server also serves resources: `crag://primer`
+Three tools change state, and each asks the user first, through the
+client (MCP elicitation), with an answer that can cover the whole
+session: `fmt` formats modules in place, `refactor` renames a name
+everywhere it is used, and `reload` starts the project's app in the
+server's image or swaps changed code into it. `eval` refuses code with
+the `io` effect until the user grants it, by answering the server's
+question or by starting it with `--allow-io`; a client that cannot ask
+needs the flag. The prompts `crag-principles`, `crag-write-module` and
+`crag-fix-diagnostics` carry the working instructions, and `crag package
+new` writes an `AGENTS.md` that points agents at the server and the
+primer. With `CRAG_AGENT_STATS=1`, the diagnostic codes agents hit are
+counted per code and day in `agent-stats` under the Crag home, and the
+REPL's `:agent-stats` shows the most frequent; nothing leaves the
+machine. The server also serves resources: `crag://primer`
 says where Crag differs from the languages agents know,
 `crag://principles` gives the design principles, `crag://spec/<section>`
 one section of the specification, `crag://std/<module>` a module's

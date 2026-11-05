@@ -37,6 +37,27 @@ pub fn principles() -> &'static str {
     PRINCIPLES
 }
 
+/// How a fresh project points agents at the toolchain: the AGENTS.md
+/// that `crag package new` writes (Specification §20.10).
+pub fn agents_md() -> &'static str {
+    include_str!("../knowledge/agents.md")
+}
+
+/// The prompt `crag-principles`: how to write Crag like Crag.
+pub fn prompt_principles() -> &'static str {
+    include_str!("../knowledge/prompt-principles.md")
+}
+
+/// The prompt `crag-write-module`, with `{module}` to fill in.
+pub fn prompt_write_module() -> &'static str {
+    include_str!("../knowledge/prompt-write-module.md")
+}
+
+/// The prompt `crag-fix-diagnostics`, with `{target}` to fill in.
+pub fn prompt_fix_diagnostics() -> &'static str {
+    include_str!("../knowledge/prompt-fix-diagnostics.md")
+}
+
 /// One section of the specification.
 #[derive(Debug)]
 pub struct Section {
@@ -173,7 +194,14 @@ mod tests {
 
     #[test]
     fn the_primer_and_the_principles_link_the_spec() {
-        for text in [primer(), principles()] {
+        for text in [
+            primer(),
+            principles(),
+            agents_md(),
+            prompt_principles(),
+            prompt_write_module(),
+            prompt_fix_diagnostics(),
+        ] {
             assert_eq!(broken_references(text), Vec::<&str>::new());
         }
         // Every primer entry carries its spec link.
