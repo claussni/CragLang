@@ -19,6 +19,8 @@
 
 #![allow(dead_code)]
 
+pub mod client;
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Once;

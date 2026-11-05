@@ -61,6 +61,13 @@ under every interleaving that matters:
     RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom \
         ./cargo test -p crag-runtime --release --lib loom_model
 
+The eval fuzz run feeds random programs — loops, deep recursion, large
+allocations, trapping arithmetic — through the agent server's `eval`;
+each must end in a structured outcome and leave the session answering.
+It runs 24 programs with the suite; more, or another sequence:
+
+    CRAG_FUZZ=200 CRAG_FUZZ_SEED=7 ./cargo test -p crag-driver --test eval_fuzz
+
 `CRAG_OPT=1` compiles in the optimizing tier, with the MIR optimizer's
 passes and Cranelift's speed setting:
 
