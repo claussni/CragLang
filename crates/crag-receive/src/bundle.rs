@@ -21,11 +21,11 @@
 //! executable carries it, so that the program checks and compiles code it
 //! receives against itself.
 //!
-//! The bytes are a version, then each part in turn: integers
-//! little-endian, a sequence as its length, a `u32`, and then its items,
-//! a string as its bytes. They come from the program's own build, so a
-//! malformed bundle is a fault of the toolchain, reported as an error.
+//! The bytes are a version, then each part in turn, as `crag_abi::wire`
+//! writes them. They come from the program's own build, so a malformed
+//! bundle is a fault of the toolchain, reported as an error.
 
+use crag_abi::wire::{self, Writer};
 use crag_abi::{FuncId, SlotKey};
 use crag_db::{Db, RootDatabase, Setter};
 use crag_hir::{ModuleId, PackageScope, Packages, Program, Resource, TypeIndices};
@@ -108,15 +108,15 @@ impl Bundle {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer(Vec::new());
+        let mut w = Writer::default();
         w.u32(VERSION);
         w.seq(&self.modules, |w, (path, text)| {
-            w.str(path);
-            w.str(text);
+            w.text(path);
+            w.text(text);
         });
         w.seq(&self.resources, |w, (module, source, content)| {
-            w.str(module);
-            w.str(source);
+            w.text(module);
+            w.text(source);
             match content {
                 Ok(bytes) => {
                     w.u8(0);
@@ -124,29 +124,29 @@ impl Bundle {
                 }
                 Err(why) => {
                     w.u8(1);
-                    w.str(why);
+                    w.text(why);
                 }
             }
         });
         w.seq(&self.packages.packages, |w, p| {
-            w.str(&p.name);
+            w.text(&p.name);
             w.u32(p.major);
-            w.seq(&p.exports, |w, s| w.str(s));
-            w.seq(&p.imports, |w, s| w.str(s));
-            w.seq(&p.dev_imports, |w, s| w.str(s));
+            w.seq(&p.exports, |w, s| w.text(s));
+            w.seq(&p.imports, |w, s| w.text(s));
+            w.seq(&p.dev_imports, |w, s| w.text(s));
             w.seq(&p.natives, |w, (name, files)| {
-                w.str(name);
-                w.seq(files, |w, s| w.str(s));
+                w.text(name);
+                w.seq(files, |w, s| w.text(s));
             });
         });
         let indices: Vec<_> = self.indices.by_hash.iter().collect();
         w.seq(&indices, |w, (hash, index)| {
-            w.0.extend_from_slice(&hash[..]);
+            w.raw(&hash[..]);
             w.u32(**index);
         });
         w.u32(self.indices.base);
         w.seq(&self.cells, |w, (name, key)| {
-            w.str(name);
+            w.text(name);
             w.u32(key.func.0);
             w.u32(key.signature);
         });
@@ -154,48 +154,48 @@ impl Bundle {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Bundle, String> {
-        let mut r = Reader { bytes, at: 0 };
+        let mut r = Reader::new(bytes);
         let version = r.u32()?;
         if version != VERSION {
             return Err(format!("a bundle of version {version}, not {VERSION}"));
         }
-        let modules = r.seq(|r| Ok((r.str()?, r.str()?)))?;
+        let modules = r.seq(|r| Ok((r.text()?, r.text()?)))?;
         let resources = r.seq(|r| {
-            let module = r.str()?;
-            let source = r.str()?;
+            let module = r.text()?;
+            let source = r.text()?;
             let content = match r.u8()? {
                 0 => Ok(r.bytes()?.to_vec()),
-                _ => Err(r.str()?),
+                _ => Err(r.text()?),
             };
             Ok((module, source, content))
         })?;
         let packages = r.seq(|r| {
             Ok(PackageScope {
-                name: r.str()?,
+                name: r.text()?,
                 major: r.u32()?,
-                exports: r.seq(Reader::str)?,
-                imports: r.seq(Reader::str)?,
-                dev_imports: r.seq(Reader::str)?,
-                natives: r.seq(|r| Ok((r.str()?, r.seq(Reader::str)?)))?,
+                exports: r.seq(Reader::text)?,
+                imports: r.seq(Reader::text)?,
+                dev_imports: r.seq(Reader::text)?,
+                natives: r.seq(|r| Ok((r.text()?, r.seq(Reader::text)?)))?,
             })
         })?;
         let mut indices = TypeIndices::default();
         for (hash, index) in r.seq(|r| {
-            let hash: [u8; 16] = r.take(16)?.try_into().expect("sixteen bytes");
+            let hash: [u8; 16] = r.array()?;
             Ok((hash, r.u32()?))
         })? {
             indices.by_hash.insert(hash, index);
         }
         indices.base = r.u32()?;
         let cells = r.seq(|r| {
-            let name = r.str()?;
+            let name = r.text()?;
             let key = SlotKey {
                 func: FuncId(r.u32()?),
                 signature: r.u32()?,
             };
             Ok((name, key))
         })?;
-        if r.at != bytes.len() {
+        if !r.is_empty() {
             return Err("bytes after the bundle".into());
         }
         Ok(Bundle {
@@ -208,79 +208,4 @@ impl Bundle {
     }
 }
 
-struct Writer(Vec<u8>);
-
-impl Writer {
-    fn u8(&mut self, n: u8) {
-        self.0.push(n);
-    }
-
-    fn u32(&mut self, n: u32) {
-        self.0.extend(n.to_le_bytes());
-    }
-
-    fn bytes(&mut self, b: &[u8]) {
-        self.u32(b.len() as u32);
-        self.0.extend_from_slice(b);
-    }
-
-    fn str(&mut self, s: &str) {
-        self.bytes(s.as_bytes());
-    }
-
-    fn seq<T>(&mut self, items: &[T], mut f: impl FnMut(&mut Writer, &T)) {
-        self.u32(items.len() as u32);
-        for item in items {
-            f(self, item);
-        }
-    }
-}
-
-struct Reader<'b> {
-    bytes: &'b [u8],
-    at: usize,
-}
-
-impl<'b> Reader<'b> {
-    fn take(&mut self, n: usize) -> Result<&'b [u8], String> {
-        let end = self
-            .at
-            .checked_add(n)
-            .filter(|&e| e <= self.bytes.len())
-            .ok_or("the bundle ends early")?;
-        let out = &self.bytes[self.at..end];
-        self.at = end;
-        Ok(out)
-    }
-
-    fn u8(&mut self) -> Result<u8, String> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32, String> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?.try_into().expect("four bytes"),
-        ))
-    }
-
-    fn bytes(&mut self) -> Result<&'b [u8], String> {
-        let n = self.u32()? as usize;
-        self.take(n)
-    }
-
-    fn str(&mut self) -> Result<String, String> {
-        String::from_utf8(self.bytes()?.to_vec()).map_err(|_| "a string that is no UTF-8".into())
-    }
-
-    fn seq<T>(
-        &mut self,
-        mut f: impl FnMut(&mut Self) -> Result<T, String>,
-    ) -> Result<Vec<T>, String> {
-        let n = self.u32()? as usize;
-        // Each item takes at least a byte, which bounds a forged length.
-        if n > self.bytes.len() - self.at {
-            return Err("a sequence longer than the bundle".into());
-        }
-        (0..n).map(|_| f(self)).collect()
-    }
-}
+type Reader<'a> = wire::Reader<'a, String>;

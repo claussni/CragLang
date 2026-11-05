@@ -84,6 +84,7 @@
 
 pub mod protocol;
 pub mod release;
+pub mod wire;
 
 /// Offset of `stack_limit` in the task context, in bytes. It is the first
 /// field, so the check loads it with no displacement.
@@ -2120,7 +2121,7 @@ impl Shapes {
     /// The table `encode` wrote, checked: every shape a shape names is in
     /// it.
     pub fn decode(bytes: &[u8]) -> Result<Shapes, String> {
-        let mut r = ShapeReader { bytes, at: 0 };
+        let mut r = ShapeReader::new(bytes);
         let shapes = Shapes {
             shapes: r.seq(ShapeReader::shape)?,
             records: r.seq(|r| Ok((r.u32()?, r.u32()?)))?,
@@ -2134,7 +2135,7 @@ impl Shapes {
                 Ok((shape, identity))
             })?,
         };
-        if r.at != bytes.len() {
+        if !r.is_empty() {
             return Err("bytes after the shapes".into());
         }
         let n = shapes.shapes.len() as u32;
@@ -2166,42 +2167,15 @@ impl Shapes {
 }
 
 /// Reads what `Shapes::encode` wrote.
-struct ShapeReader<'a> {
-    bytes: &'a [u8],
-    at: usize,
+type ShapeReader<'a> = wire::Reader<'a, String>;
+
+/// What a shape table holds beyond `wire`'s bytes.
+trait ReadShape {
+    fn shape(&mut self) -> Result<Shape, String>;
+    fn slots(&mut self) -> Result<Vec<StoredSlot>, String>;
 }
 
-impl ShapeReader<'_> {
-    fn u8(&mut self) -> Result<u8, String> {
-        let b = *self.bytes.get(self.at).ok_or("the shapes end early")?;
-        self.at += 1;
-        Ok(b)
-    }
-
-    fn u32(&mut self) -> Result<u32, String> {
-        let end = self.at + 4;
-        let b = self.bytes.get(self.at..end).ok_or("the shapes end early")?;
-        self.at = end;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    }
-
-    fn seq<T>(
-        &mut self,
-        mut item: impl FnMut(&mut Self) -> Result<T, String>,
-    ) -> Result<Vec<T>, String> {
-        let n = self.u32()? as usize;
-        // Each item takes a byte at least.
-        if n > self.bytes.len() - self.at {
-            return Err("the shapes end early".into());
-        }
-        (0..n).map(|_| item(self)).collect()
-    }
-
-    fn text(&mut self) -> Result<String, String> {
-        let bytes = self.seq(ShapeReader::u8)?;
-        String::from_utf8(bytes).map_err(|_| "text that is not UTF-8".to_string())
-    }
-
+impl ReadShape for ShapeReader<'_> {
     fn shape(&mut self) -> Result<Shape, String> {
         Ok(match self.u8()? {
             0 => Shape::Unit,
@@ -2308,16 +2282,9 @@ impl ShapeReader<'_> {
             })
         })
     }
-
-    fn u64(&mut self) -> Result<u64, String> {
-        let end = self.at + 8;
-        let b = self.bytes.get(self.at..end).ok_or("the shapes end early")?;
-        self.at = end;
-        Ok(u64::from_le_bytes(b.try_into().expect("eight bytes")))
-    }
 }
 
-/// Writes the slots of a stored shape, as `ShapeReader::slots` reads them.
+/// Writes the slots of a stored shape, as `ReadShape::slots` reads them.
 fn stored_slots(out: &mut Vec<u8>, slots: &[StoredSlot]) {
     let u32 = |out: &mut Vec<u8>, n: u32| out.extend_from_slice(&n.to_le_bytes());
     u32(out, slots.len() as u32);

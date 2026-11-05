@@ -52,6 +52,8 @@ use crag_abi::{
     HEADER_SIZE, MEMBER_BOX_SIZE, Shape, ShapeField, Shapes, TYPE_INDEX_OFFSET, narrow, widen,
 };
 
+use crag_abi::wire::{self, Malformed};
+
 use crate::heap::{Heap, alloc_box};
 use crate::print::{field_words, member_words, value_at};
 use crate::rc::Types;
@@ -401,6 +403,12 @@ unsafe fn entries(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodeError(pub String);
 
+impl From<Malformed> for DecodeError {
+    fn from(error: Malformed) -> DecodeError {
+        DecodeError(error.to_string())
+    }
+}
+
 /// The words of the value the bytes encode, of the shape `shape` of
 /// `shapes`, built on the heap. The caller owns the value.
 ///
@@ -415,64 +423,52 @@ pub unsafe fn decode_value(
     heap: &mut Heap,
     types: &Types,
 ) -> Result<Vec<u64>, DecodeError> {
-    let mut d = Decoder { bytes, at: 0 };
+    let mut d = Decoder::new(bytes);
     d.check(shapes, shape)?;
-    if d.at != bytes.len() {
-        return Err(DecodeError(format!(
-            "{} bytes after the value",
-            bytes.len() - d.at
-        )));
+    if !d.is_empty() {
+        return Err(DecodeError(format!("{} bytes after the value", d.len())));
     }
-    let mut d = Decoder { bytes, at: 0 };
+    let mut d = Decoder::new(bytes);
     // SAFETY: the bytes fit the shapes, as checked, and the caller vouches
     // for the shapes.
     Ok(unsafe { d.build(shapes, shape, heap, types) })
 }
 
-struct Decoder<'a> {
-    bytes: &'a [u8],
-    at: usize,
+type Decoder<'a> = wire::Reader<'a, DecodeError>;
+
+/// What a value's bytes hold beyond `wire`'s.
+trait Decode {
+    fn count(&mut self) -> Result<usize, DecodeError>;
+    fn own(&mut self, shapes: &Shapes, shape: u32) -> Result<u32, DecodeError>;
+    fn check(&mut self, shapes: &Shapes, shape: u32) -> Result<(), DecodeError>;
+    unsafe fn build(
+        &mut self,
+        shapes: &Shapes,
+        shape: u32,
+        heap: &mut Heap,
+        types: &Types,
+    ) -> Vec<u64>;
+    unsafe fn map(
+        &mut self,
+        shapes: &Shapes,
+        shape: u32,
+        key: u32,
+        value: Option<u32>,
+        heap: &mut Heap,
+        types: &Types,
+    ) -> u64;
 }
 
-impl Decoder<'_> {
-    fn take<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
-        let end = self.at.checked_add(N).filter(|&e| e <= self.bytes.len());
-        let Some(end) = end else {
-            return Err(DecodeError("the bytes end inside the value".into()));
-        };
-        let taken = self.bytes[self.at..end].try_into().expect("N bytes");
-        self.at = end;
-        Ok(taken)
-    }
-
-    fn u32(&mut self) -> Result<u32, DecodeError> {
-        Ok(u32::from_le_bytes(self.take()?))
-    }
-
-    fn u64(&mut self) -> Result<u64, DecodeError> {
-        Ok(u64::from_le_bytes(self.take()?))
-    }
-
-    /// A length. An element takes a byte at least, unless it is a tag or
+impl Decode for Decoder<'_> {
+    /// A count. An element takes a byte at least, unless it is a tag or
     /// `()`, so a longer collection than the bytes left is refused only
     /// when it would not fit memory either; `check` refuses the rest.
-    fn len(&mut self) -> Result<usize, DecodeError> {
+    fn count(&mut self) -> Result<usize, DecodeError> {
         let len = self.u64()?;
         match usize::try_from(len) {
             Ok(len) if len < 1 << 32 => Ok(len),
             _ => Err(DecodeError(format!("a collection of {len} elements"))),
         }
-    }
-
-    /// The next `n` bytes.
-    fn bytes(&mut self, n: usize) -> Result<&[u8], DecodeError> {
-        let end = self.at.checked_add(n).filter(|&e| e <= self.bytes.len());
-        let Some(end) = end else {
-            return Err(DecodeError("the bytes end inside the value".into()));
-        };
-        let taken = &self.bytes[self.at..end];
-        self.at = end;
-        Ok(taken)
     }
 
     /// The shape of the box of a record of the shape `shape`: a named
@@ -482,7 +478,7 @@ impl Decoder<'_> {
         let Some(Shape::Record { name: Some(_), .. }) = shapes.shapes.get(shape as usize) else {
             return Ok(shape);
         };
-        let identity = self.take::<16>()?;
+        let identity = self.array::<16>()?;
         shapes
             .by_identity(identity)
             .ok_or_else(|| DecodeError(format!("a box of a type unknown here, {identity:02x?}")))
@@ -508,7 +504,7 @@ impl Decoder<'_> {
             else {
                 return Err(DecodeError(format!("shape {stored} is no storage form")));
             };
-            let bytes = self.bytes(*size as usize)?;
+            let bytes = self.take(*size as usize)?;
             let mut register = vec![0; shape_of(*form)?.words() as usize];
             widen(slots, bytes, &mut register);
             let mut again = vec![0; bytes.len()];
@@ -594,26 +590,26 @@ impl Decoder<'_> {
             }
             &Shape::List(element) | &Shape::Set(element) => {
                 boxed(shape)?;
-                for _ in 0..self.len()? {
+                for _ in 0..self.count()? {
                     self.check(shapes, element)?;
                 }
             }
             &Shape::Map(key, value) => {
                 boxed(shape)?;
-                for _ in 0..self.len()? {
+                for _ in 0..self.count()? {
                     self.check(shapes, key)?;
                     self.check(shapes, value)?;
                 }
             }
             Shape::Str => {
-                let n = self.len()?;
-                if std::str::from_utf8(self.bytes(n)?).is_err() {
+                let n = self.count()?;
+                if std::str::from_utf8(self.take(n)?).is_err() {
                     return Err(DecodeError("a string that is not UTF-8".into()));
                 }
             }
             Shape::Bytes => {
-                let n = self.len()?;
-                self.bytes(n)?;
+                let n = self.count()?;
+                self.take(n)?;
             }
             Shape::Function => return Err(DecodeError("a function value".into())),
             Shape::Opaque { name, .. } => {
@@ -642,7 +638,7 @@ impl Decoder<'_> {
             else {
                 unreachable!("checked");
             };
-            let bytes = self.bytes(*size as usize).expect(ok);
+            let bytes = self.take(*size as usize).expect(ok);
             let mut register = vec![0; shapes.shapes[*form as usize].words() as usize];
             widen(slots, bytes, &mut register);
             return from_form(&register, shapes, *form, shape, heap);
@@ -727,7 +723,7 @@ impl Decoder<'_> {
             &Shape::List(element) => {
                 let (index, _) = shapes.boxed(shape).expect(ok);
                 let mut list = list::empty(heap, index);
-                for _ in 0..self.len().expect(ok) {
+                for _ in 0..self.count().expect(ok) {
                     // SAFETY: as the caller promises; the list is ours, and
                     // the push takes the element.
                     unsafe {
@@ -747,8 +743,8 @@ impl Decoder<'_> {
                 vec![unsafe { self.map(shapes, shape, key, Some(value), heap, types) }]
             }
             Shape::Str | Shape::Bytes => {
-                let n = self.len().expect(ok);
-                let bytes = self.bytes(n).expect(ok);
+                let n = self.count().expect(ok);
+                let bytes = self.take(n).expect(ok);
                 make_text(heap, &[bytes]).to_vec()
             }
             // An element of a collection, built in its register form and
@@ -781,7 +777,7 @@ impl Decoder<'_> {
         let ok = "checked";
         let (index, _) = shapes.boxed(shape).expect(ok);
         let mut map = map::empty(heap, index);
-        for _ in 0..self.len().expect(ok) {
+        for _ in 0..self.count().expect(ok) {
             // SAFETY: as the caller promises; the map is ours, and the
             // insert takes the key and the value.
             unsafe {

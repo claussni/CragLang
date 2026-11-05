@@ -26,6 +26,7 @@
 
 use std::io::{self, Read, Write};
 
+use crate::wire::{self, Writer};
 use crate::{
     CallHandler, CodeObject, CountedField, ElementLayout, FieldGuard, Frame, FuncId, HandlerKind,
     InlinedCode, InlinedRange, NativeSymbol, Reloc, RelocKind, RelocTarget, RuntimeFn, Shapes,
@@ -233,7 +234,7 @@ const RECEIVE: u8 = 30;
 impl Message {
     /// The body of the message's frame.
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer(Vec::new());
+        let mut w = Writer::default();
         match self {
             Message::Hello { version, pid } => {
                 w.u8(HELLO);
@@ -397,7 +398,7 @@ impl Message {
 
     /// The message a frame's body holds.
     pub fn decode(body: &[u8]) -> io::Result<Message> {
-        let mut r = Reader(body);
+        let mut r = Reader::new(body);
         let message = match r.u8()? {
             HELLO => Message::Hello {
                 version: r.u32()?,
@@ -513,7 +514,7 @@ impl Message {
             RECEIVE => Message::Receive(r.seq(Reader::u8)?),
             tag => return Err(invalid(format!("a message with the unknown tag {tag}"))),
         };
-        match r.0.len() {
+        match r.len() {
             0 => Ok(message),
             n => Err(invalid(format!("{n} bytes after a message"))),
         }
@@ -524,7 +525,7 @@ impl ShippedFunction {
     /// The function as the protocol writes it, which its content hash is
     /// taken of.
     pub fn encode(&self) -> Vec<u8> {
-        let mut w = Writer(Vec::new());
+        let mut w = Writer::default();
         w.function(self);
         w.0
     }
@@ -566,16 +567,16 @@ fn invalid(message: String) -> io::Error {
 /// A code object as the messages carry it, for the persisted store
 /// (Implementation Plan §11.9.5).
 pub fn encode_object(object: &CodeObject) -> Vec<u8> {
-    let mut w = Writer(Vec::new());
+    let mut w = Writer::default();
     w.object(object);
     w.0
 }
 
 /// The code object `encode_object` gave the bytes of.
 pub fn decode_object(bytes: &[u8]) -> io::Result<CodeObject> {
-    let mut r = Reader(bytes);
+    let mut r = Reader::new(bytes);
     let object = r.object()?;
-    match r.0.is_empty() {
+    match r.is_empty() {
         true => Ok(object),
         false => Err(invalid("bytes after a code object".into())),
     }
@@ -584,7 +585,7 @@ pub fn decode_object(bytes: &[u8]) -> io::Result<CodeObject> {
 /// Type descriptors by their indices, as the messages carry them, for
 /// release objects (Implementation Plan §11.10.3).
 pub fn encode_types(types: &[(u32, TypeDescriptor)]) -> Vec<u8> {
-    let mut w = Writer(Vec::new());
+    let mut w = Writer::default();
     w.seq(types, |w, (index, d)| {
         w.u32(*index);
         w.descriptor(d);
@@ -594,37 +595,27 @@ pub fn encode_types(types: &[(u32, TypeDescriptor)]) -> Vec<u8> {
 
 /// The type descriptors `encode_types` gave the bytes of.
 pub fn decode_types(bytes: &[u8]) -> io::Result<Vec<(u32, TypeDescriptor)>> {
-    let mut r = Reader(bytes);
+    let mut r = Reader::new(bytes);
     let types = r.seq(|r| Ok((r.u32()?, r.descriptor()?)))?;
-    match r.0.is_empty() {
+    match r.is_empty() {
         true => Ok(types),
         false => Err(invalid("bytes after the type descriptors".into())),
     }
 }
 
-struct Writer(Vec<u8>);
+/// What the messages hold beyond `wire`'s bytes.
+trait WriteProtocol {
+    fn slot_key(&mut self, key: &SlotKey);
+    fn function(&mut self, f: &ShippedFunction);
+    fn object(&mut self, o: &CodeObject);
+    fn frame(&mut self, frame: &Frame);
+    fn shapes(&mut self, shapes: &Shapes);
+    fn descriptor(&mut self, d: &TypeDescriptor);
+    fn element(&mut self, e: &ElementLayout);
+    fn counted(&mut self, fields: &[CountedField]);
+}
 
-impl Writer {
-    fn u8(&mut self, x: u8) {
-        self.0.push(x);
-    }
-
-    fn u32(&mut self, x: u32) {
-        self.0.extend(x.to_le_bytes());
-    }
-
-    fn u64(&mut self, x: u64) {
-        self.0.extend(x.to_le_bytes());
-    }
-
-    fn seq<T>(&mut self, items: &[T], mut item: impl FnMut(&mut Writer, &T)) {
-        // A frame cannot hold more items than this anyway.
-        self.u32(items.len() as u32);
-        for x in items {
-            item(self, x);
-        }
-    }
-
+impl WriteProtocol for Writer {
     fn slot_key(&mut self, key: &SlotKey) {
         self.u32(key.func.0);
         self.u32(key.signature);
@@ -725,17 +716,13 @@ impl Writer {
         });
     }
 
-    fn text(&mut self, text: &str) {
-        self.seq(text.as_bytes(), |w, b| w.u8(*b));
-    }
-
     fn frame(&mut self, frame: &Frame) {
         self.u32(frame.func.0);
         self.u8(u8::from(frame.inlined));
     }
 
     fn shapes(&mut self, shapes: &Shapes) {
-        self.seq(&shapes.encode(), |w, b| w.u8(*b));
+        self.bytes(&shapes.encode());
     }
 
     fn descriptor(&mut self, d: &TypeDescriptor) {
@@ -836,44 +823,21 @@ impl Writer {
 }
 
 /// The fields of a body, read from the front.
-struct Reader<'a>(&'a [u8]);
+type Reader<'a> = wire::Reader<'a, io::Error>;
 
-impl Reader<'_> {
-    fn take<const N: usize>(&mut self) -> io::Result<[u8; N]> {
-        let Some((bytes, rest)) = self.0.split_first_chunk::<N>() else {
-            return Err(invalid("a message cut short".into()));
-        };
-        self.0 = rest;
-        Ok(*bytes)
-    }
+/// What the messages hold beyond `wire`'s bytes.
+trait ReadProtocol {
+    fn slot_key(&mut self) -> io::Result<SlotKey>;
+    fn function(&mut self) -> io::Result<ShippedFunction>;
+    fn object(&mut self) -> io::Result<CodeObject>;
+    fn frame(&mut self) -> io::Result<Frame>;
+    fn shapes(&mut self) -> io::Result<Shapes>;
+    fn descriptor(&mut self) -> io::Result<TypeDescriptor>;
+    fn element(&mut self) -> io::Result<ElementLayout>;
+    fn counted(&mut self) -> io::Result<Vec<CountedField>>;
+}
 
-    fn u8(&mut self) -> io::Result<u8> {
-        Ok(self.take::<1>()?[0])
-    }
-
-    fn u32(&mut self) -> io::Result<u32> {
-        Ok(u32::from_le_bytes(self.take()?))
-    }
-
-    fn u64(&mut self) -> io::Result<u64> {
-        Ok(u64::from_le_bytes(self.take()?))
-    }
-
-    /// A sequence. Its length is checked against the bytes left, which
-    /// every item takes at least one of, so a corrupt length cannot make
-    /// the reader allocate more than the frame holds.
-    fn seq<T>(&mut self, mut item: impl FnMut(&mut Self) -> io::Result<T>) -> io::Result<Vec<T>> {
-        let len = self.u32()? as usize;
-        if len > self.0.len() {
-            return Err(invalid("a message cut short".into()));
-        }
-        let mut items = Vec::with_capacity(len);
-        for _ in 0..len {
-            items.push(item(self)?);
-        }
-        Ok(items)
-    }
-
+impl ReadProtocol for Reader<'_> {
     fn slot_key(&mut self) -> io::Result<SlotKey> {
         Ok(SlotKey {
             func: FuncId(self.u32()?),
@@ -992,13 +956,8 @@ impl Reader<'_> {
         })
     }
 
-    fn text(&mut self) -> io::Result<String> {
-        String::from_utf8(self.seq(Reader::u8)?)
-            .map_err(|_| invalid("text that is not UTF-8".into()))
-    }
-
     fn shapes(&mut self) -> io::Result<Shapes> {
-        Shapes::decode(&self.seq(Reader::u8)?).map_err(invalid)
+        Shapes::decode(self.bytes()?).map_err(invalid)
     }
 
     fn descriptor(&mut self) -> io::Result<TypeDescriptor> {

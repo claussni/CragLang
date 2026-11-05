@@ -30,6 +30,7 @@
 
 use std::borrow::Cow;
 
+use crag_abi::wire;
 use crag_abi::{Shape, Shapes, narrow};
 use crag_db::Db;
 use crag_hir::{
@@ -274,9 +275,9 @@ pub fn decode_transport(
 ) -> Result<Value, Untreeable> {
     let ty = transport_type(db, program, name).ok_or("a program without std.transport")?;
     let (shapes, root) = shapes(db, program, ty);
-    let mut reader = Reader { bytes, at: 0 };
+    let mut reader = Reader::new(bytes);
     let value = decode(&mut reader, &shapes, root, 0)?;
-    if reader.at != bytes.len() {
+    if !reader.is_empty() {
         return Err(format!("bytes after the {name}"));
     }
     Ok(value)
@@ -286,37 +287,14 @@ pub fn decode_transport(
 /// the stack.
 const DEPTH: u32 = 2000;
 
-struct Reader<'b> {
-    bytes: &'b [u8],
-    at: usize,
-}
+type Reader<'a> = wire::Reader<'a, Untreeable>;
 
-impl<'b> Reader<'b> {
-    fn take(&mut self, n: usize) -> Result<&'b [u8], Untreeable> {
-        let end = self.at.checked_add(n).filter(|&e| e <= self.bytes.len());
-        let end = end.ok_or("the bytes end inside the tree")?;
-        let out = &self.bytes[self.at..end];
-        self.at = end;
-        Ok(out)
-    }
-
-    fn word(&mut self) -> Result<u64, Untreeable> {
-        let b = self.take(8)?;
-        Ok(u64::from_le_bytes(b.try_into().expect("eight bytes")))
-    }
-
-    fn u32(&mut self) -> Result<u32, Untreeable> {
-        let b = self.take(4)?;
-        Ok(u32::from_le_bytes(b.try_into().expect("four bytes")))
-    }
-
-    /// A length, which no more bytes than are left can hold.
-    fn len(&mut self) -> Result<usize, Untreeable> {
-        let n = self.word()?;
-        match usize::try_from(n) {
-            Ok(n) if n <= self.bytes.len() - self.at => Ok(n),
-            _ => Err("a length past the end of the bytes".into()),
-        }
+/// A length, in a word, which no more bytes than are left can hold.
+fn count(r: &mut Reader) -> Result<usize, Untreeable> {
+    let n = r.u64()?;
+    match usize::try_from(n) {
+        Ok(n) if n <= r.len() => Ok(n),
+        _ => Err("a length past the end of the bytes".into()),
     }
 }
 
@@ -341,10 +319,10 @@ fn decode(r: &mut Reader, shapes: &Shapes, shape: u32, depth: u32) -> Result<Val
         Shape::Unit => Value::List(Vec::new()),
         Shape::Tag(n) => Value::Tag(Cow::Owned(n.clone())),
         Shape::Number(crag_abi::Number::CodePoint) => {
-            let c = u32::try_from(r.word()?).ok().and_then(char::from_u32);
+            let c = u32::try_from(r.u64()?).ok().and_then(char::from_u32);
             Value::CodePoint(c.ok_or("a code point out of range")?)
         }
-        Shape::Number(_) => Value::Int(r.word()? as i64),
+        Shape::Number(_) => Value::Int(r.u64()? as i64),
         Shape::Union { members, .. } | Shape::Variant { members, .. } => {
             let at = r.u32()? as usize;
             let &(_, member) = members.get(at).ok_or("a union member out of range")?;
@@ -352,7 +330,7 @@ fn decode(r: &mut Reader, shapes: &Shapes, shape: u32, depth: u32) -> Result<Val
         }
         Shape::Record { name, fields } => {
             if name.is_some() {
-                let identity: [u8; 16] = r.take(16)?.try_into().expect("sixteen bytes");
+                let identity: [u8; 16] = r.array()?;
                 if shapes.identity(shape) != Some(identity) {
                     return Err("a record of another type".into());
                 }
@@ -384,7 +362,7 @@ fn decode(r: &mut Reader, shapes: &Shapes, shape: u32, depth: u32) -> Result<Val
                 Shape::Stored { form, .. } => *form,
                 _ => element,
             };
-            let n = r.len()?;
+            let n = count(r)?;
             let mut items = Vec::new();
             for _ in 0..n {
                 items.push(decode(r, shapes, element, depth)?);
@@ -392,12 +370,12 @@ fn decode(r: &mut Reader, shapes: &Shapes, shape: u32, depth: u32) -> Result<Val
             Value::List(items)
         }
         Shape::Str => {
-            let n = r.len()?;
+            let n = count(r)?;
             let s = std::str::from_utf8(r.take(n)?).map_err(|_| "a string that is no UTF-8")?;
             Value::Str(s.to_string())
         }
         Shape::Bytes => {
-            let n = r.len()?;
+            let n = count(r)?;
             Value::Bytes(r.take(n)?.to_vec())
         }
         s => return Err(format!("a tree holds no {s:?}")),

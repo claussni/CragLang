@@ -36,6 +36,7 @@
 //! written; in the object file they are the addends of their relocations.
 
 use crate::protocol::{decode_object, decode_types, encode_object, encode_types};
+use crate::wire::{self, Writer};
 use crate::{CodeObject, Shapes, TypeDescriptor};
 
 /// The section that holds the table.
@@ -104,15 +105,20 @@ impl Table {
     /// cell of the receiving, in that order.
     pub fn encode(&self) -> (Vec<u8>, Vec<usize>) {
         let mut w = Writer::default();
+        let mut addresses = Vec::new();
+        let mut address = |w: &mut Writer, x: u64| {
+            addresses.push(w.0.len());
+            w.u64(x);
+        };
         w.u32(VERSION);
         // The length, once known.
         w.u32(0);
         for &entry in &self.task_entries {
-            w.address(entry);
+            address(&mut w, entry);
         }
         w.u32(self.functions.len() as u32);
         for f in &self.functions {
-            w.address(f.start);
+            address(&mut w, f.start);
             w.u32(f.len);
             w.bytes(f.name.as_bytes());
             w.bytes(&encode_object(&CodeObject {
@@ -126,7 +132,7 @@ impl Table {
         for root in &self.roots {
             w.bytes(root.name.as_bytes());
             w.u32(root.place);
-            w.address(root.entry);
+            address(&mut w, root.entry);
             w.bytes(&root.shapes.encode());
             w.u32(root.result);
         }
@@ -138,13 +144,13 @@ impl Table {
                 w.u32(receiving.cells.len() as u32);
                 for (name, at) in &receiving.cells {
                     w.bytes(name.as_bytes());
-                    w.address(*at);
+                    address(&mut w, *at);
                 }
             }
         }
-        let len = w.out.len() as u32;
-        w.out[4..8].copy_from_slice(&len.to_le_bytes());
-        (w.out, w.addresses)
+        let len = w.0.len() as u32;
+        w.0[4..8].copy_from_slice(&len.to_le_bytes());
+        (w.0, addresses)
     }
 
     /// The length of the table whose first `HEADER` bytes these are, or
@@ -163,7 +169,7 @@ impl Table {
         if Table::len(header)? != bytes.len() {
             return Err("the table's length is not its own".into());
         }
-        let mut r = Reader(&bytes[HEADER..]);
+        let mut r = Reader::new(&bytes[HEADER..]);
         let task_entries = [r.u64()?, r.u64()?, r.u64()?];
         let functions = (0..r.u32()?)
             .map(|_| {
@@ -196,7 +202,7 @@ impl Table {
                     .collect::<Result<_, String>>()?,
             }),
         };
-        match r.0.is_empty() {
+        match r.is_empty() {
             true => Ok(Table {
                 task_entries,
                 functions,
@@ -209,62 +215,8 @@ impl Table {
     }
 }
 
-#[derive(Default)]
-struct Writer {
-    out: Vec<u8>,
-    addresses: Vec<usize>,
-}
-
-impl Writer {
-    fn u32(&mut self, x: u32) {
-        self.out.extend(x.to_le_bytes());
-    }
-
-    fn address(&mut self, x: u64) {
-        self.addresses.push(self.out.len());
-        self.out.extend(x.to_le_bytes());
-    }
-
-    fn bytes(&mut self, b: &[u8]) {
-        self.u32(b.len() as u32);
-        self.out.extend(b);
-    }
-}
-
 /// Bytes read from the front.
-struct Reader<'a>(&'a [u8]);
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        if self.0.len() < n {
-            return Err("the table ends early".into());
-        }
-        let (head, rest) = self.0.split_at(n);
-        self.0 = rest;
-        Ok(head)
-    }
-
-    fn u32(&mut self) -> Result<u32, String> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?.try_into().expect("four bytes"),
-        ))
-    }
-
-    fn u64(&mut self) -> Result<u64, String> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?.try_into().expect("eight bytes"),
-        ))
-    }
-
-    fn bytes(&mut self) -> Result<&'a [u8], String> {
-        let n = self.u32()? as usize;
-        self.take(n)
-    }
-
-    fn text(&mut self) -> Result<String, String> {
-        String::from_utf8(self.bytes()?.to_vec()).map_err(|e| e.to_string())
-    }
-}
+type Reader<'a> = wire::Reader<'a, String>;
 
 #[cfg(test)]
 mod tests {
