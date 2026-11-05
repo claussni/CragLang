@@ -19,6 +19,7 @@ serde_json = "1.0.140"
 
 [dependencies]
 crag-diag = { path = "../crag-diag" }
+crag-knowledge = { path = "../crag-knowledge" }
 crag-abi = { path = "../crag-abi" }
 crag-aot = { path = "../crag-aot" }
 crag-budget = { path = "../crag-budget" }

@@ -41,12 +41,20 @@ pub fn exported(exports: &[String], module: &str) -> bool {
 }
 
 pub fn public_api(project: &Project) -> ApiFile {
+    let manifest = project.manifest.clone().unwrap_or_default();
+    api_of(project, &manifest.exports)
+}
+
+/// The API of the modules `exports` names, as `public_api` computes it.
+/// The agent server passes every module of an app, which exports none
+/// (§20.10).
+pub fn api_of(project: &Project, exports: &[String]) -> ApiFile {
     let (db, program) = (&project.db, project.program);
     let manifest = project.manifest.clone().unwrap_or_default();
     let mut entries = Vec::new();
     for file in project.own() {
         let module = file.module.path(db);
-        if !exported(&manifest.exports, module) {
+        if !exported(exports, module) {
             continue;
         }
         for item in item_tree(db, file.module).items.iter().filter(|i| i.public) {

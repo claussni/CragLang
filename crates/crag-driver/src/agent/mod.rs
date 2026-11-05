@@ -25,11 +25,12 @@
 //! defined until the context changes. Before each call the context reads
 //! the project's files again, so the answers follow the agent's edits.
 
+mod resources;
 mod tools;
 
 use std::path::{Path, PathBuf};
 
-use crag_mcp::{CallError, Catalog, Handler, Info, Outcome, ResourceSpec, TemplateSpec};
+use crag_mcp::{CallError, Catalog, Handler, Info, Outcome};
 use crag_session::ImageCommand;
 use serde_json::{Map, Value};
 
@@ -152,38 +153,18 @@ impl Handler for AgentServer {
         tools::call(self, tool, args)
     }
 
-    fn read(&mut self, uri: &str) -> Option<String> {
-        let code = uri.strip_prefix(DIAGNOSTIC)?;
-        Some(crag_diag::DiagCode::parse(code)?.entry().markdown())
+    fn read(&mut self, uri: &str) -> Result<Option<String>, String> {
+        resources::read(self, uri)
     }
 }
 
-/// Where the diagnostic resources are, by code.
-const DIAGNOSTIC: &str = "crag://diagnostic/";
-
 /// The tools and the resources.
 fn catalog() -> Catalog {
-    let resources = crag_diag::ENTRIES
-        .iter()
-        .map(|e| ResourceSpec {
-            uri: format!("{DIAGNOSTIC}{}", e.code),
-            name: e.code.to_string(),
-            title: format!("{}: {}", e.code, e.title),
-            description: format!("The diagnostic {}: {}", e.code, e.title),
-            mime_type: "text/markdown",
-        })
-        .collect();
+    let (resources, templates) = resources::list();
     Catalog {
         tools: tools::specs(),
         resources,
-        templates: vec![TemplateSpec {
-            uri_template: "crag://diagnostic/{code}",
-            name: "diagnostic",
-            title: "A diagnostic code",
-            description: "What a diagnostic code means, with a refused program, its fix and \
-                          the section of the specification",
-            mime_type: "text/markdown",
-        }],
+        templates,
     }
 }
 
@@ -192,7 +173,10 @@ fn info() -> Info {
     Info {
         name: "crag".into(),
         version: env!("CARGO_PKG_VERSION").into(),
-        instructions: "Crag's compiler, test runner and scratch image. Use `check` and \
+        instructions: "Crag's compiler, test runner and scratch image. Read the resource \
+                       crag://primer before writing Crag: it says where the language \
+                       differs from what you expect; crag://spec/<section> gives one \
+                       section of the specification. Use `check` and \
                        `typeOf` before guessing how Crag works, `members` and `searchStd` to \
                        find functions, `eval` to try code, and `test` to run a project's tests. \
                        Every diagnostic has a code; `explain` tells what it means and how to \

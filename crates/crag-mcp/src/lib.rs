@@ -99,8 +99,9 @@ pub enum CallError {
 pub trait Handler {
     fn call(&mut self, tool: &str, args: &Map<String, Value>) -> Result<Outcome, CallError>;
 
-    /// The text of the resource at `uri`, if there is one.
-    fn read(&mut self, uri: &str) -> Option<String>;
+    /// The text of the resource at `uri`: `Ok(None)` when there is none,
+    /// and `Err` when there is but it cannot be read, with why.
+    fn read(&mut self, uri: &str) -> Result<Option<String>, String>;
 }
 
 /// The server's name and version, and what it tells a client about itself.
@@ -121,7 +122,7 @@ enum Job {
     },
     Read {
         uri: String,
-        answer: tokio::sync::oneshot::Sender<Option<String>>,
+        answer: tokio::sync::oneshot::Sender<Result<Option<String>, String>>,
     },
 }
 
@@ -245,7 +246,11 @@ impl ServerHandler for Facade {
             answer,
         };
         self.jobs.send(job).map_err(|_| stopped())?;
-        let Some(text) = answered.await.map_err(|_| stopped())? else {
+        let found = answered
+            .await
+            .map_err(|_| stopped())?
+            .map_err(|why| ErrorData::internal_error(why, None))?;
+        let Some(text) = found else {
             return Err(ErrorData::resource_not_found(
                 format!("there is no resource `{uri}`"),
                 None,

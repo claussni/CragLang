@@ -334,6 +334,14 @@ fn works_in_a_project_and_follows_its_files() {
     let (_, answer) = client.call("test", json!({"filter": "greets"}));
     assert_eq!(answer["ok"], true, "{answer}");
 
+    // The project resources follow the project the server started in.
+    let manifest = client.request("resources/read", json!({"uri": "crag://project/manifest"}));
+    let text = manifest["result"]["contents"][0]["text"].as_str().unwrap();
+    assert!(text.contains("package demo 0.1"), "{text}");
+    let api = client.request("resources/read", json!({"uri": "crag://project/api"}));
+    let text = api["result"]["contents"][0]["text"].as_str().unwrap();
+    assert!(text.contains("pub fn greeting(name: Str) -> Str"), "{text}");
+
     // An edit on disk is seen by the next call, and so is a new file.
     std::fs::write(
         dir.join("main.crag"),
@@ -373,9 +381,19 @@ fn explains_diagnostics() {
         .collect();
     assert!(uris.contains(&"crag://diagnostic/E0301"), "{listed}");
     let templates = client.request("resources/templates/list", json!({}));
-    assert_eq!(
-        templates["result"]["resourceTemplates"][0]["uriTemplate"],
-        "crag://diagnostic/{code}"
+    let templates: Vec<&str> = templates["result"]["resourceTemplates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["uriTemplate"].as_str().unwrap())
+        .collect();
+    assert!(
+        templates.contains(&"crag://diagnostic/{code}"),
+        "{templates:?}"
+    );
+    assert!(
+        templates.contains(&"crag://spec/{section}"),
+        "{templates:?}"
     );
 
     let read = client.request("resources/read", json!({"uri": "crag://diagnostic/E0301"}));
@@ -383,6 +401,53 @@ fn explains_diagnostics() {
     assert_eq!(contents["mimeType"], "text/markdown");
     assert!(contents["text"].as_str().unwrap().starts_with("# E0301: "));
     let missing = client.request("resources/read", json!({"uri": "crag://diagnostic/E9999"}));
+    assert!(missing["error"].is_object(), "{missing}");
+    client.finish();
+}
+
+#[test]
+fn serves_the_knowledge_resources() {
+    let dir = common::project("mcp-knowledge", &[]);
+    let mut client = Client::start(&dir, &[]);
+    let listed = client.request("resources/list", json!({}));
+    let uris: Vec<&str> = listed["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["uri"].as_str().unwrap())
+        .collect();
+    for uri in [
+        "crag://primer",
+        "crag://principles",
+        "crag://spec/8",
+        "crag://spec/D",
+        "crag://std/std.io",
+        "crag://project/api",
+        "crag://project/manifest",
+    ] {
+        assert!(uris.contains(&uri), "{uri} is not listed");
+    }
+    // Sections are listed by chapter only; deeper ones are still read.
+    assert!(!uris.contains(&"crag://spec/8.2"));
+
+    let read = |client: &mut Client, uri: &str| {
+        let answer = client.request("resources/read", json!({"uri": uri}));
+        answer["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{uri} was not read: {answer}"))
+            .to_string()
+    };
+    let primer = read(&mut client, "crag://primer");
+    assert!(primer.contains("§8.2"), "{primer}");
+    let section = read(&mut client, "crag://spec/8.2");
+    assert!(section.starts_with("### 8.2 "), "{section}");
+    assert!(section.contains("no `?` propagation operator"));
+    let chapter = read(&mut client, "crag://spec/8");
+    assert!(chapter.contains("### 8.5 Prefixes"));
+    let io = read(&mut client, "crag://std/std.io");
+    assert!(io.contains("printLine"), "{io}");
+
+    let missing = client.request("resources/read", json!({"uri": "crag://spec/99"}));
     assert!(missing["error"].is_object(), "{missing}");
     client.finish();
 }

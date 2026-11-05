@@ -256,6 +256,7 @@ dependencies = [
  "crag-eval",
  "crag-fmt",
  "crag-hir",
+ "crag-knowledge",
  "crag-loader",
  "crag-mcp",
  "crag-mir",
@@ -304,6 +305,10 @@ dependencies = [
  "crag-diag",
  "crag-syntax",
 ]
+
+[[package]]
+name = "crag-knowledge"
+version = "0.0.0"
 
 [[package]]
 name = "crag-loader"

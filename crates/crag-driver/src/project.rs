@@ -56,6 +56,11 @@ const STD: &[(&str, &str)] = &[
     ("std.transport", include_str!("../../../std/transport.crag")),
 ];
 
+/// The module paths of `std` bundled with the tool.
+pub fn std_modules() -> impl Iterator<Item = &'static str> {
+    STD.iter().map(|(path, _)| *path)
+}
+
 /// A module's file, where diagnostics name it.
 #[derive(Clone, Debug)]
 pub struct ModuleFile {

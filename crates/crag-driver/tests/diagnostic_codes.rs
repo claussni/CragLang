@@ -48,6 +48,25 @@ fn diagnose(name: &str, example: &str) -> Result<Vec<(String, String)>, String> 
 }
 
 #[test]
+fn every_entry_links_the_specification() {
+    let mut problems = Vec::new();
+    for entry in ENTRIES {
+        if crag_knowledge::section(entry.spec).is_none() {
+            problems.push(format!(
+                "{}: `spec: {}` names no section",
+                entry.code, entry.spec
+            ));
+        }
+        for text in [entry.rule, entry.rationale] {
+            for broken in crag_knowledge::broken_references(text) {
+                problems.push(format!("{}: §{broken} names no section", entry.code));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
 fn every_entry_has_examples_that_hold() {
     common::watchdog(600, "the diagnostic examples hung");
     let only: Option<Vec<String>> = std::env::var("CRAG_DIAG")

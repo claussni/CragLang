@@ -195,8 +195,16 @@ find functions, `eval` runs code in the scratch image under a time limit,
 code means. Each tool takes an optional `project` directory; without it
 the server works in the project it was started in, or with `std` alone.
 `eval` refuses code with the `io` effect unless the server was started
-with `--allow-io`. This repository's `.mcp.json` registers `target/debug/crag mcp`, so agent
-sessions here use the toolchain as built.
+with `--allow-io`. The server also serves resources: `crag://primer`
+says where Crag differs from the languages agents know,
+`crag://principles` gives the design principles, `crag://spec/<section>`
+one section of the specification, `crag://std/<module>` a module's
+public declarations with their documentation, and `crag://project/api`
+and `crag://project/manifest` the project's surface and manifest. The
+primer and the specification come from `crates/crag-knowledge`; the
+spec there is an export of the working draft, refreshed at release.
+This repository's `.mcp.json` registers `target/debug/crag mcp`, so
+agent sessions here use the toolchain as built.
 
     /path/to/target/debug/crag
 
