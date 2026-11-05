@@ -23,21 +23,23 @@ use crate::heap::Heap;
 use crate::rc::Types;
 
 /// Defines a runtime function with the C convention that generated code
-/// calls on a fiber stack: it switches to the worker's system stack,
-/// keeping the fiber's stack pointer in a callee-saved register, and calls
-/// `$entry` there with the same arguments, at most six words, the task
-/// context first. `$entry`'s result is the function's.
+/// calls on a fiber stack, whose body runs on the worker's system stack:
+/// the function switches to it, keeping the fiber's stack pointer in a
+/// callee-saved register, and calls the body there with the same
+/// arguments, at most six words, the task context first. The body's
+/// result is the function's. The body is `entry` of a module of the
+/// function's name, which sees what the enclosing module sees.
+///
+/// Only generated code calls such a function, on a fiber stack, with the
+/// fiber's task context; the function's own `# Safety` section names
+/// what else its caller promises. Written with parentheses, so that
+/// `rustfmt` formats the body.
 macro_rules! system_stack_fn {
     (
         $(#[$meta:meta])*
-        fn $name:ident($($arg:ident: $ty:ty),*) $(-> $ret:ty)? => $entry:path
+        fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)? $body:block
     ) => {
         $(#[$meta])*
-        ///
-        /// # Safety
-        ///
-        /// Only generated code may call this, on a fiber stack, with the
-        /// fiber's task context.
         #[unsafe(naked)]
         #[unsafe(no_mangle)]
         pub(crate) unsafe extern "C" fn $name($($arg: $ty),*) $(-> $ret)? {
@@ -52,35 +54,37 @@ macro_rules! system_stack_fn {
                 "pop rbx",
                 "ret",
                 worker = const std::mem::offset_of!($crate::fiber::TaskContext, worker),
-                entry = sym $entry,
+                entry = sym $name::entry,
             )
+        }
+
+        #[doc(hidden)]
+        mod $name {
+            use super::*;
+
+            pub(super) unsafe extern "C" fn entry($($arg: $ty),*) $(-> $ret)? $body
         }
     };
 }
 
 /// Defines a runtime function that runs on the system stack, as
-/// `system_stack_fn!` does, and may suspend the fiber: when its Rust half
-/// has called `sched::suspend`, the function leaves a switch frame on the
+/// `system_stack_fn!` does, and may suspend the fiber: when its body has
+/// called `sched::suspend`, the function leaves a switch frame on the
 /// fiber stack and returns into the worker instead of to its caller. When
 /// the fiber is woken and resumed, the switch frame continues it here, and
 /// the function returns the two words the waker left in the context.
 ///
-/// Either way, when the context's `raise` word is set, by the Rust half or
-/// by whoever woke the fiber, the function traps instead of returning: it
+/// Either way, when the context's `raise` word is set, by the body or by
+/// whoever woke the fiber, the function traps instead of returning: it
 /// jumps to `rt_trap` with the stack as the call left it, as `rt_refuel`
 /// does, so the call's stack map releases what the caller holds. That is
 /// how a cancelled task stops at a suspension point (Plan §11.7.4).
 macro_rules! suspending_fn {
     (
         $(#[$meta:meta])*
-        fn $name:ident($($arg:ident: $ty:ty),*) $(-> $ret:ty)? => $entry:path
+        fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)? $body:block
     ) => {
         $(#[$meta])*
-        ///
-        /// # Safety
-        ///
-        /// Only generated code may call this, on a fiber stack, with the
-        /// fiber's task context.
         #[unsafe(naked)]
         #[unsafe(no_mangle)]
         pub(crate) unsafe extern "C" fn $name($($arg: $ty),*) $(-> $ret)? {
@@ -148,14 +152,21 @@ macro_rules! suspending_fn {
                 saved_sp = const std::mem::offset_of!($crate::fiber::TaskContext, saved_sp),
                 wake0 = const std::mem::offset_of!($crate::fiber::TaskContext, wake_words),
                 wake1 = const std::mem::offset_of!($crate::fiber::TaskContext, wake_words) + 8,
-                entry = sym $entry,
+                entry = sym $name::entry,
             )
+        }
+
+        #[doc(hidden)]
+        mod $name {
+            use super::*;
+
+            pub(super) unsafe extern "C" fn entry($($arg: $ty),*) $(-> $ret)? $body
         }
     };
 }
 
 /// The heap and the type descriptors of the worker running the fiber of
-/// `ctx`, for the Rust half of a runtime function.
+/// `ctx`, for the body of a runtime function.
 ///
 /// # Safety
 ///

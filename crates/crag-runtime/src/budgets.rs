@@ -64,72 +64,68 @@ pub fn registry() -> &'static Registry {
         .get_or_init(|| load(None).unwrap_or_else(|why| crate::die(&format!("the budgets: {why}"))))
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_budget_op(ctx, scratch, op, side, index)`: see
     /// `crag_abi::RuntimeFn::BudgetOp`.
-    fn rt_budget_op(ctx: *const TaskContext, scratch: *mut u64, op: u64, side: u64, index: u64) -> u64
-        => op_entry
-}
-
-/// The Rust half of `rt_budget_op`.
-///
-/// # Safety
-///
-/// Called only by `rt_budget_op`, with two scratch words.
-unsafe extern "C" fn op_entry(
-    ctx: *const TaskContext,
-    scratch: *mut u64,
-    op: u64,
-    side: u64,
-    index: u64,
-) -> u64 {
-    const NONE: u64 = u64::MAX;
-    let registry = registry();
-    let side = match side {
-        0 => Side::Receiving,
-        _ => Side::Sending,
-    };
-    let index = index as usize;
-    // SAFETY: as the caller promises.
-    let give = |text: &str| unsafe {
-        let (heap, _) = worker_of(&*ctx);
-        let [w0, w1] = make_text(heap, &[text.as_bytes()]);
-        scratch.write(w0);
-        scratch.add(1).write(w1);
-        0
-    };
-    let limit = |n: Option<u64>| n.unwrap_or(NONE);
-    let described = || registry.describe(side, index);
-    let text = |f: fn(&Origin) -> &str| match described() {
-        Some((origin, _)) => give(f(&origin)),
-        None => NONE,
-    };
-    let limits = |f: fn(&Limits) -> Option<u64>| match described() {
-        Some((_, limits)) => limit(f(&limits)),
-        None => NONE,
-    };
-    match op {
-        COUNT => registry.count(side) as u64,
-        DOCUMENT => text(|o| &o.document),
-        DATE => text(|o| &o.date),
-        ISSUER => text(|o| &o.issuer),
-        NAME => text(|o| &o.name),
-        LIMIT_STEPS => limits(|l| l.steps),
-        LIMIT_MEMORY => limits(|l| l.memory),
-        LIMIT_RUNS => limits(|l| l.runs),
-        USED_STEPS => registry.usage(side, index).map_or(NONE, |u| limit(u.steps)),
-        USED_MEMORY => registry
-            .usage(side, index)
-            .map_or(NONE, |u| limit(u.memory)),
-        USED_RUNS => registry.usage(side, index).map_or(NONE, |u| u.runs),
-        RENEW => match registry.renew(side, index) {
-            Ok(()) => 0,
-            Err(why) => {
-                give(&why);
-                1
-            }
-        },
-        RESET => u64::from(!registry.reset(side, index)),
-        _ => NONE,
+    ///
+    /// # Safety
+    ///
+    /// The caller passes two scratch words.
+    fn rt_budget_op(
+        ctx: *const TaskContext,
+        scratch: *mut u64,
+        op: u64,
+        side: u64,
+        index: u64,
+    ) -> u64 {
+        const NONE: u64 = u64::MAX;
+        let registry = registry();
+        let side = match side {
+            0 => Side::Receiving,
+            _ => Side::Sending,
+        };
+        let index = index as usize;
+        // SAFETY: as the caller promises.
+        let give = |text: &str| unsafe {
+            let (heap, _) = worker_of(&*ctx);
+            let [w0, w1] = make_text(heap, &[text.as_bytes()]);
+            scratch.write(w0);
+            scratch.add(1).write(w1);
+            0
+        };
+        let limit = |n: Option<u64>| n.unwrap_or(NONE);
+        let described = || registry.describe(side, index);
+        let text = |f: fn(&Origin) -> &str| match described() {
+            Some((origin, _)) => give(f(&origin)),
+            None => NONE,
+        };
+        let limits = |f: fn(&Limits) -> Option<u64>| match described() {
+            Some((_, limits)) => limit(f(&limits)),
+            None => NONE,
+        };
+        match op {
+            COUNT => registry.count(side) as u64,
+            DOCUMENT => text(|o| &o.document),
+            DATE => text(|o| &o.date),
+            ISSUER => text(|o| &o.issuer),
+            NAME => text(|o| &o.name),
+            LIMIT_STEPS => limits(|l| l.steps),
+            LIMIT_MEMORY => limits(|l| l.memory),
+            LIMIT_RUNS => limits(|l| l.runs),
+            USED_STEPS => registry.usage(side, index).map_or(NONE, |u| limit(u.steps)),
+            USED_MEMORY => registry
+                .usage(side, index)
+                .map_or(NONE, |u| limit(u.memory)),
+            USED_RUNS => registry.usage(side, index).map_or(NONE, |u| u.runs),
+            RENEW => match registry.renew(side, index) {
+                Ok(()) => 0,
+                Err(why) => {
+                    give(&why);
+                    1
+                }
+            },
+            RESET => u64::from(!registry.reset(side, index)),
+            _ => NONE,
+        }
     }
-}
+);

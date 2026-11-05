@@ -174,37 +174,25 @@ fn call_off(ctx: &TaskContext) {
     }
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_enter_no_cancel(ctx)`: see `crag_abi::RuntimeFn::EnterNoCancel`.
-    fn rt_enter_no_cancel(ctx: *const TaskContext) => enter_entry
-}
+    fn rt_enter_no_cancel(ctx: *const TaskContext) {
+        // SAFETY: as the caller promises.
+        let ctx = unsafe { &*ctx };
+        ctx.no_cancel.fetch_add(1, Ordering::Relaxed);
+    }
+);
 
-/// The Rust half of `rt_enter_no_cancel`.
-///
-/// # Safety
-///
-/// Called only by `rt_enter_no_cancel`.
-unsafe extern "C" fn enter_entry(ctx: *const TaskContext) {
-    // SAFETY: as the caller promises.
-    let ctx = unsafe { &*ctx };
-    ctx.no_cancel.fetch_add(1, Ordering::Relaxed);
-}
-
-suspending_fn! {
+suspending_fn!(
     /// `rt_exit_no_cancel(ctx)`: see `crag_abi::RuntimeFn::ExitNoCancel`.
-    fn rt_exit_no_cancel(ctx: *const TaskContext) => exit_entry
-}
-
-/// The Rust half of `rt_exit_no_cancel`. It never suspends.
-///
-/// # Safety
-///
-/// Called only by `rt_exit_no_cancel`.
-unsafe extern "C" fn exit_entry(ctx: *const TaskContext) {
-    // SAFETY: as the caller promises.
-    let ctx = unsafe { &*ctx };
-    leave_region(ctx);
-}
+    ///
+    /// It never suspends.
+    fn rt_exit_no_cancel(ctx: *const TaskContext) {
+        // SAFETY: as the caller promises.
+        let ctx = unsafe { &*ctx };
+        leave_region(ctx);
+    }
+);
 
 /// Leaves a region where cancellation waits, trapping the calling runtime
 /// function if the task was cancelled meanwhile and this was the last.

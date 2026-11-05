@@ -261,249 +261,233 @@ pub(crate) fn finished(mut fiber: Box<Fiber>, local: &mut Local) {
     }
 }
 
-suspending_fn! {
+suspending_fn!(
     /// `rt_scope_new(ctx, limit) -> scope`: see `crag_abi::RuntimeFn::ScopeNew`.
-    fn rt_scope_new(ctx: *const TaskContext, limit: u64) -> u64 => new_entry
-}
-
-/// The Rust half of `rt_scope_new`. It never suspends.
-///
-/// # Safety
-///
-/// Called only by `rt_scope_new`.
-unsafe extern "C" fn new_entry(ctx: *const TaskContext, limit: u64) -> u64 {
-    // SAFETY: as the caller promises, a worker runs the fiber of `ctx`.
-    unsafe {
-        let ctx = &*ctx;
-        if stop_if_due(ctx) {
-            return 0;
+    ///
+    /// It never suspends.
+    fn rt_scope_new(ctx: *const TaskContext, limit: u64) -> u64 {
+        // SAFETY: as the caller promises, a worker runs the fiber of `ctx`.
+        unsafe {
+            let ctx = &*ctx;
+            if stop_if_due(ctx) {
+                return 0;
+            }
+            let Some(shared) = scheduler_of(ctx) else {
+                raise(ctx, TrapKind::Unsupported, None);
+                return 0;
+            };
+            let worker: *mut Worker = ctx.worker.load(Ordering::Relaxed);
+            let entries = Worker::code(worker)
+                .task_entries()
+                .unwrap_or_else(|| die("the image gave no entry stubs for tasks"));
+            let config = (*ctx.fiber.load(Ordering::Relaxed)).config;
+            ctx.no_cancel.fetch_add(1, Ordering::Relaxed);
+            let scope = Scope {
+                shared,
+                parent: std::ptr::from_ref(ctx) as usize,
+                limit: limit as usize,
+                config,
+                entries,
+                state: Mutex::new(State {
+                    tasks: Vec::new(),
+                    counted: 0,
+                    unfinished: 0,
+                    done: VecDeque::new(),
+                    waiter: None,
+                    queued: VecDeque::new(),
+                    cancelled: false,
+                    trap: None,
+                }),
+            };
+            Arc::into_raw(Arc::new(scope)) as u64
         }
-        let Some(shared) = scheduler_of(ctx) else {
-            raise(ctx, TrapKind::Unsupported, None);
-            return 0;
-        };
-        let worker: *mut Worker = ctx.worker.load(Ordering::Relaxed);
-        let entries = Worker::code(worker)
-            .task_entries()
-            .unwrap_or_else(|| die("the image gave no entry stubs for tasks"));
-        let config = (*ctx.fiber.load(Ordering::Relaxed)).config;
-        ctx.no_cancel.fetch_add(1, Ordering::Relaxed);
-        let scope = Scope {
-            shared,
-            parent: std::ptr::from_ref(ctx) as usize,
-            limit: limit as usize,
-            config,
-            entries,
-            state: Mutex::new(State {
-                tasks: Vec::new(),
-                counted: 0,
-                unfinished: 0,
-                done: VecDeque::new(),
-                waiter: None,
-                queued: VecDeque::new(),
-                cancelled: false,
-                trap: None,
-            }),
-        };
-        Arc::into_raw(Arc::new(scope)) as u64
     }
-}
+);
 
-suspending_fn! {
+suspending_fn!(
     /// `rt_scope_start(ctx, scope, code, env, flags) -> index`: see
     /// `crag_abi::RuntimeFn::ScopeStart`.
-    fn rt_scope_start(ctx: *const TaskContext, scope: *const Scope, code: u64, env: u64, flags: u64) -> u64 => start_entry
-}
+    ///
+    /// Suspends while the limit is reached.
+    ///
+    /// # Safety
+    ///
+    /// The scope has not ended, and `code` and `env` are those of a function value
+    /// that takes one parameter, its environment, and has as many results as
+    /// `flags` says.
+    fn rt_scope_start(
+        ctx: *const TaskContext,
+        scope: *const Scope,
+        code: u64,
+        env: u64,
+        flags: u64,
+    ) -> u64 {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let ctx = &*ctx;
+            let scope = Scope::borrowed(scope);
+            let stub = scope.entries[(flags & 3) as usize];
+            let mut fiber = Fiber::new(stub, code as usize, &[env], scope.config)
+                .unwrap_or_else(|_| die("out of memory for a task's stack"));
+            // A task's signals go to the handlers its starter sees (§11.3).
+            fiber
+                .signals
+                .inherit(crate::signals::signals_of(ctx).inherited());
+            // A cancelled starter that must stop still starts the task, which
+            // owns the function value, but cancelled.
+            let starter_stops = cancel::due(ctx);
 
-/// The Rust half of `rt_scope_start`: suspends while the limit is reached.
-///
-/// # Safety
-///
-/// Called only by `rt_scope_start`, with a scope that has not ended and
-/// the code and environment of a function value that takes one
-/// parameter, its environment, and has as many results as `flags` says.
-unsafe extern "C" fn start_entry(
-    ctx: *const TaskContext,
-    scope: *const Scope,
-    code: u64,
-    env: u64,
-    flags: u64,
-) -> u64 {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let ctx = &*ctx;
-        let scope = Scope::borrowed(scope);
-        let stub = scope.entries[(flags & 3) as usize];
-        let mut fiber = Fiber::new(stub, code as usize, &[env], scope.config)
-            .unwrap_or_else(|_| die("out of memory for a task's stack"));
-        // A task's signals go to the handlers its starter sees (§11.3).
-        fiber
-            .signals
-            .inherit(crate::signals::signals_of(ctx).inherited());
-        // A cancelled starter that must stop still starts the task, which
-        // owns the function value, but cancelled.
-        let starter_stops = cancel::due(ctx);
-
-        let mut state = scope.state.lock().unwrap();
-        let mut cancelling = Cancelling::default();
-        if scope.is_parent(ctx) && ctx.cancel.load(Ordering::SeqCst) != 0 {
-            cancelling = scope.cancel_locked(&mut state);
-        }
-        let index = state.tasks.len();
-        let cancelled = state.cancelled || starter_stops;
-        let counted = flags & START_EXEMPT == 0 && !cancelled && scope.limit != 0;
-        state.tasks.push(Task {
-            ctx: fiber.ctx.clone(),
-            counted,
-            outcome: Outcome::Running,
-        });
-        state.unfinished += 1;
-        fiber.task = Some(Member {
-            scope: scope.clone(),
-            index,
-        });
-        if counted && state.counted >= scope.limit {
-            let starter = suspend(ctx, WaitReason::Start);
-            state.queued.push_back(Queued {
-                index,
-                fiber,
-                starter,
+            let mut state = scope.state.lock().unwrap();
+            let mut cancelling = Cancelling::default();
+            if scope.is_parent(ctx) && ctx.cancel.load(Ordering::SeqCst) != 0 {
+                cancelling = scope.cancel_locked(&mut state);
+            }
+            let index = state.tasks.len();
+            let cancelled = state.cancelled || starter_stops;
+            let counted = flags & START_EXEMPT == 0 && !cancelled && scope.limit != 0;
+            state.tasks.push(Task {
+                ctx: fiber.ctx.clone(),
+                counted,
+                outcome: Outcome::Running,
             });
+            state.unfinished += 1;
+            fiber.task = Some(Member {
+                scope: scope.clone(),
+                index,
+            });
+            if counted && state.counted >= scope.limit {
+                let starter = suspend(ctx, WaitReason::Start);
+                state.queued.push_back(Queued {
+                    index,
+                    fiber,
+                    starter,
+                });
+                drop(state);
+                scope.finish(cancelling);
+                wait_for(ctx, Waiting::Start { scope, index });
+                // The wake gives the index.
+                return 0;
+            }
+            if counted {
+                state.counted += 1;
+            }
             drop(state);
             scope.finish(cancelling);
-            wait_for(ctx, Waiting::Start { scope, index });
-            // The wake gives the index.
-            return 0;
+            if cancelled {
+                cancel::cancel(&fiber.ctx);
+            }
+            scope.shared.launch(fiber, local_of(ctx));
+            if starter_stops {
+                raise(ctx, TrapKind::Cancelled, None);
+            }
+            index as u64
         }
-        if counted {
-            state.counted += 1;
-        }
-        drop(state);
-        scope.finish(cancelling);
-        if cancelled {
-            cancel::cancel(&fiber.ctx);
-        }
-        scope.shared.launch(fiber, local_of(ctx));
-        if starter_stops {
-            raise(ctx, TrapKind::Cancelled, None);
-        }
-        index as u64
     }
-}
+);
 
-suspending_fn! {
+suspending_fn!(
     /// `rt_scope_next(ctx, scope) -> (index, status)`: see
     /// `crag_abi::RuntimeFn::ScopeNext`.
-    fn rt_scope_next(ctx: *const TaskContext, scope: *const Scope) -> Words => next_entry
-}
-
-/// The Rust half of `rt_scope_next`: suspends until a task finishes.
-///
-/// # Safety
-///
-/// Called only by `rt_scope_next`, by the parent of a scope that has not
-/// ended. When a task trapped, the scope ends with the last call.
-unsafe extern "C" fn next_entry(ctx: *const TaskContext, ptr: *const Scope) -> Words {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let ctx = &*ctx;
-        let scope = Scope::borrowed(ptr);
-        let mut state = scope.state.lock().unwrap();
-        let mut cancelling = Cancelling::default();
-        if ctx.cancel.load(Ordering::SeqCst) != 0 {
-            cancelling = scope.cancel_locked(&mut state);
-        }
-        let words = if let Some(i) = state.done.pop_front() {
-            Some(Words(i as u64, state.tasks[i].outcome.status()))
-        } else if state.unfinished == 0 {
-            if let Some((kind, position)) = state.trap {
-                // The parent never reaches the scope's end, so its
-                // reference ends here.
-                raise(ctx, kind, position);
-                waited(ctx);
-                Arc::decrement_strong_count(ptr);
+    ///
+    /// Suspends until a task finishes.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the parent of a scope that has not ended. When a task trapped,
+    /// the scope ends with the last call.
+    fn rt_scope_next(ctx: *const TaskContext, ptr: *const Scope) -> Words {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let ctx = &*ctx;
+            let scope = Scope::borrowed(ptr);
+            let mut state = scope.state.lock().unwrap();
+            let mut cancelling = Cancelling::default();
+            if ctx.cancel.load(Ordering::SeqCst) != 0 {
+                cancelling = scope.cancel_locked(&mut state);
             }
-            Some(Words(SCOPE_DONE, 0))
-        } else {
-            state.waiter = Some(suspend(ctx, WaitReason::Tasks));
-            None
-        };
-        drop(state);
-        scope.finish(cancelling);
-        words.unwrap_or_else(|| {
-            wait_for(ctx, Waiting::Tasks(scope));
-            // The wake gives the task.
-            Words(0, 0)
-        })
+            let words = if let Some(i) = state.done.pop_front() {
+                Some(Words(i as u64, state.tasks[i].outcome.status()))
+            } else if state.unfinished == 0 {
+                if let Some((kind, position)) = state.trap {
+                    // The parent never reaches the scope's end, so its
+                    // reference ends here.
+                    raise(ctx, kind, position);
+                    waited(ctx);
+                    Arc::decrement_strong_count(ptr);
+                }
+                Some(Words(SCOPE_DONE, 0))
+            } else {
+                state.waiter = Some(suspend(ctx, WaitReason::Tasks));
+                None
+            };
+            drop(state);
+            scope.finish(cancelling);
+            words.unwrap_or_else(|| {
+                wait_for(ctx, Waiting::Tasks(scope));
+                // The wake gives the task.
+                Words(0, 0)
+            })
+        }
     }
-}
+);
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_scope_result(ctx, scope, index) -> (w0, w1)`: see
     /// `crag_abi::RuntimeFn::ScopeResult`.
-    fn rt_scope_result(ctx: *const TaskContext, scope: *const Scope, index: u64) -> Words => result_entry
-}
-
-/// The Rust half of `rt_scope_result`.
-///
-/// # Safety
-///
-/// Called only by `rt_scope_result`, with a scope that has not ended and
-/// the index of one of its tasks.
-unsafe extern "C" fn result_entry(_: *const TaskContext, scope: *const Scope, index: u64) -> Words {
-    // SAFETY: as the caller promises.
-    let scope = unsafe { &*scope };
-    let mut state = scope.state.lock().unwrap();
-    match &mut state.tasks[index as usize].outcome {
-        Outcome::Returned(results) => {
-            let [a, b] = results
-                .take()
-                .unwrap_or_else(|| die("took a task's results twice"));
-            Words(a, b)
-        }
-        _ => die("took the results of a task that did not return"),
-    }
-}
-
-system_stack_fn! {
-    /// `rt_scope_cancel(ctx, scope)`: see `crag_abi::RuntimeFn::ScopeCancel`.
-    fn rt_scope_cancel(ctx: *const TaskContext, scope: *const Scope) => cancel_entry
-}
-
-/// The Rust half of `rt_scope_cancel`.
-///
-/// # Safety
-///
-/// Called only by `rt_scope_cancel`, with a scope that has not ended.
-unsafe extern "C" fn cancel_entry(_: *const TaskContext, scope: *const Scope) {
-    // SAFETY: as the caller promises.
-    unsafe { (*scope).cancel() }
-}
-
-suspending_fn! {
-    /// `rt_scope_end(ctx, scope)`: see `crag_abi::RuntimeFn::ScopeEnd`.
-    fn rt_scope_end(ctx: *const TaskContext, scope: *const Scope) => end_entry
-}
-
-/// The Rust half of `rt_scope_end`. It never suspends.
-///
-/// # Safety
-///
-/// Called only by `rt_scope_end`, by the parent, with the scope its
-/// `rt_scope_new` gave.
-unsafe extern "C" fn end_entry(ctx: *const TaskContext, scope: *const Scope) {
-    // SAFETY: as the caller promises; the parent's reference ends here.
-    unsafe {
-        let ctx = &*ctx;
-        let scope = Arc::from_raw(scope);
-        {
-            let state = scope.state.lock().unwrap();
-            if state.unfinished != 0 || !state.done.is_empty() {
-                die("a scope ended before the parent took all its tasks");
+    ///
+    /// # Safety
+    ///
+    /// The scope has not ended, and `index` is one of its tasks.
+    fn rt_scope_result(_ctx: *const TaskContext, scope: *const Scope, index: u64) -> Words {
+        // SAFETY: as the caller promises.
+        let scope = unsafe { &*scope };
+        let mut state = scope.state.lock().unwrap();
+        match &mut state.tasks[index as usize].outcome {
+            Outcome::Returned(results) => {
+                let [a, b] = results
+                    .take()
+                    .unwrap_or_else(|| die("took a task's results twice"));
+                Words(a, b)
             }
+            _ => die("took the results of a task that did not return"),
         }
-        waited(ctx);
-        drop(scope);
-        leave_region(ctx);
     }
-}
+);
+
+system_stack_fn!(
+    /// `rt_scope_cancel(ctx, scope)`: see `crag_abi::RuntimeFn::ScopeCancel`.
+    ///
+    /// # Safety
+    ///
+    /// The scope has not ended.
+    fn rt_scope_cancel(_ctx: *const TaskContext, scope: *const Scope) {
+        // SAFETY: as the caller promises.
+        unsafe { (*scope).cancel() }
+    }
+);
+
+suspending_fn!(
+    /// `rt_scope_end(ctx, scope)`: see `crag_abi::RuntimeFn::ScopeEnd`.
+    ///
+    /// It never suspends.
+    ///
+    /// # Safety
+    ///
+    /// The caller is the parent, and the scope is the one its `rt_scope_new` gave.
+    fn rt_scope_end(ctx: *const TaskContext, scope: *const Scope) {
+        // SAFETY: as the caller promises; the parent's reference ends here.
+        unsafe {
+            let ctx = &*ctx;
+            let scope = Arc::from_raw(scope);
+            {
+                let state = scope.state.lock().unwrap();
+                if state.unfinished != 0 || !state.done.is_empty() {
+                    die("a scope ended before the parent took all its tasks");
+                }
+            }
+            waited(ctx);
+            drop(scope);
+            leave_region(ctx);
+        }
+    }
+);

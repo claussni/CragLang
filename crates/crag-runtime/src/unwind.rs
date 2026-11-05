@@ -557,59 +557,45 @@ pub(crate) unsafe extern "C" fn rt_trap_rethrow(ctx: *const TaskContext) -> ! {
     )
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_trap_caught(ctx, which) -> u64`: see
     /// `crag_abi::RuntimeFn::TrapCaught`.
-    fn rt_trap_caught(ctx: *const TaskContext, which: u64) -> u64 => caught_entry
-}
-
-/// The Rust half of `rt_trap_caught`.
-///
-/// # Safety
-///
-/// Called only by `rt_trap_caught`.
-unsafe extern "C" fn caught_entry(ctx: *const TaskContext, which: u64) -> u64 {
-    // SAFETY: as the caller promises.
-    let ctx = unsafe { &*ctx };
-    match which {
-        0 => ctx.caught_kind.load(Ordering::Relaxed),
-        _ => {
-            // SAFETY: as the caller promises.
-            let origin = unsafe { caught_origin(ctx) };
-            let (_, line, column, _) = origin.unwrap_or_default();
-            u64::from(if which == 1 { line } else { column })
+    fn rt_trap_caught(ctx: *const TaskContext, which: u64) -> u64 {
+        // SAFETY: as the caller promises.
+        let ctx = unsafe { &*ctx };
+        match which {
+            0 => ctx.caught_kind.load(Ordering::Relaxed),
+            _ => {
+                // SAFETY: as the caller promises.
+                let origin = unsafe { caught_origin(ctx) };
+                let (_, line, column, _) = origin.unwrap_or_default();
+                u64::from(if which == 1 { line } else { column })
+            }
         }
     }
-}
+);
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_trap_caught_text(ctx, which) -> (w0, w1)`: see
     /// `crag_abi::RuntimeFn::TrapCaughtText`.
-    fn rt_trap_caught_text(ctx: *const TaskContext, which: u64) -> TextWords => caught_text_entry
-}
-
-/// The Rust half of `rt_trap_caught_text`.
-///
-/// # Safety
-///
-/// Called only by `rt_trap_caught_text`.
-unsafe extern "C" fn caught_text_entry(ctx: *const TaskContext, which: u64) -> TextWords {
-    // SAFETY: as the caller promises.
-    let ctx = unsafe { &*ctx };
-    // SAFETY: as the caller promises.
-    let (module, _, _, detail) = unsafe { caught_origin(ctx) }.unwrap_or_default();
-    let message =
-        TrapKind::from_index(ctx.caught_kind.load(Ordering::Relaxed)).map_or("", TrapKind::message);
-    let text = match which {
-        0 => module.as_str(),
-        1 => message,
-        _ => detail.as_str(),
-    };
-    // SAFETY: called on the system stack by a runtime function.
-    let (heap, _) = unsafe { crate::system::worker_of(ctx) };
-    let [w0, w1] = make_text(heap, &[text.as_bytes()]);
-    TextWords(w0, w1)
-}
+    fn rt_trap_caught_text(ctx: *const TaskContext, which: u64) -> TextWords {
+        // SAFETY: as the caller promises.
+        let ctx = unsafe { &*ctx };
+        // SAFETY: as the caller promises.
+        let (module, _, _, detail) = unsafe { caught_origin(ctx) }.unwrap_or_default();
+        let message = TrapKind::from_index(ctx.caught_kind.load(Ordering::Relaxed))
+            .map_or("", TrapKind::message);
+        let text = match which {
+            0 => module.as_str(),
+            1 => message,
+            _ => detail.as_str(),
+        };
+        // SAFETY: called on the system stack by a runtime function.
+        let (heap, _) = unsafe { crate::system::worker_of(ctx) };
+        let [w0, w1] = make_text(heap, &[text.as_bytes()]);
+        TextWords(w0, w1)
+    }
+);
 
 /// Where the trap the context holds lies: module, line, column, and what it
 /// names.

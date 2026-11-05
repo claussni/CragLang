@@ -33,24 +33,6 @@ use crate::text::{TextWords, in_buffer, make_text};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CResult(pub u64, pub u64);
 
-system_stack_fn! {
-    /// `rt_c_call(ctx, library, func, desc, buf) -> (result, class)`: see
-    /// `crag_abi::RuntimeFn::CCall`.
-    fn rt_c_call(
-        ctx: *const TaskContext,
-        library: *const NativeLibrary,
-        func: usize,
-        desc: *const u8,
-        buf: *mut u64
-    ) -> CResult => call_entry
-}
-
-system_stack_fn! {
-    /// `rt_c_str_of(ctx, address, nul) -> (w0, w1)`: see
-    /// `crag_abi::RuntimeFn::CStrOf`.
-    fn rt_c_str_of(ctx: *const TaskContext, address: u64, nul: u64) -> TextWords => str_of_entry
-}
-
 /// The registers and the stack words of a call: six integer registers,
 /// then eight vector registers.
 struct Args {
@@ -61,65 +43,67 @@ struct Args {
 /// What came back: rax, rdx and xmm0.
 type Raw = [u64; 3];
 
-/// The Rust half of `rt_c_call`, on the system stack.
-///
-/// # Safety
-///
-/// Called only by `rt_c_call`, with a loaded library, the address of a C
-/// function of it whose parameters and result the descriptor describes,
-/// and a buffer of a word per parameter and one more, whose `CStr`s are
-/// live boxes.
-unsafe extern "C" fn call_entry(
-    _ctx: *const TaskContext,
-    library: *const NativeLibrary,
-    func: usize,
-    desc: *const u8,
-    buf: *mut u64,
-) -> CResult {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let library = &*library;
-        let count = *desc as usize;
-        let result = *desc.add(1);
-        let kinds = std::slice::from_raw_parts(desc.add(2), count);
-        let args = arguments(kinds, buf);
-        let call = move || {
-            let mut raw: Raw = [0; 3];
-            c_invoke(
-                func,
-                args.regs.as_ptr(),
-                args.stack.as_ptr(),
-                args.stack.len(),
-                raw.as_mut_ptr(),
-            );
-            (raw, *libc::__errno_location())
-        };
-        let (raw, errno) = match library.threading {
-            threading::SAFE => call(),
-            threading::BOUND => on_own_thread(library, call),
-            _ => {
-                let _held = library.lock.lock().unwrap_or_else(PoisonError::into_inner);
-                call()
+system_stack_fn!(
+    /// `rt_c_call(ctx, library, func, desc, buf) -> (result, class)`: see
+    /// `crag_abi::RuntimeFn::CCall`.
+    ///
+    /// # Safety
+    ///
+    /// The library is loaded, `func` is the address of a C function of it whose
+    /// parameters and result the descriptor describes, and the buffer holds a word
+    /// per parameter and one more, whose `CStr`s are live boxes.
+    fn rt_c_call(
+        _ctx: *const TaskContext,
+        library: *const NativeLibrary,
+        func: usize,
+        desc: *const u8,
+        buf: *mut u64,
+    ) -> CResult {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let library = &*library;
+            let count = *desc as usize;
+            let result = *desc.add(1);
+            let kinds = std::slice::from_raw_parts(desc.add(2), count);
+            let args = arguments(kinds, buf);
+            let call = move || {
+                let mut raw: Raw = [0; 3];
+                c_invoke(
+                    func,
+                    args.regs.as_ptr(),
+                    args.stack.as_ptr(),
+                    args.stack.len(),
+                    raw.as_mut_ptr(),
+                );
+                (raw, *libc::__errno_location())
+            };
+            let (raw, errno) = match library.threading {
+                threading::SAFE => call(),
+                threading::BOUND => on_own_thread(library, call),
+                _ => {
+                    let _held = library.lock.lock().unwrap_or_else(PoisonError::into_inner);
+                    call()
+                }
+            };
+            for (i, &kind) in kinds.iter().enumerate() {
+                if kind & c_kind::OUT != 0 {
+                    let slot = buf.add(i);
+                    *slot = extend(kind & !c_kind::OUT, *slot);
+                }
             }
-        };
-        for (i, &kind) in kinds.iter().enumerate() {
-            if kind & c_kind::OUT != 0 {
-                let slot = buf.add(i);
-                *slot = extend(kind & !c_kind::OUT, *slot);
+            *buf.add(count) = errno as i64 as u64;
+            match result {
+                c_kind::VOID => CResult(0, 0),
+                c_kind::F64 => CResult(raw[2], class(f64::from_bits(raw[2]))),
+                c_kind::F32 => {
+                    let bits = raw[2] & 0xffff_ffff;
+                    CResult(bits, class(f32::from_bits(bits as u32).into()))
+                }
+                kind => CResult(extend(kind, raw[0]), 0),
             }
-        }
-        *buf.add(count) = errno as i64 as u64;
-        match result {
-            c_kind::VOID => CResult(0, 0),
-            c_kind::F64 => CResult(raw[2], class(f64::from_bits(raw[2]))),
-            c_kind::F32 => {
-                let bits = raw[2] & 0xffff_ffff;
-                CResult(bits, class(f32::from_bits(bits as u32).into()))
-            }
-            kind => CResult(extend(kind, raw[0]), 0),
         }
     }
-}
+);
 
 /// Where the arguments go: integers and pointers in the six integer
 /// registers, floats in the eight vector registers, the rest on the stack
@@ -127,7 +111,7 @@ unsafe extern "C" fn call_entry(
 ///
 /// # Safety
 ///
-/// As for `call_entry`.
+/// As for `rt_c_call`.
 unsafe fn arguments(kinds: &[u8], buf: *mut u64) -> Args {
     let mut args = Args {
         regs: [0; 14],
@@ -300,22 +284,24 @@ unsafe extern "C" fn c_invoke(
     )
 }
 
-/// The Rust half of `rt_c_str_of`, on the system stack.
-///
-/// # Safety
-///
-/// Called only by `rt_c_str_of`, with the address of NUL-terminated
-/// bytes.
-unsafe extern "C" fn str_of_entry(ctx: *const TaskContext, address: u64, nul: u64) -> TextWords {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let (heap, _) = worker_of(ctx);
-        let c = std::ffi::CStr::from_ptr(address as *const libc::c_char);
-        let bytes = match nul {
-            0 => c.to_bytes(),
-            _ => c.to_bytes_with_nul(),
-        };
-        let [w0, w1] = make_text(heap, &[bytes]);
-        TextWords(w0, w1)
+system_stack_fn!(
+    /// `rt_c_str_of(ctx, address, nul) -> (w0, w1)`: see
+    /// `crag_abi::RuntimeFn::CStrOf`.
+    ///
+    /// # Safety
+    ///
+    /// `address` is the address of NUL-terminated bytes.
+    fn rt_c_str_of(ctx: *const TaskContext, address: u64, nul: u64) -> TextWords {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let (heap, _) = worker_of(ctx);
+            let c = std::ffi::CStr::from_ptr(address as *const libc::c_char);
+            let bytes = match nul {
+                0 => c.to_bytes(),
+                _ => c.to_bytes_with_nul(),
+            };
+            let [w0, w1] = make_text(heap, &[bytes]);
+            TextWords(w0, w1)
+        }
     }
-}
+);

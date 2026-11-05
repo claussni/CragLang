@@ -60,136 +60,123 @@ fn table(handle: u64) -> &'static Table {
     }
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_value_shapes(ctx, w0, w1)`: see `crag_abi::RuntimeFn::ValueShapes`.
-    fn rt_value_shapes(ctx: *const TaskContext, w0: u64, w1: u64) -> u64 => shapes_entry
-}
+    ///
+    /// # Safety
+    ///
+    /// The values are live, of the table's root shape, and the caller holds them.
+    fn rt_value_shapes(_ctx: *const TaskContext, w0: u64, w1: u64) -> u64 {
+        let words = [w0, w1];
+        // SAFETY: as the caller promises.
+        let bytes = unsafe { bytes_of(&words) };
+        let mut tables = TABLES.lock().unwrap_or_else(|e| e.into_inner());
+        let tables = tables.get_or_insert_with(|| Tables {
+            by_bytes: HashMap::new(),
+            tables: Vec::new(),
+        });
+        if let Some(&handle) = tables.by_bytes.get(bytes) {
+            return u64::from(handle);
+        }
+        let Some((root, rest)) = bytes.split_first_chunk::<4>() else {
+            die("value shapes without a root");
+        };
+        let shapes = Shapes::decode(rest).unwrap_or_else(|e| die(&format!("value shapes: {e}")));
+        let table: &'static Table = Box::leak(Box::new(Table {
+            shapes,
+            root: u32::from_le_bytes(*root),
+        }));
+        let handle = tables.tables.len() as u32;
+        tables.tables.push(table);
+        tables.by_bytes.insert(bytes.to_vec(), handle);
+        u64::from(handle)
+    }
+);
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_value_op(ctx, packed, a0, a1, b0, b1)`: see
     /// `crag_abi::RuntimeFn::ValueOp`.
-    fn rt_value_op(ctx: *const TaskContext, packed: u64, a0: u64, a1: u64, b0: u64, b1: u64) -> u64
-        => op_entry
-}
-
-system_stack_fn! {
-    /// `rt_value_decode(ctx, handle, b0, b1)`: see
-    /// `crag_abi::RuntimeFn::ValueDecode`.
-    fn rt_value_decode(ctx: *const TaskContext, handle: u64, b0: u64, b1: u64) -> u64
-        => decode_entry
-}
-
-system_stack_fn! {
-    /// `rt_value_show(ctx, handle, w0, w1)`: see
-    /// `crag_abi::RuntimeFn::ValueShow`.
-    fn rt_value_show(ctx: *const TaskContext, handle: u64, w0: u64, w1: u64) -> TextWords
-        => show_entry
-}
-
-/// The Rust halves of the functions above, on the system stack.
-///
-/// # Safety
-///
-/// Called only by those functions, with live values of the table's root
-/// shape that the caller holds.
-unsafe extern "C" fn shapes_entry(_ctx: *const TaskContext, w0: u64, w1: u64) -> u64 {
-    let words = [w0, w1];
-    // SAFETY: as the caller promises.
-    let bytes = unsafe { bytes_of(&words) };
-    let mut tables = TABLES.lock().unwrap_or_else(|e| e.into_inner());
-    let tables = tables.get_or_insert_with(|| Tables {
-        by_bytes: HashMap::new(),
-        tables: Vec::new(),
-    });
-    if let Some(&handle) = tables.by_bytes.get(bytes) {
-        return u64::from(handle);
-    }
-    let Some((root, rest)) = bytes.split_first_chunk::<4>() else {
-        die("value shapes without a root");
-    };
-    let shapes = Shapes::decode(rest).unwrap_or_else(|e| die(&format!("value shapes: {e}")));
-    let table: &'static Table = Box::leak(Box::new(Table {
-        shapes,
-        root: u32::from_le_bytes(*root),
-    }));
-    let handle = tables.tables.len() as u32;
-    tables.tables.push(table);
-    tables.by_bytes.insert(bytes.to_vec(), handle);
-    u64::from(handle)
-}
-
-/// See `shapes_entry`.
-unsafe extern "C" fn op_entry(
-    ctx: *const TaskContext,
-    packed: u64,
-    a0: u64,
-    a1: u64,
-    b0: u64,
-    b1: u64,
-) -> u64 {
-    let table = table(packed >> 8);
-    // SAFETY: as the caller promises.
-    let (_, types) = unsafe { worker_of(ctx) };
-    let walk = Walk {
-        shapes: &table.shapes,
-        types,
-    };
-    let (a, b) = ([a0, a1], [b0, b1]);
-    // SAFETY: as the caller promises.
-    unsafe {
-        match packed as u8 {
-            EQUALS => u64::from(walk.equals(&a, &b, table.root)),
-            COMPARE => walk
-                .compare(&a, &b, table.root)
-                .map_or(UNORDERED, |o| (o as i64 + 1) as u64),
-            _ => {
-                let mut h = Hash(0xcbf2_9ce4_8422_2325);
-                walk.hash(&a, table.root, &mut h);
-                h.0
+    ///
+    /// # Safety
+    ///
+    /// The values are live, of the table's root shape, and the caller holds them.
+    fn rt_value_op(
+        ctx: *const TaskContext,
+        packed: u64,
+        a0: u64,
+        a1: u64,
+        b0: u64,
+        b1: u64,
+    ) -> u64 {
+        let table = table(packed >> 8);
+        // SAFETY: as the caller promises.
+        let (_, types) = unsafe { worker_of(ctx) };
+        let walk = Walk {
+            shapes: &table.shapes,
+            types,
+        };
+        let (a, b) = ([a0, a1], [b0, b1]);
+        // SAFETY: as the caller promises.
+        unsafe {
+            match packed as u8 {
+                EQUALS => u64::from(walk.equals(&a, &b, table.root)),
+                COMPARE => walk
+                    .compare(&a, &b, table.root)
+                    .map_or(UNORDERED, |o| (o as i64 + 1) as u64),
+                _ => {
+                    let mut h = Hash(0xcbf2_9ce4_8422_2325);
+                    walk.hash(&a, table.root, &mut h);
+                    h.0
+                }
             }
         }
     }
-}
+);
 
-/// See `shapes_entry`.
-unsafe extern "C" fn show_entry(
-    ctx: *const TaskContext,
-    handle: u64,
-    w0: u64,
-    w1: u64,
-) -> TextWords {
-    let table = table(handle);
-    // SAFETY: as the caller promises.
-    let (heap, types) = unsafe { worker_of(ctx) };
-    let limits = PrintLimits {
-        depth: usize::MAX,
-        items: usize::MAX,
-        chars: usize::MAX,
-    };
-    // SAFETY: as the caller promises.
-    let text = unsafe { print_value(&[w0, w1], &table.shapes, table.root, types, limits) };
-    let [w0, w1] = make_text(heap, &[text.as_bytes()]);
-    TextWords(w0, w1)
-}
-
-/// See `show_entry`.
-unsafe extern "C" fn decode_entry(ctx: *const TaskContext, handle: u64, b0: u64, b1: u64) -> u64 {
-    let table = table(handle);
-    let words = [b0, b1];
-    // SAFETY: as the caller promises.
-    let (heap, types) = unsafe { worker_of(ctx) };
-    // SAFETY: the bytes are a live value; the shapes give the boxes the
-    // layouts code generation gave them.
-    let decoded = unsafe {
-        let bytes = bytes_of(&words);
-        decode_value(bytes, &table.shapes, table.root, heap, types)
-    };
-    match decoded.as_deref() {
-        Ok([word]) => *word,
-        Ok(_) => die("a decoded value of more than a word"),
-        Err(e) => die(&format!("bytes the compiler wrote do not decode: {}", e.0)),
+system_stack_fn!(
+    /// `rt_value_show(ctx, handle, w0, w1)`: see
+    /// `crag_abi::RuntimeFn::ValueShow`.
+    ///
+    /// # Safety
+    ///
+    /// The values are live, of the table's root shape, and the caller holds them.
+    fn rt_value_show(ctx: *const TaskContext, handle: u64, w0: u64, w1: u64) -> TextWords {
+        let table = table(handle);
+        // SAFETY: as the caller promises.
+        let (heap, types) = unsafe { worker_of(ctx) };
+        let limits = PrintLimits {
+            depth: usize::MAX,
+            items: usize::MAX,
+            chars: usize::MAX,
+        };
+        // SAFETY: as the caller promises.
+        let text = unsafe { print_value(&[w0, w1], &table.shapes, table.root, types, limits) };
+        let [w0, w1] = make_text(heap, &[text.as_bytes()]);
+        TextWords(w0, w1)
     }
-}
+);
+
+system_stack_fn!(
+    /// `rt_value_decode(ctx, handle, b0, b1)`: see
+    /// `crag_abi::RuntimeFn::ValueDecode`.
+    fn rt_value_decode(ctx: *const TaskContext, handle: u64, b0: u64, b1: u64) -> u64 {
+        let table = table(handle);
+        let words = [b0, b1];
+        // SAFETY: as the caller promises.
+        let (heap, types) = unsafe { worker_of(ctx) };
+        // SAFETY: the bytes are a live value; the shapes give the boxes the
+        // layouts code generation gave them.
+        let decoded = unsafe {
+            let bytes = bytes_of(&words);
+            decode_value(bytes, &table.shapes, table.root, heap, types)
+        };
+        match decoded.as_deref() {
+            Ok([word]) => *word,
+            Ok(_) => die("a decoded value of more than a word"),
+            Err(e) => die(&format!("bytes the compiler wrote do not decode: {}", e.0)),
+        }
+    }
+);
 
 /// FNV-1a over words.
 struct Hash(u64);

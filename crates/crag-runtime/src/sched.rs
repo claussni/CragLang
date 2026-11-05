@@ -845,7 +845,7 @@ unsafe impl Send for FiberRef {}
 ///
 /// # Safety
 ///
-/// Called on the system stack by the Rust half of a function
+/// Called on the system stack by the body of a function
 /// `suspending_fn!` defined, for the fiber it was called on.
 pub(crate) unsafe fn suspend(ctx: &TaskContext, reason: WaitReason) -> FiberRef {
     // SAFETY: as the caller promises, a worker runs the fiber of `ctx`.
@@ -864,7 +864,7 @@ pub(crate) unsafe fn suspend(ctx: &TaskContext, reason: WaitReason) -> FiberRef 
 ///
 /// # Safety
 ///
-/// Called on the system stack by the Rust half of a runtime function, for
+/// Called on the system stack by the body of a runtime function, for
 /// the fiber it was called on; nothing else uses the part meanwhile.
 pub(crate) unsafe fn local_of<'a>(ctx: &TaskContext) -> Option<&'a mut Local> {
     // SAFETY: as the caller promises, a worker runs the fiber of `ctx`.
@@ -879,7 +879,7 @@ pub(crate) unsafe fn local_of<'a>(ctx: &TaskContext) -> Option<&'a mut Local> {
 ///
 /// # Safety
 ///
-/// Called on the system stack by the Rust half of a runtime function, for
+/// Called on the system stack by the body of a runtime function, for
 /// the fiber it was called on.
 pub(crate) unsafe fn scheduler_of(ctx: &TaskContext) -> Option<Arc<Shared>> {
     // SAFETY: as the caller promises, a worker runs the fiber of `ctx`.
@@ -908,27 +908,21 @@ pub fn wake(fiber: FiberRef, words: [u64; 2]) {
     });
 }
 
-suspending_fn! {
+suspending_fn!(
     /// `rt_yield(ctx)`: see `crag_abi::RuntimeFn::Yield`.
-    fn rt_yield(ctx: *const TaskContext) => yield_entry
-}
-
-/// The Rust half of `rt_yield`: suspends and wakes at once, so that the
-/// worker queues the fiber again.
-///
-/// # Safety
-///
-/// Called only by `rt_yield`.
-unsafe extern "C" fn yield_entry(ctx: *const TaskContext) {
-    // SAFETY: as the caller promises.
-    unsafe {
-        if crate::cancel::stop_if_due(&*ctx) {
-            return;
+    ///
+    /// Suspends and wakes at once, so that the worker queues the fiber again.
+    fn rt_yield(ctx: *const TaskContext) {
+        // SAFETY: as the caller promises.
+        unsafe {
+            if crate::cancel::stop_if_due(&*ctx) {
+                return;
+            }
+            let fiber = suspend(&*ctx, WaitReason::Yield);
+            wake(fiber, [0, 0]);
         }
-        let fiber = suspend(&*ctx, WaitReason::Yield);
-        wake(fiber, [0, 0]);
     }
-}
+);
 
 #[cfg(test)]
 mod tests {

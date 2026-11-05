@@ -151,149 +151,121 @@ unsafe fn share(lazy: *const LazyCell) -> Arc<LazyCell> {
     }
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_lazy_new(ctx, list) -> lazy`: see `crag_abi::RuntimeFn::LazyNew`.
-    fn rt_lazy_new(ctx: *const TaskContext, list: u64) -> u64 => new_entry
-}
+    fn rt_lazy_new(_ctx: *const TaskContext, list: u64) -> u64 {
+        let cell = LazyCell {
+            list,
+            state: Mutex::new(State {
+                phase: Phase::Unstarted,
+                waiters: VecDeque::new(),
+                next_token: 0,
+            }),
+        };
+        Arc::into_raw(Arc::new(cell)) as u64
+    }
+);
 
-/// The Rust half of `rt_lazy_new`.
-///
-/// # Safety
-///
-/// Called only by `rt_lazy_new`.
-unsafe extern "C" fn new_entry(_ctx: *const TaskContext, list: u64) -> u64 {
-    let cell = LazyCell {
-        list,
-        state: Mutex::new(State {
-            phase: Phase::Unstarted,
-            waiters: VecDeque::new(),
-            next_token: 0,
-        }),
-    };
-    Arc::into_raw(Arc::new(cell)) as u64
-}
-
-suspending_fn! {
+suspending_fn!(
     /// `rt_lazy_get(ctx, lazy, out) -> status`: see
     /// `crag_abi::RuntimeFn::LazyGet`.
-    fn rt_lazy_get(ctx: *const TaskContext, lazy: *const LazyCell, out: *mut u64) -> u64 => get_entry
-}
+    ///
+    /// Suspends while another task computes the value.
+    ///
+    /// # Safety
+    ///
+    /// The cell has not been freed, and there is room for two words at `out`.
+    fn rt_lazy_get(ctx: *const TaskContext, lazy: *const LazyCell, out: *mut u64) -> u64 {
+        // SAFETY: as the caller promises.
+        let (ctx, cell, (_, types)) = unsafe { (&*ctx, share(lazy), worker_of(&*ctx)) };
+        if stop_if_due(ctx) {
+            return 0;
+        }
+        let mut state = cell.state.lock().unwrap();
+        match &state.phase {
+            Phase::Done(words) => {
+                cell.give(types, out, *words);
+                return LAZY_DONE;
+            }
+            Phase::Trapped(kind) => {
+                // SAFETY: as the caller promises.
+                unsafe { out.write_unaligned(*kind as u64) };
+                return LAZY_TRAPPED;
+            }
+            Phase::Unstarted => {
+                // SAFETY: a worker runs the fiber.
+                let me = unsafe {
+                    (*ctx.fiber.load(std::sync::atomic::Ordering::Relaxed))
+                        .ctx
+                        .clone()
+                };
+                state.phase = Phase::Running(me);
+                drop(state);
+                ctx.lazy.lock().unwrap().push(cell);
+                return LAZY_RUN;
+            }
+            Phase::Running(runner) if std::ptr::eq(&**runner, ctx) => {
+                // SAFETY: as the caller promises.
+                unsafe { out.write_unaligned(TrapKind::Cycle as u64) };
+                return LAZY_TRAPPED;
+            }
+            Phase::Running(_) => {}
+        }
+        // SAFETY: as the caller promises.
+        if unsafe { scheduler_of(ctx) }.is_none() {
+            raise(ctx, TrapKind::Unsupported, None);
+            return 0;
+        }
+        let token = state.next_token;
+        state.next_token += 1;
+        // SAFETY: a worker runs the fiber.
+        let me = unsafe {
+            (*ctx.fiber.load(std::sync::atomic::Ordering::Relaxed))
+                .ctx
+                .clone()
+        };
+        // SAFETY: as the caller promises.
+        let fiber = unsafe { suspend(ctx, WaitReason::Lazy) };
+        state.waiters.push_back(Waiter {
+            fiber,
+            ctx: me,
+            out,
+            token,
+        });
+        drop(state);
+        wait_for(ctx, Waiting::Lazy { cell, token });
+        0
+    }
+);
 
-/// The Rust half of `rt_lazy_get`: suspends while another task computes
-/// the value.
-///
-/// # Safety
-///
-/// Called only by `rt_lazy_get`, with a cell that has not been freed and
-/// room for two words at `out`.
-unsafe extern "C" fn get_entry(
-    ctx: *const TaskContext,
-    lazy: *const LazyCell,
-    out: *mut u64,
-) -> u64 {
-    // SAFETY: as the caller promises.
-    let (ctx, cell, (_, types)) = unsafe { (&*ctx, share(lazy), worker_of(&*ctx)) };
-    if stop_if_due(ctx) {
-        return 0;
-    }
-    let mut state = cell.state.lock().unwrap();
-    match &state.phase {
-        Phase::Done(words) => {
-            cell.give(types, out, *words);
-            return LAZY_DONE;
-        }
-        Phase::Trapped(kind) => {
-            // SAFETY: as the caller promises.
-            unsafe { out.write_unaligned(*kind as u64) };
-            return LAZY_TRAPPED;
-        }
-        Phase::Unstarted => {
-            // SAFETY: a worker runs the fiber.
-            let me = unsafe {
-                (*ctx.fiber.load(std::sync::atomic::Ordering::Relaxed))
-                    .ctx
-                    .clone()
-            };
-            state.phase = Phase::Running(me);
-            drop(state);
-            ctx.lazy.lock().unwrap().push(cell);
-            return LAZY_RUN;
-        }
-        Phase::Running(runner) if std::ptr::eq(&**runner, ctx) => {
-            // SAFETY: as the caller promises.
-            unsafe { out.write_unaligned(TrapKind::Cycle as u64) };
-            return LAZY_TRAPPED;
-        }
-        Phase::Running(_) => {}
-    }
-    // SAFETY: as the caller promises.
-    if unsafe { scheduler_of(ctx) }.is_none() {
-        raise(ctx, TrapKind::Unsupported, None);
-        return 0;
-    }
-    let token = state.next_token;
-    state.next_token += 1;
-    // SAFETY: a worker runs the fiber.
-    let me = unsafe {
-        (*ctx.fiber.load(std::sync::atomic::Ordering::Relaxed))
-            .ctx
-            .clone()
-    };
-    // SAFETY: as the caller promises.
-    let fiber = unsafe { suspend(ctx, WaitReason::Lazy) };
-    state.waiters.push_back(Waiter {
-        fiber,
-        ctx: me,
-        out,
-        token,
-    });
-    drop(state);
-    wait_for(ctx, Waiting::Lazy { cell, token });
-    0
-}
-
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_lazy_set(ctx, lazy, w0, w1)`: see `crag_abi::RuntimeFn::LazySet`.
-    fn rt_lazy_set(ctx: *const TaskContext, lazy: *const LazyCell, w0: u64, w1: u64) => set_entry
-}
-
-/// The Rust half of `rt_lazy_set`.
-///
-/// # Safety
-///
-/// Called only by `rt_lazy_set`, by the task `rt_lazy_get` told to compute
-/// the value, with the value's references.
-unsafe extern "C" fn set_entry(ctx: *const TaskContext, lazy: *const LazyCell, w0: u64, w1: u64) {
-    // SAFETY: as the caller promises.
-    let (ctx, cell, (_, types)) = unsafe { (&*ctx, &*lazy, worker_of(&*ctx)) };
-    ctx.lazy
-        .lock()
-        .unwrap()
-        .retain(|c| !std::ptr::eq(&**c, cell));
-    let words = [w0, w1];
-    let mut state = cell.state.lock().unwrap();
-    state.phase = Phase::Done(words);
-    let waiters: Vec<Waiter> = state.waiters.drain(..).collect();
-    for w in &waiters {
-        cell.give(types, w.out, words);
+    ///
+    /// # Safety
+    ///
+    /// The caller is the task `rt_lazy_get` told to compute the value, and passes
+    /// the value's references.
+    fn rt_lazy_set(ctx: *const TaskContext, lazy: *const LazyCell, w0: u64, w1: u64) {
+        // SAFETY: as the caller promises.
+        let (ctx, cell, (_, types)) = unsafe { (&*ctx, &*lazy, worker_of(&*ctx)) };
+        ctx.lazy
+            .lock()
+            .unwrap()
+            .retain(|c| !std::ptr::eq(&**c, cell));
+        let words = [w0, w1];
+        let mut state = cell.state.lock().unwrap();
+        state.phase = Phase::Done(words);
+        let waiters: Vec<Waiter> = state.waiters.drain(..).collect();
+        for w in &waiters {
+            cell.give(types, w.out, words);
+        }
+        drop(state);
+        for w in waiters {
+            wake(w.fiber, [LAZY_DONE, 0]);
+        }
     }
-    drop(state);
-    for w in waiters {
-        wake(w.fiber, [LAZY_DONE, 0]);
-    }
-}
+);
 
-system_stack_fn! {
-    /// `rt_lazy_free(ctx, lazy)`: see `crag_abi::RuntimeFn::LazyFree`.
-    fn rt_lazy_free(ctx: *const TaskContext, lazy: *const LazyCell) => free_entry
-}
-
-/// The Rust half of `rt_lazy_free`.
-///
-/// # Safety
-///
-/// Called only by `rt_lazy_free`, once, with a cell no task reads or
-/// computes any more.
 /// Frees the cell of a lazy value's box being freed, with its value.
 ///
 /// # Safety
@@ -309,14 +281,21 @@ pub(crate) unsafe fn free(lazy: u64, heap: &mut Heap, types: &Types) {
     }
 }
 
-unsafe extern "C" fn free_entry(ctx: *const TaskContext, lazy: *const LazyCell) {
-    // SAFETY: as the caller promises.
-    let (cell, (heap, types)) = unsafe { (Arc::from_raw(lazy), worker_of(&*ctx)) };
-    let phase = std::mem::replace(&mut cell.state.lock().unwrap().phase, Phase::Unstarted);
-    if let Phase::Done(words) = phase {
-        release(heap, types, cell.list, words);
+system_stack_fn!(
+    /// `rt_lazy_free(ctx, lazy)`: see `crag_abi::RuntimeFn::LazyFree`.
+    ///
+    /// # Safety
+    ///
+    /// Called once, with a cell no task reads or computes any more.
+    fn rt_lazy_free(ctx: *const TaskContext, lazy: *const LazyCell) {
+        // SAFETY: as the caller promises.
+        let (cell, (heap, types)) = unsafe { (Arc::from_raw(lazy), worker_of(&*ctx)) };
+        let phase = std::mem::replace(&mut cell.state.lock().unwrap().phase, Phase::Unstarted);
+        if let Phase::Done(words) = phase {
+            release(heap, types, cell.list, words);
+        }
     }
-}
+);
 
 fn release(heap: &mut Heap, types: &Types, list: u64, mut words: [u64; 2]) {
     // SAFETY: the cell owned the value's references.

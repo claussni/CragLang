@@ -100,82 +100,51 @@ pub fn show_number(number: Number, word: u64) -> String {
     }
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_text_concat(ctx, a0, a1, b0, b1)`: see
     /// `crag_abi::RuntimeFn::TextConcat`.
-    fn rt_text_concat(ctx: *const TaskContext, a0: u64, a1: u64, b0: u64, b1: u64) -> TextWords
-        => concat_entry
-}
+    fn rt_text_concat(ctx: *const TaskContext, a0: u64, a1: u64, b0: u64, b1: u64) -> TextWords {
+        // SAFETY: as the caller promises; both values are borrowed live ones.
+        unsafe {
+            let (heap, _) = worker_of(ctx);
+            let (a, b) = ([a0, a1], [b0, b1]);
+            let [w0, w1] = make_text(heap, &[bytes_of(&a), bytes_of(&b)]);
+            TextWords(w0, w1)
+        }
+    }
+);
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_text_equals(ctx, a0, a1, b0, b1)`: see
     /// `crag_abi::RuntimeFn::TextEquals`.
-    fn rt_text_equals(ctx: *const TaskContext, a0: u64, a1: u64, b0: u64, b1: u64) -> u64
-        => equals_entry
-}
+    fn rt_text_equals(_ctx: *const TaskContext, a0: u64, a1: u64, b0: u64, b1: u64) -> u64 {
+        // SAFETY: as the caller promises.
+        unsafe { u64::from(bytes_of(&[a0, a1]) == bytes_of(&[b0, b1])) }
+    }
+);
 
-system_stack_fn! {
-    /// `rt_text_show(ctx, word, number)`: see `crag_abi::RuntimeFn::TextShow`.
-    fn rt_text_show(ctx: *const TaskContext, word: u64, number: u64) -> TextWords
-        => show_entry
-}
-
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_text_utf8(ctx, w0, w1)`: see `crag_abi::RuntimeFn::TextUtf8`.
-    fn rt_text_utf8(ctx: *const TaskContext, w0: u64, w1: u64) -> u64 => utf8_entry
-}
+    fn rt_text_utf8(_ctx: *const TaskContext, w0: u64, w1: u64) -> u64 {
+        let words = [w0, w1];
+        // SAFETY: as the caller promises.
+        u64::from(std::str::from_utf8(unsafe { bytes_of(&words) }).is_ok())
+    }
+);
 
-/// The Rust halves of the functions above, on the system stack.
-///
-/// # Safety
-///
-/// Called only by those functions, with what generated code passed them.
-unsafe extern "C" fn concat_entry(
-    ctx: *const TaskContext,
-    a0: u64,
-    a1: u64,
-    b0: u64,
-    b1: u64,
-) -> TextWords {
-    // SAFETY: as the caller promises; both values are borrowed live ones.
-    unsafe {
-        let (heap, _) = worker_of(ctx);
-        let (a, b) = ([a0, a1], [b0, b1]);
-        let [w0, w1] = make_text(heap, &[bytes_of(&a), bytes_of(&b)]);
+system_stack_fn!(
+    /// `rt_text_show(ctx, word, number)`: see `crag_abi::RuntimeFn::TextShow`.
+    fn rt_text_show(ctx: *const TaskContext, word: u64, number: u64) -> TextWords {
+        let Some(number) = Number::from_code(number) else {
+            die(&format!("no number has the code {number}"));
+        };
+        let text = show_number(number, word);
+        // SAFETY: as the caller promises.
+        let (heap, _) = unsafe { worker_of(ctx) };
+        let [w0, w1] = make_text(heap, &[text.as_bytes()]);
         TextWords(w0, w1)
     }
-}
-
-/// See `concat_entry`.
-unsafe extern "C" fn equals_entry(
-    _ctx: *const TaskContext,
-    a0: u64,
-    a1: u64,
-    b0: u64,
-    b1: u64,
-) -> u64 {
-    // SAFETY: as the caller promises.
-    unsafe { u64::from(bytes_of(&[a0, a1]) == bytes_of(&[b0, b1])) }
-}
-
-/// See `concat_entry`.
-unsafe extern "C" fn utf8_entry(_ctx: *const TaskContext, w0: u64, w1: u64) -> u64 {
-    let words = [w0, w1];
-    // SAFETY: as the caller promises.
-    u64::from(std::str::from_utf8(unsafe { bytes_of(&words) }).is_ok())
-}
-
-/// See `concat_entry`.
-unsafe extern "C" fn show_entry(ctx: *const TaskContext, word: u64, number: u64) -> TextWords {
-    let Some(number) = Number::from_code(number) else {
-        die(&format!("no number has the code {number}"));
-    };
-    let text = show_number(number, word);
-    // SAFETY: as the caller promises.
-    let (heap, _) = unsafe { worker_of(ctx) };
-    let [w0, w1] = make_text(heap, &[text.as_bytes()]);
-    TextWords(w0, w1)
-}
+);
 
 #[cfg(test)]
 mod tests {

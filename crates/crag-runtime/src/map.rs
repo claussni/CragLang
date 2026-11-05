@@ -1091,7 +1091,7 @@ pub(crate) unsafe fn boxes_of(
     }
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_map_insert(ctx, map, k0, k1, v0, v1)`: see
     /// `crag_abi::RuntimeFn::MapInsert`.
     fn rt_map_insert(
@@ -1100,54 +1100,27 @@ system_stack_fn! {
         k0: u64,
         k1: u64,
         v0: u64,
-        v1: u64
-    ) -> *mut u8 => insert_entry
-}
+        v1: u64,
+    ) -> *mut u8 {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let (heap, types) = worker_of(ctx);
+            let value = crate::list::passed(value_layout(types, map), v0, v1);
+            insert(heap, types, map, &[k0, k1], &value)
+        }
+    }
+);
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_map_get(ctx, map, k0, k1)`: see `crag_abi::RuntimeFn::MapGet`.
-    fn rt_map_get(ctx: *const TaskContext, map: *mut u8, k0: u64, k1: u64) -> *mut u64
-        => get_entry
-}
-
-/// The Rust halves of the functions above, on the system stack.
-///
-/// # Safety
-///
-/// Called only by those functions, with what generated code passed them.
-unsafe extern "C" fn insert_entry(
-    ctx: *const TaskContext,
-    map: *mut u8,
-    k0: u64,
-    k1: u64,
-    v0: u64,
-    v1: u64,
-) -> *mut u8 {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let (heap, types) = worker_of(ctx);
-        let value = crate::list::passed(value_layout(types, map), v0, v1);
-        insert(heap, types, map, &[k0, k1], &value)
+    fn rt_map_get(ctx: *const TaskContext, map: *mut u8, k0: u64, k1: u64) -> *mut u64 {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let (_, types) = worker_of(ctx);
+            get(types, map, &[k0, k1])
+        }
     }
-}
-
-/// See `insert_entry`.
-///
-/// # Safety
-///
-/// See `insert_entry`.
-unsafe extern "C" fn get_entry(
-    ctx: *const TaskContext,
-    map: *mut u8,
-    k0: u64,
-    k1: u64,
-) -> *mut u64 {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let (_, types) = worker_of(ctx);
-        get(types, map, &[k0, k1])
-    }
-}
+);
 
 #[cfg(test)]
 mod tests {

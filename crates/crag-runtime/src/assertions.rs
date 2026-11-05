@@ -31,23 +31,20 @@ pub fn take_test_failures() -> Vec<(String, u64)> {
     std::mem::take(&mut *FAILURES.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_test_record(ctx, w0, w1, position)`: see
     /// `crag_abi::RuntimeFn::TestRecord`.
-    fn rt_test_record(ctx: *const TaskContext, w0: u64, w1: u64, position: u64) => record_entry
-}
-
-/// The Rust half of `rt_test_record`.
-///
-/// # Safety
-///
-/// Called only by `rt_test_record`, with a string the caller holds.
-unsafe extern "C" fn record_entry(_ctx: *const TaskContext, w0: u64, w1: u64, position: u64) {
-    let words = [w0, w1];
-    // SAFETY: as the caller promises.
-    let message = String::from_utf8_lossy(unsafe { bytes_of(&words) }).into_owned();
-    FAILURES
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((message, position));
-}
+    ///
+    /// # Safety
+    ///
+    /// The caller holds the string.
+    fn rt_test_record(_ctx: *const TaskContext, w0: u64, w1: u64, position: u64) {
+        let words = [w0, w1];
+        // SAFETY: as the caller promises.
+        let message = String::from_utf8_lossy(unsafe { bytes_of(&words) }).into_owned();
+        FAILURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((message, position));
+    }
+);

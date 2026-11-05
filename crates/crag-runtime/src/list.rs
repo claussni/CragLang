@@ -878,74 +878,40 @@ pub(crate) unsafe fn boxes_of(
     }
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_list_push(ctx, list, w0, w1)`: see `crag_abi::RuntimeFn::ListPush`.
-    fn rt_list_push(ctx: *const TaskContext, list: *mut u8, w0: u64, w1: u64) -> *mut u8
-        => push_entry
-}
+    fn rt_list_push(ctx: *const TaskContext, list: *mut u8, w0: u64, w1: u64) -> *mut u8 {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let (heap, types) = worker_of(ctx);
+            let words = passed(element(types, list), w0, w1);
+            push(heap, types, list, &words)
+        }
+    }
+);
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_list_elem(ctx, list, index)`: see `crag_abi::RuntimeFn::ListElem`.
-    fn rt_list_elem(ctx: *const TaskContext, list: *mut u8, index: u64) -> *mut u64
-        => elem_entry
-}
+    fn rt_list_elem(ctx: *const TaskContext, list: *mut u8, index: u64) -> *mut u64 {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let (_, types) = worker_of(ctx);
+            get(types, list, index as usize)
+        }
+    }
+);
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_list_slice(ctx, list, front, back)`: see
     /// `crag_abi::RuntimeFn::ListSlice`.
-    fn rt_list_slice(ctx: *const TaskContext, list: *mut u8, front: u64, back: u64) -> *mut u8
-        => slice_entry
-}
-
-/// The Rust halves of the functions above, on the system stack.
-///
-/// # Safety
-///
-/// Called only by those functions, with what generated code passed them.
-unsafe extern "C" fn push_entry(
-    ctx: *const TaskContext,
-    list: *mut u8,
-    w0: u64,
-    w1: u64,
-) -> *mut u8 {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let (heap, types) = worker_of(ctx);
-        let words = passed(element(types, list), w0, w1);
-        push(heap, types, list, &words)
+    fn rt_list_slice(ctx: *const TaskContext, list: *mut u8, front: u64, back: u64) -> *mut u8 {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let (heap, types) = worker_of(ctx);
+            slice(heap, types, list, front as usize, back as usize)
+        }
     }
-}
-
-/// See `push_entry`.
-///
-/// # Safety
-///
-/// See `push_entry`.
-unsafe extern "C" fn elem_entry(ctx: *const TaskContext, list: *mut u8, index: u64) -> *mut u64 {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let (_, types) = worker_of(ctx);
-        get(types, list, index as usize)
-    }
-}
-
-/// See `push_entry`.
-///
-/// # Safety
-///
-/// See `push_entry`.
-unsafe extern "C" fn slice_entry(
-    ctx: *const TaskContext,
-    list: *mut u8,
-    front: u64,
-    back: u64,
-) -> *mut u8 {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let (heap, types) = worker_of(ctx);
-        slice(heap, types, list, front as usize, back as usize)
-    }
-}
+);
 
 #[cfg(test)]
 mod tests {

@@ -235,7 +235,7 @@ impl Signals {
 ///
 /// # Safety
 ///
-/// Called by the Rust half of a runtime function for the fiber of `ctx`.
+/// Called by the body of a runtime function for the fiber of `ctx`.
 pub(crate) unsafe fn signals_of<'a>(ctx: &TaskContext) -> &'a mut Signals {
     // SAFETY: as the caller promises, a worker runs the fiber.
     unsafe { &mut (*ctx.fiber.load(Ordering::Relaxed)).signals }
@@ -246,206 +246,174 @@ pub(crate) fn stopped(fiber: &mut Fiber, heap: &mut Heap, types: &Types) {
     fiber.signals.clear(heap, types);
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_signal_emit(ctx, qualifier, list, w0, w1, info) -> status`: see
     /// `crag_abi::RuntimeFn::SignalEmit`.
-    fn rt_signal_emit(ctx: *const TaskContext, qualifier: u64, list: u64, w0: u64, w1: u64, info: u64) -> u64 => emit_entry
-}
-
-/// The Rust half of `rt_signal_emit`.
-///
-/// # Safety
-///
-/// Called only by `rt_signal_emit`, in a block, with a signal laid out as
-/// the elements of list type `list` whose references the caller owns.
-unsafe extern "C" fn emit_entry(
-    ctx: *const TaskContext,
-    qualifier: u64,
-    list: u64,
-    w0: u64,
-    w1: u64,
-    info: u64,
-) -> u64 {
-    // SAFETY: as the caller promises.
-    let signals = unsafe { signals_of(&*ctx) };
-    if signals.depth == 0 {
-        return SIGNAL_DELIVER;
+    ///
+    /// # Safety
+    ///
+    /// The caller is in a block, and the signal is laid out as the elements of list
+    /// type `list`, whose references the caller owns.
+    fn rt_signal_emit(
+        ctx: *const TaskContext,
+        qualifier: u64,
+        list: u64,
+        w0: u64,
+        w1: u64,
+        info: u64,
+    ) -> u64 {
+        // SAFETY: as the caller promises.
+        let signals = unsafe { signals_of(&*ctx) };
+        if signals.depth == 0 {
+            return SIGNAL_DELIVER;
+        }
+        signals.held.push(Held {
+            depth: signals.depth,
+            qualifier,
+            list,
+            words: [w0, w1],
+            info,
+        });
+        SIGNAL_HELD
     }
-    signals.held.push(Held {
-        depth: signals.depth,
-        qualifier,
-        list,
-        words: [w0, w1],
-        info,
-    });
-    SIGNAL_HELD
-}
+);
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_signal_next(ctx, out) -> list`: see
     /// `crag_abi::RuntimeFn::SignalNext`.
-    fn rt_signal_next(ctx: *const TaskContext, out: *mut u64) -> u64 => next_entry
-}
-
-/// The Rust half of `rt_signal_next`.
-///
-/// # Safety
-///
-/// Called only by `rt_signal_next`, with room for two words at `out`.
-unsafe extern "C" fn next_entry(ctx: *const TaskContext, out: *mut u64) -> u64 {
-    // SAFETY: as the caller promises.
-    let (signals, (heap, types)) = unsafe { (signals_of(&*ctx), worker_of(ctx)) };
-    if let Some((list, words)) = signals.taken.take() {
-        release(heap, types, list, words);
-    }
-    match signals.ready.pop_front() {
-        Some((list, words, info)) => {
-            // SAFETY: as the caller promises.
-            unsafe {
-                out.cast::<[u64; 3]>()
-                    .write_unaligned([words[0], words[1], info])
-            };
-            signals.taken = Some((list, words));
-            list
+    ///
+    /// # Safety
+    ///
+    /// There is room for two words at `out`.
+    fn rt_signal_next(ctx: *const TaskContext, out: *mut u64) -> u64 {
+        // SAFETY: as the caller promises.
+        let (signals, (heap, types)) = unsafe { (signals_of(&*ctx), worker_of(ctx)) };
+        if let Some((list, words)) = signals.taken.take() {
+            release(heap, types, list, words);
         }
-        None => SIGNAL_NONE,
+        match signals.ready.pop_front() {
+            Some((list, words, info)) => {
+                // SAFETY: as the caller promises.
+                unsafe {
+                    out.cast::<[u64; 3]>()
+                        .write_unaligned([words[0], words[1], info])
+                };
+                signals.taken = Some((list, words));
+                list
+            }
+            None => SIGNAL_NONE,
+        }
     }
-}
+);
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_signal_mark(ctx) -> mark`: see `crag_abi::RuntimeFn::SignalMark`.
-    fn rt_signal_mark(ctx: *const TaskContext) -> u64 => mark_entry
-}
+    fn rt_signal_mark(ctx: *const TaskContext) -> u64 {
+        // SAFETY: as the caller promises.
+        unsafe { signals_of(&*ctx) }.handlers.len() as u64
+    }
+);
 
-/// The Rust half of `rt_signal_mark`.
-///
-/// # Safety
-///
-/// Called only by `rt_signal_mark`.
-unsafe extern "C" fn mark_entry(ctx: *const TaskContext) -> u64 {
-    // SAFETY: as the caller promises.
-    unsafe { signals_of(&*ctx) }.handlers.len() as u64
-}
-
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_signal_reset(ctx, mark)`: see `crag_abi::RuntimeFn::SignalReset`.
-    fn rt_signal_reset(ctx: *const TaskContext, mark: u64) => reset_entry
-}
+    ///
+    /// # Safety
+    ///
+    /// `mark` is a mark of the fiber.
+    fn rt_signal_reset(ctx: *const TaskContext, mark: u64) {
+        // SAFETY: as the caller promises.
+        let signals = unsafe { signals_of(&*ctx) };
+        signals.handlers.truncate(mark as usize);
+    }
+);
 
-/// The Rust half of `rt_signal_reset`.
-///
-/// # Safety
-///
-/// Called only by `rt_signal_reset`, with a mark of the fiber.
-unsafe extern "C" fn reset_entry(ctx: *const TaskContext, mark: u64) {
-    // SAFETY: as the caller promises.
-    let signals = unsafe { signals_of(&*ctx) };
-    signals.handlers.truncate(mark as usize);
-}
-
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_signal_on(ctx, code, env, types, packed, base)`: see
     /// `crag_abi::RuntimeFn::SignalOn`.
-    fn rt_signal_on(ctx: *const TaskContext, code: u64, env: u64, types: u64, packed: u64, base: u64) => on_entry
-}
+    ///
+    /// # Safety
+    ///
+    /// The caller keeps the function value until it resets the fiber's handlers to
+    /// `base`, and the type indices are a sorted array in static data.
+    fn rt_signal_on(
+        ctx: *const TaskContext,
+        code: u64,
+        env: u64,
+        types: u64,
+        packed: u64,
+        base: u64,
+    ) {
+        // SAFETY: as the caller promises.
+        let signals = unsafe { signals_of(&*ctx) };
+        signals.handlers.push(Handler {
+            code,
+            env,
+            types: types as usize,
+            count: (packed >> 32) as usize,
+            specificity: ((packed >> 8) & 0xff_ffff) as u32,
+            words: packed & 0xff,
+            base: base as usize,
+        });
+    }
+);
 
-/// The Rust half of `rt_signal_on`.
-///
-/// # Safety
-///
-/// Called only by `rt_signal_on`, with a function value the caller keeps
-/// until it resets the fiber's handlers to `base`, and a sorted array of
-/// type indices in static data.
-unsafe extern "C" fn on_entry(
-    ctx: *const TaskContext,
-    code: u64,
-    env: u64,
-    types: u64,
-    packed: u64,
-    base: u64,
-) {
-    // SAFETY: as the caller promises.
-    let signals = unsafe { signals_of(&*ctx) };
-    signals.handlers.push(Handler {
-        code,
-        env,
-        types: types as usize,
-        count: (packed >> 32) as usize,
-        specificity: ((packed >> 8) & 0xff_ffff) as u32,
-        words: packed & 0xff,
-        base: base as usize,
-    });
-}
-
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_signal_find(ctx, index, out) -> found`: see
     /// `crag_abi::RuntimeFn::SignalFind`.
-    fn rt_signal_find(ctx: *const TaskContext, index: u64, out: *mut u64) -> u64 => find_entry
-}
+    ///
+    /// # Safety
+    ///
+    /// There is room for three words at `out`.
+    fn rt_signal_find(ctx: *const TaskContext, index: u64, out: *mut u64) -> u64 {
+        // SAFETY: as the caller promises.
+        let signals = unsafe { signals_of(&*ctx) };
+        let index = index as u32;
+        let visible = |k: usize| !signals.is_hidden(k);
+        let Some(innermost) = (0..signals.handlers.len())
+            .rev()
+            .find(|&k| visible(k) && signals.handlers[k].takes(index))
+        else {
+            return 0;
+        };
+        // The most specific of the block's handlers that take it.
+        let base = signals.handlers[innermost].base;
+        let chosen = (base..signals.handlers.len())
+            .filter(|&k| {
+                visible(k) && signals.handlers[k].base == base && signals.handlers[k].takes(index)
+            })
+            .max_by_key(|&k| (signals.handlers[k].specificity, k))
+            .unwrap_or(innermost);
+        let handler = signals.handlers[chosen];
+        signals.hidden.push((base, signals.handlers.len()));
+        // SAFETY: as the caller promises.
+        unsafe {
+            out.cast::<[u64; 3]>()
+                .write_unaligned([handler.code, handler.env, handler.words])
+        };
+        1
+    }
+);
 
-/// The Rust half of `rt_signal_find`.
-///
-/// # Safety
-///
-/// Called only by `rt_signal_find`, with room for three words at `out`.
-unsafe extern "C" fn find_entry(ctx: *const TaskContext, index: u64, out: *mut u64) -> u64 {
-    // SAFETY: as the caller promises.
-    let signals = unsafe { signals_of(&*ctx) };
-    let index = index as u32;
-    let visible = |k: usize| !signals.is_hidden(k);
-    let Some(innermost) = (0..signals.handlers.len())
-        .rev()
-        .find(|&k| visible(k) && signals.handlers[k].takes(index))
-    else {
-        return 0;
-    };
-    // The most specific of the block's handlers that take it.
-    let base = signals.handlers[innermost].base;
-    let chosen = (base..signals.handlers.len())
-        .filter(|&k| {
-            visible(k) && signals.handlers[k].base == base && signals.handlers[k].takes(index)
-        })
-        .max_by_key(|&k| (signals.handlers[k].specificity, k))
-        .unwrap_or(innermost);
-    let handler = signals.handlers[chosen];
-    signals.hidden.push((base, signals.handlers.len()));
-    // SAFETY: as the caller promises.
-    unsafe {
-        out.cast::<[u64; 3]>()
-            .write_unaligned([handler.code, handler.env, handler.words])
-    };
-    1
-}
-
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_signal_leave(ctx)`: see `crag_abi::RuntimeFn::SignalLeave`.
-    fn rt_signal_leave(ctx: *const TaskContext) => leave_entry
-}
+    fn rt_signal_leave(ctx: *const TaskContext) {
+        // SAFETY: as the caller promises.
+        unsafe { signals_of(&*ctx) }.hidden.pop();
+    }
+);
 
-/// The Rust half of `rt_signal_leave`.
-///
-/// # Safety
-///
-/// Called only by `rt_signal_leave`.
-unsafe extern "C" fn leave_entry(ctx: *const TaskContext) {
-    // SAFETY: as the caller promises.
-    unsafe { signals_of(&*ctx) }.hidden.pop();
-}
-
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_signal_default(ctx, name, len)`: see
     /// `crag_abi::RuntimeFn::SignalDefault`.
-    fn rt_signal_default(ctx: *const TaskContext, name: *const u8, len: u64) => default_entry
-}
-
-/// The Rust half of `rt_signal_default`: the root's handler.
-///
-/// # Safety
-///
-/// Called only by `rt_signal_default`, with `len` bytes of UTF-8 at
-/// `name`.
-unsafe extern "C" fn default_entry(_ctx: *const TaskContext, name: *const u8, len: u64) {
-    // SAFETY: as the caller promises.
-    let name = unsafe { std::slice::from_raw_parts(name, len as usize) };
-    eprintln!("signal: {}", String::from_utf8_lossy(name));
-}
+    ///
+    /// The root's handler.
+    ///
+    /// # Safety
+    ///
+    /// `name` holds `len` bytes of UTF-8.
+    fn rt_signal_default(_ctx: *const TaskContext, name: *const u8, len: u64) {
+        // SAFETY: as the caller promises.
+        let name = unsafe { std::slice::from_raw_parts(name, len as usize) };
+        eprintln!("signal: {}", String::from_utf8_lossy(name));
+    }
+);

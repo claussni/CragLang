@@ -138,73 +138,71 @@ pub fn release_all() {
     }
 }
 
-suspending_fn! {
+suspending_fn!(
     /// `rt_step(ctx, cell, words, count, fp, inlined)`: see
     /// `crag_abi::RuntimeFn::Step`.
-    fn rt_step(ctx: *const TaskContext, cell: *const u64, words: *const u64, count: u64, fp: u64, inlined: u64) => step_entry
-}
-
-/// The Rust half of `rt_step`: stops the task if it is to.
-///
-/// # Safety
-///
-/// Called only by `rt_step`: `cell` is a step's cell, `words` holds
-/// `count` words in the calling frame, whose frame pointer is `fp`, on the
-/// fiber of `ctx`.
-unsafe extern "C" fn step_entry(
-    ctx: *const TaskContext,
-    cell: *const u64,
-    words: *const u64,
-    count: u64,
-    fp: u64,
-    inlined: u64,
-) {
-    // SAFETY: as the caller promises.
-    let ctx_ref = unsafe { &*ctx };
-    let task = ctx as u64;
-    // SAFETY: a step's cell has its name in its second word.
-    let word = unsafe { std::ptr::read_volatile(cell.add(1)) };
-    let (func, step) = crag_abi::step_of_cell_word(word);
-    // SAFETY: a worker runs the fiber of `ctx`.
-    let top = unsafe {
-        (*ctx_ref.fiber.load(std::sync::atomic::Ordering::Relaxed))
-            .stack
-            .top()
-    };
-    // Code inlined into the frame is deeper than the frame's own: frames
-    // lie at least 16 bytes apart, and inlined calls nest less deeply.
-    let depth = top.saturating_sub(fp as usize) + inlined as usize;
-    let mut state = state();
-    let stop = state.breaks.contains(&(func, step))
-        || match state.stepping.get(&task) {
-            Some((Resume::Into, _)) => true,
-            Some((Resume::Over, from)) => depth <= *from,
-            Some((Resume::Out, from)) => depth < *from,
-            Some((Resume::Continue, _)) | None => false,
+    ///
+    /// Stops the task if it is to.
+    ///
+    /// # Safety
+    ///
+    /// `cell` is a step's cell, and `words` holds `count` words in the calling
+    /// frame, whose frame pointer is `fp`, on the fiber of `ctx`.
+    fn rt_step(
+        ctx: *const TaskContext,
+        cell: *const u64,
+        words: *const u64,
+        count: u64,
+        fp: u64,
+        inlined: u64,
+    ) {
+        // SAFETY: as the caller promises.
+        let ctx_ref = unsafe { &*ctx };
+        let task = ctx as u64;
+        // SAFETY: a step's cell has its name in its second word.
+        let word = unsafe { std::ptr::read_volatile(cell.add(1)) };
+        let (func, step) = crag_abi::step_of_cell_word(word);
+        // SAFETY: a worker runs the fiber of `ctx`.
+        let top = unsafe {
+            (*ctx_ref.fiber.load(std::sync::atomic::Ordering::Relaxed))
+                .stack
+                .top()
         };
-    if !stop {
-        return;
+        // Code inlined into the frame is deeper than the frame's own: frames
+        // lie at least 16 bytes apart, and inlined calls nest less deeply.
+        let depth = top.saturating_sub(fp as usize) + inlined as usize;
+        let mut state = state();
+        let stop = state.breaks.contains(&(func, step))
+            || match state.stepping.get(&task) {
+                Some((Resume::Into, _)) => true,
+                Some((Resume::Over, from)) => depth <= *from,
+                Some((Resume::Out, from)) => depth < *from,
+                Some((Resume::Continue, _)) | None => false,
+            };
+        if !stop {
+            return;
+        }
+        state.stepping.remove(&task);
+        // SAFETY: as the caller promises.
+        let words = unsafe { std::slice::from_raw_parts(words, count as usize) }.to_vec();
+        // SAFETY: the worker's code map stays while it runs the fiber.
+        let callers = unsafe {
+            let worker: *mut Worker = ctx_ref.worker.load(std::sync::atomic::Ordering::Relaxed);
+            crate::unwind::callers(Worker::code(worker), fp as usize)
+        };
+        // SAFETY: called by the body of a suspending function, for its
+        // fiber.
+        let fiber = unsafe { suspend(ctx_ref, WaitReason::Debug) };
+        state.stopped.push(Stopped {
+            paused: Paused {
+                task,
+                func,
+                step,
+                words,
+                callers,
+            },
+            depth,
+            fiber,
+        });
     }
-    state.stepping.remove(&task);
-    // SAFETY: as the caller promises.
-    let words = unsafe { std::slice::from_raw_parts(words, count as usize) }.to_vec();
-    // SAFETY: the worker's code map stays while it runs the fiber.
-    let callers = unsafe {
-        let worker: *mut Worker = ctx_ref.worker.load(std::sync::atomic::Ordering::Relaxed);
-        crate::unwind::callers(Worker::code(worker), fp as usize)
-    };
-    // SAFETY: called by the Rust half of a suspending function, for its
-    // fiber.
-    let fiber = unsafe { suspend(ctx_ref, WaitReason::Debug) };
-    state.stopped.push(Stopped {
-        paused: Paused {
-            task,
-            func,
-            step,
-            words,
-            callers,
-        },
-        depth,
-        fiber,
-    });
-}
+);

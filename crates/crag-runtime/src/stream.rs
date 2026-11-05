@@ -352,49 +352,42 @@ fn end(chan: Arc<Channel>, role: Role, closed: bool) -> u64 {
     Box::into_raw(Box::new(End { chan, role, closed })) as u64
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_stream_new(ctx, capacity, list) -> (sink, source)`: see
     /// `crag_abi::RuntimeFn::StreamNew`.
-    fn rt_stream_new(ctx: *const TaskContext, capacity: u64, list: u64) -> Words => new_entry
-}
-
-/// The Rust half of `rt_stream_new`.
-///
-/// # Safety
-///
-/// Called only by `rt_stream_new`.
-unsafe extern "C" fn new_entry(ctx: *const TaskContext, capacity: u64, list: u64) -> Words {
-    // SAFETY: as the caller promises.
-    let (_, types) = unsafe { worker_of(ctx) };
-    let chan = Arc::new(Channel::new(
-        Kind::Stream,
-        capacity as usize,
-        types.cell_of(list).clone(),
-    ));
-    {
-        let mut state = chan.state.lock().unwrap();
-        state.producers = 1;
-        state.sealed = true;
-        state.consumers.insert(
-            0,
-            Consumer {
-                queue: VecDeque::new(),
-                waiter: None,
-            },
-        );
-        state.next_id = 1;
+    fn rt_stream_new(ctx: *const TaskContext, capacity: u64, list: u64) -> Words {
+        // SAFETY: as the caller promises.
+        let (_, types) = unsafe { worker_of(ctx) };
+        let chan = Arc::new(Channel::new(
+            Kind::Stream,
+            capacity as usize,
+            types.cell_of(list).clone(),
+        ));
+        {
+            let mut state = chan.state.lock().unwrap();
+            state.producers = 1;
+            state.sealed = true;
+            state.consumers.insert(
+                0,
+                Consumer {
+                    queue: VecDeque::new(),
+                    waiter: None,
+                },
+            );
+            state.next_id = 1;
+        }
+        let sink = end(chan.clone(), Role::Producer, false);
+        let source = end(chan, Role::Consumer(0), false);
+        Words(sink, source)
     }
-    let sink = end(chan.clone(), Role::Producer, false);
-    let source = end(chan, Role::Consumer(0), false);
-    Words(sink, source)
-}
+);
 
 /// Puts a value from the sink at `end`: its status, or none when the
 /// fiber suspends with it.
 ///
 /// # Safety
 ///
-/// Called by the Rust half of a runtime function for the fiber of `ctx`,
+/// Called by the body of a runtime function for the fiber of `ctx`,
 /// with a sink that has not been disposed.
 unsafe fn put(ctx: &TaskContext, end: *mut End, value: Value, wait: bool) -> Option<u64> {
     // SAFETY: as the caller promises.
@@ -459,179 +452,160 @@ unsafe fn put(ctx: &TaskContext, end: *mut End, value: Value, wait: bool) -> Opt
     status
 }
 
-suspending_fn! {
+suspending_fn!(
     /// `rt_stream_put(ctx, sink, w0, w1) -> status`: see
     /// `crag_abi::RuntimeFn::StreamPut`.
-    fn rt_stream_put(ctx: *const TaskContext, end: *mut End, w0: u64, w1: u64) -> u64 => put_entry
-}
+    ///
+    /// Suspends while there is no room.
+    ///
+    /// # Safety
+    ///
+    /// The sink has not been disposed.
+    fn rt_stream_put(ctx: *const TaskContext, end: *mut End, w0: u64, w1: u64) -> u64 {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let ctx = &*ctx;
+            if stop_if_due(ctx) {
+                return 0;
+            }
+            // The wake gives the status of a put that waits.
+            put(ctx, end, [w0, w1], true).unwrap_or(0)
+        }
+    }
+);
 
-/// The Rust half of `rt_stream_put`: suspends while there is no room.
-///
-/// # Safety
-///
-/// Called only by `rt_stream_put`, with a sink that has not been disposed.
-unsafe extern "C" fn put_entry(ctx: *const TaskContext, end: *mut End, w0: u64, w1: u64) -> u64 {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let ctx = &*ctx;
+system_stack_fn!(
+    /// `rt_stream_try_put(ctx, sink, w0, w1) -> status`: see
+    /// `crag_abi::RuntimeFn::StreamTryPut`.
+    ///
+    /// # Safety
+    ///
+    /// The sink has not been disposed.
+    fn rt_stream_try_put(ctx: *const TaskContext, end: *mut End, w0: u64, w1: u64) -> u64 {
+        // SAFETY: as the caller promises; a put that does not wait gives a
+        // status.
+        unsafe { put(&*ctx, end, [w0, w1], false).expect("a status") }
+    }
+);
+
+suspending_fn!(
+    /// `rt_stream_next(ctx, source, out) -> status`: see
+    /// `crag_abi::RuntimeFn::StreamNext`.
+    ///
+    /// Suspends while there is no value.
+    ///
+    /// # Safety
+    ///
+    /// The source has not been disposed, and there is a place for a value at `out`.
+    fn rt_stream_next(ctx: *const TaskContext, end: *mut End, out: *mut u64) -> u64 {
+        // SAFETY: as the caller promises.
+        let (ctx, end, (heap, types)) = unsafe { (&*ctx, &*end, worker_of(ctx)) };
         if stop_if_due(ctx) {
             return 0;
         }
-        // The wake gives the status of a put that waits.
-        put(ctx, end, [w0, w1], true).unwrap_or(0)
-    }
-}
-
-system_stack_fn! {
-    /// `rt_stream_try_put(ctx, sink, w0, w1) -> status`: see
-    /// `crag_abi::RuntimeFn::StreamTryPut`.
-    fn rt_stream_try_put(ctx: *const TaskContext, end: *mut End, w0: u64, w1: u64) -> u64 => try_put_entry
-}
-
-/// The Rust half of `rt_stream_try_put`.
-///
-/// # Safety
-///
-/// Called only by `rt_stream_try_put`, with a sink that has not been
-/// disposed.
-unsafe extern "C" fn try_put_entry(
-    ctx: *const TaskContext,
-    end: *mut End,
-    w0: u64,
-    w1: u64,
-) -> u64 {
-    // SAFETY: as the caller promises; a put that does not wait gives a
-    // status.
-    unsafe { put(&*ctx, end, [w0, w1], false).expect("a status") }
-}
-
-suspending_fn! {
-    /// `rt_stream_next(ctx, source, out) -> status`: see
-    /// `crag_abi::RuntimeFn::StreamNext`.
-    fn rt_stream_next(ctx: *const TaskContext, end: *mut End, out: *mut u64) -> u64 => next_entry
-}
-
-/// The Rust half of `rt_stream_next`: suspends while there is no value.
-///
-/// # Safety
-///
-/// Called only by `rt_stream_next`, with a source that has not been
-/// disposed and a place for a value at `out`.
-unsafe extern "C" fn next_entry(ctx: *const TaskContext, end: *mut End, out: *mut u64) -> u64 {
-    // SAFETY: as the caller promises.
-    let (ctx, end, (heap, types)) = unsafe { (&*ctx, &*end, worker_of(ctx)) };
-    if stop_if_due(ctx) {
-        return 0;
-    }
-    if end.closed {
-        return STREAM_CLOSED;
-    }
-    let Role::Consumer(id) = end.role else {
-        die("took a value from a sink");
-    };
-    let chan = &*end.chan;
-    let mut wakes = Wakes::new();
-    let mut state = chan.state.lock().unwrap();
-    let status = 'next: {
-        let value = match chan.kind {
-            Kind::Broadcast => state
-                .consumers
-                .get_mut(&id)
-                .expect("a consumer")
-                .queue
-                .pop_front(),
-            _ => state.queue.pop_front(),
+        if end.closed {
+            return STREAM_CLOSED;
+        }
+        let Role::Consumer(id) = end.role else {
+            die("took a value from a sink");
         };
-        if let Some(value) = value {
-            chan.give(out, value);
-            chan.admit(&mut state, heap, types, &mut wakes);
-            break 'next Some(STREAM_OK);
-        }
-        if chan.kind != Kind::Broadcast
-            && let Some(p) = state.pending.pop_front()
-        {
-            // A hand-off from a waiting put.
-            chan.give(out, p.value);
-            wakes.push((p.fiber, STREAM_OK));
-            break 'next Some(STREAM_OK);
-        }
-        if chan.kind != Kind::Broadcast && state.released > 0 {
-            state.released -= 1;
-            break 'next Some(STREAM_CLOSED);
-        }
-        if let Some(status) = Channel::ended(&state) {
-            break 'next Some(status);
-        }
-        // SAFETY: as the caller promises.
-        if unsafe { scheduler_of(ctx) }.is_none() {
-            raise(ctx, TrapKind::Unsupported, None);
-            break 'next Some(0);
-        }
-        let token = state.next_id;
-        state.next_id += 1;
-        // SAFETY: as the caller promises.
-        let fiber = unsafe { suspend(ctx, WaitReason::Stream) };
-        state.consumers.get_mut(&id).expect("a consumer").waiter =
-            Some(Waiter { fiber, out, token });
-        if chan.kind == Kind::Broadcast {
-            // Waiting may let a hand-off through.
-            chan.admit(&mut state, heap, types, &mut wakes);
-        } else {
-            state.waiting.push_back(id);
-        }
+        let chan = &*end.chan;
+        let mut wakes = Wakes::new();
+        let mut state = chan.state.lock().unwrap();
+        let status = 'next: {
+            let value = match chan.kind {
+                Kind::Broadcast => state
+                    .consumers
+                    .get_mut(&id)
+                    .expect("a consumer")
+                    .queue
+                    .pop_front(),
+                _ => state.queue.pop_front(),
+            };
+            if let Some(value) = value {
+                chan.give(out, value);
+                chan.admit(&mut state, heap, types, &mut wakes);
+                break 'next Some(STREAM_OK);
+            }
+            if chan.kind != Kind::Broadcast
+                && let Some(p) = state.pending.pop_front()
+            {
+                // A hand-off from a waiting put.
+                chan.give(out, p.value);
+                wakes.push((p.fiber, STREAM_OK));
+                break 'next Some(STREAM_OK);
+            }
+            if chan.kind != Kind::Broadcast && state.released > 0 {
+                state.released -= 1;
+                break 'next Some(STREAM_CLOSED);
+            }
+            if let Some(status) = Channel::ended(&state) {
+                break 'next Some(status);
+            }
+            // SAFETY: as the caller promises.
+            if unsafe { scheduler_of(ctx) }.is_none() {
+                raise(ctx, TrapKind::Unsupported, None);
+                break 'next Some(0);
+            }
+            let token = state.next_id;
+            state.next_id += 1;
+            // SAFETY: as the caller promises.
+            let fiber = unsafe { suspend(ctx, WaitReason::Stream) };
+            state.consumers.get_mut(&id).expect("a consumer").waiter =
+                Some(Waiter { fiber, out, token });
+            if chan.kind == Kind::Broadcast {
+                // Waiting may let a hand-off through.
+                chan.admit(&mut state, heap, types, &mut wakes);
+            } else {
+                state.waiting.push_back(id);
+            }
+            drop(state);
+            wake_all(wakes);
+            wait_for(
+                ctx,
+                Waiting::Stream {
+                    chan: end.chan.clone(),
+                    token,
+                },
+            );
+            return 0;
+        };
         drop(state);
         wake_all(wakes);
-        wait_for(
-            ctx,
-            Waiting::Stream {
-                chan: end.chan.clone(),
-                token,
-            },
-        );
-        return 0;
-    };
-    drop(state);
-    wake_all(wakes);
-    status.expect("a status")
-}
+        status.expect("a status")
+    }
+);
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_stream_close(ctx, end)`: see `crag_abi::RuntimeFn::StreamClose`.
-    fn rt_stream_close(ctx: *const TaskContext, end: *mut End) => close_entry
-}
-
-/// The Rust half of `rt_stream_close`.
-///
-/// # Safety
-///
-/// Called only by `rt_stream_close`, with an end that has not been
-/// disposed.
-unsafe extern "C" fn close_entry(ctx: *const TaskContext, end: *mut End) {
-    // SAFETY: as the caller promises.
-    let (end, (heap, types)) = unsafe { (&mut *end, worker_of(ctx)) };
-    if !end.closed {
-        end.closed = true;
-        end.chan.leave(&end.role, true, heap, types);
+    ///
+    /// # Safety
+    ///
+    /// The end has not been disposed.
+    fn rt_stream_close(ctx: *const TaskContext, end: *mut End) {
+        // SAFETY: as the caller promises.
+        let (end, (heap, types)) = unsafe { (&mut *end, worker_of(ctx)) };
+        if !end.closed {
+            end.closed = true;
+            end.chan.leave(&end.role, true, heap, types);
+        }
     }
-}
+);
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_stream_dispose(ctx, end)`: see `crag_abi::RuntimeFn::StreamDispose`.
-    fn rt_stream_dispose(ctx: *const TaskContext, end: *mut End) => dispose_entry
-}
-
-/// The Rust half of `rt_stream_dispose`.
-///
-/// # Safety
-///
-/// Called only by `rt_stream_dispose`, once for each end.
-unsafe extern "C" fn dispose_entry(ctx: *const TaskContext, end: *mut End) {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let (heap, types) = worker_of(ctx);
-        dispose(end as u64, heap, types);
+    ///
+    /// # Safety
+    ///
+    /// Called once for each end.
+    fn rt_stream_dispose(ctx: *const TaskContext, end: *mut End) {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let (heap, types) = worker_of(ctx);
+            dispose(end as u64, heap, types);
+        }
     }
-}
+);
 
 /// Disposes of an end, as `rt_stream_dispose` does: for the box of a
 /// `RuntimeStream` being freed.
@@ -647,33 +621,21 @@ pub(crate) unsafe fn dispose(end: u64, heap: &mut Heap, types: &Types) {
     }
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_hub_new(ctx, capacity, list, kind) -> hub`: see
     /// `crag_abi::RuntimeFn::HubNew`.
-    fn rt_hub_new(ctx: *const TaskContext, capacity: u64, list: u64, kind: u64) -> u64 => hub_new_entry
-}
-
-/// The Rust half of `rt_hub_new`.
-///
-/// # Safety
-///
-/// Called only by `rt_hub_new`.
-unsafe extern "C" fn hub_new_entry(
-    ctx: *const TaskContext,
-    capacity: u64,
-    list: u64,
-    kind: u64,
-) -> u64 {
-    // SAFETY: as the caller promises.
-    let (_, types) = unsafe { worker_of(ctx) };
-    let kind = if kind == HUB_BROADCAST {
-        Kind::Broadcast
-    } else {
-        Kind::FanOut
-    };
-    let chan = Channel::new(kind, capacity as usize, types.cell_of(list).clone());
-    Arc::into_raw(Arc::new(chan)) as u64
-}
+    fn rt_hub_new(ctx: *const TaskContext, capacity: u64, list: u64, kind: u64) -> u64 {
+        // SAFETY: as the caller promises.
+        let (_, types) = unsafe { worker_of(ctx) };
+        let kind = if kind == HUB_BROADCAST {
+            Kind::Broadcast
+        } else {
+            Kind::FanOut
+        };
+        let chan = Channel::new(kind, capacity as usize, types.cell_of(list).clone());
+        Arc::into_raw(Arc::new(chan)) as u64
+    }
+);
 
 /// The hub behind the word generated code holds.
 ///
@@ -698,54 +660,48 @@ unsafe fn hub_arc(hub: *const Channel) -> Arc<Channel> {
     }
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_hub_sink(ctx, hub) -> sink`: see `crag_abi::RuntimeFn::HubSink`.
-    fn rt_hub_sink(ctx: *const TaskContext, hub: *const Channel) -> u64 => hub_sink_entry
-}
-
-/// The Rust half of `rt_hub_sink`.
-///
-/// # Safety
-///
-/// Called only by `rt_hub_sink`, with a hub that has not been dropped.
-unsafe extern "C" fn hub_sink_entry(_: *const TaskContext, ptr: *const Channel) -> u64 {
-    // SAFETY: as the caller promises.
-    let chan = unsafe { hub_arc(ptr) };
-    let mut state = chan.state.lock().unwrap();
-    let sealed = state.sealed;
-    if !sealed {
-        state.producers += 1;
+    ///
+    /// # Safety
+    ///
+    /// The hub has not been dropped.
+    fn rt_hub_sink(_ctx: *const TaskContext, ptr: *const Channel) -> u64 {
+        // SAFETY: as the caller promises.
+        let chan = unsafe { hub_arc(ptr) };
+        let mut state = chan.state.lock().unwrap();
+        let sealed = state.sealed;
+        if !sealed {
+            state.producers += 1;
+        }
+        drop(state);
+        end(chan, Role::Producer, sealed)
     }
-    drop(state);
-    end(chan, Role::Producer, sealed)
-}
+);
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_hub_source(ctx, hub) -> source`: see `crag_abi::RuntimeFn::HubSource`.
-    fn rt_hub_source(ctx: *const TaskContext, hub: *const Channel) -> u64 => hub_source_entry
-}
-
-/// The Rust half of `rt_hub_source`.
-///
-/// # Safety
-///
-/// Called only by `rt_hub_source`, with a hub that has not been dropped.
-unsafe extern "C" fn hub_source_entry(_: *const TaskContext, ptr: *const Channel) -> u64 {
-    // SAFETY: as the caller promises.
-    let chan = unsafe { hub_arc(ptr) };
-    let mut state = chan.state.lock().unwrap();
-    let id = state.next_id;
-    state.next_id += 1;
-    state.consumers.insert(
-        id,
-        Consumer {
-            queue: VecDeque::new(),
-            waiter: None,
-        },
-    );
-    drop(state);
-    end(chan, Role::Consumer(id), false)
-}
+    ///
+    /// # Safety
+    ///
+    /// The hub has not been dropped.
+    fn rt_hub_source(_ctx: *const TaskContext, ptr: *const Channel) -> u64 {
+        // SAFETY: as the caller promises.
+        let chan = unsafe { hub_arc(ptr) };
+        let mut state = chan.state.lock().unwrap();
+        let id = state.next_id;
+        state.next_id += 1;
+        state.consumers.insert(
+            id,
+            Consumer {
+                queue: VecDeque::new(),
+                waiter: None,
+            },
+        );
+        drop(state);
+        end(chan, Role::Consumer(id), false)
+    }
+);
 
 /// Seals a hub, waking its waiting consumers if the producers are gone.
 fn seal(state: &mut State, wakes: &mut Wakes) {
@@ -753,70 +709,61 @@ fn seal(state: &mut State, wakes: &mut Wakes) {
     Channel::end_waiting(state, wakes);
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_hub_seal(ctx, hub)`: see `crag_abi::RuntimeFn::HubSeal`.
-    fn rt_hub_seal(ctx: *const TaskContext, hub: *const Channel) => hub_seal_entry
-}
+    ///
+    /// # Safety
+    ///
+    /// The hub has not been dropped.
+    fn rt_hub_seal(_ctx: *const TaskContext, ptr: *const Channel) {
+        // SAFETY: as the caller promises.
+        let chan = unsafe { hub(ptr) };
+        let mut wakes = Wakes::new();
+        seal(&mut chan.state.lock().unwrap(), &mut wakes);
+        wake_all(wakes);
+    }
+);
 
-/// The Rust half of `rt_hub_seal`.
-///
-/// # Safety
-///
-/// Called only by `rt_hub_seal`, with a hub that has not been dropped.
-unsafe extern "C" fn hub_seal_entry(_: *const TaskContext, ptr: *const Channel) {
-    // SAFETY: as the caller promises.
-    let chan = unsafe { hub(ptr) };
-    let mut wakes = Wakes::new();
-    seal(&mut chan.state.lock().unwrap(), &mut wakes);
-    wake_all(wakes);
-}
-
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_hub_release(ctx, hub, n)`: see `crag_abi::RuntimeFn::HubRelease`.
-    fn rt_hub_release(ctx: *const TaskContext, hub: *const Channel, n: u64) => hub_release_entry
-}
+    ///
+    /// # Safety
+    ///
+    /// The hub has not been dropped.
+    fn rt_hub_release(_ctx: *const TaskContext, ptr: *const Channel, n: u64) {
+        // SAFETY: as the caller promises.
+        let chan = unsafe { hub(ptr) };
+        let mut wakes = Wakes::new();
+        let mut state = chan.state.lock().unwrap();
+        let mut n = n as usize;
+        while n > 0
+            && let Some(id) = state.waiting.pop_front()
+        {
+            if let Some(waiter) = state.consumers.get_mut(&id).and_then(|c| c.waiter.take()) {
+                wakes.push((waiter.fiber, STREAM_CLOSED));
+                n -= 1;
+            }
+        }
+        state.released += n;
+        drop(state);
+        wake_all(wakes);
+    }
+);
 
-/// The Rust half of `rt_hub_release`.
-///
-/// # Safety
-///
-/// Called only by `rt_hub_release`, with a hub that has not been dropped.
-unsafe extern "C" fn hub_release_entry(_: *const TaskContext, ptr: *const Channel, n: u64) {
-    // SAFETY: as the caller promises.
-    let chan = unsafe { hub(ptr) };
-    let mut wakes = Wakes::new();
-    let mut state = chan.state.lock().unwrap();
-    let mut n = n as usize;
-    while n > 0
-        && let Some(id) = state.waiting.pop_front()
-    {
-        if let Some(waiter) = state.consumers.get_mut(&id).and_then(|c| c.waiter.take()) {
-            wakes.push((waiter.fiber, STREAM_CLOSED));
-            n -= 1;
+system_stack_fn!(
+    /// `rt_hub_drop(ctx, hub)`: see `crag_abi::RuntimeFn::HubDrop`.
+    ///
+    /// # Safety
+    ///
+    /// Called once, for the word `rt_hub_new` gave.
+    fn rt_hub_drop(ctx: *const TaskContext, ptr: *const Channel) {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let (heap, types) = worker_of(ctx);
+            drop_hub(ptr as u64, heap, types);
         }
     }
-    state.released += n;
-    drop(state);
-    wake_all(wakes);
-}
-
-system_stack_fn! {
-    /// `rt_hub_drop(ctx, hub)`: see `crag_abi::RuntimeFn::HubDrop`.
-    fn rt_hub_drop(ctx: *const TaskContext, hub: *const Channel) => hub_drop_entry
-}
-
-/// The Rust half of `rt_hub_drop`.
-///
-/// # Safety
-///
-/// Called only by `rt_hub_drop`, once for the word `rt_hub_new` gave.
-unsafe extern "C" fn hub_drop_entry(ctx: *const TaskContext, ptr: *const Channel) {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let (heap, types) = worker_of(ctx);
-        drop_hub(ptr as u64, heap, types);
-    }
-}
+);
 
 /// Gives up a hub's handle, as `rt_hub_drop` does: for the box of a
 /// `RuntimeHub` being freed.

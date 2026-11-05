@@ -307,27 +307,6 @@ pub(crate) struct Waiter {
 // suspended until the waiter wakes it, and only the waiter writes them.
 unsafe impl Send for Waiter {}
 
-suspending_fn! {
-    /// `rt_transport_run(ctx, scratch, x0, x1, i0, i1) -> status`: see
-    /// `crag_abi::RuntimeFn::TransportRun`.
-    fn rt_transport_run(ctx: *const TaskContext, scratch: *mut u64, x0: u64, x1: u64, i0: u64, i1: u64) -> u64
-        => run_entry
-}
-
-system_stack_fn! {
-    /// `rt_transport_encode(ctx, scratch, env, stamp) -> status`: see
-    /// `crag_abi::RuntimeFn::TransportEncode`.
-    fn rt_transport_encode(ctx: *const TaskContext, scratch: *mut u64, env: u64, stamp: u64) -> u64
-        => encode_entry
-}
-
-system_stack_fn! {
-    /// `rt_transport_decode(ctx, scratch, x0, x1, b0, b1) -> status`: see
-    /// `crag_abi::RuntimeFn::TransportDecode`.
-    fn rt_transport_decode(ctx: *const TaskContext, scratch: *mut u64, x0: u64, x1: u64, b0: u64, b1: u64) -> u64
-        => decode_entry
-}
-
 /// The accepting policy in the first scratch word, and whether the
 /// caller emitted the signals of mismatched callees.
 fn accept_of(word: u64) -> (Accept, bool) {
@@ -344,7 +323,7 @@ fn accept_of(word: u64) -> (Accept, bool) {
 ///
 /// # Safety
 ///
-/// As `run_entry`'s.
+/// As `rt_transport_run`'s.
 unsafe fn receiver_of(
     ctx: &TaskContext,
     scratch: *mut u64,
@@ -372,278 +351,288 @@ unsafe fn receiver_of(
     }
 }
 
-/// The Rust half of `rt_transport_run`.
-///
-/// # Safety
-///
-/// Called only by `rt_transport_run`, with scratch words as it describes
-/// them, the environment of a live `Expr` and the words of an input of the
-/// type the code expects, which the caller holds across the call.
-unsafe extern "C" fn run_entry(
-    ctx: *const TaskContext,
-    scratch: *mut u64,
-    x0: u64,
-    x1: u64,
-    i0: u64,
-    i1: u64,
-) -> u64 {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let ctx = &*ctx;
-        let word = |i: usize| scratch.add(i).read();
-        let (accept, emitted) = accept_of(word(0));
-        let env = word(3) as *mut u8;
-        let tree = pair(env, TREE_AT);
-        let expected = [x0, x1];
-        let (_, types) = worker_of(ctx);
-        let (shared, receiver) = match receiver_of(ctx, scratch) {
-            Ok(found) => found,
-            Err(status) => return status,
-        };
-        // Code that arrived under a budget takes its limits from it too.
-        let budget = env.add(BUDGET_AT).cast::<u64>().read();
-        let mut grant = None;
-        if budget > 0 {
-            let index = budget - 1;
-            match registry().reserve(index as usize, word(1), word(2)) {
-                Ok(g) => grant = Some((g, index)),
-                Err(Refusal::Limit { .. }) => {
-                    scratch.write(index);
-                    return BUDGET_LIMIT;
-                }
-                Err(Refusal::Unbudgeted(why)) => {
-                    return refuse(ctx, scratch, Refused::Unresolved(why));
-                }
-            }
-        }
-        let (steps, memory) = match &grant {
-            Some((g, _)) => (g.steps, g.memory),
-            None => (word(1), word(2)),
-        };
-        let request = Request {
-            tree: bytes_of(&tree),
-            expected: bytes_of(&expected),
-            accept,
-            steps,
-            memory,
-            signalled: emitted,
-            types,
-        };
-        let result = receiver.receive(&request);
-        let mismatched = match &result {
-            Ok(received) => &received.mismatched[..],
-            Err(Refused::StepLimit(m) | Refused::MemoryLimit(m)) => &m[..],
-            Err(_) => &[],
-        };
-        // The code does not run now, so the grant goes back.
-        if !emitted && !mismatched.is_empty() {
-            let lines: Vec<String> = mismatched
-                .iter()
-                .map(|(m, n)| format!("{m} {n}\n"))
-                .collect();
-            give_text(ctx, scratch, &lines.concat());
-            return MISMATCHED;
-        }
-        let received = match result {
-            Ok(received) => received,
-            Err(refused) => {
-                if let Some((g, index)) = grant {
-                    // Receiving that ran out of steps took them all.
-                    let (capped, left) = match &refused {
-                        Refused::StepLimit(_) => (g.steps_capped, 0),
-                        Refused::MemoryLimit(_) => (g.memory_capped, g.steps),
-                        _ => (false, g.steps),
-                    };
-                    g.settle(left);
-                    if capped {
+suspending_fn!(
+    /// `rt_transport_run(ctx, scratch, x0, x1, i0, i1) -> status`: see
+    /// `crag_abi::RuntimeFn::TransportRun`.
+    ///
+    /// # Safety
+    ///
+    /// The scratch words are as the function describes them, the environment is a
+    /// live `Expr`'s, and the words are those of an input of the type the code
+    /// expects, which the caller holds across the call.
+    fn rt_transport_run(
+        ctx: *const TaskContext,
+        scratch: *mut u64,
+        x0: u64,
+        x1: u64,
+        i0: u64,
+        i1: u64,
+    ) -> u64 {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let ctx = &*ctx;
+            let word = |i: usize| scratch.add(i).read();
+            let (accept, emitted) = accept_of(word(0));
+            let env = word(3) as *mut u8;
+            let tree = pair(env, TREE_AT);
+            let expected = [x0, x1];
+            let (_, types) = worker_of(ctx);
+            let (shared, receiver) = match receiver_of(ctx, scratch) {
+                Ok(found) => found,
+                Err(status) => return status,
+            };
+            // Code that arrived under a budget takes its limits from it too.
+            let budget = env.add(BUDGET_AT).cast::<u64>().read();
+            let mut grant = None;
+            if budget > 0 {
+                let index = budget - 1;
+                match registry().reserve(index as usize, word(1), word(2)) {
+                    Ok(g) => grant = Some((g, index)),
+                    Err(Refusal::Limit { .. }) => {
                         scratch.write(index);
                         return BUDGET_LIMIT;
                     }
+                    Err(Refusal::Unbudgeted(why)) => {
+                        return refuse(ctx, scratch, Refused::Unresolved(why));
+                    }
                 }
-                return refuse(ctx, scratch, refused);
             }
-        };
-        // The code takes its environment and its input: the caller keeps
-        // its own.
-        retain(env);
-        let input = [i0, i1];
-        let n = received.input_words as usize;
-        let (shapes, root) = &received.input;
-        retain_value(&input[..n], shapes, *root);
-        let mut args = vec![env as u64];
-        args.extend_from_slice(&input[..n]);
-        let config = (*ctx.fiber.load(Ordering::Relaxed)).config;
-        let mut fiber = Fiber::new(received.stub, received.entry, &args, config)
-            .unwrap_or_else(|_| die("out of memory for a stack of received code"));
-        fiber.set_meter(Meter {
-            steps: received.steps,
-            memory: received.memory as usize,
-        });
-        let caller = suspend(ctx, WaitReason::Received);
-        fiber.received = Some(Box::new(Waiter {
-            caller,
-            scratch,
-            hold: received.hold,
-            budget: grant,
-        }));
-        shared.launch(fiber, local_of(ctx));
-        // The wake gives the status.
-        0
+            let (steps, memory) = match &grant {
+                Some((g, _)) => (g.steps, g.memory),
+                None => (word(1), word(2)),
+            };
+            let request = Request {
+                tree: bytes_of(&tree),
+                expected: bytes_of(&expected),
+                accept,
+                steps,
+                memory,
+                signalled: emitted,
+                types,
+            };
+            let result = receiver.receive(&request);
+            let mismatched = match &result {
+                Ok(received) => &received.mismatched[..],
+                Err(Refused::StepLimit(m) | Refused::MemoryLimit(m)) => &m[..],
+                Err(_) => &[],
+            };
+            // The code does not run now, so the grant goes back.
+            if !emitted && !mismatched.is_empty() {
+                let lines: Vec<String> = mismatched
+                    .iter()
+                    .map(|(m, n)| format!("{m} {n}\n"))
+                    .collect();
+                give_text(ctx, scratch, &lines.concat());
+                return MISMATCHED;
+            }
+            let received = match result {
+                Ok(received) => received,
+                Err(refused) => {
+                    if let Some((g, index)) = grant {
+                        // Receiving that ran out of steps took them all.
+                        let (capped, left) = match &refused {
+                            Refused::StepLimit(_) => (g.steps_capped, 0),
+                            Refused::MemoryLimit(_) => (g.memory_capped, g.steps),
+                            _ => (false, g.steps),
+                        };
+                        g.settle(left);
+                        if capped {
+                            scratch.write(index);
+                            return BUDGET_LIMIT;
+                        }
+                    }
+                    return refuse(ctx, scratch, refused);
+                }
+            };
+            // The code takes its environment and its input: the caller keeps
+            // its own.
+            retain(env);
+            let input = [i0, i1];
+            let n = received.input_words as usize;
+            let (shapes, root) = &received.input;
+            retain_value(&input[..n], shapes, *root);
+            let mut args = vec![env as u64];
+            args.extend_from_slice(&input[..n]);
+            let config = (*ctx.fiber.load(Ordering::Relaxed)).config;
+            let mut fiber = Fiber::new(received.stub, received.entry, &args, config)
+                .unwrap_or_else(|_| die("out of memory for a stack of received code"));
+            fiber.set_meter(Meter {
+                steps: received.steps,
+                memory: received.memory as usize,
+            });
+            let caller = suspend(ctx, WaitReason::Received);
+            fiber.received = Some(Box::new(Waiter {
+                caller,
+                scratch,
+                hold: received.hold,
+                budget: grant,
+            }));
+            shared.launch(fiber, local_of(ctx));
+            // The wake gives the status.
+            0
+        }
     }
-}
+);
 
-/// The Rust half of `rt_transport_encode`.
-///
-/// # Safety
-///
-/// Called only by `rt_transport_encode`, with two scratch words and the
-/// environment of a live `Expr`, which the caller holds.
-unsafe extern "C" fn encode_entry(
-    ctx: *const TaskContext,
-    scratch: *mut u64,
-    env: u64,
-    stamp: u64,
-) -> u64 {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let ctx = &*ctx;
-        let env = env as *mut u8;
-        let tree = bytes_of(&pair(env, TREE_AT)).to_vec();
-        let wire_words = pair(env, WIRE_AT);
-        let wire = bytes_of(&wire_words);
-        let Some((root, rest)) = wire.split_first_chunk::<4>() else {
-            die("an `Expr` without the shapes of its environment");
-        };
-        let shapes =
-            Shapes::decode(rest).unwrap_or_else(|e| die(&format!("the shapes of an `Expr`: {e}")));
-        let (_, types) = worker_of(ctx);
-        let encoded = encode_value(&[env as u64], &shapes, u32::from_le_bytes(*root), types);
-        let env_bytes = match encoded {
-            Ok(bytes) => bytes,
-            Err(what) => {
-                let why = format!("its captures hold {}, which cannot be sent", what.0);
-                give_text(ctx, scratch, &why);
-                return 1;
-            }
-        };
-        let stamp = match stamp as i64 {
-            ..0 => None,
-            index => match registry().stamp(index as usize, &tree, &env_bytes) {
-                Some(stamp) => Some(stamp),
-                None => {
-                    give_text(ctx, scratch, "no such budget to send under");
+system_stack_fn!(
+    /// `rt_transport_encode(ctx, scratch, env, stamp) -> status`: see
+    /// `crag_abi::RuntimeFn::TransportEncode`.
+    ///
+    /// # Safety
+    ///
+    /// The caller passes two scratch words and the environment of a live `Expr`,
+    /// which it holds.
+    fn rt_transport_encode(
+        ctx: *const TaskContext,
+        scratch: *mut u64,
+        env: u64,
+        stamp: u64,
+    ) -> u64 {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let ctx = &*ctx;
+            let env = env as *mut u8;
+            let tree = bytes_of(&pair(env, TREE_AT)).to_vec();
+            let wire_words = pair(env, WIRE_AT);
+            let wire = bytes_of(&wire_words);
+            let Some((root, rest)) = wire.split_first_chunk::<4>() else {
+                die("an `Expr` without the shapes of its environment");
+            };
+            let shapes = Shapes::decode(rest)
+                .unwrap_or_else(|e| die(&format!("the shapes of an `Expr`: {e}")));
+            let (_, types) = worker_of(ctx);
+            let encoded = encode_value(&[env as u64], &shapes, u32::from_le_bytes(*root), types);
+            let env_bytes = match encoded {
+                Ok(bytes) => bytes,
+                Err(what) => {
+                    let why = format!("its captures hold {}, which cannot be sent", what.0);
+                    give_text(ctx, scratch, &why);
                     return 1;
                 }
-            },
-        };
-        let message = Message {
-            stamp,
-            tree,
-            env: env_bytes,
-        };
-        give_bytes(ctx, scratch, &message.encode());
-        0
+            };
+            let stamp = match stamp as i64 {
+                ..0 => None,
+                index => match registry().stamp(index as usize, &tree, &env_bytes) {
+                    Some(stamp) => Some(stamp),
+                    None => {
+                        give_text(ctx, scratch, "no such budget to send under");
+                        return 1;
+                    }
+                },
+            };
+            let message = Message {
+                stamp,
+                tree,
+                env: env_bytes,
+            };
+            give_bytes(ctx, scratch, &message.encode());
+            0
+        }
     }
-}
+);
 
-/// The Rust half of `rt_transport_decode`.
-///
-/// # Safety
-///
-/// Called only by `rt_transport_decode`, with scratch words as it
-/// describes them and bytes the caller holds.
-unsafe extern "C" fn decode_entry(
-    ctx: *const TaskContext,
-    scratch: *mut u64,
-    x0: u64,
-    x1: u64,
-    b0: u64,
-    b1: u64,
-) -> u64 {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let ctx = &*ctx;
-        let word = |i: usize| scratch.add(i).read();
-        let (accept, _) = accept_of(word(0));
-        let (steps, memory) = (word(1), word(2));
-        let bytes = [b0, b1];
-        let message = match Message::decode(bytes_of(&bytes)) {
-            Ok(message) => message,
-            Err(why) => {
-                give_text(ctx, scratch, &why);
+system_stack_fn!(
+    /// `rt_transport_decode(ctx, scratch, x0, x1, b0, b1) -> status`: see
+    /// `crag_abi::RuntimeFn::TransportDecode`.
+    ///
+    /// # Safety
+    ///
+    /// The scratch words are as the function describes them, and the caller holds
+    /// the bytes.
+    fn rt_transport_decode(
+        ctx: *const TaskContext,
+        scratch: *mut u64,
+        x0: u64,
+        x1: u64,
+        b0: u64,
+        b1: u64,
+    ) -> u64 {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let ctx = &*ctx;
+            let word = |i: usize| scratch.add(i).read();
+            let (accept, _) = accept_of(word(0));
+            let (steps, memory) = (word(1), word(2));
+            let bytes = [b0, b1];
+            let message = match Message::decode(bytes_of(&bytes)) {
+                Ok(message) => message,
+                Err(why) => {
+                    give_text(ctx, scratch, &why);
+                    return NOT_CODE;
+                }
+            };
+            let budget = match registry().admit(message.stamp.as_ref(), &message.tree, &message.env)
+            {
+                Ok(budget) => budget,
+                Err(Refusal::Unbudgeted(why)) => {
+                    give_text(ctx, scratch, &why);
+                    return UNBUDGETED;
+                }
+                Err(Refusal::Limit { index, .. }) => {
+                    scratch.write(index as u64);
+                    return BUDGET_LIMIT;
+                }
+            };
+            let (_, receiver) = match receiver_of(ctx, scratch) {
+                Ok(found) => found,
+                Err(status) => return status,
+            };
+            let expected = [x0, x1];
+            let (heap, types) = worker_of(ctx);
+            let request = Request {
+                tree: &message.tree,
+                expected: bytes_of(&expected),
+                accept,
+                steps,
+                memory,
+                signalled: true,
+                types,
+            };
+            let decoded = match receiver.decode(&request) {
+                Ok(decoded) => decoded,
+                Err(refused) => return refuse(ctx, scratch, refused),
+            };
+            let (shapes, root) = &decoded.env;
+            let words = match decode_value(&message.env, shapes, *root, heap, types) {
+                Ok(words) => words,
+                Err(e) => {
+                    let why = format!("its captures do not decode: {}", e.0);
+                    give_text(ctx, scratch, &why);
+                    return NOT_CODE;
+                }
+            };
+            let env = words[0] as *mut u8;
+            let (heap, types) = worker_of(ctx);
+            // The environment must carry the tree that was checked.
+            if bytes_of(&pair(env, TREE_AT)) != &message.tree[..] {
+                drop_box(heap, types, env);
+                give_text(ctx, scratch, "its environment carries another tree");
                 return NOT_CODE;
             }
-        };
-        let budget = match registry().admit(message.stamp.as_ref(), &message.tree, &message.env) {
-            Ok(budget) => budget,
-            Err(Refusal::Unbudgeted(why)) => {
-                give_text(ctx, scratch, &why);
-                return UNBUDGETED;
+            // It carries its budget, and travels on in the receiver's layout.
+            env.add(BUDGET_AT)
+                .cast::<u64>()
+                .write(budget.map_or(0, |b| b as u64 + 1));
+            let old = pair(env, WIRE_AT);
+            let [w0, w1] = make_text(heap, &[&decoded.wire]);
+            env.add(WIRE_AT).cast::<u64>().write(w0);
+            env.add(WIRE_AT + 8).cast::<u64>().write(w1);
+            if in_buffer(old[0]) {
+                drop_box(heap, types, old[0] as *mut u8);
             }
-            Err(Refusal::Limit { index, .. }) => {
-                scratch.write(index as u64);
-                return BUDGET_LIMIT;
-            }
-        };
-        let (_, receiver) = match receiver_of(ctx, scratch) {
-            Ok(found) => found,
-            Err(status) => return status,
-        };
-        let expected = [x0, x1];
-        let (heap, types) = worker_of(ctx);
-        let request = Request {
-            tree: &message.tree,
-            expected: bytes_of(&expected),
-            accept,
-            steps,
-            memory,
-            signalled: true,
-            types,
-        };
-        let decoded = match receiver.decode(&request) {
-            Ok(decoded) => decoded,
-            Err(refused) => return refuse(ctx, scratch, refused),
-        };
-        let (shapes, root) = &decoded.env;
-        let words = match decode_value(&message.env, shapes, *root, heap, types) {
-            Ok(words) => words,
-            Err(e) => {
-                let why = format!("its captures do not decode: {}", e.0);
-                give_text(ctx, scratch, &why);
-                return NOT_CODE;
-            }
-        };
-        let env = words[0] as *mut u8;
-        let (heap, types) = worker_of(ctx);
-        // The environment must carry the tree that was checked.
-        if bytes_of(&pair(env, TREE_AT)) != &message.tree[..] {
-            drop_box(heap, types, env);
-            give_text(ctx, scratch, "its environment carries another tree");
-            return NOT_CODE;
+            scratch.write(decoded.entry as u64);
+            scratch.add(1).write(env as u64);
+            RAN
         }
-        // It carries its budget, and travels on in the receiver's layout.
-        env.add(BUDGET_AT)
-            .cast::<u64>()
-            .write(budget.map_or(0, |b| b as u64 + 1));
-        let old = pair(env, WIRE_AT);
-        let [w0, w1] = make_text(heap, &[&decoded.wire]);
-        env.add(WIRE_AT).cast::<u64>().write(w0);
-        env.add(WIRE_AT + 8).cast::<u64>().write(w1);
-        if in_buffer(old[0]) {
-            drop_box(heap, types, old[0] as *mut u8);
-        }
-        scratch.write(decoded.entry as u64);
-        scratch.add(1).write(env as u64);
-        RAN
     }
-}
+);
 
 /// Writes why the code does not run where the caller reads it, and gives
 /// the status.
 ///
 /// # Safety
 ///
-/// As `run_entry`'s.
+/// As `rt_transport_run`'s.
 unsafe fn refuse(ctx: &TaskContext, scratch: *mut u64, refused: Refused) -> u64 {
     let (status, message) = match refused {
         Refused::Unresolved(m) => (UNRESOLVED, m),
@@ -661,7 +650,7 @@ unsafe fn refuse(ctx: &TaskContext, scratch: *mut u64, refused: Refused) -> u64 
 ///
 /// # Safety
 ///
-/// As `run_entry`'s.
+/// As `rt_transport_run`'s.
 unsafe fn give_text(ctx: &TaskContext, scratch: *mut u64, text: &str) {
     // SAFETY: as the caller promises.
     unsafe { give_bytes(ctx, scratch, text.as_bytes()) }
@@ -671,7 +660,7 @@ unsafe fn give_text(ctx: &TaskContext, scratch: *mut u64, text: &str) {
 ///
 /// # Safety
 ///
-/// As `run_entry`'s.
+/// As `rt_transport_run`'s.
 unsafe fn give_bytes(ctx: &TaskContext, scratch: *mut u64, bytes: &[u8]) {
     // SAFETY: as the caller promises.
     unsafe {

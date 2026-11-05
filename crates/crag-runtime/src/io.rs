@@ -40,46 +40,39 @@ use crate::sched::{WaitReason, scheduler_of, suspend, wake};
 #[repr(C)]
 pub(crate) struct Words(pub(crate) u64, pub(crate) u64);
 
-suspending_fn! {
+suspending_fn!(
     /// `rt_sleep(ctx, nanos)`: see `crag_abi::RuntimeFn::Sleep`.
-    fn rt_sleep(ctx: *const TaskContext, nanos: u64) => sleep_entry
-}
-
-/// The Rust half of `rt_sleep`.
-///
-/// # Safety
-///
-/// Called only by `rt_sleep`.
-unsafe extern "C" fn sleep_entry(ctx: *const TaskContext, nanos: u64) {
-    // SAFETY: as the caller promises.
-    if stop_if_due(unsafe { &*ctx }) || nanos == 0 {
-        return;
-    }
-    let duration = Duration::from_nanos(nanos);
-    let now = Instant::now();
-    // Beyond what the clock counts, a century does as well.
-    let deadline = now
-        .checked_add(duration)
-        .unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 86_400));
-    // SAFETY: as the caller promises.
-    unsafe {
-        let ctx = &*ctx;
-        let Some(shared) = scheduler_of(ctx) else {
-            std::thread::sleep(duration);
-            stop_if_due(ctx);
+    fn rt_sleep(ctx: *const TaskContext, nanos: u64) {
+        // SAFETY: as the caller promises.
+        if stop_if_due(unsafe { &*ctx }) || nanos == 0 {
             return;
-        };
-        let fiber = suspend(ctx, WaitReason::Sleep);
-        let id = shared.reactor.sleep_until(deadline, fiber);
-        wait_for(ctx, Waiting::Timer { shared, id });
+        }
+        let duration = Duration::from_nanos(nanos);
+        let now = Instant::now();
+        // Beyond what the clock counts, a century does as well.
+        let deadline = now
+            .checked_add(duration)
+            .unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 86_400));
+        // SAFETY: as the caller promises.
+        unsafe {
+            let ctx = &*ctx;
+            let Some(shared) = scheduler_of(ctx) else {
+                std::thread::sleep(duration);
+                stop_if_due(ctx);
+                return;
+            };
+            let fiber = suspend(ctx, WaitReason::Sleep);
+            let id = shared.reactor.sleep_until(deadline, fiber);
+            wait_for(ctx, Waiting::Timer { shared, id });
+        }
     }
-}
+);
 
 /// Runs `op` for the fiber of `ctx`, suspending it while it would block.
 ///
 /// # Safety
 ///
-/// Called by the Rust half of a function `suspending_fn!` defined, for
+/// Called by the body of a function `suspending_fn!` defined, for
 /// the fiber it was called on, with an operation whose buffer lives until
 /// the fiber continues.
 pub(crate) unsafe fn perform(ctx: *const TaskContext, op: IoOp) -> Words {
@@ -110,103 +103,66 @@ pub(crate) unsafe fn perform(ctx: *const TaskContext, op: IoOp) -> Words {
     Words(0, 0)
 }
 
-suspending_fn! {
+suspending_fn!(
     /// `rt_io_read(ctx, fd, buf, len) -> (n, errno)`: see
     /// `crag_abi::RuntimeFn::IoRead`.
-    fn rt_io_read(ctx: *const TaskContext, fd: u64, buf: *mut u8, len: u64) -> Words => read_entry
-}
+    fn rt_io_read(ctx: *const TaskContext, fd: u64, buf: *mut u8, len: u64) -> Words {
+        let op = IoOp::Read {
+            fd: fd as i32,
+            buf,
+            len: len as usize,
+        };
+        // SAFETY: generated code passes a buffer of its fiber.
+        unsafe { perform(ctx, op) }
+    }
+);
 
-/// The Rust half of `rt_io_read`.
-///
-/// # Safety
-///
-/// Called only by `rt_io_read`.
-unsafe extern "C" fn read_entry(ctx: *const TaskContext, fd: u64, buf: *mut u8, len: u64) -> Words {
-    let op = IoOp::Read {
-        fd: fd as i32,
-        buf,
-        len: len as usize,
-    };
-    // SAFETY: generated code passes a buffer of its fiber.
-    unsafe { perform(ctx, op) }
-}
-
-suspending_fn! {
+suspending_fn!(
     /// `rt_io_write(ctx, fd, buf, len) -> (n, errno)`: see
     /// `crag_abi::RuntimeFn::IoWrite`.
-    fn rt_io_write(ctx: *const TaskContext, fd: u64, buf: *const u8, len: u64) -> Words => write_entry
-}
+    fn rt_io_write(ctx: *const TaskContext, fd: u64, buf: *const u8, len: u64) -> Words {
+        let op = IoOp::Write {
+            fd: fd as i32,
+            buf,
+            len: len as usize,
+        };
+        // SAFETY: as in `rt_io_read`.
+        unsafe { perform(ctx, op) }
+    }
+);
 
-/// The Rust half of `rt_io_write`.
-///
-/// # Safety
-///
-/// Called only by `rt_io_write`.
-unsafe extern "C" fn write_entry(
-    ctx: *const TaskContext,
-    fd: u64,
-    buf: *const u8,
-    len: u64,
-) -> Words {
-    let op = IoOp::Write {
-        fd: fd as i32,
-        buf,
-        len: len as usize,
-    };
-    // SAFETY: as in `read_entry`.
-    unsafe { perform(ctx, op) }
-}
-
-suspending_fn! {
+suspending_fn!(
     /// `rt_io_accept(ctx, fd) -> (fd, errno)`: see
     /// `crag_abi::RuntimeFn::IoAccept`.
-    fn rt_io_accept(ctx: *const TaskContext, fd: u64) -> Words => accept_entry
-}
+    fn rt_io_accept(ctx: *const TaskContext, fd: u64) -> Words {
+        // SAFETY: the operation has no buffer.
+        unsafe { perform(ctx, IoOp::Accept { fd: fd as i32 }) }
+    }
+);
 
-/// The Rust half of `rt_io_accept`.
-///
-/// # Safety
-///
-/// Called only by `rt_io_accept`.
-unsafe extern "C" fn accept_entry(ctx: *const TaskContext, fd: u64) -> Words {
-    // SAFETY: the operation has no buffer.
-    unsafe { perform(ctx, IoOp::Accept { fd: fd as i32 }) }
-}
-
-suspending_fn! {
+suspending_fn!(
     /// `rt_io_connect(ctx, fd, addr, len) -> (0, errno)`: see
     /// `crag_abi::RuntimeFn::IoConnect`.
-    fn rt_io_connect(ctx: *const TaskContext, fd: u64, addr: *const u8, len: u64) -> Words => connect_entry
-}
-
-/// The Rust half of `rt_io_connect`: starts the connection, then waits
-/// until it is made.
-///
-/// # Safety
-///
-/// Called only by `rt_io_connect`.
-unsafe extern "C" fn connect_entry(
-    ctx: *const TaskContext,
-    fd: u64,
-    addr: *const u8,
-    len: u64,
-) -> Words {
-    // SAFETY: as the caller promises.
-    if stop_if_due(unsafe { &*ctx }) {
-        return Words(0, 0);
+    ///
+    /// Starts the connection, then waits until it is made.
+    fn rt_io_connect(ctx: *const TaskContext, fd: u64, addr: *const u8, len: u64) -> Words {
+        // SAFETY: as the caller promises.
+        if stop_if_due(unsafe { &*ctx }) {
+            return Words(0, 0);
+        }
+        let fd = fd as i32;
+        // SAFETY: generated code passes a socket address of `len` bytes.
+        let started = unsafe { libc::connect(fd, addr.cast(), len as libc::socklen_t) };
+        if started == 0 {
+            return Words(0, 0);
+        }
+        let errno = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        if errno != libc::EINPROGRESS && errno != libc::EINTR {
+            return Words(0, errno as u64);
+        }
+        // SAFETY: the operation has no buffer.
+        unsafe { perform(ctx, IoOp::Connect { fd }) }
     }
-    let fd = fd as i32;
-    // SAFETY: generated code passes a socket address of `len` bytes.
-    let started = unsafe { libc::connect(fd, addr.cast(), len as libc::socklen_t) };
-    if started == 0 {
-        return Words(0, 0);
-    }
-    let errno = std::io::Error::last_os_error()
-        .raw_os_error()
-        .unwrap_or(libc::EIO);
-    if errno != libc::EINPROGRESS && errno != libc::EINTR {
-        return Words(0, errno as u64);
-    }
-    // SAFETY: the operation has no buffer.
-    unsafe { perform(ctx, IoOp::Connect { fd }) }
-}
+);

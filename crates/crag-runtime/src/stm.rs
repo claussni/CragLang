@@ -170,7 +170,7 @@ fn enter_alone_once(log: &mut TxLog) {
 ///
 /// # Safety
 ///
-/// Called by the Rust half of a runtime function for the fiber of `ctx`.
+/// Called by the body of a runtime function for the fiber of `ctx`.
 unsafe fn log_of<'a>(ctx: &TaskContext) -> &'a mut TxLog {
     // SAFETY: as the caller promises, a worker runs the fiber.
     let fiber = unsafe { &mut *ctx.fiber.load(Ordering::Relaxed) };
@@ -235,112 +235,90 @@ pub(crate) fn conflicted(ctx: &TaskContext) {
     ctx.tx_conflict.store(1, Ordering::Relaxed);
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_tx_begin(ctx) -> depth`: see `crag_abi::RuntimeFn::TxBegin`.
-    fn rt_tx_begin(ctx: *const TaskContext) -> u64 => begin_entry
-}
-
-/// The Rust half of `rt_tx_begin`.
-///
-/// # Safety
-///
-/// Called only by `rt_tx_begin`.
-unsafe extern "C" fn begin_entry(ctx: *const TaskContext) -> u64 {
-    // SAFETY: as the caller promises.
-    let (ctx, log, signals) = unsafe { (&*ctx, log_of(&*ctx), signals_of(&*ctx)) };
-    signals.open();
-    if log.depth == 0 {
-        log.start(ctx);
-    } else {
-        log.savepoints.push(log.writes.len());
-        log.depth += 1;
+    fn rt_tx_begin(ctx: *const TaskContext) -> u64 {
+        // SAFETY: as the caller promises.
+        let (ctx, log, signals) = unsafe { (&*ctx, log_of(&*ctx), signals_of(&*ctx)) };
+        signals.open();
+        if log.depth == 0 {
+            log.start(ctx);
+        } else {
+            log.savepoints.push(log.writes.len());
+            log.depth += 1;
+        }
+        u64::from(log.depth)
     }
-    u64::from(log.depth)
-}
+);
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_tx_read(ctx, cell, out) -> status`: see
     /// `crag_abi::RuntimeFn::TxRead`.
-    fn rt_tx_read(ctx: *const TaskContext, cell: *const Cell, out: *mut u64) -> u64 => read_entry
-}
-
-/// The Rust half of `rt_tx_read`.
-///
-/// # Safety
-///
-/// Called only by `rt_tx_read`, in a block, with a live cell and room for
-/// two words at `out`.
-unsafe extern "C" fn read_entry(ctx: *const TaskContext, cell: *const Cell, out: *mut u64) -> u64 {
-    // SAFETY: as the caller promises.
-    let log = unsafe { log_of(&*ctx) };
-    // SAFETY: as the caller promises.
-    match unsafe { log.read(cell) } {
-        Some(words) => {
-            // SAFETY: as the caller promises.
-            unsafe { out.cast::<[u64; 2]>().write_unaligned(words) };
-            TX_OK
+    ///
+    /// # Safety
+    ///
+    /// The caller is in a block, the cell is live, and there is room for two words
+    /// at `out`.
+    fn rt_tx_read(ctx: *const TaskContext, cell: *const Cell, out: *mut u64) -> u64 {
+        // SAFETY: as the caller promises.
+        let log = unsafe { log_of(&*ctx) };
+        // SAFETY: as the caller promises.
+        match unsafe { log.read(cell) } {
+            Some(words) => {
+                // SAFETY: as the caller promises.
+                unsafe { out.cast::<[u64; 2]>().write_unaligned(words) };
+                TX_OK
+            }
+            None => TX_CONFLICT,
         }
-        None => TX_CONFLICT,
     }
-}
+);
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_tx_write(ctx, cell, list, w0, w1)`: see
     /// `crag_abi::RuntimeFn::TxWrite`.
-    fn rt_tx_write(ctx: *const TaskContext, cell: *const Cell, list: u64, w0: u64, w1: u64) => write_entry
-}
-
-/// The Rust half of `rt_tx_write`.
-///
-/// # Safety
-///
-/// Called only by `rt_tx_write`, in a block, with a live cell and a value
-/// of the elements of list type `list` whose references the caller owns.
-unsafe extern "C" fn write_entry(
-    ctx: *const TaskContext,
-    cell: *const Cell,
-    list: u64,
-    w0: u64,
-    w1: u64,
-) {
-    // SAFETY: as the caller promises.
-    let (log, (heap, types)) = unsafe { (log_of(&*ctx), parts(&*ctx)) };
-    let mut words = [w0, w1];
-    // SAFETY: as the caller promises.
-    if !unsafe { log.write(cell, words, list) } {
-        // SAFETY: the cell or the log holds a reference besides the
-        // caller's, and the pin keeps the cell's.
-        unsafe {
-            release_value(
-                heap,
-                types,
-                words.as_mut_ptr().cast(),
-                types.ref_cell_of(list),
-            )
-        };
-    }
-}
-
-system_stack_fn! {
-    /// `rt_tx_commit(ctx) -> status`: see `crag_abi::RuntimeFn::TxCommit`.
-    fn rt_tx_commit(ctx: *const TaskContext) -> u64 => commit_entry
-}
-
-/// The Rust half of `rt_tx_commit`.
-///
-/// # Safety
-///
-/// Called only by `rt_tx_commit`, in a block.
-unsafe extern "C" fn commit_entry(ctx: *const TaskContext) -> u64 {
-    // SAFETY: as the caller promises.
-    let (ctx, log, (heap, types)) = unsafe { (&*ctx, log_of(&*ctx), parts(&*ctx)) };
-    let status = commit(ctx, log, heap, types);
-    if status == TX_OK {
+    ///
+    /// # Safety
+    ///
+    /// The caller is in a block, the cell is live, and the value is of the elements
+    /// of list type `list`, whose references the caller owns.
+    fn rt_tx_write(ctx: *const TaskContext, cell: *const Cell, list: u64, w0: u64, w1: u64) {
         // SAFETY: as the caller promises.
-        unsafe { signals_of(ctx) }.commit(heap, types);
+        let (log, (heap, types)) = unsafe { (log_of(&*ctx), parts(&*ctx)) };
+        let mut words = [w0, w1];
+        // SAFETY: as the caller promises.
+        if !unsafe { log.write(cell, words, list) } {
+            // SAFETY: the cell or the log holds a reference besides the
+            // caller's, and the pin keeps the cell's.
+            unsafe {
+                release_value(
+                    heap,
+                    types,
+                    words.as_mut_ptr().cast(),
+                    types.ref_cell_of(list),
+                )
+            };
+        }
     }
-    status
-}
+);
+
+system_stack_fn!(
+    /// `rt_tx_commit(ctx) -> status`: see `crag_abi::RuntimeFn::TxCommit`.
+    ///
+    /// # Safety
+    ///
+    /// The caller is in a block.
+    fn rt_tx_commit(ctx: *const TaskContext) -> u64 {
+        // SAFETY: as the caller promises.
+        let (ctx, log, (heap, types)) = unsafe { (&*ctx, log_of(&*ctx), parts(&*ctx)) };
+        let status = commit(ctx, log, heap, types);
+        if status == TX_OK {
+            // SAFETY: as the caller promises.
+            unsafe { signals_of(ctx) }.commit(heap, types);
+        }
+        status
+    }
+);
 
 /// Commits the innermost block.
 fn commit(ctx: &TaskContext, log: &mut TxLog, heap: &mut Heap, types: &Arc<Types>) -> u64 {
@@ -503,56 +481,52 @@ impl TxLog {
     }
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_tx_depth(ctx) -> depth`: see `crag_abi::RuntimeFn::TxDepth`.
-    fn rt_tx_depth(ctx: *const TaskContext) -> u64 => depth_entry
-}
-
-/// The Rust half of `rt_tx_depth`.
-///
-/// # Safety
-///
-/// Called only by `rt_tx_depth`.
-unsafe extern "C" fn depth_entry(ctx: *const TaskContext) -> u64 {
-    // SAFETY: as the caller promises, a worker runs the fiber.
-    let fiber = unsafe { &*(*ctx).fiber.load(Ordering::Relaxed) };
-    fiber.tx.as_deref().map_or(0, |log| u64::from(log.depth))
-}
-
-system_stack_fn! {
-    /// `rt_tx_unwind(ctx, depth)`: see `crag_abi::RuntimeFn::TxUnwind`.
-    fn rt_tx_unwind(ctx: *const TaskContext, depth: u64) => unwind_entry
-}
-
-/// The Rust half of `rt_tx_unwind`: aborts the blocks begun inside
-/// `depth`, innermost first, as `rt_tx_abort` aborts one.
-///
-/// # Safety
-///
-/// Called only by `rt_tx_unwind`.
-unsafe extern "C" fn unwind_entry(ctx: *const TaskContext, depth: u64) {
-    loop {
+    fn rt_tx_depth(ctx: *const TaskContext) -> u64 {
         // SAFETY: as the caller promises, a worker runs the fiber.
         let fiber = unsafe { &*(*ctx).fiber.load(Ordering::Relaxed) };
-        if fiber.tx.as_deref().map_or(0, |log| u64::from(log.depth)) <= depth {
-            return;
-        }
-        // SAFETY: as the caller promises.
-        unsafe { abort_entry(ctx) };
+        fiber.tx.as_deref().map_or(0, |log| u64::from(log.depth))
     }
-}
+);
 
-system_stack_fn! {
+system_stack_fn!(
+    /// `rt_tx_unwind(ctx, depth)`: see `crag_abi::RuntimeFn::TxUnwind`.
+    ///
+    /// Aborts the blocks begun inside `depth`, innermost first, as `rt_tx_abort`
+    /// aborts one.
+    fn rt_tx_unwind(ctx: *const TaskContext, depth: u64) {
+        loop {
+            // SAFETY: as the caller promises, a worker runs the fiber.
+            let fiber = unsafe { &*(*ctx).fiber.load(Ordering::Relaxed) };
+            if fiber.tx.as_deref().map_or(0, |log| u64::from(log.depth)) <= depth {
+                return;
+            }
+            // SAFETY: as the caller promises.
+            unsafe { abort(ctx) };
+        }
+    }
+);
+
+system_stack_fn!(
     /// `rt_tx_abort(ctx)`: see `crag_abi::RuntimeFn::TxAbort`.
-    fn rt_tx_abort(ctx: *const TaskContext) => abort_entry
-}
+    ///
+    /// # Safety
+    ///
+    /// The caller is in a block.
+    fn rt_tx_abort(ctx: *const TaskContext) {
+        // SAFETY: as the caller promises.
+        unsafe { abort(ctx) }
+    }
+);
 
-/// The Rust half of `rt_tx_abort`.
+/// Aborts the innermost block of the fiber of `ctx`.
 ///
 /// # Safety
 ///
-/// Called only by `rt_tx_abort`, in a block.
-unsafe extern "C" fn abort_entry(ctx: *const TaskContext) {
+/// Called on the system stack while a worker runs the fiber of `ctx`,
+/// which is in a block.
+unsafe fn abort(ctx: *const TaskContext) {
     // SAFETY: as the caller promises.
     let (ctx, log, (heap, types)) = unsafe { (&*ctx, log_of(&*ctx), parts(&*ctx)) };
     // SAFETY: as the caller promises.
@@ -566,35 +540,32 @@ unsafe extern "C" fn abort_entry(ctx: *const TaskContext) {
     }
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_tx_retry(ctx)`: see `crag_abi::RuntimeFn::TxRetry`.
-    fn rt_tx_retry(ctx: *const TaskContext) => retry_entry
-}
-
-/// The Rust half of `rt_tx_retry`.
-///
-/// # Safety
-///
-/// Called only by `rt_tx_retry`, in a block.
-unsafe extern "C" fn retry_entry(ctx: *const TaskContext) {
-    // SAFETY: as the caller promises.
-    let (ctx, log, (heap, types)) = unsafe { (&*ctx, log_of(&*ctx), parts(&*ctx)) };
-    // SAFETY: as the caller promises.
-    unsafe { signals_of(ctx) }.conflict(true, heap, types);
-    log.clear(ctx, heap, types);
-    log.attempts += 1;
-    if log.attempts >= ALONE_AFTER {
-        enter_alone_once(log);
-    } else {
-        // Randomized exponential backoff, so that the attempts that
-        // collided do not collide again.
-        let spins = log.random(log.attempts.min(10) + 4);
-        for _ in 0..spins {
-            std::hint::spin_loop();
+    ///
+    /// # Safety
+    ///
+    /// The caller is in a block.
+    fn rt_tx_retry(ctx: *const TaskContext) {
+        // SAFETY: as the caller promises.
+        let (ctx, log, (heap, types)) = unsafe { (&*ctx, log_of(&*ctx), parts(&*ctx)) };
+        // SAFETY: as the caller promises.
+        unsafe { signals_of(ctx) }.conflict(true, heap, types);
+        log.clear(ctx, heap, types);
+        log.attempts += 1;
+        if log.attempts >= ALONE_AFTER {
+            enter_alone_once(log);
+        } else {
+            // Randomized exponential backoff, so that the attempts that
+            // collided do not collide again.
+            let spins = log.random(log.attempts.min(10) + 4);
+            for _ in 0..spins {
+                std::hint::spin_loop();
+            }
         }
+        log.start(ctx);
     }
-    log.start(ctx);
-}
+);
 
 /// Loom model (Plan §11.7.13): two transfers between two cells commit or
 /// conflict, and a third transaction that reads both sees their total.

@@ -597,30 +597,23 @@ pub fn alloc_box(heap: &mut Heap, size: usize, type_index: u64) -> *mut u8 {
     ptr
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_alloc(ctx, size, type_index)`: see `crag_abi::RuntimeFn::Alloc`.
     ///
     /// Called when the inline path finds no free block.
-    fn rt_alloc(ctx: *const TaskContext, size: u64, type_index: u64) -> *mut u8 => alloc_slow_entry
-}
-
-/// The Rust half of `rt_alloc`, on the system stack.
-///
-/// # Safety
-///
-/// Called only by `rt_alloc`, while a worker runs the fiber of `ctx`.
-unsafe extern "C" fn alloc_slow_entry(
-    ctx: *const TaskContext,
-    size: u64,
-    type_index: u64,
-) -> *mut u8 {
-    // SAFETY: `Worker::resume` stored its heap in the context, and nothing
-    // else uses the heap while the fiber runs.
-    unsafe {
-        let heap = &mut *(*ctx).heap.load(Ordering::Relaxed);
-        alloc_box(heap, size as usize, type_index)
+    ///
+    /// # Safety
+    ///
+    /// A worker runs the fiber of `ctx`.
+    fn rt_alloc(ctx: *const TaskContext, size: u64, type_index: u64) -> *mut u8 {
+        // SAFETY: `Worker::resume` stored its heap in the context, and nothing
+        // else uses the heap while the fiber runs.
+        unsafe {
+            let heap = &mut *(*ctx).heap.load(Ordering::Relaxed);
+            alloc_box(heap, size as usize, type_index)
+        }
     }
-}
+);
 
 #[cfg(test)]
 mod tests {

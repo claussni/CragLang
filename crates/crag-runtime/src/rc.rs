@@ -393,24 +393,20 @@ pub(crate) unsafe fn free_chain(
     }
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_release(ctx, ptr)`: see `crag_abi::RuntimeFn::Release`.
-    fn rt_release(ctx: *const TaskContext, ptr: *mut u8) => release_entry
-}
-
-/// The Rust half of `rt_release`, on the system stack.
-///
-/// # Safety
-///
-/// Called only by `rt_release`, for a box whose count generated code has
-/// just taken to zero.
-unsafe extern "C" fn release_entry(ctx: *const TaskContext, ptr: *mut u8) {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let (heap, types) = worker_of(ctx);
-        release_box(heap, types, ptr);
+    ///
+    /// # Safety
+    ///
+    /// Generated code has just taken the box's count to zero.
+    fn rt_release(ctx: *const TaskContext, ptr: *mut u8) {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let (heap, types) = worker_of(ctx);
+            release_box(heap, types, ptr);
+        }
     }
-}
+);
 
 /// Two words of a runtime function's result, in its two result registers.
 #[repr(C)]
@@ -419,23 +415,16 @@ pub struct Disposal {
     code: u64,
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_disposal(ctx) -> (ptr, code)`: see `crag_abi::RuntimeFn::Disposal`.
-    fn rt_disposal(ctx: *const TaskContext) -> Disposal => disposal_entry
-}
-
-/// The Rust half of `rt_disposal`, on the system stack.
-///
-/// # Safety
-///
-/// Called only by `rt_disposal`.
-unsafe extern "C" fn disposal_entry(ctx: *const TaskContext) -> Disposal {
-    // SAFETY: as the caller promises.
-    let (heap, types) = unsafe { worker_of(ctx) };
-    // SAFETY: a queued box is live, with the reference the queue holds,
-    // and its type has a dispose word.
-    unsafe { next_disposal(heap, types) }
-}
+    fn rt_disposal(ctx: *const TaskContext) -> Disposal {
+        // SAFETY: as the caller promises.
+        let (heap, types) = unsafe { worker_of(ctx) };
+        // SAFETY: a queued box is live, with the reference the queue holds,
+        // and its type has a dispose word.
+        unsafe { next_disposal(heap, types) }
+    }
+);
 
 /// The next box whose handler must run and its dispose code, which takes
 /// the queue's reference, with the box's word of the code cleared; or null

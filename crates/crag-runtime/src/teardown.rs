@@ -42,36 +42,32 @@ use crate::system::worker_of;
 /// at a time.
 pub const BUDGET: usize = 1024;
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_release_deferred(ctx, ptr)`: see
     /// `crag_abi::RuntimeFn::ReleaseDeferred`.
-    fn rt_release_deferred(ctx: *const TaskContext, ptr: *mut u8) => release_entry
-}
-
-/// The Rust half of `rt_release_deferred`.
-///
-/// # Safety
-///
-/// Called only by `rt_release_deferred`, for a box whose count generated
-/// code has just taken to zero.
-unsafe extern "C" fn release_entry(ctx: *const TaskContext, ptr: *mut u8) {
-    // SAFETY: as the caller promises.
-    unsafe {
-        let (heap, types) = worker_of(ctx);
-        let Some(shared) = scheduler_of(&*ctx) else {
-            // No one to hand the rest to.
-            release_box(heap, types, ptr);
-            return;
-        };
-        let mut pending = start_chain(ptr);
-        free_chain(heap, types, &mut pending, BUDGET, &mut |heap, ptr| {
-            heap.queue_disposal(ptr)
-        });
-        if !pending.is_null() {
-            shared.queue_teardown(pending);
+    ///
+    /// # Safety
+    ///
+    /// Generated code has just taken the box's count to zero.
+    fn rt_release_deferred(ctx: *const TaskContext, ptr: *mut u8) {
+        // SAFETY: as the caller promises.
+        unsafe {
+            let (heap, types) = worker_of(ctx);
+            let Some(shared) = scheduler_of(&*ctx) else {
+                // No one to hand the rest to.
+                release_box(heap, types, ptr);
+                return;
+            };
+            let mut pending = start_chain(ptr);
+            free_chain(heap, types, &mut pending, BUDGET, &mut |heap, ptr| {
+                heap.queue_disposal(ptr)
+            });
+            if !pending.is_null() {
+                shared.queue_teardown(pending);
+            }
         }
     }
-}
+);
 
 /// Frees a batch of the queued structure at `head` on `worker`, starts
 /// the dispose handlers it meets, and queues the rest again.

@@ -101,7 +101,7 @@ unsafe fn share(ext: *const ExtLock) -> Arc<ExtLock> {
 ///
 /// # Safety
 ///
-/// Called by the Rust half of a runtime function for the fiber of `ctx`.
+/// Called by the body of a runtime function for the fiber of `ctx`.
 unsafe fn fiber_of<'a>(ctx: &TaskContext) -> &'a mut Fiber {
     // SAFETY: as the caller promises.
     unsafe { &mut *ctx.fiber.load(std::sync::atomic::Ordering::Relaxed) }
@@ -114,93 +114,70 @@ pub(crate) fn stopped(fiber: &mut Fiber) {
     }
 }
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_ext_new(ctx) -> ext`: see `crag_abi::RuntimeFn::ExtNew`.
-    fn rt_ext_new(ctx: *const TaskContext) -> u64 => new_entry
-}
+    fn rt_ext_new(_ctx: *const TaskContext) -> u64 {
+        let lock = ExtLock {
+            state: Mutex::new(State::default()),
+        };
+        Arc::into_raw(Arc::new(lock)) as u64
+    }
+);
 
-/// The Rust half of `rt_ext_new`.
-///
-/// # Safety
-///
-/// Called only by `rt_ext_new`.
-unsafe extern "C" fn new_entry(_ctx: *const TaskContext) -> u64 {
-    let lock = ExtLock {
-        state: Mutex::new(State::default()),
-    };
-    Arc::into_raw(Arc::new(lock)) as u64
-}
-
-suspending_fn! {
+suspending_fn!(
     /// `rt_ext_lock(ctx, ext)`: see `crag_abi::RuntimeFn::ExtLock`.
-    fn rt_ext_lock(ctx: *const TaskContext, ext: *const ExtLock) => lock_entry
-}
-
-/// The Rust half of `rt_ext_lock`: suspends while another holds the lock.
-///
-/// # Safety
-///
-/// Called only by `rt_ext_lock`, with a lock that has not been freed and
-/// that the fiber neither holds nor waits for.
-unsafe extern "C" fn lock_entry(ctx: *const TaskContext, ext: *const ExtLock) {
-    // SAFETY: as the caller promises.
-    let (ctx, lock, fiber) = unsafe { (&*ctx, share(ext), fiber_of(&*ctx)) };
-    if stop_if_due(ctx) {
-        return;
-    }
-    let mut state = lock.state.lock().unwrap();
-    let token = state.next_token;
-    state.next_token += 1;
-    if state.holder.is_none() {
-        state.holder = Some(token);
+    ///
+    /// Suspends while another holds the lock.
+    ///
+    /// # Safety
+    ///
+    /// The lock has not been freed, and the fiber neither holds nor waits for it.
+    fn rt_ext_lock(ctx: *const TaskContext, ext: *const ExtLock) {
+        // SAFETY: as the caller promises.
+        let (ctx, lock, fiber) = unsafe { (&*ctx, share(ext), fiber_of(&*ctx)) };
+        if stop_if_due(ctx) {
+            return;
+        }
+        let mut state = lock.state.lock().unwrap();
+        let token = state.next_token;
+        state.next_token += 1;
+        if state.holder.is_none() {
+            state.holder = Some(token);
+            drop(state);
+            fiber.ext = Some((lock, token));
+            return;
+        }
+        // SAFETY: as the caller promises.
+        if unsafe { scheduler_of(ctx) }.is_none() {
+            raise(ctx, TrapKind::Unsupported, None);
+            return;
+        }
+        // The hold the wake gives is the fiber's from the hand-over on.
+        fiber.ext = Some((lock.clone(), token));
+        // SAFETY: as the caller promises.
+        let waiter = unsafe { suspend(ctx, WaitReason::Ext) };
+        state.waiters.push_back((waiter, token));
         drop(state);
-        fiber.ext = Some((lock, token));
-        return;
+        wait_for(ctx, Waiting::Ext { lock, token });
     }
-    // SAFETY: as the caller promises.
-    if unsafe { scheduler_of(ctx) }.is_none() {
-        raise(ctx, TrapKind::Unsupported, None);
-        return;
-    }
-    // The hold the wake gives is the fiber's from the hand-over on.
-    fiber.ext = Some((lock.clone(), token));
-    // SAFETY: as the caller promises.
-    let waiter = unsafe { suspend(ctx, WaitReason::Ext) };
-    state.waiters.push_back((waiter, token));
-    drop(state);
-    wait_for(ctx, Waiting::Ext { lock, token });
-}
+);
 
-system_stack_fn! {
+system_stack_fn!(
     /// `rt_ext_unlock(ctx, ext)`: see `crag_abi::RuntimeFn::ExtUnlock`.
-    fn rt_ext_unlock(ctx: *const TaskContext, ext: *const ExtLock) => unlock_entry
-}
-
-/// The Rust half of `rt_ext_unlock`.
-///
-/// # Safety
-///
-/// Called only by `rt_ext_unlock`, by the fiber that holds the lock.
-unsafe extern "C" fn unlock_entry(ctx: *const TaskContext, _ext: *const ExtLock) {
-    // SAFETY: as the caller promises.
-    let fiber = unsafe { fiber_of(&*ctx) };
-    match fiber.ext.take() {
-        Some((lock, token)) => lock.leave(token),
-        None => crate::die("unlocked an ext that was not locked"),
+    ///
+    /// # Safety
+    ///
+    /// The fiber holds the lock.
+    fn rt_ext_unlock(ctx: *const TaskContext, _ext: *const ExtLock) {
+        // SAFETY: as the caller promises.
+        let fiber = unsafe { fiber_of(&*ctx) };
+        match fiber.ext.take() {
+            Some((lock, token)) => lock.leave(token),
+            None => crate::die("unlocked an ext that was not locked"),
+        }
     }
-}
+);
 
-system_stack_fn! {
-    /// `rt_ext_free(ctx, ext)`: see `crag_abi::RuntimeFn::ExtFree`.
-    fn rt_ext_free(ctx: *const TaskContext, ext: *const ExtLock) => free_entry
-}
-
-/// The Rust half of `rt_ext_free`.
-///
-/// # Safety
-///
-/// Called only by `rt_ext_free`, once, with a lock no fiber holds or
-/// waits for.
 /// Frees the lock of an `ext` box being freed, which no task holds or
 /// waits for any more.
 ///
@@ -212,7 +189,14 @@ pub(crate) unsafe fn free(ext: u64) {
     drop(unsafe { Arc::from_raw(ext as *const ExtLock) });
 }
 
-unsafe extern "C" fn free_entry(_ctx: *const TaskContext, ext: *const ExtLock) {
-    // SAFETY: as the caller promises.
-    drop(unsafe { Arc::from_raw(ext) });
-}
+system_stack_fn!(
+    /// `rt_ext_free(ctx, ext)`: see `crag_abi::RuntimeFn::ExtFree`.
+    ///
+    /// # Safety
+    ///
+    /// Called once, with a lock no fiber holds or waits for.
+    fn rt_ext_free(_ctx: *const TaskContext, ext: *const ExtLock) {
+        // SAFETY: as the caller promises.
+        drop(unsafe { Arc::from_raw(ext) });
+    }
+);
