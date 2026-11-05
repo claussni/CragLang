@@ -52,10 +52,9 @@ use crate::cancel::{Waiting, raise, stop_if_due, wait_for};
 use crate::die;
 use crate::fiber::TaskContext;
 use crate::heap::Heap;
-use crate::io::Words;
 use crate::rc::{Types, release_value, retain_value};
 use crate::sched::{FiberRef, WaitReason, scheduler_of, suspend, wake};
-use crate::system::worker_of;
+use crate::system::{Words, worker_of};
 
 /// The words of a value, as far as its layout has words.
 type Value = [u64; 2];

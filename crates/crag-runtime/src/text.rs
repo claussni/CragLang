@@ -26,13 +26,7 @@ use crag_abi::{
 use crate::die;
 use crate::fiber::TaskContext;
 use crate::heap::Heap;
-use crate::system::worker_of;
-
-/// The two words of a string or bytes value, as the runtime functions
-/// return them: in the first two result registers.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TextWords(pub u64, pub u64);
+use crate::system::{Words, worker_of};
 
 /// Whether the first word of a value points at a buffer.
 pub fn in_buffer(w0: u64) -> bool {
@@ -103,13 +97,13 @@ pub fn show_number(number: Number, word: u64) -> String {
 system_stack_fn!(
     /// `rt_text_concat(ctx, a0, a1, b0, b1)`: see
     /// `crag_abi::RuntimeFn::TextConcat`.
-    fn rt_text_concat(ctx: *const TaskContext, a0: u64, a1: u64, b0: u64, b1: u64) -> TextWords {
+    fn rt_text_concat(ctx: *const TaskContext, a0: u64, a1: u64, b0: u64, b1: u64) -> Words {
         // SAFETY: as the caller promises; both values are borrowed live ones.
         unsafe {
             let (heap, _) = worker_of(ctx);
             let (a, b) = ([a0, a1], [b0, b1]);
             let [w0, w1] = make_text(heap, &[bytes_of(&a), bytes_of(&b)]);
-            TextWords(w0, w1)
+            Words(w0, w1)
         }
     }
 );
@@ -134,7 +128,7 @@ system_stack_fn!(
 
 system_stack_fn!(
     /// `rt_text_show(ctx, word, number)`: see `crag_abi::RuntimeFn::TextShow`.
-    fn rt_text_show(ctx: *const TaskContext, word: u64, number: u64) -> TextWords {
+    fn rt_text_show(ctx: *const TaskContext, word: u64, number: u64) -> Words {
         let Some(number) = Number::from_code(number) else {
             die(&format!("no number has the code {number}"));
         };
@@ -142,7 +136,7 @@ system_stack_fn!(
         // SAFETY: as the caller promises.
         let (heap, _) = unsafe { worker_of(ctx) };
         let [w0, w1] = make_text(heap, &[text.as_bytes()]);
-        TextWords(w0, w1)
+        Words(w0, w1)
     }
 );
 

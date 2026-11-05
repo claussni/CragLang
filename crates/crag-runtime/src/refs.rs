@@ -50,10 +50,10 @@ use crate::sync::{AtomicU64, fence};
 use crate::epoch::{pin, retire, unpin};
 use crate::fiber::{TaskContext, Worker};
 use crate::heap::Heap;
-use crate::io::Words;
 use crate::rc::{Types, release_value, retain_value};
 use crate::signals::signals_of;
 use crate::stm::{conflicted, running};
+use crate::system::Words;
 
 /// A ref cell, as generated code lays it out.
 #[repr(C)]

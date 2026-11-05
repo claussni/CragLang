@@ -22,6 +22,13 @@ use crate::fiber::{TaskContext, Worker};
 use crate::heap::Heap;
 use crate::rc::Types;
 
+/// Two words a runtime function returns, in `rax` and `rdx`: the words of
+/// a string or bytes value, a result and an error number, or whatever the
+/// function documents.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Words(pub u64, pub u64);
+
 /// Defines a runtime function with the C convention that generated code
 /// calls on a fiber stack, whose body runs on the worker's system stack:
 /// the function switches to it, keeping the fiber's stack pointer in a

@@ -48,7 +48,8 @@ use crag_abi::{
 use crate::die;
 use crate::fiber::{STATUS_TRAPPED, TaskContext, Worker};
 use crate::rc::{drop_box, holds_box};
-use crate::text::{TextWords, make_text};
+use crate::system::Words;
+use crate::text::make_text;
 
 /// What the runtime knows of the loaded code: the stack maps of its calls,
 /// by return address, and where each function lies.
@@ -578,7 +579,7 @@ system_stack_fn!(
 system_stack_fn!(
     /// `rt_trap_caught_text(ctx, which) -> (w0, w1)`: see
     /// `crag_abi::RuntimeFn::TrapCaughtText`.
-    fn rt_trap_caught_text(ctx: *const TaskContext, which: u64) -> TextWords {
+    fn rt_trap_caught_text(ctx: *const TaskContext, which: u64) -> Words {
         // SAFETY: as the caller promises.
         let ctx = unsafe { &*ctx };
         // SAFETY: as the caller promises.
@@ -593,7 +594,7 @@ system_stack_fn!(
         // SAFETY: called on the system stack by a runtime function.
         let (heap, _) = unsafe { crate::system::worker_of(ctx) };
         let [w0, w1] = make_text(heap, &[text.as_bytes()]);
-        TextWords(w0, w1)
+        Words(w0, w1)
     }
 );
 

@@ -34,8 +34,8 @@ use crate::codec::decode_value;
 use crate::fiber::TaskContext;
 use crate::print::{PrintLimits, field_words, member_words, print_value, value_at};
 use crate::rc::Types;
-use crate::system::worker_of;
-use crate::text::{TextWords, bytes_of, make_text};
+use crate::system::{Words, worker_of};
+use crate::text::{bytes_of, make_text};
 use crate::{die, list, map};
 
 /// A decoded table and its root shape.
@@ -140,7 +140,7 @@ system_stack_fn!(
     /// # Safety
     ///
     /// The values are live, of the table's root shape, and the caller holds them.
-    fn rt_value_show(ctx: *const TaskContext, handle: u64, w0: u64, w1: u64) -> TextWords {
+    fn rt_value_show(ctx: *const TaskContext, handle: u64, w0: u64, w1: u64) -> Words {
         let table = table(handle);
         // SAFETY: as the caller promises.
         let (heap, types) = unsafe { worker_of(ctx) };
@@ -152,7 +152,7 @@ system_stack_fn!(
         // SAFETY: as the caller promises.
         let text = unsafe { print_value(&[w0, w1], &table.shapes, table.root, types, limits) };
         let [w0, w1] = make_text(heap, &[text.as_bytes()]);
-        TextWords(w0, w1)
+        Words(w0, w1)
     }
 );
 

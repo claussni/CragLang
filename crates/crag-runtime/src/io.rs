@@ -35,10 +35,7 @@ use crate::cancel::{Waiting, stop_if_due, wait_for};
 use crate::fiber::TaskContext;
 use crate::reactor::{IoOp, IoResult};
 use crate::sched::{WaitReason, scheduler_of, suspend, wake};
-
-/// Two words in `rax` and `rdx`.
-#[repr(C)]
-pub(crate) struct Words(pub(crate) u64, pub(crate) u64);
+use crate::system::Words;
 
 suspending_fn!(
     /// `rt_sleep(ctx, nanos)`: see `crag_abi::RuntimeFn::Sleep`.

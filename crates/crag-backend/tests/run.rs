@@ -44,7 +44,7 @@ use crag_hir::{
 };
 use crag_loader::{CodeArena, SymbolTable, load, load_group};
 use crag_mir::{InstanceKey, Tier, collect_instances};
-use crag_runtime::text::TextWords;
+use crag_runtime::Words;
 use crag_runtime::{
     CodeMap, Disposal, Fiber, FiberConfig, FiberState, Heap, Meter, PrintLimits, StopReason, Trap,
     Types, Worker, alloc_box, decode_value, encode_value, list, map, next_disposal, print_value,
@@ -220,13 +220,13 @@ extern "C" fn rt_map_get(_ctx: *mut u64, map: *mut u8, k0: u64, k1: u64) -> *mut
     unsafe { map::get(types(), map, &[k0, k1]) }
 }
 
-extern "C" fn rt_text_concat(ctx: *mut u64, a0: u64, a1: u64, b0: u64, b1: u64) -> TextWords {
+extern "C" fn rt_text_concat(ctx: *mut u64, a0: u64, a1: u64, b0: u64, b1: u64) -> Words {
     // SAFETY: see above; the values are borrowed live ones.
     unsafe {
         let (a, b) = ([a0, a1], [b0, b1]);
         let parts = [text::bytes_of(&a), text::bytes_of(&b)];
         let [w0, w1] = text::make_text(heap_of(ctx), &parts);
-        TextWords(w0, w1)
+        Words(w0, w1)
     }
 }
 
@@ -236,11 +236,11 @@ extern "C" fn rt_text_equals(_ctx: *mut u64, a0: u64, a1: u64, b0: u64, b1: u64)
     unsafe { u64::from(text::bytes_of(&[a0, a1]) == text::bytes_of(&[b0, b1])) }
 }
 
-extern "C" fn rt_text_show(ctx: *mut u64, word: u64, number: u64) -> TextWords {
+extern "C" fn rt_text_show(ctx: *mut u64, word: u64, number: u64) -> Words {
     let shown = text::show_number(Number::from_code(number).unwrap(), word);
     // SAFETY: see above.
     let [w0, w1] = text::make_text(unsafe { heap_of(ctx) }, &[shown.as_bytes()]);
-    TextWords(w0, w1)
+    Words(w0, w1)
 }
 
 extern "C" fn rt_disposal(ctx: *mut u64) -> Disposal {

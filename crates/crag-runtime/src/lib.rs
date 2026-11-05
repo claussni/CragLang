@@ -103,6 +103,7 @@ pub use print::{PrintLimits, print_value, record_field, release_value, retain_va
 pub use rc::{Disposal, Types, next_disposal, release_box};
 pub use sched::{FiberRef, Scheduler, SchedulerConfig, WaitReason, WorkerStats, wake};
 pub use sentinel::{StopHandle, StopReason, request_stop};
+pub use system::Words;
 pub use timer::{TimerId, TimerWheel};
 pub use unwind::{CodeMap, Trap};
 

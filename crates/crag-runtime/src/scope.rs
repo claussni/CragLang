@@ -46,8 +46,8 @@ use crag_abi::{SCOPE_DONE, START_EXEMPT, TASK_CANCELLED, TASK_RETURNED, TASK_TRA
 use crate::cancel::{self, Waiting, leave_region, raise, stop_if_due, wait_for, waited};
 use crate::die;
 use crate::fiber::{Fiber, FiberConfig, FiberState, TaskContext, Worker};
-use crate::io::Words;
 use crate::sched::{FiberRef, Local, Shared, WaitReason, local_of, scheduler_of, suspend, wake};
+use crate::system::Words;
 
 /// The tasks one combinator or group started.
 pub(crate) struct Scope {

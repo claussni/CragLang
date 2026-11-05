@@ -32,9 +32,9 @@ use crag_abi::{BUFFER_HEADER, COUNT_OFFSET, HEADER_SIZE, INLINE_TEXT_MAX, TYPE_I
 use crate::cancel::stop_if_due;
 use crate::fiber::TaskContext;
 use crate::heap::Heap;
-use crate::io::{Words, perform};
+use crate::io::perform;
 use crate::reactor::IoOp;
-use crate::system::worker_of;
+use crate::system::{Words, worker_of};
 use crate::text::{bytes_of, in_buffer, make_text};
 
 /// The error number of the last failed call.

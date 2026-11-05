@@ -26,9 +26,8 @@
 use crag_abi::text_op::*;
 
 use crate::fiber::TaskContext;
-use crate::io::Words;
-use crate::system::worker_of;
-use crate::text::{TextWords, bytes_of, make_text};
+use crate::system::{Words, worker_of};
+use crate::text::{bytes_of, make_text};
 
 /// No offset, position or code point.
 const NONE: u64 = u64::MAX;
@@ -46,11 +45,11 @@ fn as_str(bytes: &[u8]) -> &str {
     })
 }
 
-fn text(ctx: *const TaskContext, bytes: &[u8]) -> TextWords {
+fn text(ctx: *const TaskContext, bytes: &[u8]) -> Words {
     // SAFETY: called on the system stack by a runtime function.
     let (heap, _) = unsafe { worker_of(ctx) };
     let [w0, w1] = make_text(heap, &[bytes]);
-    TextWords(w0, w1)
+    Words(w0, w1)
 }
 
 system_stack_fn!(
@@ -170,7 +169,7 @@ system_stack_fn!(
     /// # Safety
     ///
     /// The caller holds the values.
-    fn rt_text_map(ctx: *const TaskContext, op: u64, w0: u64, w1: u64) -> TextWords {
+    fn rt_text_map(ctx: *const TaskContext, op: u64, w0: u64, w1: u64) -> Words {
         let words = [w0, w1];
         // SAFETY: as the caller promises.
         let bytes = unsafe { bytes_of(&words) };
@@ -196,7 +195,7 @@ system_stack_fn!(
     /// # Safety
     ///
     /// The caller holds the values.
-    fn rt_text_slice(ctx: *const TaskContext, w0: u64, w1: u64, from: u64, to: u64) -> TextWords {
+    fn rt_text_slice(ctx: *const TaskContext, w0: u64, w1: u64, from: u64, to: u64) -> Words {
         let words = [w0, w1];
         // SAFETY: as the caller promises.
         let bytes = unsafe { bytes_of(&words) };
@@ -351,7 +350,7 @@ system_stack_fn!(
         w1: u64,
         at: u64,
         value: u64,
-    ) -> TextWords {
+    ) -> Words {
         use crag_abi::bytes_kind::*;
         let words = [w0, w1];
         // SAFETY: as the caller promises.
@@ -384,7 +383,7 @@ system_stack_fn!(
     /// # Safety
     ///
     /// The caller holds the values.
-    fn rt_bytes_of_list(ctx: *const TaskContext, list: *mut u8) -> TextWords {
+    fn rt_bytes_of_list(ctx: *const TaskContext, list: *mut u8) -> Words {
         // SAFETY: as the caller promises: a live list of `UInt8`, whose
         // elements are a byte, or a word without flat layouts, the byte first.
         let bytes: Vec<u8> = unsafe {

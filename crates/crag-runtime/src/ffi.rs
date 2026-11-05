@@ -24,14 +24,8 @@ use std::sync::{Mutex, PoisonError};
 use crag_abi::{HEADER_SIZE, NativeJob, NativeLibrary, c_kind, threading};
 
 use crate::fiber::TaskContext;
-use crate::system::worker_of;
-use crate::text::{TextWords, in_buffer, make_text};
-
-/// The C result's word and the class of a float result, as `rt_c_call`
-/// returns them.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CResult(pub u64, pub u64);
+use crate::system::{Words, worker_of};
+use crate::text::{in_buffer, make_text};
 
 /// The registers and the stack words of a call: six integer registers,
 /// then eight vector registers.
@@ -58,7 +52,7 @@ system_stack_fn!(
         func: usize,
         desc: *const u8,
         buf: *mut u64,
-    ) -> CResult {
+    ) -> Words {
         // SAFETY: as the caller promises.
         unsafe {
             let library = &*library;
@@ -93,13 +87,13 @@ system_stack_fn!(
             }
             *buf.add(count) = errno as i64 as u64;
             match result {
-                c_kind::VOID => CResult(0, 0),
-                c_kind::F64 => CResult(raw[2], class(f64::from_bits(raw[2]))),
+                c_kind::VOID => Words(0, 0),
+                c_kind::F64 => Words(raw[2], class(f64::from_bits(raw[2]))),
                 c_kind::F32 => {
                     let bits = raw[2] & 0xffff_ffff;
-                    CResult(bits, class(f32::from_bits(bits as u32).into()))
+                    Words(bits, class(f32::from_bits(bits as u32).into()))
                 }
-                kind => CResult(extend(kind, raw[0]), 0),
+                kind => Words(extend(kind, raw[0]), 0),
             }
         }
     }
@@ -291,7 +285,7 @@ system_stack_fn!(
     /// # Safety
     ///
     /// `address` is the address of NUL-terminated bytes.
-    fn rt_c_str_of(ctx: *const TaskContext, address: u64, nul: u64) -> TextWords {
+    fn rt_c_str_of(ctx: *const TaskContext, address: u64, nul: u64) -> Words {
         // SAFETY: as the caller promises.
         unsafe {
             let (heap, _) = worker_of(ctx);
@@ -301,7 +295,7 @@ system_stack_fn!(
                 _ => c.to_bytes_with_nul(),
             };
             let [w0, w1] = make_text(heap, &[bytes]);
-            TextWords(w0, w1)
+            Words(w0, w1)
         }
     }
 );
