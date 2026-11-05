@@ -24,16 +24,15 @@ use std::io;
 
 use crag_abi::{FuncId, SlotKey};
 use crag_backend::{func_id, shapes};
-use crag_codegen::{CodeObject, CodegenSettings, compile_entry_stub};
+use crag_codegen::{CodeObject, CodegenSettings};
 use crag_mir::InstanceKey;
 use crag_runtime::Trap;
-use crag_session::{
-    ImageCommand, ImageKind, Message, RunResult, Session, ShippedFunction, Stub, TierUp,
-};
+use crag_session::{ImageCommand, ImageKind, Message, RunResult, Session, ShippedFunction, TierUp};
 use crag_types::Ty;
 
 use crate::exec::{
-    Compiled, Function, Sources, bundle, compile, constants, receives, report, stub_settings,
+    Compiled, Function, Sources, bundle, compile, constants, entry_stubs, receives, report,
+    stub_settings,
 };
 use crate::project::Project;
 use crate::tier::{Hot, tiers_up};
@@ -140,34 +139,8 @@ impl Scratch {
         fill: bool,
     ) -> Result<Shipment, String> {
         let functions = shipped_functions(compiled);
-        // Tasks start in the stubs for one argument, the task's closure;
-        // the host ships each stub once.
-        let mut stubs = Vec::new();
-        for returns in 0..3 {
-            let object = compile_entry_stub(1, returns, &self.settings)
-                .map_err(|e| format!("cannot compile an entry stub: {e}"))?;
-            stubs.push(Stub {
-                params: 1,
-                returns,
-                object,
-            });
-        }
-        for &root in roots {
-            let f = &compiled.functions[&func_id(root)];
-            if f.params == 0
-                && !stubs
-                    .iter()
-                    .any(|s: &Stub| s.params == 0 && s.returns == f.returns)
-            {
-                let object = compile_entry_stub(0, f.returns, &self.settings)
-                    .map_err(|e| format!("cannot compile an entry stub: {e}"))?;
-                stubs.push(Stub {
-                    params: 0,
-                    returns: f.returns,
-                    object,
-                });
-            }
-        }
+        // The host ships each stub once.
+        let stubs = entry_stubs(&self.settings, compiled, roots)?;
         // A value is computed again once the code it is computed with
         // changed. Every run ships its root first, which reaches every value
         // the run may read, so the image never reads a value computed with

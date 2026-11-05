@@ -17,8 +17,8 @@
 //! The driver (Implementation Plan §11.4.15): the `crag` command's `run`,
 //! `test` and `build`. It loads a project into the database, prints the
 //! diagnostics of every module, compiles what the entry points reach, and
-//! runs them on fibers. `Scratch` runs code in the scratch image instead
-//! (§11.6.3).
+//! runs them in an image in its own process. `Scratch` runs code in the
+//! scratch image instead (§11.6.3).
 
 pub mod api;
 pub mod app;

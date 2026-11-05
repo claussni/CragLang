@@ -908,25 +908,7 @@ impl Session {
         func: FuncId,
         tier: Option<&mut dyn TierUp>,
     ) -> Result<RunResult, SessionError> {
-        match self.request_running(&Message::Run(func), tier)? {
-            Message::Finished(words) => Ok(RunResult::Finished(words)),
-            Message::Interrupted => Ok(RunResult::Interrupted),
-            Message::Trapped {
-                kind,
-                position,
-                stack,
-                detail,
-            } => Ok(RunResult::Trapped(Trap {
-                kind,
-                position,
-                stack,
-                detail,
-            })),
-            Message::Failed(why) => Err(SessionError::Refused(why)),
-            other => Err(SessionError::Refused(format!(
-                "the image answered {other:?} to Run"
-            ))),
-        }
+        run_result(self.request_running(&Message::Run(func), tier)?)
     }
 
     /// Starts a loaded function as the app in the app image.
@@ -945,24 +927,7 @@ impl Session {
         Ok(match self.request_to(ImageKind::App, &Message::Status)? {
             Message::Running => AppStatus::Running,
             Message::Stopped => AppStatus::Stopped,
-            Message::Finished(words) => AppStatus::Ended(RunResult::Finished(words)),
-            Message::Trapped {
-                kind,
-                position,
-                stack,
-                detail,
-            } => AppStatus::Ended(RunResult::Trapped(Trap {
-                kind,
-                position,
-                stack,
-                detail,
-            })),
-            Message::Failed(why) => return Err(SessionError::Refused(why)),
-            other => {
-                return Err(SessionError::Refused(format!(
-                    "the image answered {other:?} to Status"
-                )));
-            }
+            ended => AppStatus::Ended(run_result(ended)?),
         })
     }
 
@@ -1055,25 +1020,7 @@ impl Session {
             root,
             text,
         };
-        match self.request_running(&show, tier)? {
-            Message::Shown(text) => Ok(RunResult::Shown(text)),
-            Message::Trapped {
-                kind,
-                position,
-                stack,
-                detail,
-            } => Ok(RunResult::Trapped(Trap {
-                kind,
-                position,
-                stack,
-                detail,
-            })),
-            Message::Interrupted => Ok(RunResult::Interrupted),
-            Message::Failed(why) => Err(SessionError::Refused(why)),
-            other => Err(SessionError::Refused(format!(
-                "the image answered {other:?} to Show"
-            ))),
-        }
+        run_result(self.request_running(&show, tier)?)
     }
 
     /// Kills the scratch image, for one that runs away, and starts a fresh
@@ -1129,4 +1076,29 @@ pub enum RunResult {
     Interrupted,
     /// The result as the image shows it.
     Shown(String),
+}
+
+/// How a run ended, from the image's answer to `Run` or `Show`, or to
+/// `Status` once the app ended.
+pub fn run_result(answer: Message) -> Result<RunResult, SessionError> {
+    match answer {
+        Message::Finished(words) => Ok(RunResult::Finished(words)),
+        Message::Shown(text) => Ok(RunResult::Shown(text)),
+        Message::Interrupted => Ok(RunResult::Interrupted),
+        Message::Trapped {
+            kind,
+            position,
+            stack,
+            detail,
+        } => Ok(RunResult::Trapped(Trap {
+            kind,
+            position,
+            stack,
+            detail,
+        })),
+        Message::Failed(why) => Err(SessionError::Refused(why)),
+        other => Err(SessionError::Refused(format!(
+            "the image answered {other:?} to a run"
+        ))),
+    }
 }

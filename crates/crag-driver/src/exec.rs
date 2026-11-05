@@ -14,70 +14,43 @@
 // You should have received a copy of the GNU General Public License along with
 // Crag. If not, see <https://www.gnu.org/licenses/>.
 
-//! Compiling what a program reaches, loading it, and running it on fibers.
+//! Compiling what a program reaches, and running it in an image in this
+//! process.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
 
-use crag_abi::{
-    CELL_FULL, Frame, FuncId, RuntimeFn, Shapes, SlotKey, TrapKind, TypeDescriptor, profile_cell,
-};
+use crag_abi::{Frame, FuncId, Shapes, SlotKey, TrapKind, TypeDescriptor};
 use crag_backend::{code, func_id, shapes};
 use crag_codegen::{CodeObject, CodegenSettings, OptLevel, compile_entry_stub, target_for};
 use crag_eval::{EvalSite, const_eval};
 use crag_hir::{ItemId, ModuleId, Owner};
-use crag_loader::{CodeArena, SymbolTable, load, load_group, publish, stage_group};
 use crag_mir::{Entry, InstanceKey, Tier, collect_instances, mir};
-use crag_runtime::{
-    CodeMap, Fiber, FiberConfig, FiberState, Scheduler, SchedulerConfig, Trap, Types, Worker,
-    decode_value,
-};
-use crag_session::Fill;
+use crag_runtime::Trap;
+use crag_session::{Fill, Message, RunResult, Stub, TierUp, run_result};
 
 use crate::diagnostics::render_at;
 use crate::project::Project;
+use crate::scratch::{Shipped, shipped_functions};
+use crate::tier::{Hot, tiers_up};
 
-/// Loaded code with a worker to run it.
-///
-/// While a run waits, the image compiles the functions whose baseline code
-/// counted many calls and back-edges again in the optimizing tier and
-/// swaps them in through their slots (Implementation Plan §11.10.2): the
-/// workers take a code map with the new code first, so whatever runs it
-/// can unwind it, and frames already running finish on the old code.
+/// Compiled code in an image in this process, as `crag run` and `crag
+/// test` run it: the image a session would start as a process of its own,
+/// with the host's side of shipping and tier-up (Implementation Plan
+/// §11.10.2) done here.
 pub struct Image<'a> {
     project: &'a Project,
-    arena: CodeArena,
-    symbols: SymbolTable,
-    settings: CodegenSettings,
-    functions: HashMap<FuncId, Function>,
-    /// Each function's entry.
-    entries: HashMap<FuncId, usize>,
-    /// The instances compiled in the baseline tier, which may become hot.
-    baseline: HashMap<FuncId, InstanceKey<'a>>,
-    /// Every code object loaded, old code included, for the code map.
-    code: Vec<(FuncId, usize, CodeObject)>,
-    types: Vec<(u32, TypeDescriptor)>,
-    task_entries: [usize; 3],
-    /// The worker whose heap holds the values the compiler computed, kept
-    /// as long as they are.
-    _worker: Worker,
-    /// Runs the fibers of the image's programs and their tasks.
-    scheduler: Scheduler,
+    image: crag_session::Image,
+    /// The instances compiled, by their functions, for tier-up.
+    instances: HashMap<FuncId, InstanceKey<'a>>,
+    /// What the host knows of the code shipped: the functions, for
+    /// reports, and the tier-up so far.
+    shipped: Shipped,
     /// The values the compiler computed, whose cells were filled.
     constants: usize,
-    /// The functions swapped for optimized code so far.
-    optimized: usize,
 }
-
-/// How often a run looks for hot functions.
-const PROFILE_PERIOD: Duration = Duration::from_millis(20);
 
 /// How many calls and back-edges make a function hot.
 const HOT: u64 = 10_000;
-
-/// How long a tier-up waits for the workers to take the new tables.
-const TABLES_WAIT: Duration = Duration::from_secs(2);
 
 /// How many calls and back-edges make a function hot: `HOT`, or the
 /// count `CRAG_HOT` gives, so that tests can have most code optimized
@@ -400,218 +373,106 @@ pub fn owner_name(project: &Project, owner: Owner) -> String {
     }
 }
 
+/// The entry stubs an image needs for compiled code with these roots: the
+/// stubs tasks start in, for one argument, the task's closure, and one for
+/// the words of each root without parameters.
+pub(crate) fn entry_stubs(
+    settings: &CodegenSettings,
+    compiled: &Compiled,
+    roots: &[InstanceKey],
+) -> Result<Vec<Stub>, String> {
+    let mut shapes: Vec<(u32, u32)> = (0..3).map(|returns| (1, returns)).collect();
+    for &root in roots {
+        let f = &compiled.functions[&func_id(root)];
+        if f.params == 0 && !shapes.contains(&(0, f.returns)) {
+            shapes.push((0, f.returns));
+        }
+    }
+    shapes
+        .into_iter()
+        .map(|(params, returns)| {
+            let object = compile_entry_stub(params, returns, settings)
+                .map_err(|e| format!("cannot compile an entry stub: {e}"))?;
+            Ok(Stub {
+                params,
+                returns,
+                object,
+            })
+        })
+        .collect()
+}
+
+/// Why an image did not do as asked, from its answer.
+fn refused(answer: Option<Message>) -> String {
+    match answer {
+        Some(Message::Failed(why)) => why,
+        other => format!("the image answered {other:?}"),
+    }
+}
+
 impl<'a> Image<'a> {
-    /// Compiles the instances and everything they call, and loads them
-    /// with the runtime's functions.
+    /// Compiles the instances and everything they call, and loads them into
+    /// an image, with the values the compiler computed in their cells.
     pub fn build(project: &'a Project, roots: &[InstanceKey<'a>]) -> Result<Image<'a>, String> {
-        let Compiled {
-            objects,
-            types,
-            functions,
-            values,
-            instances,
-        } = compile(project, roots)?;
-        let io = |e: std::io::Error| format!("cannot map memory for code: {e}");
-        let mut arena = CodeArena::new(64 << 20).map_err(io)?;
-        let mut symbols = SymbolTable::new();
-        for func in RuntimeFn::ALL {
-            symbols.define_runtime(func, crag_runtime::runtime_fn_addr(func));
+        let compiled = compile(project, roots)?;
+        let stubs = entry_stubs(&stub_settings()?, &compiled, roots)?;
+        let fills = constants(project, &compiled.values);
+        let constants = fills.len();
+        let mut image =
+            crag_session::Image::new().map_err(|e| format!("cannot map memory for code: {e}"))?;
+        let load = Message::Load {
+            types: compiled.types.clone(),
+            stubs,
+            functions: shipped_functions(&compiled),
+            reset: Vec::new(),
+            fills,
+        };
+        match image.answer(load) {
+            Some(Message::Loaded) => {}
+            other => return Err(refused(other)),
         }
-        let entries = load_group(&mut arena, &mut symbols, &objects)
-            .map_err(|e| format!("cannot load the code: {e:?}"))?;
-        let mut map = CodeMap::new();
-        let mut addrs = HashMap::new();
-        for (&(slot, object), entry) in objects.iter().zip(&entries) {
-            map.add(slot.func, entry.addr(), object);
-            addrs.insert(slot.func, entry.addr());
-        }
-        let settings = stub_settings()?;
-        // Tasks start in the stubs for one argument, the task's closure.
-        let task_entries = [0, 1, 2].map(|results| {
-            let stub = compile_entry_stub(1, results, &settings).expect("the stub compiles");
-            load(&mut arena, &symbols, &stub)
-                .expect("the stub loads")
-                .addr()
-        });
-        // SAFETY: the stubs stay loaded while the image exists, which
-        // outlives its scheduler's fibers.
-        unsafe { map.set_task_entries(task_entries) };
-        let mut worker = Worker::new();
-        let all_types = types.clone();
-        let types = Arc::new(Types::new(types));
-        let code = Arc::new(map);
-        worker.set_types(types.clone());
-        worker.set_code_map(code.clone());
-        let scheduler = Scheduler::new(SchedulerConfig::default(), types.clone(), code);
-        // The constants are in their cells before any code runs.
-        for fill in constants(project, &values) {
-            // SAFETY: the shapes describe the layouts the code was compiled
-            // with, whose descriptors the worker has.
-            let words = unsafe {
-                decode_value(&fill.bytes, &fill.shapes, fill.root, worker.heap(), &types)
-            }
-            .map_err(|e| format!("cannot decode a constant: {}", e.0))?;
-            symbols.cells().fill(fill.cell, &words);
-        }
-        let cells = symbols.cells();
-        let constants = values
-            .iter()
-            .filter(|(key, _)| cells.state(*key) == Some(CELL_FULL))
-            .count();
         // A program that runs received code checks and compiles it itself,
         // sharing the cells of its values (§11.10.9).
-        if receives(project, &instances) {
-            let bundle = bundle(project, &instances, &values);
-            let addresses = bundle
-                .cells
-                .iter()
-                .filter_map(|(name, key)| Some((name.clone(), cells.address(*key)?)))
-                .collect();
-            let receiver = crag_receive::Receiver::new(bundle, addresses)
-                .map_err(|e| format!("cannot start the receiver of code: {e}"))?;
-            receiver.install(&scheduler);
+        if receives(project, &compiled.instances) {
+            let bytes = bundle(project, &compiled.instances, &compiled.values).encode();
+            match image.answer(Message::Receive(bytes)) {
+                Some(Message::Done) => {}
+                other => return Err(refused(other)),
+            }
         }
-        let code = objects
-            .iter()
-            .zip(&entries)
-            .map(|(&(slot, object), entry)| (slot.func, entry.addr(), object.clone()))
-            .collect();
-        // Code compiled in the optimizing tier already counts nothing.
-        let baseline = match Tier::compiled() {
-            Tier::Baseline => instances,
-            _ => HashMap::new(),
-        };
         Ok(Image {
             project,
-            arena,
-            symbols,
-            settings,
-            functions,
-            entries: addrs,
-            baseline,
-            code,
-            types: all_types,
-            task_entries,
-            _worker: worker,
-            scheduler,
+            image,
+            instances: compiled.instances,
+            shipped: Shipped {
+                functions: compiled.functions,
+                ..Shipped::default()
+            },
             constants,
-            optimized: 0,
         })
     }
 
-    /// Runs a function without parameters as the root task of the
-    /// scheduler: its result words, or the trap that ended it.
+    /// Runs a function without parameters as the root task of the image:
+    /// its result words, or the trap that ended it. Functions that become
+    /// hot meanwhile are swapped for optimized code.
     pub fn run(&mut self, func: FuncId) -> Result<Vec<u64>, Trap> {
-        let f = &self.functions[&func];
-        assert_eq!(f.params, 0, "an entry point takes no parameters");
-        let returns = f.returns;
-        let stub = compile_entry_stub(0, returns, &self.settings).expect("the stub compiles");
-        let stub = load(&mut self.arena, &self.symbols, &stub).expect("the stub loads");
-        // SAFETY: the stub was compiled for the function's words, and both
-        // stay loaded while the image exists, which outlives the fiber.
-        let entry = self.entries[&func];
-        let fiber = unsafe { Fiber::new(stub.addr(), entry, &[], FiberConfig::default()) }
-            .expect("a fiber's stack can be mapped");
-        self.scheduler.spawn(fiber);
-        let mut stopped = loop {
-            if self.baseline.is_empty() || hot() == 0 {
-                break self.scheduler.wait();
-            }
-            if let Some(stopped) = self.scheduler.wait_timeout(PROFILE_PERIOD) {
-                break stopped;
-            }
-            self.tier_up();
+        let mut hot = Hot {
+            project: self.project,
+            instances: &self.instances,
+            shipped: &mut self.shipped,
         };
-        assert_eq!(stopped.len(), 1, "only the root task stops on its own");
-        let fiber = stopped.pop().expect("one");
-        match fiber.state() {
-            FiberState::Finished => {
-                Ok(fiber.results().expect("finished")[..returns as usize].to_vec())
-            }
-            FiberState::Trapped => Err(fiber.trap().expect("trapped").clone()),
-            state => unreachable!("a fiber nothing stops ended {state:?}"),
+        let tier = tiers_up().then_some(&mut hot as &mut dyn TierUp);
+        match run_result(self.image.run_with(func, tier)) {
+            Ok(RunResult::Finished(words)) => Ok(words),
+            Ok(RunResult::Trapped(trap)) => Err(trap),
+            Ok(other) => unreachable!("a run in this process ended {other:?}"),
+            Err(e) => panic!("the image refused the run: {e}"),
         }
-    }
-
-    /// Compiles the hot functions in the optimizing tier and swaps them in
-    /// through their slots. A function whose optimized code cannot be
-    /// compiled or loaded stays as it is.
-    fn tier_up(&mut self) {
-        let project = self.project;
-        let (db, program) = (&project.db, project.program);
-        let cells = self.symbols.cells();
-        let threshold = hot();
-        let mut hot: Vec<(FuncId, InstanceKey<'a>)> = self
-            .baseline
-            .iter()
-            .filter(|&(&func, _)| {
-                cells
-                    .words(profile_cell(func))
-                    .is_some_and(|w| w[0].saturating_add(w[1]) >= threshold)
-            })
-            .map(|(&func, &instance)| (func, instance))
-            .collect();
-        if hot.is_empty() {
-            return;
-        }
-        hot.sort_by_key(|&(func, _)| func.0);
-        let mut group = Vec::new();
-        let mut types = Vec::new();
-        for (func, instance) in hot {
-            self.baseline.remove(&func);
-            // Optimized code calls what baseline code calls, and inlines it.
-            let Some(Ok(optimized)) = code(db, program, instance, Tier::Hot) else {
-                continue;
-            };
-            let calls = &optimized.calls;
-            if calls
-                .iter()
-                .any(|&c| !self.entries.contains_key(&func_id(c)))
-            {
-                continue;
-            }
-            for t in &optimized.types {
-                if !self.types.contains(t) && !types.contains(t) {
-                    types.push(t.clone());
-                }
-            }
-            group.push((optimized.slot, &optimized.object));
-        }
-        if group.is_empty() {
-            return;
-        }
-        let Ok(staged) = stage_group(&mut self.arena, &mut self.symbols, &group) else {
-            return;
-        };
-        let entries = staged.entries();
-        for (&(slot, object), entry) in group.iter().zip(&entries) {
-            self.code.push((slot.func, entry.addr(), object.clone()));
-        }
-        self.types.extend(types);
-        let mut map = CodeMap::new();
-        for (func, entry, object) in &self.code {
-            map.add(*func, *entry, object);
-        }
-        // SAFETY: the stubs stay loaded while the image exists, which
-        // outlives its scheduler's fibers.
-        unsafe { map.set_task_entries(self.task_entries) };
-        let types = Arc::new(Types::new(self.types.iter().cloned()));
-        let epoch = self.scheduler.update_tables(types, Arc::new(map));
-        // Workers that keep old tables cannot unwind the new code, so it
-        // is not reached; it stays loaded and in the map.
-        if !self.scheduler.wait_tables(epoch, TABLES_WAIT) {
-            return;
-        }
-        publish(&self.symbols, staged);
-        for (&(slot, _), entry) in group.iter().zip(entries) {
-            self.entries.insert(slot.func, entry.addr());
-        }
-        self.optimized += group.len();
     }
 
     /// A trap as the user sees it.
     pub fn report(&self, project: &Project, trap: &Trap) -> String {
-        report(project, &self.functions, trap)
+        report(project, &self.shipped.functions, trap)
     }
 
     /// How many values were in their cells when the image was built: the
@@ -622,6 +483,6 @@ impl<'a> Image<'a> {
 
     /// How many functions runs swapped for optimized code so far.
     pub fn optimized(&self) -> usize {
-        self.optimized
+        self.shipped.optimized
     }
 }

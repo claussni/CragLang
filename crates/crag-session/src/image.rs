@@ -44,6 +44,11 @@
 //! answers both while a run waits, so a long REPL input speeds up as it
 //! runs.
 //!
+//! `crag run` and `crag test` host an image in their own process: the
+//! driver loads and runs code through `Image::answer` and `Image::run_with`
+//! as the session would over the socket, and does the host's side of
+//! tier-up itself.
+//!
 //! SIGINT interrupts a run (§11.6.2): the image cancels the root task,
 //! which stops at its next safepoint, a function entry, a loop's back-edge
 //! or a wait, and passes the cancellation to the tasks it started (Plan
@@ -66,7 +71,7 @@ use crag_runtime::{
     Worker, decode_value, print_value, release_value,
 };
 
-use crate::host::ImageKind;
+use crate::host::{ImageKind, TierUp};
 use crate::protocol::{
     Fill, Message, PROTOCOL_VERSION, PausedTask, ShippedFunction, Stub, read_message, write_message,
 };
@@ -333,8 +338,10 @@ impl Image {
                 None => Message::Failed(format!("no way of resuming is numbered {how}")),
             },
             Message::Locals { task, locals } => self.locals(task, &locals),
-            Message::Profile { threshold } => self.hot(threshold),
-            Message::Optimize { types, functions } => self.optimize(types, functions, None),
+            Message::Profile { threshold } => Message::Hot(self.hot(threshold)),
+            Message::Optimize { types, functions } => {
+                Message::Optimized(self.optimize(types, functions, None))
+            }
             Message::Receive(bundle) => self.receive(&bundle),
             other => Message::Failed(format!("an image does not take {other:?}")),
         })
@@ -486,7 +493,7 @@ impl Image {
 
     /// The functions whose baseline code counted at least `threshold` calls
     /// and back-edges, but those with a breakpoint.
-    fn hot(&self, threshold: u64) -> Message {
+    fn hot(&self, threshold: u64) -> Vec<FuncId> {
         let cells = self.symbols.cells();
         let stopping = self.stopping();
         let mut hot: Vec<FuncId> = self
@@ -501,20 +508,21 @@ impl Image {
             })
             .collect();
         hot.sort_by_key(|f| f.0);
-        Message::Hot(hot)
+        hot
     }
 
     /// Swaps optimized code in for baseline code: loaded as one group, in
     /// the slots once every worker has the tables that describe it. A
     /// function that is optimized already, has a breakpoint in its own or
     /// its inlined code, or comes for another slot than its baseline code
-    /// fills stays baseline, as all do when the code cannot be loaded.
+    /// fills stays baseline, as all do when the code cannot be loaded. The
+    /// functions swapped.
     fn optimize(
         &mut self,
         types: Vec<(u32, TypeDescriptor)>,
         functions: Vec<ShippedFunction>,
         running: Option<&Scheduler>,
-    ) -> Message {
+    ) -> Vec<FuncId> {
         let stopping = self.stopping();
         let functions: Vec<(ShippedFunction, Vec<FuncId>)> = functions
             .into_iter()
@@ -533,14 +541,14 @@ impl Image {
             })
             .collect();
         if functions.is_empty() || self.check_types(&types).is_err() {
-            return Message::Optimized(Vec::new());
+            return Vec::new();
         }
         let group: Vec<(SlotKey, &CodeObject)> = functions
             .iter()
             .map(|(f, _)| (self.baseline[&f.id].0, &f.object))
             .collect();
         let Ok(staged) = stage_group(&mut self.arena, &mut self.symbols, &group) else {
-            return Message::Optimized(Vec::new());
+            return Vec::new();
         };
         let entries = staged.entries();
         for ((f, _), entry) in functions.iter().zip(&entries) {
@@ -550,7 +558,7 @@ impl Image {
         // Workers that keep old tables cannot unwind the new code, so it
         // is not reached; it stays loaded and in the code map.
         if self.swap_tables(running).is_err() {
-            return Message::Optimized(Vec::new());
+            return Vec::new();
         }
         publish(&self.symbols, staged);
         let mut swapped = Vec::new();
@@ -561,7 +569,21 @@ impl Image {
             self.optimized.insert(f.id, inlined);
             swapped.push(f.id);
         }
-        Message::Optimized(swapped)
+        swapped
+    }
+
+    /// Swaps optimized code in for the functions of a run that are hot, as
+    /// the host asks for a run in the scratch image: `tier` compiles it.
+    fn tier_up(&mut self, tier: &mut dyn TierUp, running: &Scheduler) {
+        let hot = self.hot(tier.threshold());
+        if hot.is_empty() {
+            return;
+        }
+        let Some((types, functions)) = tier.hot(&hot) else {
+            return;
+        };
+        let swapped = self.optimize(types, functions, Some(running));
+        tier.optimized(&swapped);
     }
 
     /// Answers what the host asks while a run waits: which functions are
@@ -574,9 +596,9 @@ impl Image {
         };
         while readable(&stream) {
             let reply = match read_message(&mut stream) {
-                Ok(Message::Profile { threshold }) => self.hot(threshold),
+                Ok(Message::Profile { threshold }) => Message::Hot(self.hot(threshold)),
                 Ok(Message::Optimize { types, functions }) => {
-                    self.optimize(types, functions, Some(scheduler))
+                    Message::Optimized(self.optimize(types, functions, Some(scheduler)))
                 }
                 Ok(Message::Ping(n)) => Message::Pong(n),
                 // The run's tasks may be in the middle of anything, and
@@ -772,7 +794,23 @@ impl Image {
     /// scheduler: its result words, or the answer that tells how it ended
     /// otherwise.
     fn run(&mut self, func: FuncId) -> Result<Vec<u64>, Message> {
-        let (fiber, returns) = self.root_fiber(func)?;
+        match self.run_with(func, None) {
+            Message::Finished(words) => Ok(words),
+            other => Err(other),
+        }
+    }
+
+    /// Runs a loaded function without parameters as the root task of a
+    /// scheduler, answering the host meanwhile: how the run ended, as the
+    /// image answers `Run`. With `tier`, the functions that become hot
+    /// while it runs are swapped for optimized code, as the host sees to
+    /// for a run in the scratch image; that is how the `crag` command runs
+    /// a program in its own process.
+    pub fn run_with(&mut self, func: FuncId, mut tier: Option<&mut dyn TierUp>) -> Message {
+        let (fiber, returns) = match self.root_fiber(func) {
+            Ok(root) => root,
+            Err(reply) => return reply,
+        };
         let cancel = fiber.cancel_handle();
         let scheduler = self.scheduler();
         INTERRUPTED.store(false, Ordering::SeqCst);
@@ -787,12 +825,12 @@ impl Image {
                 cancel.cancel();
             }
             self.answer_running(&scheduler);
+            if let Some(tier) = tier.as_deref_mut() {
+                self.tier_up(tier, &scheduler);
+            }
         };
         drop(scheduler);
-        match Self::ended(stopped.pop(), returns, interrupted) {
-            Message::Finished(words) => Ok(words),
-            other => Err(other),
-        }
+        Self::ended(stopped.pop(), returns, interrupted)
     }
 }
 

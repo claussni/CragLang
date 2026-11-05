@@ -28,7 +28,7 @@ pub use crag_abi::protocol;
 pub use host::{
     AppStatus, ImageCommand, ImageExit, ImageHandle, ImageKind, ImageState, Optimized,
     PROFILE_PERIOD, RunResult, Session, SessionError, TierUp, describe, descriptor_hash, receive,
-    send, spawn_image,
+    run_result, send, spawn_image,
 };
 pub use image::{Image, serve};
 pub use protocol::{
