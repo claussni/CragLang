@@ -1313,9 +1313,9 @@ fn run_backend(
         let name = &names[*name];
         let target = match name.namespace {
             NS_FUNCTION => RelocTarget::Function(FuncId(name.index)),
-            NS_RUNTIME => {
-                RelocTarget::Runtime(RuntimeFn::from_index(name.index).ok_or_else(unsupported)?)
-            }
+            NS_RUNTIME => RelocTarget::Runtime(
+                RuntimeFn::from_index(u64::from(name.index)).ok_or_else(unsupported)?,
+            ),
             NS_LOCAL => RelocTarget::Local(name.index),
             NS_SLOT => RelocTarget::Slot(*keys.get(name.index as usize).ok_or_else(unsupported)?),
             NS_CELL => RelocTarget::Cell(*keys.get(name.index as usize).ok_or_else(unsupported)?),

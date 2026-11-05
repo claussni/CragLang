@@ -906,9 +906,9 @@ impl Reader<'_> {
                     0 => RelocTarget::Function(FuncId(r.u32()?)),
                     1 => {
                         let index = r.u32()?;
-                        RelocTarget::Runtime(RuntimeFn::from_index(index).ok_or_else(|| {
-                            invalid(format!("the unknown runtime function {index}"))
-                        })?)
+                        RelocTarget::Runtime(RuntimeFn::from_index(u64::from(index)).ok_or_else(
+                            || invalid(format!("the unknown runtime function {index}")),
+                        )?)
                     }
                     2 => RelocTarget::Local(r.u32()?),
                     3 => RelocTarget::Slot(r.slot_key()?),

@@ -139,885 +139,935 @@ pub const RUNTIME_RESERVE: u32 = 512;
 /// Usable bytes the runtime keeps below `stack_limit`.
 pub const STACK_MARGIN: u32 = FRAME_BUDGET + RUNTIME_RESERVE;
 
-/// Runtime functions that generated code calls. Code objects name them in
-/// relocations; the loader resolves them to addresses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(u32)]
-pub enum RuntimeFn {
-    /// `rt_morestack(ctx: *mut TaskContext, needed: usize)`.
-    ///
-    /// Called when a stack check fails. It takes its arguments in the first
-    /// two argument registers of the C calling convention and preserves every
-    /// register, vector registers included, so the call costs the passing
-    /// path nothing. It is therefore an assembly routine, not a Rust function.
-    /// The runtime handles a pending stop
-    /// request if `stack_limit` holds the sentinel, then grows the stack
-    /// until `sp - needed >= stack_limit`. `needed` is zero for the ordinary
-    /// check and the body's footprint for the sized check. It returns into
-    /// the same frame, which may have moved to a new stack.
-    Morestack = 0,
-
-    /// `rt_side_grow(ctx: *mut TaskContext, size: usize, align: usize)`.
-    ///
-    /// Called when a side-stack push does not fit the current chunk. The
-    /// runtime makes the side-stack fields of the context describe a chunk
-    /// with room for `size` bytes at alignment `align`, and generated code
-    /// then repeats the push. It has the same convention as `rt_morestack`:
-    /// C argument registers, every register preserved, no result.
-    SideGrow = 1,
-
-    /// `rt_trap(ctx: *mut TaskContext, kind: u64, position: u64) -> !`, with
-    /// `kind` a [`TrapKind`] and `position` the byte offset of the
-    /// expression that trapped in its module's source, or [`NO_POSITION`].
-    ///
-    /// Called where a check fails, after the frame has released what it
-    /// holds; it never returns. It releases what the frames below hold, as
-    /// their stack maps list it, and ends the fiber (Implementation Plan
-    /// §11.4.14). The functions from here on have the C calling convention,
-    /// take the task context first, and run on the system stack.
-    Trap = 2,
-
-    /// `rt_alloc(ctx: *mut TaskContext, size: u64, type_index: u64) -> *mut u8`.
-    ///
-    /// A box of `size` bytes, header included, with a count of one and the
-    /// type index in its header (Implementation Plan §11.4.11).
-    Alloc = 3,
-
-    /// `rt_release(ctx: *mut TaskContext, ptr: *mut u8)`.
-    ///
-    /// Called when the inline decrement has taken a box's count from one to
-    /// zero: releases the box's fields, using its type's descriptor, and
-    /// frees it, and so on for every field whose count reaches zero
-    /// (Implementation Plan §11.4.12). Retaining is inline code only.
-    Release = 4,
-
-    /// `rt_list_push(ctx, list, w0, w1) -> list`.
-    ///
-    /// The list with the element appended, whose words are `w0` and `w1`
-    /// as far as its layout has words, or of more than two words at the
-    /// address in `w0` (`ElementLayout`). It takes the list's reference and the
-    /// element's, and updates in place what only that reference holds
-    /// (Implementation Plan §11.4.13).
-    ListPush = 5,
-
-    /// `rt_list_elem(ctx, list, index) -> *const u64`.
-    ///
-    /// The address of the element's words, for an index inside the list. It
-    /// borrows the list, and the address is valid while the list is.
-    ListElem = 6,
-
-    /// `rt_list_slice(ctx, list, front, back) -> list`.
-    ///
-    /// A new list of the elements without the first `front` and the last
-    /// `back`, which together are at most the length. It borrows the list.
-    ListSlice = 7,
-
-    /// `rt_map_insert(ctx, map, k0, k1, v0, v1) -> map`.
-    ///
-    /// The map with the key bound to the value, words as for
-    /// `rt_list_push`; a set is a map whose values have no words. It takes
-    /// the references of the map, the key and the value.
-    MapInsert = 8,
-
-    /// `rt_map_get(ctx, map, k0, k1) -> *const u64`.
-    ///
-    /// The address of the words of the key's value, or null when the map
-    /// has none. It borrows the map, and the address is valid while the map
-    /// is.
-    MapGet = 9,
-
-    /// `rt_refuel(ctx: *mut TaskContext)`.
-    ///
-    /// Called by metered code when its fuel went negative. It has the
-    /// convention of `rt_morestack`: every register preserved, no result.
-    /// The runtime refills the fuel and returns, or, when the task's steps
-    /// or its memory budget are used up, or the fiber's poll asks it to
-    /// stop, traps with `OutOfSteps`, `OutOfMemory` or `Cancelled` as
-    /// `rt_trap` would at this call, releasing what the
-    /// frames hold as the call's stack map lists it.
-    Refuel = 10,
-
-    /// `rt_text_concat(ctx, a0, a1, b0, b1) -> (w0, w1)`.
-    ///
-    /// The string or bytes `a` followed by `b`, both borrowed, as a new
-    /// value with a reference of its own (see [`INLINE_TEXT_MAX`]). Its
-    /// two words come back in the first two result registers.
-    TextConcat = 11,
-
-    /// `rt_text_equals(ctx, a0, a1, b0, b1) -> u64`.
-    ///
-    /// 1 when the strings or bytes `a` and `b`, both borrowed, hold the
-    /// same bytes, else 0.
-    TextEquals = 12,
-
-    /// `rt_text_show(ctx, word, number) -> (w0, w1)`.
-    ///
-    /// A number as a string, as interpolation writes it: the word, of the
-    /// [`Number`] whose [`Number::code`] is `number`. A code point is its
-    /// character.
-    TextShow = 13,
-
-    /// `rt_disposal(ctx) -> (ptr, code)`.
-    ///
-    /// The next box whose dispose handler must run, and the address of its
-    /// dispose code, or two zeros when none waits (Implementation Plan
-    /// §11.6.11). Freeing a box of a type with a handler does not free it:
-    /// the runtime gives it a count of one again and queues it, since it
-    /// never runs Crag code itself. Generated code calls this after every
-    /// release that may free boxes, and calls each `code(ctx, ptr)`, which
-    /// takes the reference. The runtime clears the box's word of the code
-    /// first, so the next time its count reaches zero it is freed.
-    Disposal = 14,
-
-    /// `rt_yield(ctx)`.
-    ///
-    /// Gives the other fibers a turn: the fiber suspends, goes to the back
-    /// of a run queue and continues when a worker picks it again
-    /// (Implementation Plan §11.7.1). Like every runtime function that may
-    /// suspend, it returns on the fiber stack it was called on, possibly
-    /// on another thread, and it is a point where a cancelled task traps
-    /// with `Cancelled` instead of returning (§11.7.4).
-    Yield = 15,
-
-    /// `rt_sleep(ctx, nanos)`.
-    ///
-    /// Suspends the fiber for at least `nanos` nanoseconds (Implementation
-    /// Plan §11.7.2). The other fibers run meanwhile; a fiber that no
-    /// scheduler runs blocks its thread.
-    Sleep = 16,
-
-    /// `rt_io_read(ctx, fd, buf, len) -> (n, errno)`.
-    ///
-    /// Reads at most `len` bytes from the non-blocking file descriptor `fd`
-    /// into `buf`, suspending the fiber until some are there. Gives the
-    /// count and zero, zero at the end of the input, or zero and the
-    /// error number (Implementation Plan §11.7.2). `buf` must stay where it
-    /// is until the call returns.
-    IoRead = 17,
-
-    /// `rt_io_write(ctx, fd, buf, len) -> (n, errno)`.
-    ///
-    /// Writes at most `len` bytes of `buf` to `fd`, suspending the fiber
-    /// until some can go; gives the count written, or zero and the error
-    /// number, as `IoRead` does.
-    IoWrite = 18,
-
-    /// `rt_io_accept(ctx, fd) -> (fd, errno)`.
-    ///
-    /// Accepts a connection on the listening socket `fd`, suspending the
-    /// fiber until one comes. The new socket is non-blocking and closed on
-    /// exec.
-    IoAccept = 19,
-
-    /// `rt_io_connect(ctx, fd, addr, len) -> (0, errno)`.
-    ///
-    /// Connects the non-blocking socket `fd` to the socket address of
-    /// `len` bytes at `addr`, suspending the fiber until the connection is
-    /// made or fails.
-    IoConnect = 20,
-
-    /// `rt_scope_new(ctx, limit) -> scope`.
-    ///
-    /// A scope for the tasks a combinator or group starts (Implementation
-    /// Plan §11.7.3): at most `limit` of them run at once, any number for
-    /// zero. The fiber that creates it is its parent; cancellation waits
-    /// until the scope ends (`ScopeEnd`). Traps with `Unsupported` on a
-    /// fiber that no scheduler runs.
-    ScopeNew = 21,
-
-    /// `rt_scope_start(ctx, scope, code, env, flags) -> index`.
-    ///
-    /// Starts a task of the scope that calls `code(ctx, env)`, the code and
-    /// environment of a function value, which it takes. The low two bits of
-    /// `flags` are the code's number of results; with [`START_EXEMPT`] the
-    /// task does not count towards the limit. Suspends while the limit is
-    /// reached. Gives the task's index, from zero in the order of starts.
-    /// The parent and the scope's own tasks may start tasks.
-    ScopeStart = 22,
-
-    /// `rt_scope_next(ctx, scope) -> (index, status)`.
-    ///
-    /// The next task of the scope to finish, as [`TASK_RETURNED`],
-    /// [`TASK_CANCELLED`] or [`TASK_TRAPPED`], suspending until one does;
-    /// [`SCOPE_DONE`] when every task has been given. A task that traps
-    /// cancels the others, and once all are given the scope ends and the
-    /// parent traps with its kind. Only the parent calls it; a cancelled
-    /// parent cancels the tasks and goes on giving them.
-    ScopeNext = 23,
-
-    /// `rt_scope_result(ctx, scope, index) -> (w0, w1)`.
-    ///
-    /// The results of a task that returned, taken once, with their
-    /// references.
-    ScopeResult = 24,
-
-    /// `rt_scope_cancel(ctx, scope)`.
-    ///
-    /// Cancels every task of the scope that has not finished, and the tasks
-    /// started later (Implementation Plan §11.7.4).
-    ScopeCancel = 25,
-
-    /// `rt_scope_end(ctx, scope)`.
-    ///
-    /// Frees a scope whose tasks have all been given. Traps with
-    /// `Cancelled` if the parent was cancelled meanwhile.
-    ScopeEnd = 26,
-
-    /// `rt_enter_no_cancel(ctx)`.
-    ///
-    /// Opens a region where cancellation waits (Specification §10.4):
-    /// atomic blocks, update and `ext` closures, foreign calls, drop and
-    /// dispose handlers. Regions nest.
-    EnterNoCancel = 27,
-
-    /// `rt_exit_no_cancel(ctx)`.
-    ///
-    /// Closes the innermost such region; when it was the last and the task
-    /// was cancelled meanwhile, traps with `Cancelled`.
-    ExitNoCancel = 28,
-
-    /// `rt_stream_new(ctx, capacity, list) -> (sink, source)`.
-    ///
-    /// A stream with a buffer of `capacity` values, zero for a hand-off
-    /// (Specification §10.5), and its two ends. Its values are laid out as
-    /// the elements of the list type with index `list`, which the runtime
-    /// needs to release those left in the buffer (Implementation Plan
-    /// §11.7.5). Each end is closed at most once and disposed exactly once.
-    StreamNew = 29,
-
-    /// `rt_stream_put(ctx, sink, w0, w1) -> status`.
-    ///
-    /// Puts a value, suspending while the buffer is full: [`STREAM_OK`]
-    /// once it is sent, else [`STREAM_CLOSED`] or [`STREAM_ABANDONED`].
-    /// The value's references go with it only when it is sent. Cancellation
-    /// takes effect here (§11.7.4).
-    StreamPut = 30,
-
-    /// `rt_stream_try_put(ctx, sink, w0, w1) -> status`.
-    ///
-    /// As `StreamPut`, but [`STREAM_FULL`] instead of waiting.
-    StreamTryPut = 31,
-
-    /// `rt_stream_next(ctx, source, out) -> status`.
-    ///
-    /// Takes the next value, suspending while there is none: [`STREAM_OK`]
-    /// with the value's words, and references, at `out`, else
-    /// [`STREAM_CLOSED`] or [`STREAM_ABANDONED`] once the producers are
-    /// gone and the buffer is empty. `out` must stay where it is until the
-    /// call returns. Cancellation takes effect here.
-    StreamNext = 32,
-
-    /// `rt_stream_close(ctx, end)`.
-    ///
-    /// Ends a stream deliberately from either end, or leaves a hub: the
-    /// other side reads `Closed` (Specification §10.5.2).
-    StreamClose = 33,
-
-    /// `rt_stream_dispose(ctx, end)`.
-    ///
-    /// Frees an end. One that was not closed is abandoned: the other side
-    /// reads `Abandoned`.
-    StreamDispose = 34,
-
-    /// `rt_hub_new(ctx, capacity, list, kind) -> hub`.
-    ///
-    /// A hub of [`HUB_FAN_OUT`] or [`HUB_BROADCAST`], with values laid out
-    /// as for `StreamNew` (Specification §10.6). Its ends are those of
-    /// streams.
-    HubNew = 35,
-
-    /// `rt_hub_sink(ctx, hub) -> sink`.
-    ///
-    /// Joins as a producer; after `HubSeal` the sink starts closed.
-    HubSink = 36,
-
-    /// `rt_hub_source(ctx, hub) -> source`.
-    ///
-    /// Joins as a consumer, from the values put from now on.
-    HubSource = 37,
-
-    /// `rt_hub_seal(ctx, hub)`.
-    ///
-    /// Admits no further producers: once every producer has left, the
-    /// consumers read `Closed`, or `Abandoned` if one left without closing.
-    HubSeal = 38,
-
-    /// `rt_hub_release(ctx, hub, n)`.
-    ///
-    /// Makes `n` consumers of a fan-out read `Closed`: those waiting now,
-    /// and the rest at their next `StreamNext`.
-    HubRelease = 39,
-
-    /// `rt_hub_drop(ctx, hub)`.
-    ///
-    /// Gives up the hub's handle, which seals it.
-    HubDrop = 40,
-
-    /// `rt_ref_read(ctx, cell, out) -> version`.
-    ///
-    /// While the task runs a transaction, this and the other ref functions
-    /// act on its log as `TxRead` and `TxWrite` do: an update writes to the
-    /// log and commits, and a read that conflicts sets the conflict word
-    /// ([`TX_CONFLICT_OFFSET`]) and gives zero words (Implementation Plan
-    /// §11.7.14).
-    ///
-    /// Reads the ref cell at `cell` (see [`REF_CELL_SIZE`]): its value's
-    /// two words to `out`, borrowed, and the version they belong to. The
-    /// task stays pinned until `RefCommit` or `RefDone`, so a value a
-    /// write replaces meanwhile is not released (Implementation Plan
-    /// §11.7.6). Nothing between may suspend.
-    RefRead = 41,
-
-    /// `rt_ref_commit(ctx, cell, version, list, w0, w1) -> status`.
-    ///
-    /// Ends an update begun by `RefRead`: [`REF_COMMITTED`] when the cell
-    /// still holds `version`, else [`REF_CONFLICT`] and the update must
-    /// rerun. The value is laid out as the `ref_cell` of the list type
-    /// with index `list` says (`TypeDescriptor::List`). A committed value's references go to the cell; one
-    /// identical to the value read is not written and its references are
-    /// given up (Specification §9.3), and so are those of a value that
-    /// conflicted. Unpins the task.
-    RefCommit = 42,
-
-    /// `rt_ref_done(ctx)`.
-    ///
-    /// Ends a read that writes nothing, as `use` or an update whose closure
-    /// gave an error: unpins the task.
-    RefDone = 43,
-
-    /// `rt_ref_swap(ctx, cell, list, w0, w1) -> (w0, w1)`.
-    ///
-    /// Places a value, laid out as for `RefCommit`, with its references,
-    /// and gives the old one with references of its own.
-    RefSwap = 44,
-
-    /// `rt_tx_begin(ctx) -> depth`.
-    ///
-    /// Opens an `atomic` block (Specification §9.5): the outermost starts
-    /// an attempt of a transaction, an inner one takes a savepoint
-    /// (Implementation Plan §11.7.7). Gives the number of blocks open, 1
-    /// for the outermost. The block is a region where cancellation waits,
-    /// and nothing in it may suspend.
-    TxBegin = 45,
-
-    /// `rt_tx_read(ctx, cell, out) -> status`.
-    ///
-    /// Reads a ref cell in the block: [`TX_OK`] with the value's two words
-    /// at `out`, borrowed, which is what the block wrote to it if it did,
-    /// else [`TX_CONFLICT`], and the outermost block must rerun.
-    TxRead = 46,
-
-    /// `rt_tx_write(ctx, cell, list, w0, w1)`.
-    ///
-    /// Writes a value, laid out as for `RefCommit`, with its references, to
-    /// a ref cell at the commit. One identical to what the block sees is
-    /// not written, and its references are given up.
-    TxWrite = 47,
-
-    /// `rt_tx_commit(ctx) -> status`.
-    ///
-    /// Closes the block: an inner one keeps its writes for the outermost,
-    /// which writes them all at once, [`TX_OK`], or [`TX_CONFLICT`] and it
-    /// must rerun.
-    TxCommit = 48,
-
-    /// `rt_tx_abort(ctx)`.
-    ///
-    /// Closes a block whose value is an error: its writes are dropped, and
-    /// those of the blocks around it stay (Specification §9.5.1).
-    TxAbort = 49,
-
-    /// `rt_tx_retry(ctx)`.
-    ///
-    /// After a conflict, drops the attempt's reads and writes, backs off
-    /// and starts the outermost block's next attempt, after which the
-    /// block's code runs again from its start.
-    TxRetry = 50,
-
-    /// `rt_ref_apply(ctx, cell, op, ty, k, list) -> status`.
-    ///
-    /// Applies `v ⊕ k` to the integer in a ref cell under the cell's lock,
-    /// as the compiler lowers an update whose closure has that shape, so
-    /// it never reruns (Implementation Plan §11.7.8). `op` is one of
-    /// [`REF_ADD`] to [`REF_MAX`]; `ty` is the integer's width in bits, 8,
-    /// 16, 32 or 64, with [`REF_UNSIGNED`] for an unsigned one. Gives
-    /// [`REF_COMMITTED`], or [`REF_OVERFLOW`] when the result is outside
-    /// the type, and then the cell is unchanged and the caller traps.
-    /// `list` is the type index of a list of the integers, which a
-    /// transaction's log keeps the write with.
-    RefApply = 51,
-
-    /// `rt_ext_new(ctx) -> ext`.
-    ///
-    /// Makes the lock of an `ext` binding (Specification §9.6), whose value
-    /// generated code keeps and touches only while it holds the lock.
-    ExtNew = 52,
-
-    /// `rt_ext_lock(ctx, ext)`.
-    ///
-    /// Takes the lock before an access closure runs, suspending while
-    /// another task holds it; a point where a cancelled task traps. A task
-    /// holds at most one lock, and one that stops gives it up.
-    ExtLock = 53,
-
-    /// `rt_ext_unlock(ctx, ext)`.
-    ///
-    /// Gives the lock up after the closure, to the task that waited
-    /// longest.
-    ExtUnlock = 54,
-
-    /// `rt_ext_free(ctx, ext)`.
-    ///
-    /// Frees the lock when the binding's scope ends, which no task holds
-    /// or waits for any more (§10.1).
-    ExtFree = 55,
-
-    /// `rt_signal_emit(ctx, qualifier, list, w0, w1, info) -> status`.
-    ///
-    /// Emits a signal (Specification §11.2), laid out as the elements of
-    /// the list type with index `list`. `qualifier` is one of
-    /// [`SIGNAL_PLAIN`], [`SIGNAL_OK`], [`SIGNAL_FAIL`] and
-    /// [`SIGNAL_RETRY`]. In an `atomic` block or an update closure the
-    /// signal is held, with its references, until the block's outcome
-    /// decides whether it is delivered (Implementation Plan §11.7.10):
-    /// [`SIGNAL_HELD`]. Elsewhere generated code delivers it itself, and
-    /// keeps its references: [`SIGNAL_DELIVER`]. `info` points at what
-    /// generated code knows of the signal's type, in its static data:
-    /// the type index, 1 if the value is a box whose header has the
-    /// index, the length of the type's name and the name.
-    SignalEmit = 56,
-
-    /// `rt_signal_next(ctx, out) -> list`.
-    ///
-    /// Takes the next signal an outcome made deliverable: its list type,
-    /// with its two words and its `info` at `out`, or [`SIGNAL_NONE`].
-    /// The signal is borrowed until the next call, which gives it up.
-    /// Generated code calls it after `TxCommit`, `TxAbort`, `TxRetry`,
-    /// `RefCommit` and `RefDone` until there is none, and delivers each.
-    SignalNext = 57,
-
-    /// `rt_lazy_new(ctx, list) -> lazy`.
-    ///
-    /// Makes a lazy cell (Specification §6.10) for a value laid out as the
-    /// elements of the list type with index `list`.
-    LazyNew = 58,
-
-    /// `rt_lazy_get(ctx, lazy, out) -> status`.
-    ///
-    /// Reads a lazy cell (Implementation Plan §11.7.11): [`LAZY_DONE`] with
-    /// the value's two words at `out` and references of its own;
-    /// [`LAZY_RUN`] when the caller must compute the value and store it
-    /// with `LazySet`; or [`LAZY_TRAPPED`] with the kind of the trap at
-    /// `out`, at which the caller traps. Suspends while another task
-    /// computes the value; a point where a cancelled task traps.
-    LazyGet = 59,
-
-    /// `rt_lazy_set(ctx, lazy, w0, w1)`.
-    ///
-    /// Stores the value the caller computed, with its references, and
-    /// hands it to the reads that wait.
-    LazySet = 60,
-
-    /// `rt_lazy_free(ctx, lazy)`.
-    ///
-    /// Frees the cell, which no task reads any more, with its value.
-    LazyFree = 61,
-
-    /// `rt_release_deferred(ctx, ptr)`.
-    ///
-    /// As `Release`, for a box of a type that is not `Immediate`
-    /// (Specification §13.3): frees a bounded part of the structure and
-    /// leaves the rest to the scheduler, which frees it between fibers and
-    /// runs the `Deferred` dispose handlers in it as tasks of their own
-    /// (Implementation Plan §11.7.12). The handlers of the part freed at
-    /// once are queued for `Disposal`, as `Release` queues them.
-    ReleaseDeferred = 62,
-
-    /// `rt_tx_throw(ctx) -> !`.
-    ///
-    /// Leaves the attempt of a transaction from code an `atomic` block
-    /// called: releases what the frames hold, as a trap does, up to the
-    /// first frame whose call has a handler, and continues at the handler
-    /// (Implementation Plan §11.7.14).
-    TxThrow = 63,
-
-    /// `rt_io_listen(ctx, port) -> (fd, errno)`.
-    ///
-    /// A non-blocking TCP socket listening on the loopback interface at
-    /// `port`, any free one for zero (Implementation Plan §11.7.14).
-    IoListen = 64,
-
-    /// `rt_io_port(ctx, fd) -> port`.
-    ///
-    /// The port a socket is bound to.
-    IoPort = 65,
-
-    /// `rt_io_socket(ctx) -> (fd, errno)`.
-    ///
-    /// A new non-blocking TCP socket, for `IoConnectLocal`.
-    IoSocket = 66,
-
-    /// `rt_io_connect_local(ctx, fd, port) -> (0, errno)`.
-    ///
-    /// Connects a socket to `port` on the loopback interface, suspending
-    /// until the connection is made, as `IoConnect` does.
-    IoConnectLocal = 67,
-
-    /// `rt_io_buffer(ctx, len) -> buffer`.
-    ///
-    /// A buffer of a string or bytes with room for `len` bytes, for a read
-    /// into it after its header.
-    IoBuffer = 68,
-
-    /// `rt_io_bytes(ctx, buffer, n) -> (w0, w1)`.
-    ///
-    /// The bytes value of the first `n` bytes of a buffer from `IoBuffer`,
-    /// whose reference it takes: inline when they fit, and the buffer is
-    /// freed.
-    IoBytes = 69,
-
-    /// `rt_io_write_bytes(ctx, fd, w0, w1, left) -> (left, errno)`.
-    ///
-    /// Writes the last `left` bytes of a bytes value, all of them for
-    /// `u64::MAX`, suspending until some can go: how many are left
-    /// afterwards, or the error number. The caller holds the value until
-    /// the call returns.
-    IoWriteBytes = 70,
-
-    /// `rt_signal_mark(ctx) -> mark`.
-    ///
-    /// How many signal handlers the task has registered: the base of a
-    /// block's handlers, which `SignalReset` returns to when the block
-    /// ends (Implementation Plan §11.7.14).
-    SignalMark = 71,
-
-    /// `rt_signal_reset(ctx, mark)`.
-    ///
-    /// Forgets the handlers registered since the mark.
-    SignalReset = 72,
-
-    /// `rt_signal_on(ctx, code, env, types, packed, base)`.
-    ///
-    /// Registers a handler (Specification §11.3) of the block whose mark is
-    /// `base`: its function value, which the caller keeps until the block
-    /// ends, and a sorted array of the `u32` type indices of the signal
-    /// types it takes, in static data. `packed` holds the array's length
-    /// in its upper half, then how many parent types the handler's type
-    /// has, shifted by 8, then the words of its parameter, zero or one.
-    SignalOn = 73,
-
-    /// `rt_signal_find(ctx, index, out) -> found`.
-    ///
-    /// Finds the handler of a signal of type index `index`: the innermost
-    /// block's that takes it, and of those the most specific. Gives 1 with
-    /// its code, its environment and the words of its parameter at `out`,
-    /// and hides its block and those above while it runs, until
-    /// `SignalLeave`; else 0.
-    SignalFind = 74,
-
-    /// `rt_signal_leave(ctx)`.
-    ///
-    /// Shows what `SignalFind` hid, once the handler returned.
-    SignalLeave = 75,
-
-    /// `rt_signal_default(ctx, name, len)`.
-    ///
-    /// The root's handler of a signal no handler takes: writes the name of
-    /// its type to standard error.
-    SignalDefault = 76,
-
-    /// `rt_step(ctx, cell, words, count, fp, inlined)`.
-    ///
-    /// A statement's step, called while its flag is set (Implementation
-    /// Plan §11.8.6): `cell` is the step's cell, whose second word names
-    /// it (`step_cell_word`), so code holds no function id outside its
-    /// relocations and can be kept across programs; the `count` words at
-    /// `words` are those of its locals, `fp` is the frame pointer of the
-    /// calling frame, and `inlined` how many inlined calls deep in the
-    /// frame's code the step is (Implementation Plan §11.10.1). The
-    /// debugger may stop the task here; it returns once the task is
-    /// resumed.
-    Step = 77,
-
-    /// `rt_io_print(ctx, w0, w1, newline) -> errno`.
-    ///
-    /// Writes a string to standard output, with a newline when `newline`
-    /// is 1, as one write that other prints do not interleave with: 0, or
-    /// the error number (Specification §15.6).
-    IoPrint = 78,
-
-    /// `rt_io_read_file(ctx, w0, w1, out) -> errno`.
-    ///
-    /// Reads the whole file the string names into a bytes value, whose
-    /// two words it writes at `out`: 0, or the error number.
-    IoReadFile = 79,
-
-    /// `rt_io_socket_any(ctx) -> (fd, errno)`.
-    ///
-    /// A new non-blocking TCP socket for `IoConnectHost`, which reaches
-    /// IPv6 and IPv4 addresses alike where the system has IPv6.
-    IoSocketAny = 80,
-
-    /// `rt_io_connect_host(ctx, fd, w0, w1, port) -> (0, errno)`.
-    ///
-    /// Looks up the host the string names and connects a socket from
-    /// `IoSocketAny` to `port` there, suspending until the connection is
-    /// made: 0, the error number, or [`UNKNOWN_HOST`] when the name has no
-    /// address.
-    IoConnectHost = 81,
-
-    /// `rt_text_utf8(ctx, w0, w1) -> 1 | 0`.
-    ///
-    /// Whether the bytes of a value are valid UTF-8.
-    TextUtf8 = 82,
-
-    /// `rt_text_measure(ctx, op, w0, w1) -> n`.
-    ///
-    /// A count of a string or bytes value, by the operation of
-    /// [`text_op`]: `BYTE_COUNT` or `CODE_POINT_COUNT`.
-    TextMeasure = 83,
-
-    /// `rt_text_at(ctx, op, w0, w1, at) -> n`.
-    ///
-    /// What is at a byte offset: `IS_BOUNDARY`, `NEXT`, `PREVIOUS`,
-    /// `CODE_POINT_AT` or `BYTE_AT` of [`text_op`]; -1 where there is
-    /// nothing.
-    TextAt = 84,
-
-    /// `rt_text_find(ctx, a0, a1, b0, b1, packed) -> n`.
-    ///
-    /// Looks for the second value in the first. `packed` holds the
-    /// operation of [`text_op`] in its low 3 bits and the offset to
-    /// search from above them: `INDEX_OF` and `LAST_INDEX_OF` give a byte
-    /// offset or -1, `STARTS_WITH` and `ENDS_WITH` 1 or 0, and `COMPARE`
-    /// 0, 1 or 2 for less, equal and greater, by the bytes.
-    TextFind = 85,
-
-    /// `rt_text_map(ctx, op, w0, w1) -> (w0, w1)`.
-    ///
-    /// A new string from one: `TRIM`, `TRIM_START`, `TRIM_END`,
-    /// `TO_UPPER`, `TO_LOWER` or `HEX` of [`text_op`].
-    TextMap = 86,
-
-    /// `rt_text_slice(ctx, w0, w1, from, to) -> (w0, w1)`.
-    ///
-    /// The bytes from `from` up to `to`, both clamped to the value.
-    TextSlice = 87,
-
-    /// `rt_code_point(ctx, op, value) -> n`.
-    ///
-    /// A property or mapping of a code point, by the `CP_…` operations of
-    /// [`text_op`].
-    CodePointOp = 88,
-
-    /// `rt_text_parse(ctx, op, w0, w1, base) -> (value, ok)`.
-    ///
-    /// A number from text: `PARSE_INT` in the base, or `PARSE_FLOAT` as
-    /// its bits; `ok` is 0 when the text is no such number.
-    TextParse = 89,
-
-    /// `rt_value_shapes(ctx, w0, w1) -> handle`.
-    ///
-    /// The runtime's handle of a type's shapes: the bytes of
-    /// `Shapes::encode` after the root shape's index, four bytes little
-    /// endian, decoded once for each distinct table.
-    ValueShapes = 90,
-
-    /// `rt_value_op(ctx, packed, a0, a1, b0, b1) -> n`.
-    ///
-    /// Equality, order or the hash of values by their shape (Specification
-    /// §19.11): `packed` holds the operation of [`value_op`] in its low 8
-    /// bits and a handle of `ValueShapes` above them. `EQUALS` gives 1 or
-    /// 0, `COMPARE` 0, 1 or 2 for less, equal and greater, or `UNORDERED`,
-    /// and `HASH` the hash of the first value.
-    ValueOp = 91,
-
-    /// `rt_value_show(ctx, handle, w0, w1) -> (w0, w1)`.
-    ///
-    /// A value written as source, as the REPL shows it.
-    ValueShow = 92,
-
-    /// `rt_list_set(ctx, list, at, w0, w1) -> list`.
-    ///
-    /// The list with element `at` replaced. It takes the list's reference
-    /// and the value's; `at` is inside the list.
-    ListSet = 93,
-
-    /// `rt_list_concat(ctx, a, b) -> list`.
-    ///
-    /// A new list of the elements of `a`, then those of `b`. It borrows
-    /// both.
-    ListConcat = 94,
-
-    /// `rt_map_remove(ctx, map, k0, k1) -> map`.
-    ///
-    /// The map or set without the key. It takes the map's reference and
-    /// borrows the key.
-    MapRemove = 95,
-
-    /// `rt_map_list(ctx, map, list, values) -> list`.
-    ///
-    /// The list with the keys of the map or set after its elements, or
-    /// with the values for `values` 1, in the map's order, each with a
-    /// reference of its own. It borrows the map and takes the list's
-    /// reference.
-    MapList = 96,
-
-    /// `rt_test_record(ctx, w0, w1, position)`.
-    ///
-    /// Records a failed assertion of a test, its message and the byte
-    /// offset of the assertion in its module (Specification §19.12).
-    TestRecord = 97,
-
-    /// `rt_env_args(ctx, list) -> list`.
-    ///
-    /// The list of bytes values with the program's arguments after its
-    /// elements, without the program's name (Specification §19.7). It takes
-    /// the list's reference.
-    EnvArgs = 98,
-
-    /// `rt_env_var(ctx, w0, w1, out) -> found`.
-    ///
-    /// Whether the environment has the variable the string names: 1, with
-    /// its value's bytes written at `out`, or 0.
-    EnvVar = 99,
-
-    /// `rt_env_vars(ctx, map) -> map`.
-    ///
-    /// The map of strings with the environment's variables bound, those
-    /// whose name or value is not UTF-8 left out. It takes the map's
-    /// reference.
-    EnvVars = 100,
-
-    /// `rt_env_platform(ctx, which) -> code`.
-    ///
-    /// The system for `which` 0, by the order of `Os` in `std.env`, or the
-    /// processor for 1, by the order of `Arch`.
-    EnvPlatform = 101,
-
-    /// `rt_bytes_read(ctx, packed, w0, w1, at) -> (value, ok)`.
-    ///
-    /// The number of the kind of [`bytes_kind`] in the low 8 bits of
-    /// `packed`, big-endian when bit 8 is set, at the byte offset: an
-    /// integer sign- or zero-extended, a float as the bits of a `Float`;
-    /// `ok` is 0 when it does not fit before the end, or a float is not
-    /// finite.
-    BytesRead = 102,
-
-    /// `rt_bytes_write(ctx, packed, w0, w1, at, value) -> (w0, w1)`.
-    ///
-    /// New bytes with the number written at the offset, as `BytesRead`
-    /// reads it; the offset is inside the bytes.
-    BytesWrite = 103,
-
-    /// `rt_bytes_of_list(ctx, list) -> (w0, w1)`.
-    ///
-    /// The bytes of a list of `UInt8` values. It borrows the list.
-    BytesOfList = 104,
-
-    /// `rt_trap_catch(ctx, kind, position)`.
-    ///
-    /// A trap that a handler of its own frame takes (Specification
-    /// §8.3.1): records it, as `rt_trap` records one it unwinds to a
-    /// handler, and returns, so the frame goes on at the handler.
-    TrapCatch = 105,
-
-    /// `rt_trap_rethrow(ctx) -> !`.
-    ///
-    /// Raises the trap a handler took again, for the handlers around it.
-    TrapRethrow = 106,
-
-    /// `rt_trap_caught(ctx, which) -> u64`.
-    ///
-    /// Of the trap a handler took: its kind (0), the line (1) and the
-    /// column (2) of its origin, from one.
-    TrapCaught = 107,
-
-    /// `rt_trap_caught_text(ctx, which) -> (w0, w1)`.
-    ///
-    /// Of the trap a handler took, as a string: the module of its origin
-    /// (0), its message (1), and what it names (2), such as the type of
-    /// the error `!!` met.
-    TrapCaughtText = 108,
-
-    /// `rt_tx_depth(ctx) -> depth`.
-    ///
-    /// How many `atomic` blocks the task is in.
-    TxDepth = 109,
-
-    /// `rt_tx_unwind(ctx, depth)`.
-    ///
-    /// Abandons the transactions begun inside `depth`, as a trap leaves
-    /// them for a handler outside (Specification §8.3.1).
-    TxUnwind = 110,
-
-    /// `rt_c_call(ctx, library, func, desc, buf) -> (result, class)`.
-    ///
-    /// Calls the C function at `func` of the [`NativeLibrary`] with the C
-    /// calling convention, on the system stack, as the library's thread
-    /// safety allows (Specification §16.4). `desc` is a [`c_kind`]
-    /// descriptor: the number of parameters, the result's kind, then each
-    /// parameter's. `buf` holds a word per parameter: a value, a `CStr`'s
-    /// box or null, or, for an out parameter, room for what the function
-    /// writes there, which the call leaves extended to a word; the word
-    /// after them gets `errno` as read right after the call. The result
-    /// comes back extended to a word, a `CF32` as its bits, with the class
-    /// of a float: 0 finite, 1 NaN, 2 positive, 3 negative infinity.
-    CCall = 111,
-
-    /// `rt_c_str_of(ctx, address, nul) -> (w0, w1)`.
-    ///
-    /// A copy of the NUL-terminated bytes at the address, which is not
-    /// null, as `Bytes`: with the NUL when `nul` is not zero.
-    CStrOf = 112,
-
-    /// `rt_value_decode(ctx, handle, b0, b1) -> word`.
-    ///
-    /// The value whose encoding the bytes `b0`, `b1` are, of a type of one
-    /// word and a handle of `ValueShapes`, built on the heap: the tree of
-    /// an `Expr`, which the compiler wrote (Plan §11.10.11).
-    ValueDecode = 113,
-
-    /// `rt_transport_run(ctx, scratch, x0, x1, i0, i1) -> status`.
-    ///
-    /// Runs the code of an `Expr` as received code (Plan §11.10.9): the
-    /// program checks and compiles its tree again, then runs it as a
-    /// metered task of its own on the input `i0`, `i1`, which the call
-    /// takes, and waits for it. `scratch[3]` is the `Expr`'s environment,
-    /// which it borrows; `scratch[0..3]` the policy: `Accept` as 0
-    /// `Exact`, 1 `SameMajor` or 2 `Signature`, the steps and the bytes of
-    /// memory; 256 added to `scratch[0]` says that the caller signalled
-    /// the callees accepted with another body. `x0`, `x1` are the bytes of
-    /// the function type the code is expected to have, an `FnType` (Plan
-    /// §11.10.11). The status is 0 when it ran, with its result in
-    /// `scratch[0..2]`; 1 to 3 when it was not accepted, as `Unresolved`,
-    /// `IllTyped` or `Impure`, with the reason as a `Str` there; 4 or 5
-    /// when it ran out of steps or memory, with nothing there; 6 when the
-    /// caller has not signalled such callees yet, which did not run the
-    /// code, with a `Str` there of one `module name` a line. A trap of the
-    /// code is the call's. 7 when the `Expr` arrived under a budget that
-    /// cannot run it, or 8 when the budget ran out while it ran, with the
-    /// budget's index in `scratch[0]` (Specification §18.7).
-    TransportRun = 114,
-    /// `rt_transport_encode(ctx, scratch, env, stamp) -> status`: the bytes
-    /// that send the `Expr` of the environment `env` (Plan §11.10.9),
-    /// stamped with the process's sending budget `stamp`, or none when it
-    /// is negative. The status is 0 with the `Bytes` in `scratch[0..2]`,
-    /// or 1 with why it cannot be sent, a `Str`, there.
-    TransportEncode = 115,
-    /// `rt_transport_decode(ctx, scratch, x0, x1, b0, b1) -> status`: the
-    /// `Expr` that the bytes `b0`, `b1` send, checked against the function
-    /// type `x0`, `x1` as `TransportRun` checks code, under the policy in
-    /// `scratch[0..3]` as there. The status is 0 with the `Expr` in
-    /// `scratch[0..2]`; 1 to 5 as for `TransportRun`; 7 when its stamp is
-    /// missing or not valid, with why as a `Str` there; 8 when its budget
-    /// is used up, with the budget's index there; 9 when the bytes are not
-    /// code, with why as a `Str` there.
-    TransportDecode = 116,
-    /// `rt_budget_op(ctx, scratch, op, side, index) -> value`: an
-    /// operation on the process's budgets (`budget_op`), on side 0, those
-    /// it enforces, or 1, those it sends under.
-    BudgetOp = 117,
+/// Defines an enumeration whose variants are numbered from zero, each with
+/// a value: the type, `ALL` of its variants in order, `from_index` for the
+/// variant with a discriminant, and the function giving the values. The
+/// numbers are checked to be the positions, so that one list keeps the
+/// four in step.
+macro_rules! table {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $($(#[$doc:meta])* $variant:ident = $index:literal => $value:expr,)*
+        }
+        $(#[$fn_doc:meta])*
+        fn $value_fn:ident -> $ty:ty;
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        #[repr(u32)]
+        pub enum $name {
+            $($(#[$doc])* $variant = $index,)*
+        }
+
+        impl $name {
+            /// Every one, indexed by its discriminant.
+            pub const ALL: [$name; [$($index),*].len()] = [$($name::$variant),*];
+
+            /// The one with this discriminant, if any.
+            pub fn from_index(index: u64) -> Option<$name> {
+                Self::ALL.get(usize::try_from(index).ok()?).copied()
+            }
+
+            $(#[$fn_doc])*
+            pub fn $value_fn(self) -> $ty {
+                match self {
+                    $($name::$variant => $value,)*
+                }
+            }
+        }
+
+        const _: () = {
+            let mut i = 0;
+            while i < $name::ALL.len() {
+                assert!($name::ALL[i] as usize == i, "a discriminant out of order");
+                i += 1;
+            }
+        };
+    };
+}
+
+table! {
+    /// Runtime functions that generated code calls. Code objects name them in
+    /// relocations; the loader resolves them to addresses.
+    pub enum RuntimeFn {
+        /// `rt_morestack(ctx: *mut TaskContext, needed: usize)`.
+        ///
+        /// Called when a stack check fails. It takes its arguments in the first
+        /// two argument registers of the C calling convention and preserves every
+        /// register, vector registers included, so the call costs the passing
+        /// path nothing. It is therefore an assembly routine, not a Rust function.
+        /// The runtime handles a pending stop
+        /// request if `stack_limit` holds the sentinel, then grows the stack
+        /// until `sp - needed >= stack_limit`. `needed` is zero for the ordinary
+        /// check and the body's footprint for the sized check. It returns into
+        /// the same frame, which may have moved to a new stack.
+        Morestack = 0 => "rt_morestack",
+
+        /// `rt_side_grow(ctx: *mut TaskContext, size: usize, align: usize)`.
+        ///
+        /// Called when a side-stack push does not fit the current chunk. The
+        /// runtime makes the side-stack fields of the context describe a chunk
+        /// with room for `size` bytes at alignment `align`, and generated code
+        /// then repeats the push. It has the same convention as `rt_morestack`:
+        /// C argument registers, every register preserved, no result.
+        SideGrow = 1 => "rt_side_grow",
+
+        /// `rt_trap(ctx: *mut TaskContext, kind: u64, position: u64) -> !`, with
+        /// `kind` a [`TrapKind`] and `position` the byte offset of the
+        /// expression that trapped in its module's source, or [`NO_POSITION`].
+        ///
+        /// Called where a check fails, after the frame has released what it
+        /// holds; it never returns. It releases what the frames below hold, as
+        /// their stack maps list it, and ends the fiber (Implementation Plan
+        /// §11.4.14). The functions from here on have the C calling convention,
+        /// take the task context first, and run on the system stack.
+        Trap = 2 => "rt_trap",
+
+        /// `rt_alloc(ctx: *mut TaskContext, size: u64, type_index: u64) -> *mut u8`.
+        ///
+        /// A box of `size` bytes, header included, with a count of one and the
+        /// type index in its header (Implementation Plan §11.4.11).
+        Alloc = 3 => "rt_alloc",
+
+        /// `rt_release(ctx: *mut TaskContext, ptr: *mut u8)`.
+        ///
+        /// Called when the inline decrement has taken a box's count from one to
+        /// zero: releases the box's fields, using its type's descriptor, and
+        /// frees it, and so on for every field whose count reaches zero
+        /// (Implementation Plan §11.4.12). Retaining is inline code only.
+        Release = 4 => "rt_release",
+
+        /// `rt_list_push(ctx, list, w0, w1) -> list`.
+        ///
+        /// The list with the element appended, whose words are `w0` and `w1`
+        /// as far as its layout has words, or of more than two words at the
+        /// address in `w0` (`ElementLayout`). It takes the list's reference and the
+        /// element's, and updates in place what only that reference holds
+        /// (Implementation Plan §11.4.13).
+        ListPush = 5 => "rt_list_push",
+
+        /// `rt_list_elem(ctx, list, index) -> *const u64`.
+        ///
+        /// The address of the element's words, for an index inside the list. It
+        /// borrows the list, and the address is valid while the list is.
+        ListElem = 6 => "rt_list_elem",
+
+        /// `rt_list_slice(ctx, list, front, back) -> list`.
+        ///
+        /// A new list of the elements without the first `front` and the last
+        /// `back`, which together are at most the length. It borrows the list.
+        ListSlice = 7 => "rt_list_slice",
+
+        /// `rt_map_insert(ctx, map, k0, k1, v0, v1) -> map`.
+        ///
+        /// The map with the key bound to the value, words as for
+        /// `rt_list_push`; a set is a map whose values have no words. It takes
+        /// the references of the map, the key and the value.
+        MapInsert = 8 => "rt_map_insert",
+
+        /// `rt_map_get(ctx, map, k0, k1) -> *const u64`.
+        ///
+        /// The address of the words of the key's value, or null when the map
+        /// has none. It borrows the map, and the address is valid while the map
+        /// is.
+        MapGet = 9 => "rt_map_get",
+
+        /// `rt_refuel(ctx: *mut TaskContext)`.
+        ///
+        /// Called by metered code when its fuel went negative. It has the
+        /// convention of `rt_morestack`: every register preserved, no result.
+        /// The runtime refills the fuel and returns, or, when the task's steps
+        /// or its memory budget are used up, or the fiber's poll asks it to
+        /// stop, traps with `OutOfSteps`, `OutOfMemory` or `Cancelled` as
+        /// `rt_trap` would at this call, releasing what the
+        /// frames hold as the call's stack map lists it.
+        Refuel = 10 => "rt_refuel",
+
+        /// `rt_text_concat(ctx, a0, a1, b0, b1) -> (w0, w1)`.
+        ///
+        /// The string or bytes `a` followed by `b`, both borrowed, as a new
+        /// value with a reference of its own (see [`INLINE_TEXT_MAX`]). Its
+        /// two words come back in the first two result registers.
+        TextConcat = 11 => "rt_text_concat",
+
+        /// `rt_text_equals(ctx, a0, a1, b0, b1) -> u64`.
+        ///
+        /// 1 when the strings or bytes `a` and `b`, both borrowed, hold the
+        /// same bytes, else 0.
+        TextEquals = 12 => "rt_text_equals",
+
+        /// `rt_text_show(ctx, word, number) -> (w0, w1)`.
+        ///
+        /// A number as a string, as interpolation writes it: the word, of the
+        /// [`Number`] whose [`Number::code`] is `number`. A code point is its
+        /// character.
+        TextShow = 13 => "rt_text_show",
+
+        /// `rt_disposal(ctx) -> (ptr, code)`.
+        ///
+        /// The next box whose dispose handler must run, and the address of its
+        /// dispose code, or two zeros when none waits (Implementation Plan
+        /// §11.6.11). Freeing a box of a type with a handler does not free it:
+        /// the runtime gives it a count of one again and queues it, since it
+        /// never runs Crag code itself. Generated code calls this after every
+        /// release that may free boxes, and calls each `code(ctx, ptr)`, which
+        /// takes the reference. The runtime clears the box's word of the code
+        /// first, so the next time its count reaches zero it is freed.
+        Disposal = 14 => "rt_disposal",
+
+        /// `rt_yield(ctx)`.
+        ///
+        /// Gives the other fibers a turn: the fiber suspends, goes to the back
+        /// of a run queue and continues when a worker picks it again
+        /// (Implementation Plan §11.7.1). Like every runtime function that may
+        /// suspend, it returns on the fiber stack it was called on, possibly
+        /// on another thread, and it is a point where a cancelled task traps
+        /// with `Cancelled` instead of returning (§11.7.4).
+        Yield = 15 => "rt_yield",
+
+        /// `rt_sleep(ctx, nanos)`.
+        ///
+        /// Suspends the fiber for at least `nanos` nanoseconds (Implementation
+        /// Plan §11.7.2). The other fibers run meanwhile; a fiber that no
+        /// scheduler runs blocks its thread.
+        Sleep = 16 => "rt_sleep",
+
+        /// `rt_io_read(ctx, fd, buf, len) -> (n, errno)`.
+        ///
+        /// Reads at most `len` bytes from the non-blocking file descriptor `fd`
+        /// into `buf`, suspending the fiber until some are there. Gives the
+        /// count and zero, zero at the end of the input, or zero and the
+        /// error number (Implementation Plan §11.7.2). `buf` must stay where it
+        /// is until the call returns.
+        IoRead = 17 => "rt_io_read",
+
+        /// `rt_io_write(ctx, fd, buf, len) -> (n, errno)`.
+        ///
+        /// Writes at most `len` bytes of `buf` to `fd`, suspending the fiber
+        /// until some can go; gives the count written, or zero and the error
+        /// number, as `IoRead` does.
+        IoWrite = 18 => "rt_io_write",
+
+        /// `rt_io_accept(ctx, fd) -> (fd, errno)`.
+        ///
+        /// Accepts a connection on the listening socket `fd`, suspending the
+        /// fiber until one comes. The new socket is non-blocking and closed on
+        /// exec.
+        IoAccept = 19 => "rt_io_accept",
+
+        /// `rt_io_connect(ctx, fd, addr, len) -> (0, errno)`.
+        ///
+        /// Connects the non-blocking socket `fd` to the socket address of
+        /// `len` bytes at `addr`, suspending the fiber until the connection is
+        /// made or fails.
+        IoConnect = 20 => "rt_io_connect",
+
+        /// `rt_scope_new(ctx, limit) -> scope`.
+        ///
+        /// A scope for the tasks a combinator or group starts (Implementation
+        /// Plan §11.7.3): at most `limit` of them run at once, any number for
+        /// zero. The fiber that creates it is its parent; cancellation waits
+        /// until the scope ends (`ScopeEnd`). Traps with `Unsupported` on a
+        /// fiber that no scheduler runs.
+        ScopeNew = 21 => "rt_scope_new",
+
+        /// `rt_scope_start(ctx, scope, code, env, flags) -> index`.
+        ///
+        /// Starts a task of the scope that calls `code(ctx, env)`, the code and
+        /// environment of a function value, which it takes. The low two bits of
+        /// `flags` are the code's number of results; with [`START_EXEMPT`] the
+        /// task does not count towards the limit. Suspends while the limit is
+        /// reached. Gives the task's index, from zero in the order of starts.
+        /// The parent and the scope's own tasks may start tasks.
+        ScopeStart = 22 => "rt_scope_start",
+
+        /// `rt_scope_next(ctx, scope) -> (index, status)`.
+        ///
+        /// The next task of the scope to finish, as [`TASK_RETURNED`],
+        /// [`TASK_CANCELLED`] or [`TASK_TRAPPED`], suspending until one does;
+        /// [`SCOPE_DONE`] when every task has been given. A task that traps
+        /// cancels the others, and once all are given the scope ends and the
+        /// parent traps with its kind. Only the parent calls it; a cancelled
+        /// parent cancels the tasks and goes on giving them.
+        ScopeNext = 23 => "rt_scope_next",
+
+        /// `rt_scope_result(ctx, scope, index) -> (w0, w1)`.
+        ///
+        /// The results of a task that returned, taken once, with their
+        /// references.
+        ScopeResult = 24 => "rt_scope_result",
+
+        /// `rt_scope_cancel(ctx, scope)`.
+        ///
+        /// Cancels every task of the scope that has not finished, and the tasks
+        /// started later (Implementation Plan §11.7.4).
+        ScopeCancel = 25 => "rt_scope_cancel",
+
+        /// `rt_scope_end(ctx, scope)`.
+        ///
+        /// Frees a scope whose tasks have all been given. Traps with
+        /// `Cancelled` if the parent was cancelled meanwhile.
+        ScopeEnd = 26 => "rt_scope_end",
+
+        /// `rt_enter_no_cancel(ctx)`.
+        ///
+        /// Opens a region where cancellation waits (Specification §10.4):
+        /// atomic blocks, update and `ext` closures, foreign calls, drop and
+        /// dispose handlers. Regions nest.
+        EnterNoCancel = 27 => "rt_enter_no_cancel",
+
+        /// `rt_exit_no_cancel(ctx)`.
+        ///
+        /// Closes the innermost such region; when it was the last and the task
+        /// was cancelled meanwhile, traps with `Cancelled`.
+        ExitNoCancel = 28 => "rt_exit_no_cancel",
+
+        /// `rt_stream_new(ctx, capacity, list) -> (sink, source)`.
+        ///
+        /// A stream with a buffer of `capacity` values, zero for a hand-off
+        /// (Specification §10.5), and its two ends. Its values are laid out as
+        /// the elements of the list type with index `list`, which the runtime
+        /// needs to release those left in the buffer (Implementation Plan
+        /// §11.7.5). Each end is closed at most once and disposed exactly once.
+        StreamNew = 29 => "rt_stream_new",
+
+        /// `rt_stream_put(ctx, sink, w0, w1) -> status`.
+        ///
+        /// Puts a value, suspending while the buffer is full: [`STREAM_OK`]
+        /// once it is sent, else [`STREAM_CLOSED`] or [`STREAM_ABANDONED`].
+        /// The value's references go with it only when it is sent. Cancellation
+        /// takes effect here (§11.7.4).
+        StreamPut = 30 => "rt_stream_put",
+
+        /// `rt_stream_try_put(ctx, sink, w0, w1) -> status`.
+        ///
+        /// As `StreamPut`, but [`STREAM_FULL`] instead of waiting.
+        StreamTryPut = 31 => "rt_stream_try_put",
+
+        /// `rt_stream_next(ctx, source, out) -> status`.
+        ///
+        /// Takes the next value, suspending while there is none: [`STREAM_OK`]
+        /// with the value's words, and references, at `out`, else
+        /// [`STREAM_CLOSED`] or [`STREAM_ABANDONED`] once the producers are
+        /// gone and the buffer is empty. `out` must stay where it is until the
+        /// call returns. Cancellation takes effect here.
+        StreamNext = 32 => "rt_stream_next",
+
+        /// `rt_stream_close(ctx, end)`.
+        ///
+        /// Ends a stream deliberately from either end, or leaves a hub: the
+        /// other side reads `Closed` (Specification §10.5.2).
+        StreamClose = 33 => "rt_stream_close",
+
+        /// `rt_stream_dispose(ctx, end)`.
+        ///
+        /// Frees an end. One that was not closed is abandoned: the other side
+        /// reads `Abandoned`.
+        StreamDispose = 34 => "rt_stream_dispose",
+
+        /// `rt_hub_new(ctx, capacity, list, kind) -> hub`.
+        ///
+        /// A hub of [`HUB_FAN_OUT`] or [`HUB_BROADCAST`], with values laid out
+        /// as for `StreamNew` (Specification §10.6). Its ends are those of
+        /// streams.
+        HubNew = 35 => "rt_hub_new",
+
+        /// `rt_hub_sink(ctx, hub) -> sink`.
+        ///
+        /// Joins as a producer; after `HubSeal` the sink starts closed.
+        HubSink = 36 => "rt_hub_sink",
+
+        /// `rt_hub_source(ctx, hub) -> source`.
+        ///
+        /// Joins as a consumer, from the values put from now on.
+        HubSource = 37 => "rt_hub_source",
+
+        /// `rt_hub_seal(ctx, hub)`.
+        ///
+        /// Admits no further producers: once every producer has left, the
+        /// consumers read `Closed`, or `Abandoned` if one left without closing.
+        HubSeal = 38 => "rt_hub_seal",
+
+        /// `rt_hub_release(ctx, hub, n)`.
+        ///
+        /// Makes `n` consumers of a fan-out read `Closed`: those waiting now,
+        /// and the rest at their next `StreamNext`.
+        HubRelease = 39 => "rt_hub_release",
+
+        /// `rt_hub_drop(ctx, hub)`.
+        ///
+        /// Gives up the hub's handle, which seals it.
+        HubDrop = 40 => "rt_hub_drop",
+
+        /// `rt_ref_read(ctx, cell, out) -> version`.
+        ///
+        /// While the task runs a transaction, this and the other ref functions
+        /// act on its log as `TxRead` and `TxWrite` do: an update writes to the
+        /// log and commits, and a read that conflicts sets the conflict word
+        /// ([`TX_CONFLICT_OFFSET`]) and gives zero words (Implementation Plan
+        /// §11.7.14).
+        ///
+        /// Reads the ref cell at `cell` (see [`REF_CELL_SIZE`]): its value's
+        /// two words to `out`, borrowed, and the version they belong to. The
+        /// task stays pinned until `RefCommit` or `RefDone`, so a value a
+        /// write replaces meanwhile is not released (Implementation Plan
+        /// §11.7.6). Nothing between may suspend.
+        RefRead = 41 => "rt_ref_read",
+
+        /// `rt_ref_commit(ctx, cell, version, list, w0, w1) -> status`.
+        ///
+        /// Ends an update begun by `RefRead`: [`REF_COMMITTED`] when the cell
+        /// still holds `version`, else [`REF_CONFLICT`] and the update must
+        /// rerun. The value is laid out as the `ref_cell` of the list type
+        /// with index `list` says (`TypeDescriptor::List`). A committed value's references go to the cell; one
+        /// identical to the value read is not written and its references are
+        /// given up (Specification §9.3), and so are those of a value that
+        /// conflicted. Unpins the task.
+        RefCommit = 42 => "rt_ref_commit",
+
+        /// `rt_ref_done(ctx)`.
+        ///
+        /// Ends a read that writes nothing, as `use` or an update whose closure
+        /// gave an error: unpins the task.
+        RefDone = 43 => "rt_ref_done",
+
+        /// `rt_ref_swap(ctx, cell, list, w0, w1) -> (w0, w1)`.
+        ///
+        /// Places a value, laid out as for `RefCommit`, with its references,
+        /// and gives the old one with references of its own.
+        RefSwap = 44 => "rt_ref_swap",
+
+        /// `rt_tx_begin(ctx) -> depth`.
+        ///
+        /// Opens an `atomic` block (Specification §9.5): the outermost starts
+        /// an attempt of a transaction, an inner one takes a savepoint
+        /// (Implementation Plan §11.7.7). Gives the number of blocks open, 1
+        /// for the outermost. The block is a region where cancellation waits,
+        /// and nothing in it may suspend.
+        TxBegin = 45 => "rt_tx_begin",
+
+        /// `rt_tx_read(ctx, cell, out) -> status`.
+        ///
+        /// Reads a ref cell in the block: [`TX_OK`] with the value's two words
+        /// at `out`, borrowed, which is what the block wrote to it if it did,
+        /// else [`TX_CONFLICT`], and the outermost block must rerun.
+        TxRead = 46 => "rt_tx_read",
+
+        /// `rt_tx_write(ctx, cell, list, w0, w1)`.
+        ///
+        /// Writes a value, laid out as for `RefCommit`, with its references, to
+        /// a ref cell at the commit. One identical to what the block sees is
+        /// not written, and its references are given up.
+        TxWrite = 47 => "rt_tx_write",
+
+        /// `rt_tx_commit(ctx) -> status`.
+        ///
+        /// Closes the block: an inner one keeps its writes for the outermost,
+        /// which writes them all at once, [`TX_OK`], or [`TX_CONFLICT`] and it
+        /// must rerun.
+        TxCommit = 48 => "rt_tx_commit",
+
+        /// `rt_tx_abort(ctx)`.
+        ///
+        /// Closes a block whose value is an error: its writes are dropped, and
+        /// those of the blocks around it stay (Specification §9.5.1).
+        TxAbort = 49 => "rt_tx_abort",
+
+        /// `rt_tx_retry(ctx)`.
+        ///
+        /// After a conflict, drops the attempt's reads and writes, backs off
+        /// and starts the outermost block's next attempt, after which the
+        /// block's code runs again from its start.
+        TxRetry = 50 => "rt_tx_retry",
+
+        /// `rt_ref_apply(ctx, cell, op, ty, k, list) -> status`.
+        ///
+        /// Applies `v ⊕ k` to the integer in a ref cell under the cell's lock,
+        /// as the compiler lowers an update whose closure has that shape, so
+        /// it never reruns (Implementation Plan §11.7.8). `op` is one of
+        /// [`REF_ADD`] to [`REF_MAX`]; `ty` is the integer's width in bits, 8,
+        /// 16, 32 or 64, with [`REF_UNSIGNED`] for an unsigned one. Gives
+        /// [`REF_COMMITTED`], or [`REF_OVERFLOW`] when the result is outside
+        /// the type, and then the cell is unchanged and the caller traps.
+        /// `list` is the type index of a list of the integers, which a
+        /// transaction's log keeps the write with.
+        RefApply = 51 => "rt_ref_apply",
+
+        /// `rt_ext_new(ctx) -> ext`.
+        ///
+        /// Makes the lock of an `ext` binding (Specification §9.6), whose value
+        /// generated code keeps and touches only while it holds the lock.
+        ExtNew = 52 => "rt_ext_new",
+
+        /// `rt_ext_lock(ctx, ext)`.
+        ///
+        /// Takes the lock before an access closure runs, suspending while
+        /// another task holds it; a point where a cancelled task traps. A task
+        /// holds at most one lock, and one that stops gives it up.
+        ExtLock = 53 => "rt_ext_lock",
+
+        /// `rt_ext_unlock(ctx, ext)`.
+        ///
+        /// Gives the lock up after the closure, to the task that waited
+        /// longest.
+        ExtUnlock = 54 => "rt_ext_unlock",
+
+        /// `rt_ext_free(ctx, ext)`.
+        ///
+        /// Frees the lock when the binding's scope ends, which no task holds
+        /// or waits for any more (§10.1).
+        ExtFree = 55 => "rt_ext_free",
+
+        /// `rt_signal_emit(ctx, qualifier, list, w0, w1, info) -> status`.
+        ///
+        /// Emits a signal (Specification §11.2), laid out as the elements of
+        /// the list type with index `list`. `qualifier` is one of
+        /// [`SIGNAL_PLAIN`], [`SIGNAL_OK`], [`SIGNAL_FAIL`] and
+        /// [`SIGNAL_RETRY`]. In an `atomic` block or an update closure the
+        /// signal is held, with its references, until the block's outcome
+        /// decides whether it is delivered (Implementation Plan §11.7.10):
+        /// [`SIGNAL_HELD`]. Elsewhere generated code delivers it itself, and
+        /// keeps its references: [`SIGNAL_DELIVER`]. `info` points at what
+        /// generated code knows of the signal's type, in its static data:
+        /// the type index, 1 if the value is a box whose header has the
+        /// index, the length of the type's name and the name.
+        SignalEmit = 56 => "rt_signal_emit",
+
+        /// `rt_signal_next(ctx, out) -> list`.
+        ///
+        /// Takes the next signal an outcome made deliverable: its list type,
+        /// with its two words and its `info` at `out`, or [`SIGNAL_NONE`].
+        /// The signal is borrowed until the next call, which gives it up.
+        /// Generated code calls it after `TxCommit`, `TxAbort`, `TxRetry`,
+        /// `RefCommit` and `RefDone` until there is none, and delivers each.
+        SignalNext = 57 => "rt_signal_next",
+
+        /// `rt_lazy_new(ctx, list) -> lazy`.
+        ///
+        /// Makes a lazy cell (Specification §6.10) for a value laid out as the
+        /// elements of the list type with index `list`.
+        LazyNew = 58 => "rt_lazy_new",
+
+        /// `rt_lazy_get(ctx, lazy, out) -> status`.
+        ///
+        /// Reads a lazy cell (Implementation Plan §11.7.11): [`LAZY_DONE`] with
+        /// the value's two words at `out` and references of its own;
+        /// [`LAZY_RUN`] when the caller must compute the value and store it
+        /// with `LazySet`; or [`LAZY_TRAPPED`] with the kind of the trap at
+        /// `out`, at which the caller traps. Suspends while another task
+        /// computes the value; a point where a cancelled task traps.
+        LazyGet = 59 => "rt_lazy_get",
+
+        /// `rt_lazy_set(ctx, lazy, w0, w1)`.
+        ///
+        /// Stores the value the caller computed, with its references, and
+        /// hands it to the reads that wait.
+        LazySet = 60 => "rt_lazy_set",
+
+        /// `rt_lazy_free(ctx, lazy)`.
+        ///
+        /// Frees the cell, which no task reads any more, with its value.
+        LazyFree = 61 => "rt_lazy_free",
+
+        /// `rt_release_deferred(ctx, ptr)`.
+        ///
+        /// As `Release`, for a box of a type that is not `Immediate`
+        /// (Specification §13.3): frees a bounded part of the structure and
+        /// leaves the rest to the scheduler, which frees it between fibers and
+        /// runs the `Deferred` dispose handlers in it as tasks of their own
+        /// (Implementation Plan §11.7.12). The handlers of the part freed at
+        /// once are queued for `Disposal`, as `Release` queues them.
+        ReleaseDeferred = 62 => "rt_release_deferred",
+
+        /// `rt_tx_throw(ctx) -> !`.
+        ///
+        /// Leaves the attempt of a transaction from code an `atomic` block
+        /// called: releases what the frames hold, as a trap does, up to the
+        /// first frame whose call has a handler, and continues at the handler
+        /// (Implementation Plan §11.7.14).
+        TxThrow = 63 => "rt_tx_throw",
+
+        /// `rt_io_listen(ctx, port) -> (fd, errno)`.
+        ///
+        /// A non-blocking TCP socket listening on the loopback interface at
+        /// `port`, any free one for zero (Implementation Plan §11.7.14).
+        IoListen = 64 => "rt_io_listen",
+
+        /// `rt_io_port(ctx, fd) -> port`.
+        ///
+        /// The port a socket is bound to.
+        IoPort = 65 => "rt_io_port",
+
+        /// `rt_io_socket(ctx) -> (fd, errno)`.
+        ///
+        /// A new non-blocking TCP socket, for `IoConnectLocal`.
+        IoSocket = 66 => "rt_io_socket",
+
+        /// `rt_io_connect_local(ctx, fd, port) -> (0, errno)`.
+        ///
+        /// Connects a socket to `port` on the loopback interface, suspending
+        /// until the connection is made, as `IoConnect` does.
+        IoConnectLocal = 67 => "rt_io_connect_local",
+
+        /// `rt_io_buffer(ctx, len) -> buffer`.
+        ///
+        /// A buffer of a string or bytes with room for `len` bytes, for a read
+        /// into it after its header.
+        IoBuffer = 68 => "rt_io_buffer",
+
+        /// `rt_io_bytes(ctx, buffer, n) -> (w0, w1)`.
+        ///
+        /// The bytes value of the first `n` bytes of a buffer from `IoBuffer`,
+        /// whose reference it takes: inline when they fit, and the buffer is
+        /// freed.
+        IoBytes = 69 => "rt_io_bytes",
+
+        /// `rt_io_write_bytes(ctx, fd, w0, w1, left) -> (left, errno)`.
+        ///
+        /// Writes the last `left` bytes of a bytes value, all of them for
+        /// `u64::MAX`, suspending until some can go: how many are left
+        /// afterwards, or the error number. The caller holds the value until
+        /// the call returns.
+        IoWriteBytes = 70 => "rt_io_write_bytes",
+
+        /// `rt_signal_mark(ctx) -> mark`.
+        ///
+        /// How many signal handlers the task has registered: the base of a
+        /// block's handlers, which `SignalReset` returns to when the block
+        /// ends (Implementation Plan §11.7.14).
+        SignalMark = 71 => "rt_signal_mark",
+
+        /// `rt_signal_reset(ctx, mark)`.
+        ///
+        /// Forgets the handlers registered since the mark.
+        SignalReset = 72 => "rt_signal_reset",
+
+        /// `rt_signal_on(ctx, code, env, types, packed, base)`.
+        ///
+        /// Registers a handler (Specification §11.3) of the block whose mark is
+        /// `base`: its function value, which the caller keeps until the block
+        /// ends, and a sorted array of the `u32` type indices of the signal
+        /// types it takes, in static data. `packed` holds the array's length
+        /// in its upper half, then how many parent types the handler's type
+        /// has, shifted by 8, then the words of its parameter, zero or one.
+        SignalOn = 73 => "rt_signal_on",
+
+        /// `rt_signal_find(ctx, index, out) -> found`.
+        ///
+        /// Finds the handler of a signal of type index `index`: the innermost
+        /// block's that takes it, and of those the most specific. Gives 1 with
+        /// its code, its environment and the words of its parameter at `out`,
+        /// and hides its block and those above while it runs, until
+        /// `SignalLeave`; else 0.
+        SignalFind = 74 => "rt_signal_find",
+
+        /// `rt_signal_leave(ctx)`.
+        ///
+        /// Shows what `SignalFind` hid, once the handler returned.
+        SignalLeave = 75 => "rt_signal_leave",
+
+        /// `rt_signal_default(ctx, name, len)`.
+        ///
+        /// The root's handler of a signal no handler takes: writes the name of
+        /// its type to standard error.
+        SignalDefault = 76 => "rt_signal_default",
+
+        /// `rt_step(ctx, cell, words, count, fp, inlined)`.
+        ///
+        /// A statement's step, called while its flag is set (Implementation
+        /// Plan §11.8.6): `cell` is the step's cell, whose second word names
+        /// it (`step_cell_word`), so code holds no function id outside its
+        /// relocations and can be kept across programs; the `count` words at
+        /// `words` are those of its locals, `fp` is the frame pointer of the
+        /// calling frame, and `inlined` how many inlined calls deep in the
+        /// frame's code the step is (Implementation Plan §11.10.1). The
+        /// debugger may stop the task here; it returns once the task is
+        /// resumed.
+        Step = 77 => "rt_step",
+
+        /// `rt_io_print(ctx, w0, w1, newline) -> errno`.
+        ///
+        /// Writes a string to standard output, with a newline when `newline`
+        /// is 1, as one write that other prints do not interleave with: 0, or
+        /// the error number (Specification §15.6).
+        IoPrint = 78 => "rt_io_print",
+
+        /// `rt_io_read_file(ctx, w0, w1, out) -> errno`.
+        ///
+        /// Reads the whole file the string names into a bytes value, whose
+        /// two words it writes at `out`: 0, or the error number.
+        IoReadFile = 79 => "rt_io_read_file",
+
+        /// `rt_io_socket_any(ctx) -> (fd, errno)`.
+        ///
+        /// A new non-blocking TCP socket for `IoConnectHost`, which reaches
+        /// IPv6 and IPv4 addresses alike where the system has IPv6.
+        IoSocketAny = 80 => "rt_io_socket_any",
+
+        /// `rt_io_connect_host(ctx, fd, w0, w1, port) -> (0, errno)`.
+        ///
+        /// Looks up the host the string names and connects a socket from
+        /// `IoSocketAny` to `port` there, suspending until the connection is
+        /// made: 0, the error number, or [`UNKNOWN_HOST`] when the name has no
+        /// address.
+        IoConnectHost = 81 => "rt_io_connect_host",
+
+        /// `rt_text_utf8(ctx, w0, w1) -> 1 | 0`.
+        ///
+        /// Whether the bytes of a value are valid UTF-8.
+        TextUtf8 = 82 => "rt_text_utf8",
+
+        /// `rt_text_measure(ctx, op, w0, w1) -> n`.
+        ///
+        /// A count of a string or bytes value, by the operation of
+        /// [`text_op`]: `BYTE_COUNT` or `CODE_POINT_COUNT`.
+        TextMeasure = 83 => "rt_text_measure",
+
+        /// `rt_text_at(ctx, op, w0, w1, at) -> n`.
+        ///
+        /// What is at a byte offset: `IS_BOUNDARY`, `NEXT`, `PREVIOUS`,
+        /// `CODE_POINT_AT` or `BYTE_AT` of [`text_op`]; -1 where there is
+        /// nothing.
+        TextAt = 84 => "rt_text_at",
+
+        /// `rt_text_find(ctx, a0, a1, b0, b1, packed) -> n`.
+        ///
+        /// Looks for the second value in the first. `packed` holds the
+        /// operation of [`text_op`] in its low 3 bits and the offset to
+        /// search from above them: `INDEX_OF` and `LAST_INDEX_OF` give a byte
+        /// offset or -1, `STARTS_WITH` and `ENDS_WITH` 1 or 0, and `COMPARE`
+        /// 0, 1 or 2 for less, equal and greater, by the bytes.
+        TextFind = 85 => "rt_text_find",
+
+        /// `rt_text_map(ctx, op, w0, w1) -> (w0, w1)`.
+        ///
+        /// A new string from one: `TRIM`, `TRIM_START`, `TRIM_END`,
+        /// `TO_UPPER`, `TO_LOWER` or `HEX` of [`text_op`].
+        TextMap = 86 => "rt_text_map",
+
+        /// `rt_text_slice(ctx, w0, w1, from, to) -> (w0, w1)`.
+        ///
+        /// The bytes from `from` up to `to`, both clamped to the value.
+        TextSlice = 87 => "rt_text_slice",
+
+        /// `rt_code_point(ctx, op, value) -> n`.
+        ///
+        /// A property or mapping of a code point, by the `CP_…` operations of
+        /// [`text_op`].
+        CodePointOp = 88 => "rt_code_point",
+
+        /// `rt_text_parse(ctx, op, w0, w1, base) -> (value, ok)`.
+        ///
+        /// A number from text: `PARSE_INT` in the base, or `PARSE_FLOAT` as
+        /// its bits; `ok` is 0 when the text is no such number.
+        TextParse = 89 => "rt_text_parse",
+
+        /// `rt_value_shapes(ctx, w0, w1) -> handle`.
+        ///
+        /// The runtime's handle of a type's shapes: the bytes of
+        /// `Shapes::encode` after the root shape's index, four bytes little
+        /// endian, decoded once for each distinct table.
+        ValueShapes = 90 => "rt_value_shapes",
+
+        /// `rt_value_op(ctx, packed, a0, a1, b0, b1) -> n`.
+        ///
+        /// Equality, order or the hash of values by their shape (Specification
+        /// §19.11): `packed` holds the operation of [`value_op`] in its low 8
+        /// bits and a handle of `ValueShapes` above them. `EQUALS` gives 1 or
+        /// 0, `COMPARE` 0, 1 or 2 for less, equal and greater, or `UNORDERED`,
+        /// and `HASH` the hash of the first value.
+        ValueOp = 91 => "rt_value_op",
+
+        /// `rt_value_show(ctx, handle, w0, w1) -> (w0, w1)`.
+        ///
+        /// A value written as source, as the REPL shows it.
+        ValueShow = 92 => "rt_value_show",
+
+        /// `rt_list_set(ctx, list, at, w0, w1) -> list`.
+        ///
+        /// The list with element `at` replaced. It takes the list's reference
+        /// and the value's; `at` is inside the list.
+        ListSet = 93 => "rt_list_set",
+
+        /// `rt_list_concat(ctx, a, b) -> list`.
+        ///
+        /// A new list of the elements of `a`, then those of `b`. It borrows
+        /// both.
+        ListConcat = 94 => "rt_list_concat",
+
+        /// `rt_map_remove(ctx, map, k0, k1) -> map`.
+        ///
+        /// The map or set without the key. It takes the map's reference and
+        /// borrows the key.
+        MapRemove = 95 => "rt_map_remove",
+
+        /// `rt_map_list(ctx, map, list, values) -> list`.
+        ///
+        /// The list with the keys of the map or set after its elements, or
+        /// with the values for `values` 1, in the map's order, each with a
+        /// reference of its own. It borrows the map and takes the list's
+        /// reference.
+        MapList = 96 => "rt_map_list",
+
+        /// `rt_test_record(ctx, w0, w1, position)`.
+        ///
+        /// Records a failed assertion of a test, its message and the byte
+        /// offset of the assertion in its module (Specification §19.12).
+        TestRecord = 97 => "rt_test_record",
+
+        /// `rt_env_args(ctx, list) -> list`.
+        ///
+        /// The list of bytes values with the program's arguments after its
+        /// elements, without the program's name (Specification §19.7). It takes
+        /// the list's reference.
+        EnvArgs = 98 => "rt_env_args",
+
+        /// `rt_env_var(ctx, w0, w1, out) -> found`.
+        ///
+        /// Whether the environment has the variable the string names: 1, with
+        /// its value's bytes written at `out`, or 0.
+        EnvVar = 99 => "rt_env_var",
+
+        /// `rt_env_vars(ctx, map) -> map`.
+        ///
+        /// The map of strings with the environment's variables bound, those
+        /// whose name or value is not UTF-8 left out. It takes the map's
+        /// reference.
+        EnvVars = 100 => "rt_env_vars",
+
+        /// `rt_env_platform(ctx, which) -> code`.
+        ///
+        /// The system for `which` 0, by the order of `Os` in `std.env`, or the
+        /// processor for 1, by the order of `Arch`.
+        EnvPlatform = 101 => "rt_env_platform",
+
+        /// `rt_bytes_read(ctx, packed, w0, w1, at) -> (value, ok)`.
+        ///
+        /// The number of the kind of [`bytes_kind`] in the low 8 bits of
+        /// `packed`, big-endian when bit 8 is set, at the byte offset: an
+        /// integer sign- or zero-extended, a float as the bits of a `Float`;
+        /// `ok` is 0 when it does not fit before the end, or a float is not
+        /// finite.
+        BytesRead = 102 => "rt_bytes_read",
+
+        /// `rt_bytes_write(ctx, packed, w0, w1, at, value) -> (w0, w1)`.
+        ///
+        /// New bytes with the number written at the offset, as `BytesRead`
+        /// reads it; the offset is inside the bytes.
+        BytesWrite = 103 => "rt_bytes_write",
+
+        /// `rt_bytes_of_list(ctx, list) -> (w0, w1)`.
+        ///
+        /// The bytes of a list of `UInt8` values. It borrows the list.
+        BytesOfList = 104 => "rt_bytes_of_list",
+
+        /// `rt_trap_catch(ctx, kind, position)`.
+        ///
+        /// A trap that a handler of its own frame takes (Specification
+        /// §8.3.1): records it, as `rt_trap` records one it unwinds to a
+        /// handler, and returns, so the frame goes on at the handler.
+        TrapCatch = 105 => "rt_trap_catch",
+
+        /// `rt_trap_rethrow(ctx) -> !`.
+        ///
+        /// Raises the trap a handler took again, for the handlers around it.
+        TrapRethrow = 106 => "rt_trap_rethrow",
+
+        /// `rt_trap_caught(ctx, which) -> u64`.
+        ///
+        /// Of the trap a handler took: its kind (0), the line (1) and the
+        /// column (2) of its origin, from one.
+        TrapCaught = 107 => "rt_trap_caught",
+
+        /// `rt_trap_caught_text(ctx, which) -> (w0, w1)`.
+        ///
+        /// Of the trap a handler took, as a string: the module of its origin
+        /// (0), its message (1), and what it names (2), such as the type of
+        /// the error `!!` met.
+        TrapCaughtText = 108 => "rt_trap_caught_text",
+
+        /// `rt_tx_depth(ctx) -> depth`.
+        ///
+        /// How many `atomic` blocks the task is in.
+        TxDepth = 109 => "rt_tx_depth",
+
+        /// `rt_tx_unwind(ctx, depth)`.
+        ///
+        /// Abandons the transactions begun inside `depth`, as a trap leaves
+        /// them for a handler outside (Specification §8.3.1).
+        TxUnwind = 110 => "rt_tx_unwind",
+
+        /// `rt_c_call(ctx, library, func, desc, buf) -> (result, class)`.
+        ///
+        /// Calls the C function at `func` of the [`NativeLibrary`] with the C
+        /// calling convention, on the system stack, as the library's thread
+        /// safety allows (Specification §16.4). `desc` is a [`c_kind`]
+        /// descriptor: the number of parameters, the result's kind, then each
+        /// parameter's. `buf` holds a word per parameter: a value, a `CStr`'s
+        /// box or null, or, for an out parameter, room for what the function
+        /// writes there, which the call leaves extended to a word; the word
+        /// after them gets `errno` as read right after the call. The result
+        /// comes back extended to a word, a `CF32` as its bits, with the class
+        /// of a float: 0 finite, 1 NaN, 2 positive, 3 negative infinity.
+        CCall = 111 => "rt_c_call",
+
+        /// `rt_c_str_of(ctx, address, nul) -> (w0, w1)`.
+        ///
+        /// A copy of the NUL-terminated bytes at the address, which is not
+        /// null, as `Bytes`: with the NUL when `nul` is not zero.
+        CStrOf = 112 => "rt_c_str_of",
+
+        /// `rt_value_decode(ctx, handle, b0, b1) -> word`.
+        ///
+        /// The value whose encoding the bytes `b0`, `b1` are, of a type of one
+        /// word and a handle of `ValueShapes`, built on the heap: the tree of
+        /// an `Expr`, which the compiler wrote (Plan §11.10.11).
+        ValueDecode = 113 => "rt_value_decode",
+
+        /// `rt_transport_run(ctx, scratch, x0, x1, i0, i1) -> status`.
+        ///
+        /// Runs the code of an `Expr` as received code (Plan §11.10.9): the
+        /// program checks and compiles its tree again, then runs it as a
+        /// metered task of its own on the input `i0`, `i1`, which the call
+        /// takes, and waits for it. `scratch[3]` is the `Expr`'s environment,
+        /// which it borrows; `scratch[0..3]` the policy: `Accept` as 0
+        /// `Exact`, 1 `SameMajor` or 2 `Signature`, the steps and the bytes of
+        /// memory; 256 added to `scratch[0]` says that the caller signalled
+        /// the callees accepted with another body. `x0`, `x1` are the bytes of
+        /// the function type the code is expected to have, an `FnType` (Plan
+        /// §11.10.11). The status is 0 when it ran, with its result in
+        /// `scratch[0..2]`; 1 to 3 when it was not accepted, as `Unresolved`,
+        /// `IllTyped` or `Impure`, with the reason as a `Str` there; 4 or 5
+        /// when it ran out of steps or memory, with nothing there; 6 when the
+        /// caller has not signalled such callees yet, which did not run the
+        /// code, with a `Str` there of one `module name` a line. A trap of the
+        /// code is the call's. 7 when the `Expr` arrived under a budget that
+        /// cannot run it, or 8 when the budget ran out while it ran, with the
+        /// budget's index in `scratch[0]` (Specification §18.7).
+        TransportRun = 114 => "rt_transport_run",
+        /// `rt_transport_encode(ctx, scratch, env, stamp) -> status`: the bytes
+        /// that send the `Expr` of the environment `env` (Plan §11.10.9),
+        /// stamped with the process's sending budget `stamp`, or none when it
+        /// is negative. The status is 0 with the `Bytes` in `scratch[0..2]`,
+        /// or 1 with why it cannot be sent, a `Str`, there.
+        TransportEncode = 115 => "rt_transport_encode",
+        /// `rt_transport_decode(ctx, scratch, x0, x1, b0, b1) -> status`: the
+        /// `Expr` that the bytes `b0`, `b1` send, checked against the function
+        /// type `x0`, `x1` as `TransportRun` checks code, under the policy in
+        /// `scratch[0..3]` as there. The status is 0 with the `Expr` in
+        /// `scratch[0..2]`; 1 to 5 as for `TransportRun`; 7 when its stamp is
+        /// missing or not valid, with why as a `Str` there; 8 when its budget
+        /// is used up, with the budget's index there; 9 when the bytes are not
+        /// code, with why as a `Str` there.
+        TransportDecode = 116 => "rt_transport_decode",
+        /// `rt_budget_op(ctx, scratch, op, side, index) -> value`: an
+        /// operation on the process's budgets (`budget_op`), on side 0, those
+        /// it enforces, or 1, those it sends under.
+        BudgetOp = 117 => "rt_budget_op",
+    }
+    /// The symbol the loader looks up.
+    fn symbol -> &'static str;
 }
 
 /// The operations of [`RuntimeFn::BudgetOp`]. Counts and numbers come
@@ -1262,328 +1312,53 @@ pub const TASK_CANCELLED: u64 = 1;
 /// A task that trapped.
 pub const TASK_TRAPPED: u64 = 2;
 
-impl RuntimeFn {
-    /// Every runtime function, indexed by its discriminant.
-    pub const ALL: [RuntimeFn; 118] = [
-        RuntimeFn::Morestack,
-        RuntimeFn::SideGrow,
-        RuntimeFn::Trap,
-        RuntimeFn::Alloc,
-        RuntimeFn::Release,
-        RuntimeFn::ListPush,
-        RuntimeFn::ListElem,
-        RuntimeFn::ListSlice,
-        RuntimeFn::MapInsert,
-        RuntimeFn::MapGet,
-        RuntimeFn::Refuel,
-        RuntimeFn::TextConcat,
-        RuntimeFn::TextEquals,
-        RuntimeFn::TextShow,
-        RuntimeFn::Disposal,
-        RuntimeFn::Yield,
-        RuntimeFn::Sleep,
-        RuntimeFn::IoRead,
-        RuntimeFn::IoWrite,
-        RuntimeFn::IoAccept,
-        RuntimeFn::IoConnect,
-        RuntimeFn::ScopeNew,
-        RuntimeFn::ScopeStart,
-        RuntimeFn::ScopeNext,
-        RuntimeFn::ScopeResult,
-        RuntimeFn::ScopeCancel,
-        RuntimeFn::ScopeEnd,
-        RuntimeFn::EnterNoCancel,
-        RuntimeFn::ExitNoCancel,
-        RuntimeFn::StreamNew,
-        RuntimeFn::StreamPut,
-        RuntimeFn::StreamTryPut,
-        RuntimeFn::StreamNext,
-        RuntimeFn::StreamClose,
-        RuntimeFn::StreamDispose,
-        RuntimeFn::HubNew,
-        RuntimeFn::HubSink,
-        RuntimeFn::HubSource,
-        RuntimeFn::HubSeal,
-        RuntimeFn::HubRelease,
-        RuntimeFn::HubDrop,
-        RuntimeFn::RefRead,
-        RuntimeFn::RefCommit,
-        RuntimeFn::RefDone,
-        RuntimeFn::RefSwap,
-        RuntimeFn::TxBegin,
-        RuntimeFn::TxRead,
-        RuntimeFn::TxWrite,
-        RuntimeFn::TxCommit,
-        RuntimeFn::TxAbort,
-        RuntimeFn::TxRetry,
-        RuntimeFn::RefApply,
-        RuntimeFn::ExtNew,
-        RuntimeFn::ExtLock,
-        RuntimeFn::ExtUnlock,
-        RuntimeFn::ExtFree,
-        RuntimeFn::SignalEmit,
-        RuntimeFn::SignalNext,
-        RuntimeFn::LazyNew,
-        RuntimeFn::LazyGet,
-        RuntimeFn::LazySet,
-        RuntimeFn::LazyFree,
-        RuntimeFn::ReleaseDeferred,
-        RuntimeFn::TxThrow,
-        RuntimeFn::IoListen,
-        RuntimeFn::IoPort,
-        RuntimeFn::IoSocket,
-        RuntimeFn::IoConnectLocal,
-        RuntimeFn::IoBuffer,
-        RuntimeFn::IoBytes,
-        RuntimeFn::IoWriteBytes,
-        RuntimeFn::SignalMark,
-        RuntimeFn::SignalReset,
-        RuntimeFn::SignalOn,
-        RuntimeFn::SignalFind,
-        RuntimeFn::SignalLeave,
-        RuntimeFn::SignalDefault,
-        RuntimeFn::Step,
-        RuntimeFn::IoPrint,
-        RuntimeFn::IoReadFile,
-        RuntimeFn::IoSocketAny,
-        RuntimeFn::IoConnectHost,
-        RuntimeFn::TextUtf8,
-        RuntimeFn::TextMeasure,
-        RuntimeFn::TextAt,
-        RuntimeFn::TextFind,
-        RuntimeFn::TextMap,
-        RuntimeFn::TextSlice,
-        RuntimeFn::CodePointOp,
-        RuntimeFn::TextParse,
-        RuntimeFn::ValueShapes,
-        RuntimeFn::ValueOp,
-        RuntimeFn::ValueShow,
-        RuntimeFn::ListSet,
-        RuntimeFn::ListConcat,
-        RuntimeFn::MapRemove,
-        RuntimeFn::MapList,
-        RuntimeFn::TestRecord,
-        RuntimeFn::EnvArgs,
-        RuntimeFn::EnvVar,
-        RuntimeFn::EnvVars,
-        RuntimeFn::EnvPlatform,
-        RuntimeFn::BytesRead,
-        RuntimeFn::BytesWrite,
-        RuntimeFn::BytesOfList,
-        RuntimeFn::TrapCatch,
-        RuntimeFn::TrapRethrow,
-        RuntimeFn::TrapCaught,
-        RuntimeFn::TrapCaughtText,
-        RuntimeFn::TxDepth,
-        RuntimeFn::TxUnwind,
-        RuntimeFn::CCall,
-        RuntimeFn::CStrOf,
-        RuntimeFn::ValueDecode,
-        RuntimeFn::TransportRun,
-        RuntimeFn::TransportEncode,
-        RuntimeFn::TransportDecode,
-        RuntimeFn::BudgetOp,
-    ];
-
-    /// The symbol the loader looks up.
-    pub fn symbol(self) -> &'static str {
-        match self {
-            RuntimeFn::Morestack => "rt_morestack",
-            RuntimeFn::SideGrow => "rt_side_grow",
-            RuntimeFn::Trap => "rt_trap",
-            RuntimeFn::Alloc => "rt_alloc",
-            RuntimeFn::Release => "rt_release",
-            RuntimeFn::ListPush => "rt_list_push",
-            RuntimeFn::ListElem => "rt_list_elem",
-            RuntimeFn::ListSlice => "rt_list_slice",
-            RuntimeFn::MapInsert => "rt_map_insert",
-            RuntimeFn::MapGet => "rt_map_get",
-            RuntimeFn::Refuel => "rt_refuel",
-            RuntimeFn::TextConcat => "rt_text_concat",
-            RuntimeFn::TextEquals => "rt_text_equals",
-            RuntimeFn::TextShow => "rt_text_show",
-            RuntimeFn::Disposal => "rt_disposal",
-            RuntimeFn::Yield => "rt_yield",
-            RuntimeFn::Sleep => "rt_sleep",
-            RuntimeFn::IoRead => "rt_io_read",
-            RuntimeFn::IoWrite => "rt_io_write",
-            RuntimeFn::IoAccept => "rt_io_accept",
-            RuntimeFn::IoConnect => "rt_io_connect",
-            RuntimeFn::ScopeNew => "rt_scope_new",
-            RuntimeFn::ScopeStart => "rt_scope_start",
-            RuntimeFn::ScopeNext => "rt_scope_next",
-            RuntimeFn::ScopeResult => "rt_scope_result",
-            RuntimeFn::ScopeCancel => "rt_scope_cancel",
-            RuntimeFn::ScopeEnd => "rt_scope_end",
-            RuntimeFn::EnterNoCancel => "rt_enter_no_cancel",
-            RuntimeFn::ExitNoCancel => "rt_exit_no_cancel",
-            RuntimeFn::StreamNew => "rt_stream_new",
-            RuntimeFn::StreamPut => "rt_stream_put",
-            RuntimeFn::StreamTryPut => "rt_stream_try_put",
-            RuntimeFn::StreamNext => "rt_stream_next",
-            RuntimeFn::StreamClose => "rt_stream_close",
-            RuntimeFn::StreamDispose => "rt_stream_dispose",
-            RuntimeFn::HubNew => "rt_hub_new",
-            RuntimeFn::HubSink => "rt_hub_sink",
-            RuntimeFn::HubSource => "rt_hub_source",
-            RuntimeFn::HubSeal => "rt_hub_seal",
-            RuntimeFn::HubRelease => "rt_hub_release",
-            RuntimeFn::HubDrop => "rt_hub_drop",
-            RuntimeFn::RefRead => "rt_ref_read",
-            RuntimeFn::RefCommit => "rt_ref_commit",
-            RuntimeFn::RefDone => "rt_ref_done",
-            RuntimeFn::RefSwap => "rt_ref_swap",
-            RuntimeFn::TxBegin => "rt_tx_begin",
-            RuntimeFn::TxRead => "rt_tx_read",
-            RuntimeFn::TxWrite => "rt_tx_write",
-            RuntimeFn::TxCommit => "rt_tx_commit",
-            RuntimeFn::TxAbort => "rt_tx_abort",
-            RuntimeFn::TxRetry => "rt_tx_retry",
-            RuntimeFn::RefApply => "rt_ref_apply",
-            RuntimeFn::ExtNew => "rt_ext_new",
-            RuntimeFn::ExtLock => "rt_ext_lock",
-            RuntimeFn::ExtUnlock => "rt_ext_unlock",
-            RuntimeFn::ExtFree => "rt_ext_free",
-            RuntimeFn::SignalEmit => "rt_signal_emit",
-            RuntimeFn::SignalNext => "rt_signal_next",
-            RuntimeFn::LazyNew => "rt_lazy_new",
-            RuntimeFn::LazyGet => "rt_lazy_get",
-            RuntimeFn::LazySet => "rt_lazy_set",
-            RuntimeFn::LazyFree => "rt_lazy_free",
-            RuntimeFn::ReleaseDeferred => "rt_release_deferred",
-            RuntimeFn::TxThrow => "rt_tx_throw",
-            RuntimeFn::IoListen => "rt_io_listen",
-            RuntimeFn::IoPort => "rt_io_port",
-            RuntimeFn::IoSocket => "rt_io_socket",
-            RuntimeFn::IoConnectLocal => "rt_io_connect_local",
-            RuntimeFn::IoBuffer => "rt_io_buffer",
-            RuntimeFn::IoBytes => "rt_io_bytes",
-            RuntimeFn::IoWriteBytes => "rt_io_write_bytes",
-            RuntimeFn::SignalMark => "rt_signal_mark",
-            RuntimeFn::SignalReset => "rt_signal_reset",
-            RuntimeFn::SignalOn => "rt_signal_on",
-            RuntimeFn::SignalFind => "rt_signal_find",
-            RuntimeFn::SignalLeave => "rt_signal_leave",
-            RuntimeFn::SignalDefault => "rt_signal_default",
-            RuntimeFn::Step => "rt_step",
-            RuntimeFn::IoPrint => "rt_io_print",
-            RuntimeFn::IoReadFile => "rt_io_read_file",
-            RuntimeFn::IoSocketAny => "rt_io_socket_any",
-            RuntimeFn::IoConnectHost => "rt_io_connect_host",
-            RuntimeFn::TextUtf8 => "rt_text_utf8",
-            RuntimeFn::TextMeasure => "rt_text_measure",
-            RuntimeFn::TextAt => "rt_text_at",
-            RuntimeFn::TextFind => "rt_text_find",
-            RuntimeFn::TextMap => "rt_text_map",
-            RuntimeFn::TextSlice => "rt_text_slice",
-            RuntimeFn::CodePointOp => "rt_code_point",
-            RuntimeFn::TextParse => "rt_text_parse",
-            RuntimeFn::ValueShapes => "rt_value_shapes",
-            RuntimeFn::ValueOp => "rt_value_op",
-            RuntimeFn::ValueShow => "rt_value_show",
-            RuntimeFn::ListSet => "rt_list_set",
-            RuntimeFn::ListConcat => "rt_list_concat",
-            RuntimeFn::MapRemove => "rt_map_remove",
-            RuntimeFn::MapList => "rt_map_list",
-            RuntimeFn::TestRecord => "rt_test_record",
-            RuntimeFn::EnvArgs => "rt_env_args",
-            RuntimeFn::EnvVar => "rt_env_var",
-            RuntimeFn::EnvVars => "rt_env_vars",
-            RuntimeFn::EnvPlatform => "rt_env_platform",
-            RuntimeFn::BytesRead => "rt_bytes_read",
-            RuntimeFn::BytesWrite => "rt_bytes_write",
-            RuntimeFn::BytesOfList => "rt_bytes_of_list",
-            RuntimeFn::TrapCatch => "rt_trap_catch",
-            RuntimeFn::TrapRethrow => "rt_trap_rethrow",
-            RuntimeFn::TrapCaught => "rt_trap_caught",
-            RuntimeFn::TrapCaughtText => "rt_trap_caught_text",
-            RuntimeFn::TxDepth => "rt_tx_depth",
-            RuntimeFn::TxUnwind => "rt_tx_unwind",
-            RuntimeFn::CCall => "rt_c_call",
-            RuntimeFn::CStrOf => "rt_c_str_of",
-            RuntimeFn::ValueDecode => "rt_value_decode",
-            RuntimeFn::TransportRun => "rt_transport_run",
-            RuntimeFn::TransportEncode => "rt_transport_encode",
-            RuntimeFn::TransportDecode => "rt_transport_decode",
-            RuntimeFn::BudgetOp => "rt_budget_op",
-        }
+table! {
+    /// Why generated code stopped a computation (Specification §8.3).
+    pub enum TrapKind {
+        Overflow = 0 => "arithmetic overflow",
+        DivideByZero = 1 => "division by zero",
+        /// An index outside the list.
+        Index = 2 => "index out of range",
+        /// `???` was reached.
+        Hole = 3 => "reached `???`",
+        /// No arm of a `case` matched.
+        NoMatch = 4 => "no arm of `case` matched",
+        /// The function had compile errors.
+        Error = 5 => "reached code with errors",
+        /// The compiler does not support what was reached yet.
+        Unsupported = 6 => "reached code the compiler does not support yet",
+        /// Metered code used up its steps.
+        OutOfSteps = 7 => "ran out of steps",
+        /// Metered code used up its memory budget.
+        OutOfMemory = 8 => "ran out of memory",
+        /// The task was cancelled (Specification §10.4), or the runtime's poll
+        /// at a refill asked metered code to stop, as the host does when an
+        /// edit cancels a compile-time evaluation.
+        Cancelled = 9 => "was cancelled",
+        /// A lazy value's computation read the value itself.
+        Cycle = 10 => "a lazy value needed itself",
+        /// The environment failed an operation that has no error value, such
+        /// as writing to a closed standard output (Specification §8.3, §15.6).
+        Fault = 11 => "the environment failed",
+        /// Values without an order were compared: functions, maps or sets
+        /// (Specification §19.11).
+        Unordered = 12 => "compared values that have no order",
+        /// `!!` met an error (Specification §8.4).
+        Expectation = 13 => "`!!` met an error",
+        /// A value failed a condition of its type (Specification §3.10.1).
+        ConditionFailed = 14 => "a value failed a condition of its type",
+        /// `number()` met a NaN or an infinity (Specification §3.1.4).
+        NotFinite = 15 => "a number was not finite",
+        /// A C function broke what its import declares (Specification §16.1).
+        ForeignFault = 16 => "a C function broke what its import declares",
+        /// A fiber's stack would grow past its maximum size.
+        StackOverflow = 17 => "the stack overflowed",
     }
-
-    /// The function with this discriminant, if any.
-    pub fn from_index(index: u32) -> Option<RuntimeFn> {
-        Self::ALL.get(index as usize).copied()
-    }
-}
-
-/// Why generated code stopped a computation (Specification §8.3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(u32)]
-pub enum TrapKind {
-    Overflow = 0,
-    DivideByZero = 1,
-    /// An index outside the list.
-    Index = 2,
-    /// `???` was reached.
-    Hole = 3,
-    /// No arm of a `case` matched.
-    NoMatch = 4,
-    /// The function had compile errors.
-    Error = 5,
-    /// The compiler does not support what was reached yet.
-    Unsupported = 6,
-    /// Metered code used up its steps.
-    OutOfSteps = 7,
-    /// Metered code used up its memory budget.
-    OutOfMemory = 8,
-    /// The task was cancelled (Specification §10.4), or the runtime's poll
-    /// at a refill asked metered code to stop, as the host does when an
-    /// edit cancels a compile-time evaluation.
-    Cancelled = 9,
-    /// A lazy value's computation read the value itself.
-    Cycle = 10,
-    /// The environment failed an operation that has no error value, such
-    /// as writing to a closed standard output (Specification §8.3, §15.6).
-    Fault = 11,
-    /// Values without an order were compared: functions, maps or sets
-    /// (Specification §19.11).
-    Unordered = 12,
-    /// `!!` met an error (Specification §8.4).
-    Expectation = 13,
-    /// A value failed a condition of its type (Specification §3.10.1).
-    ConditionFailed = 14,
-    /// `number()` met a NaN or an infinity (Specification §3.1.4).
-    NotFinite = 15,
-    /// A C function broke what its import declares (Specification §16.1).
-    ForeignFault = 16,
-    /// A fiber's stack would grow past its maximum size.
-    StackOverflow = 17,
+    /// What a trap of the kind tells the user.
+    fn message -> &'static str;
 }
 
 impl TrapKind {
-    /// What a trap of the kind tells the user.
-    pub fn message(self) -> &'static str {
-        match self {
-            TrapKind::Overflow => "arithmetic overflow",
-            TrapKind::DivideByZero => "division by zero",
-            TrapKind::Index => "index out of range",
-            TrapKind::Hole => "reached `???`",
-            TrapKind::NoMatch => "no arm of `case` matched",
-            TrapKind::Error => "reached code with errors",
-            TrapKind::Unsupported => "reached code the compiler does not support yet",
-            TrapKind::OutOfSteps => "ran out of steps",
-            TrapKind::OutOfMemory => "ran out of memory",
-            TrapKind::Cancelled => "was cancelled",
-            TrapKind::Cycle => "a lazy value needed itself",
-            TrapKind::Fault => "the environment failed",
-            TrapKind::Unordered => "compared values that have no order",
-            TrapKind::Expectation => "`!!` met an error",
-            TrapKind::ConditionFailed => "a value failed a condition of its type",
-            TrapKind::NotFinite => "a number was not finite",
-            TrapKind::ForeignFault => "a C function broke what its import declares",
-            TrapKind::StackOverflow => "the stack overflowed",
-        }
-    }
-
     /// Whether a trap handler may take a trap of the kind: cancellation
     /// is no trap (Specification §10.4), and code with errors or the
     /// compiler's gaps are not the program's.
@@ -1592,34 +1367,6 @@ impl TrapKind {
             self,
             TrapKind::Cancelled | TrapKind::Error | TrapKind::Unsupported
         )
-    }
-}
-
-impl TrapKind {
-    pub const ALL: [TrapKind; 18] = [
-        TrapKind::Overflow,
-        TrapKind::DivideByZero,
-        TrapKind::Index,
-        TrapKind::Hole,
-        TrapKind::NoMatch,
-        TrapKind::Error,
-        TrapKind::Unsupported,
-        TrapKind::OutOfSteps,
-        TrapKind::OutOfMemory,
-        TrapKind::Cancelled,
-        TrapKind::Cycle,
-        TrapKind::Fault,
-        TrapKind::Unordered,
-        TrapKind::Expectation,
-        TrapKind::ConditionFailed,
-        TrapKind::NotFinite,
-        TrapKind::ForeignFault,
-        TrapKind::StackOverflow,
-    ];
-
-    /// The kind with this discriminant, if any.
-    pub fn from_index(index: u64) -> Option<TrapKind> {
-        Self::ALL.get(usize::try_from(index).ok()?).copied()
     }
 }
 
