@@ -11,6 +11,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+crag-diag = { path = "../crag-diag" }
 crag-db = { path = "../crag-db" }
 crag-hir = { path = "../crag-hir" }
 blake3 = "1.8.7"

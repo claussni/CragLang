@@ -276,7 +276,7 @@ fn what_has_no_layout() {
     assert_eq!(layout(&mut r, ""), "error: :layout takes a type\n");
     assert_eq!(
         layout(&mut r, "Nope"),
-        "error: `Nope` is not a type\n --> input:1:1\n  |\n1 | Nope\n  | ^^^^\n"
+        "error[E0202]: `Nope` is not a type\n --> input:1:1\n  |\n1 | Nope\n  | ^^^^\n"
     );
     // The session is as it was.
     assert_eq!(eval(&mut r, "1 + 1"), "2\n");

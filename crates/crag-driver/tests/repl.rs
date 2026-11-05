@@ -142,14 +142,14 @@ fn embeds_read_their_files_again_when_they_change() {
     std::fs::write(&note, [0xffu8]).unwrap();
     let error = eval(&mut r, "raw");
     assert!(
-        error.starts_with("error: an `embed` of `Str` needs UTF-8, which the resource is not at byte 0\n --> note:1:22\n"),
+        error.starts_with("error[E0801]: an `embed` of `Str` needs UTF-8, which the resource is not at byte 0\n --> note:1:22\n"),
         "{error}"
     );
     std::fs::write(&note, "third").unwrap();
     assert_eq!(eval(&mut r, "raw"), "b\"third\"\n");
     let error = eval(&mut r, "embed gone from \"gone.txt\"");
     assert!(
-        error.starts_with("error: cannot read `gone.txt`: "),
+        error.starts_with("error[E0206]: cannot read `gone.txt`: "),
         "{error}"
     );
 }
@@ -187,23 +187,23 @@ fn errors_are_shown_against_the_input_and_change_nothing() {
     assert_eq!(eval(&mut r, "fn double(n: Int) -> Int { n * 2 }"), "");
     assert_eq!(
         eval(&mut r, "double(missing)"),
-        "error: `missing` is not defined\n --> input:1:8\n  |\n1 | double(missing)\n  |        ^^^^^^^\n"
+        "error[E0201]: `missing` is not defined\n --> input:1:8\n  |\n1 | double(missing)\n  |        ^^^^^^^\n"
     );
     assert_eq!(
         eval(&mut r, "fn broken() -> Int {\n  nothing\n}"),
-        "error: `nothing` is not defined\n --> input:2:3\n  |\n2 |   nothing\n  |   ^^^^^^^\n"
+        "error[E0201]: `nothing` is not defined\n --> input:2:3\n  |\n2 |   nothing\n  |   ^^^^^^^\n"
     );
     // The broken definition was not added.
     assert_eq!(
         eval(&mut r, "broken()"),
-        "error: `broken` is not defined\n --> input:1:1\n  |\n1 | broken()\n  | ^^^^^^\n"
+        "error[E0201]: `broken` is not defined\n --> input:1:1\n  |\n1 | broken()\n  | ^^^^^^\n"
     );
-    assert!(eval(&mut r, "fn ) {").starts_with("error: "));
+    assert!(eval(&mut r, "fn ) {").starts_with("error[E0001]: "));
     // A constant is computed when it is defined, and one that fails is an
     // error.
     assert_eq!(
         eval(&mut r, "let half: Int = double(1) / 0"),
-        "error: `half` cannot be computed at compile time: it traps with division by zero\n --> input:1:1\n  |\n1 | let half: Int = double(1) / 0\n  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
+        "error[E0803]: `half` cannot be computed at compile time: it traps with division by zero\n --> input:1:1\n  |\n1 | let half: Int = double(1) / 0\n  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n"
     );
     assert_eq!(eval(&mut r, "double(21)"), "42\n");
 }
@@ -272,7 +272,7 @@ fn rebind_replaces_a_definition_and_names_its_dependents() {
     // in the dependent.
     assert_eq!(
         eval(&mut r, ":rebind fn tax(x: Int, y: Int) -> Int { x }"),
-        "error: the argument `y` is missing\n --> gross:1:31\n  |\n1 | fn gross(x: Int) -> Int { x + tax(x) }\n  |                               ^^^^^^\n"
+        "error[E0308]: the argument `y` is missing\n --> gross:1:31\n  |\n1 | fn gross(x: Int) -> Int { x + tax(x) }\n  |                               ^^^^^^\n"
     );
     assert_eq!(eval(&mut r, "gross(100)"), "110\n");
 
@@ -370,7 +370,7 @@ fn crag_without_arguments_reads_inputs_from_its_input() {
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
-        stdout.starts_with("42\nrebound double\n6\nerror: "),
+        stdout.starts_with("42\nrebound double\n6\nerror[E0001]: "),
         "{stdout}"
     );
     // Nothing runs after `:quit`.

@@ -119,7 +119,13 @@ fn report(error: &FormatError, file: &str, text: &str, out: &mut dyn Write) {
                 let _ = write!(
                     out,
                     "{}",
-                    render_at("error", &e.message, file, text, e.range.clone())
+                    render_at(
+                        &crate::diagnostics::error_kind(Some(e.code)),
+                        &e.message,
+                        file,
+                        text,
+                        e.range.clone(),
+                    )
                 );
             }
             let _ = writeln!(out, "{file}: not formatted, since it does not parse");

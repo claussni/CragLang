@@ -20,6 +20,7 @@
 use std::ops::Range;
 
 use crag_db::Db;
+use crag_diag::DiagCode;
 
 use crate::{LowerError, NameError, Origin, PathError, Previous, Redeclaration};
 
@@ -135,5 +136,49 @@ pub fn lower_message(db: &dyn Db, error: &LowerError) -> (Range<u32>, String) {
             range.clone(),
             "only `Pure` marks a function or a function type".into(),
         ),
+    }
+}
+
+/// The code of a name error.
+pub fn name_code(error: &NameError) -> DiagCode {
+    match error {
+        NameError::Path {
+            error: PathError::Unknown(_),
+            ..
+        } => crag_diag::UNKNOWN_PATH,
+        NameError::Path {
+            error: PathError::PastElement(_),
+            ..
+        } => crag_diag::PATH_PAST_ELEMENT,
+        NameError::Path {
+            error: PathError::Hidden { .. },
+            ..
+        } => crag_diag::HIDDEN_PATH,
+        NameError::ModuleRenamed { .. } => crag_diag::MODULE_RENAMED,
+        NameError::UnknownElement { .. } => crag_diag::UNKNOWN_ELEMENT,
+        NameError::PrivateElement { .. } => crag_diag::PRIVATE_ELEMENT,
+        NameError::ModuleBesideDirectory { .. } => crag_diag::MODULE_BESIDE_DIRECTORY,
+        NameError::Collision { .. } => crag_diag::NAME_COLLISION,
+    }
+}
+
+/// The code of a lowering error.
+pub fn lower_code(error: &LowerError) -> DiagCode {
+    match error {
+        LowerError::Unresolved { .. } => crag_diag::UNDEFINED,
+        LowerError::UnknownType { .. } => crag_diag::NOT_A_TYPE,
+        LowerError::Redeclared(_) => crag_diag::REDECLARED,
+        LowerError::NotInEveryAlternative { .. } => crag_diag::NOT_IN_EVERY_ALTERNATIVE,
+        LowerError::UnnamedField { .. } => crag_diag::UNNAMED_FIELD,
+        LowerError::Literal { .. } => crag_diag::BAD_LITERAL,
+        LowerError::Embed { .. } => crag_diag::EMBED_UNREADABLE,
+        LowerError::UnknownPrefix { .. } => crag_diag::UNKNOWN_PREFIX,
+        LowerError::NoOperator { .. } => crag_diag::NO_OPERATOR,
+        LowerError::NotAVar { .. } => crag_diag::NOT_A_VAR,
+        LowerError::VarWrittenInClosure { .. } => crag_diag::VAR_WRITTEN_IN_CLOSURE,
+        LowerError::MisplacedSpread { .. } => crag_diag::MISPLACED_SPREAD,
+        LowerError::ExpectedType { .. } => crag_diag::EXPECTED_TYPE,
+        LowerError::ExpectedValue { .. } => crag_diag::EXPECTED_VALUE,
+        LowerError::Marker { .. } => crag_diag::MISPLACED_MARKER,
     }
 }

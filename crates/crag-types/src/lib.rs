@@ -91,13 +91,28 @@ pub use ty::{Builtin, Ty, TyKind};
 
 /// The types of a body: a function, a module-level `let`, a test, or the
 /// field defaults of a type declaration.
-#[crag_db::tracked(returns(ref))]
+#[crag_db::tracked(returns(ref), cycle_result = body_types_cycle)]
 pub fn body_types<'db>(
     db: &'db dyn Db,
     program: Program,
     owner: Owner<'db>,
 ) -> InferenceResult<'db> {
     infer::infer(db, program, owner)
+}
+
+/// A body whose types depend on themselves gives the fetch inside the
+/// cycle no types. It happens when an alias's condition calls a function
+/// that checks a literal against the alias (§3.10.1): checking the literal
+/// needs the condition's types, which need the function's. The empty
+/// result makes that inner check undecided, an ordinary diagnostic, and
+/// the completed query keeps the real types.
+fn body_types_cycle<'db>(
+    _db: &'db dyn Db,
+    _id: crag_db::Id,
+    _program: Program,
+    _owner: Owner<'db>,
+) -> InferenceResult<'db> {
+    InferenceResult::default()
 }
 
 /// Every type error of a module, with the owner of the body it is in,

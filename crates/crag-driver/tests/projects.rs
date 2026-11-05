@@ -129,7 +129,7 @@ fn errors_are_shown_against_the_source() {
     let out = text(out);
     assert!(
         out.starts_with(
-            "error: `missing` is not defined\n --> app.crag:2:11\n  |\n2 |   let n = missing + 1\n  |           ^^^^^^^\n"
+            "error[E0201]: `missing` is not defined\n --> app.crag:2:11\n  |\n2 |   let n = missing + 1\n  |           ^^^^^^^\n"
         ),
         "{out}"
     );
@@ -163,7 +163,7 @@ fn a_more_specific_overload_wins_unless_the_function_is_final() {
     let out = text(out);
     assert!(
         out.contains(
-            "error: `verify(Int)` of `demo.app` is more specific than the final `verify(T)` of \
+            "error[E0514]: `verify(Int)` of `demo.app` is more specific than the final `verify(T)` of \
              `demo.lib`, which no overload may outrank; import one of them selectively or rename \
              one with `as`\n --> app.crag:3:1"
         ),
@@ -214,6 +214,27 @@ fn derived_functions_take_the_own_functions_seen_where_they_are_called() {
 }
 
 #[test]
+fn a_condition_whose_types_depend_on_themselves_is_an_error() {
+    // The condition of `Small` calls `limit`, and `limit`'s body checks a
+    // literal against `Small`, so the condition's types depend on
+    // themselves. The cycle is broken and the check inside it is
+    // undecided, an ordinary diagnostic (§3.10.1), not a crash.
+    let app = "type Small = Int where this < limit()\n\
+               fn limit() { let s: Small = 3\n 10 }\n\
+               fn main() {}\n";
+    let root = project("cycle", &[("package.crag", MANIFEST), ("app.crag", app)]);
+    let mut out = Vec::new();
+    assert_eq!(crag_run(&root, &mut out), 1);
+    let out = text(out);
+    assert!(
+        out.contains(
+            "error[E0408]: the condition `this < limit()` of Small cannot be decided here"
+        ),
+        "{out}"
+    );
+}
+
+#[test]
 fn printing_and_transforms_that_print_are_not_pure() {
     // §3.14: the runtime functions of `std.io` do `io`, and a transform
     // runs where the record is built (§6.7).
@@ -226,7 +247,8 @@ fn printing_and_transforms_that_print_are_not_pure() {
     let mut out = Vec::new();
     assert_eq!(crag_run(&root, &mut out), 1);
     let out = text(out);
-    let wrong = "error: this has the effect `io`, which an `is Pure` function does not allow";
+    let wrong =
+        "error[E0601]: this has the effect `io`, which an `is Pure` function does not allow";
     assert_eq!(out.matches(wrong).count(), 2, "{out}");
     assert!(out.contains(" --> app.crag:4:3"), "{out}");
     assert!(out.contains(" --> app.crag:8:3"), "{out}");
@@ -245,12 +267,12 @@ fn handles_are_not_solid() {
     assert_eq!(crag_run(&root, &mut out), 1);
     let out = text(out);
     assert!(
-        out.contains("error: Token is not Solid: it has an `on Dispose` handler"),
+        out.contains("error[E0607]: Token is not Solid: it has an `on Dispose` handler"),
         "{out}"
     );
     assert!(
         out.contains(
-            "error: a module-level binding holds only Solid values, and this is not: Token is \
+            "error[E0608]: a module-level binding holds only Solid values, and this is not: Token is \
              not Solid: it has an `on Dispose` handler"
         ),
         "{out}"
@@ -307,7 +329,7 @@ fn a_constant_that_fails_at_compile_time_is_an_error() {
     let out = text(out);
     assert!(
         out.starts_with(
-            "error: `ratio` cannot be computed at compile time: it traps with division by zero in down\n --> app.crag:5:1\n  |\n5 | let ratio = down(3)\n  | ^^^^^^^^^^^^^^^^^^^\n"
+            "error[E0803]: `ratio` cannot be computed at compile time: it traps with division by zero in down\n --> app.crag:5:1\n  |\n5 | let ratio = down(3)\n  | ^^^^^^^^^^^^^^^^^^^\n"
         ),
         "{out}"
     );
@@ -449,7 +471,7 @@ fn main() {}
     let out = text(out);
     let messages: Vec<&str> = out
         .lines()
-        .filter_map(|l| l.strip_prefix("error: "))
+        .filter_map(|l| l.strip_prefix("error[")?.split_once("]: ").map(|(_, m)| m))
         .collect();
     assert_eq!(
         messages,
@@ -516,7 +538,7 @@ fn main() -> ExitCode {
     let out = text(out);
     assert!(
         out.starts_with(
-            "error: `level` cannot be embedded: expected low or high, at level.txt:1:1\n  --> app.crag:19:1\n"
+            "error[E0804]: `level` cannot be embedded: expected low or high, at level.txt:1:1\n  --> app.crag:19:1\n"
         ),
         "{out}"
     );
@@ -527,7 +549,7 @@ fn main() -> ExitCode {
     let out = text(out);
     assert!(
         out.starts_with(
-            "error: an `embed` of `Level` needs UTF-8, which the resource is not at byte 0\n"
+            "error[E0801]: an `embed` of `Level` needs UTF-8, which the resource is not at byte 0\n"
         ),
         "{out}"
     );
@@ -615,7 +637,7 @@ fn main() {}
     let out = text(out);
     let messages: Vec<&str> = out
         .lines()
-        .filter_map(|l| l.strip_prefix("error: "))
+        .filter_map(|l| l.strip_prefix("error[")?.split_once("]: ").map(|(_, m)| m))
         .collect();
     assert_eq!(
         messages,
@@ -953,12 +975,12 @@ fn main() {}
     assert_eq!(crag_run(&root, &mut out), 1);
     let out = text(out);
     for message in [
-        "error: List[Int] is no C type here; a C function takes sized integers, `Float`, `CF32`, `CPtr[T]`, `CStr` and `Option[CStr]`, and `Float` with any of `NaN`, `PosInfinity` and `NegInfinity`; a result may also be `Str`, `Option[Str]` or `()`\n --> app.crag:4:11",
-        "error: an out parameter cannot point to CStr; it takes a sized integer, `Float`, `CF32` or `CPtr[T]`\n --> app.crag:4:25",
-        "error: List[Int] is no C type here; a C function takes sized integers, `Float`, `CF32`, `CPtr[T]`, `CStr` and `Option[CStr]`, and `Float` with any of `NaN`, `PosInfinity` and `NegInfinity`; a result may also be `Str`, `Option[Str]` or `()`\n --> app.crag:4:40",
-        "error: `cLib(\"c\")` is imported as ThreadSafe here but as ThreadUnsafe in `demo.app`",
-        "error: `cLib(\"c\")` is imported as ThreadUnsafe here but as ThreadSafe in `demo.app`",
-        "error: package demo declares no native library `undeclared`; add `native undeclared \"<file>\"` to its manifest",
+        "error[E0751]: List[Int] is no C type here; a C function takes sized integers, `Float`, `CF32`, `CPtr[T]`, `CStr` and `Option[CStr]`, and `Float` with any of `NaN`, `PosInfinity` and `NegInfinity`; a result may also be `Str`, `Option[Str]` or `()`\n --> app.crag:4:11",
+        "error[E0751]: an out parameter cannot point to CStr; it takes a sized integer, `Float`, `CF32` or `CPtr[T]`\n --> app.crag:4:25",
+        "error[E0751]: List[Int] is no C type here; a C function takes sized integers, `Float`, `CF32`, `CPtr[T]`, `CStr` and `Option[CStr]`, and `Float` with any of `NaN`, `PosInfinity` and `NegInfinity`; a result may also be `Str`, `Option[Str]` or `()`\n --> app.crag:4:40",
+        "error[E0752]: `cLib(\"c\")` is imported as ThreadSafe here but as ThreadUnsafe in `demo.app`",
+        "error[E0752]: `cLib(\"c\")` is imported as ThreadUnsafe here but as ThreadSafe in `demo.app`",
+        "error[E0753]: package demo declares no native library `undeclared`; add `native undeclared \"<file>\"` to its manifest",
     ] {
         assert!(out.contains(message), "{message}\nnot in\n{out}");
     }

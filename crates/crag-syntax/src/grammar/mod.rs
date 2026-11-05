@@ -83,7 +83,10 @@ fn modifiers_but_final(p: &mut Parser) {
     loop {
         match p.current() {
             T::Pub | T::Opaque | T::Distinct => p.bump(),
-            T::Final => p.bump_error("only a function can be `final`"),
+            T::Final => p.bump_error_coded(
+                crag_diag::FINAL_NOT_FUNCTION,
+                "only a function can be `final`",
+            ),
             _ => break,
         }
     }

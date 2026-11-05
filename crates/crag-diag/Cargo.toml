@@ -1,0 +1,11 @@
+[package]
+name = "crag-diag"
+description = "The registry of Crag's diagnostic codes, with what each means and an example of each"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

@@ -52,7 +52,7 @@ pub use items::{
 };
 pub use literal::Literal;
 pub use lower::{BodySourceMap, LowerError};
-pub use messages::{lower_message, name_message, redeclared};
+pub use messages::{lower_code, lower_message, name_code, name_message, redeclared};
 pub use package::{PackageScope, Packages};
 pub use pretty::pretty;
 pub use scope::{

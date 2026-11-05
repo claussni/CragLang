@@ -223,6 +223,18 @@ pub enum FitError<'db> {
 }
 
 impl<'db> FitError<'db> {
+    pub fn code(&self) -> crag_diag::DiagCode {
+        match self {
+            FitError::Bound { .. } => crag_diag::FIT_BOUND,
+            FitError::Missing { .. } => crag_diag::FORM_MISSING,
+            FitError::Ambiguous { .. } => crag_diag::FORM_AMBIGUOUS,
+            FitError::NoneOf { .. } => crag_diag::NONE_OF_FORMS,
+            FitError::NotDerived { .. } => crag_diag::NOT_DERIVED,
+            FitError::NotSolid { .. } => crag_diag::PARAM_NOT_SOLID,
+            FitError::Marker { .. } => crag_diag::MARKER_NOT_MET,
+        }
+    }
+
     pub fn message(&self, db: &'db dyn Db) -> String {
         match self {
             FitError::Bound { param, arg, bound } => format!(

@@ -146,7 +146,15 @@ fn lists_the_tools() {
         .collect();
     assert_eq!(
         names,
-        ["check", "typeOf", "members", "searchStd", "eval", "test"]
+        [
+            "check",
+            "typeOf",
+            "members",
+            "searchStd",
+            "explain",
+            "eval",
+            "test"
+        ]
     );
     client.finish();
 }
@@ -170,6 +178,8 @@ fn checks_and_types_snippets() {
         (&diagnostic["line"], &diagnostic["column"]),
         (&json!(1), &json!(28))
     );
+    assert_eq!(diagnostic["code"], "E0303");
+    assert_eq!(diagnostic["resource"], "crag://diagnostic/E0303");
 
     let (_, answer) = client.call(
         "check",
@@ -337,5 +347,42 @@ fn works_in_a_project_and_follows_its_files() {
     std::fs::write(dir.join("extra.crag"), "pub fn extra() -> Int { \"no\" }\n").unwrap();
     let (_, answer) = client.call("check", json!({}));
     assert_eq!(answer["diagnostics"][0]["file"], "extra.crag", "{answer}");
+    client.finish();
+}
+
+#[test]
+fn explains_diagnostics() {
+    let dir = common::project("mcp-explain", &[]);
+    let mut client = Client::start(&dir, &[]);
+    let (failed, answer) = client.call("explain", json!({"code": "e0301"}));
+    assert!(!failed, "{answer}");
+    assert_eq!(answer["code"], "E0301");
+    assert!(answer["failing"].as_str().unwrap().contains("fn "));
+    assert!(answer["spec"].as_str().unwrap().starts_with('§'));
+
+    let (failed, answer) = client.call("explain", json!({"code": "E9999"}));
+    assert!(failed);
+    assert!(answer["error"].as_str().unwrap().contains("E9999"));
+
+    let listed = client.request("resources/list", json!({}));
+    let uris: Vec<&str> = listed["result"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["uri"].as_str().unwrap())
+        .collect();
+    assert!(uris.contains(&"crag://diagnostic/E0301"), "{listed}");
+    let templates = client.request("resources/templates/list", json!({}));
+    assert_eq!(
+        templates["result"]["resourceTemplates"][0]["uriTemplate"],
+        "crag://diagnostic/{code}"
+    );
+
+    let read = client.request("resources/read", json!({"uri": "crag://diagnostic/E0301"}));
+    let contents = &read["result"]["contents"][0];
+    assert_eq!(contents["mimeType"], "text/markdown");
+    assert!(contents["text"].as_str().unwrap().starts_with("# E0301: "));
+    let missing = client.request("resources/read", json!({"uri": "crag://diagnostic/E9999"}));
+    assert!(missing["error"].is_object(), "{missing}");
     client.finish();
 }

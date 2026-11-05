@@ -555,6 +555,7 @@ impl Server {
                                 "range": text::json_range(source, d.range, encoding),
                                 "severity": 1,
                                 "source": "crag",
+                                "code": d.code.as_str(),
                                 "message": d.message,
                             })
                         })

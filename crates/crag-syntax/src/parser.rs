@@ -29,6 +29,8 @@
 
 use std::ops::Range;
 
+use crag_diag::DiagCode;
+
 use crate::green::{Builder, Checkpoint, GreenNode, NodeCache};
 use crate::kind::{LeafKind, SyntaxKind};
 use crate::token::{Token, TokenKind};
@@ -36,6 +38,7 @@ use crate::token::{Token, TokenKind};
 /// A syntax error: what was wrong, and where.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseError {
+    pub code: DiagCode,
     pub message: String,
     pub range: Range<u32>,
 }
@@ -281,7 +284,7 @@ impl<'a> Parser<'a> {
             return true;
         }
         self.too_deep = true;
-        self.bump_error("nesting too deep");
+        self.bump_error_coded(crag_diag::NESTING_TOO_DEEP, "nesting too deep");
         false
     }
 
@@ -289,6 +292,11 @@ impl<'a> Parser<'a> {
 
     /// Reports an error at the current token.
     pub(crate) fn error(&mut self, message: impl Into<String>) {
+        self.error_coded(crag_diag::SYNTAX, message);
+    }
+
+    /// Reports an error of a code of its own at the current token.
+    pub(crate) fn error_coded(&mut self, code: DiagCode, message: impl Into<String>) {
         let token = self.tokens[self.pos];
         let range = if token.kind == TokenKind::Newline || token.kind == TokenKind::Eof {
             // Point at the end of the line rather than at the next one.
@@ -301,6 +309,7 @@ impl<'a> Parser<'a> {
             return;
         }
         self.errors.push(ParseError {
+            code,
             message: message.into(),
             range,
         });
@@ -326,7 +335,12 @@ impl<'a> Parser<'a> {
     /// Wraps the current token in an `Error` node, with everything up to the
     /// matching closer if it opens a bracket.
     pub(crate) fn bump_error(&mut self, message: impl Into<String>) {
-        self.error(message);
+        self.bump_error_coded(crag_diag::SYNTAX, message);
+    }
+
+    /// `bump_error` with an error of a code of its own.
+    pub(crate) fn bump_error_coded(&mut self, code: DiagCode, message: impl Into<String>) {
+        self.error_coded(code, message);
         if self.at(TokenKind::Eof) {
             return;
         }

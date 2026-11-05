@@ -31,6 +31,7 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-receive` | Receiving code: checking a tree again, compiling it metered against the program's own types and cells, and running it under the policy's limits and its sender's budget (M7) |
 | `crates/crag-budget` | Budgets of code transport: budget documents, tokens and token files, the bytes of code on the wire, and the process's budgets with what each has taken (M7) |
 | `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1); `build`, the release executable, and `lmt new`, the salt and token files of a budget document (M7); the UI with the built-in editor, the app image, hot reload, the debugger, the language server `crag lsp` and the debug adapter `crag dap` (M5); the agent server `crag mcp` and its tools (M9) |
+| `crates/crag-diag` | The registry of diagnostic codes: one entry per code in `diagnostics/`, with its rule, why, a refused program and its fix, and its section of the specification (M9) |
 | `crates/crag-mcp` | The facade over the Model Context Protocol SDK, on which the agent server speaks to coding agents (M9) |
 | `crates/crag-session` | Session manager: image processes and their supervision (M3) |
 | `crates/crag-eval` | Compile-time evaluation of constants, `embed`s among them, in the metered tier (M3) |
@@ -147,6 +148,15 @@ Compiled code is kept in the settings directory's `cache/`, so a second
 run, `crag test` or a new session compiles only what changed;
 `CRAG_CACHE_STATS=1` prints how much was reused.
 
+Every diagnostic has a code, such as `error[E0301]`, the same in `crag`,
+the REPL, the language server and the agent server. Its entry in
+`crates/crag-diag/diagnostics/` says what the rule is, why, and shows a
+refused program and its fix; the agent server serves it as
+`crag://diagnostic/E0301`. A code never changes meaning. A new diagnostic
+needs an entry, and the test `diagnostic_codes` checks that every entry's
+refused program reports its code and the fixed one checks clean;
+`CRAG_DIAG=E0301` checks one.
+
 `crag lsp` is the language server, for editors that speak the Language
 Server Protocol: diagnostics as you type, hover, go to definition,
 references, rename, completion, formatting and the outline. An editor
@@ -181,11 +191,11 @@ the app, with line breakpoints, stepping and locals.
 Context Protocol: `check` type-checks a snippet, a file or the project,
 `typeOf` gives an expression's type and effects, `members` and `searchStd`
 find functions, `eval` runs code in the scratch image under a time limit,
-and `test` runs the project's tests. Each tool takes an optional
-`project` directory; without it the server works in the project it was
-started in, or with `std` alone. `eval` refuses code with the `io`
-effect unless the server was started with `--allow-io`. This
-repository's `.mcp.json` registers `target/debug/crag mcp`, so agent
+`test` runs the project's tests, and `explain` tells what a diagnostic
+code means. Each tool takes an optional `project` directory; without it
+the server works in the project it was started in, or with `std` alone.
+`eval` refuses code with the `io` effect unless the server was started
+with `--allow-io`. This repository's `.mcp.json` registers `target/debug/crag mcp`, so agent
 sessions here use the toolchain as built.
 
     /path/to/target/debug/crag

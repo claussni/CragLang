@@ -311,7 +311,7 @@ fn derived_forms_follow_the_structure() {
     assert!(eval(&mut r, "h(Secret(n: 1))").contains("does not hold"));
     assert_eq!(
         eval(&mut r, "fn hash(s: Secret) -> Int { 1 }"),
-        "error: Secret is `not Hash`, so no function may make it fit `Hash`\n --> input:1:4\n  |\n1 | fn hash(s: Secret) -> Int { 1 }\n  |    ^^^^\n"
+        "error[E0512]: Secret is `not Hash`, so no function may make it fit `Hash`\n --> input:1:4\n  |\n1 | fn hash(s: Secret) -> Int { 1 }\n  |    ^^^^\n"
     );
 }
 
@@ -676,7 +676,9 @@ fn expr_values_run_as_the_closures_they_are() {
     );
     let hole = eval(&mut r, "count(ages, { a -> a > ??? })");
     assert!(
-        hole.starts_with("error: code sent as an `Expr` cannot hold `???`, which can only trap\n"),
+        hole.starts_with(
+            "error[E0703]: code sent as an `Expr` cannot hold `???`, which can only trap\n"
+        ),
         "{hole}"
     );
 }

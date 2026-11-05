@@ -126,6 +126,22 @@ pub fn specs() -> Vec<ToolSpec> {
             destructive: false,
         },
         ToolSpec {
+            name: "explain",
+            title: "Explain a diagnostic",
+            description: "What a diagnostic code means: the rule, why it exists, a program it \
+                          refuses and the same program fixed, and the section of the \
+                          specification. Every diagnostic `check` returns has a code, such as \
+                          `E0301`; the same text is the resource `crag://diagnostic/<code>`.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "A diagnostic code, such as `E0301`."},
+                },
+                "required": ["code"],
+            }),
+            destructive: false,
+        },
+        ToolSpec {
             name: "eval",
             title: "Evaluate Crag code",
             description: "Runs Crag code in the scratch image, as REPL input: definitions and \
@@ -192,6 +208,7 @@ pub fn call(
             text_arg(args, "name")?,
             text_arg(args, "signature")?,
         ),
+        "explain" => explain(&required(args, "code")?),
         "eval" => {
             let wall = seconds(args, EVAL_WALL, EVAL_WALL_MAX)?;
             eval(server, project, &required(args, "code")?, wall)
@@ -252,18 +269,49 @@ fn seconds(args: &Map<String, Value>, default: u64, max: u64) -> Result<Duration
     Ok(Duration::from_secs(seconds))
 }
 
+/// `explain`: a code's entry in the registry.
+fn explain(code: &str) -> Answer {
+    let Some(code) = crag_diag::DiagCode::parse(code) else {
+        return Err(
+            format!("there is no diagnostic code `{code}`; codes look like `E0301`").into(),
+        );
+    };
+    let entry = code.entry();
+    let mut answer = json!({
+        "code": code.as_str(),
+        "title": entry.title,
+        "rule": entry.rule,
+        "rationale": entry.rationale,
+        "spec": format!("§{}", entry.spec),
+        "resource": format!("crag://diagnostic/{code}"),
+    });
+    if !entry.failing.is_empty() {
+        answer["failing"] = json!(entry.failing);
+        answer["fixed"] = json!(entry.fixed);
+    }
+    if let Some(note) = entry.retired {
+        answer["retired"] = json!(note);
+    }
+    Ok(answer)
+}
+
 fn located_json(found: &[Located]) -> Value {
     let diagnostics: Vec<Value> = found
         .iter()
         .map(|l| {
-            json!({
+            let mut d = json!({
                 "file": l.file,
                 "line": l.line,
                 "column": l.column,
                 "endLine": l.end_line,
                 "endColumn": l.end_column,
                 "message": l.message,
-            })
+            });
+            if let Some(code) = l.code {
+                d["code"] = json!(code.as_str());
+                d["resource"] = json!(format!("crag://diagnostic/{code}"));
+            }
+            d
         })
         .collect();
     let text: String = found.iter().map(|l| l.rendered.as_str()).collect();
@@ -304,7 +352,13 @@ fn check_tool(
                 })
                 .map(|d| {
                     let shown = &project.file(d.module).shown;
-                    locate_error(&d.message, shown, project.source(d.module), d.range.clone())
+                    locate_error(
+                        Some(d.code),
+                        &d.message,
+                        shown,
+                        project.source(d.module),
+                        d.range.clone(),
+                    )
                 })
                 .collect()
         }

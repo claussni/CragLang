@@ -20,6 +20,7 @@
 use std::ops::Range;
 
 use crag_db::Db;
+use crag_diag::DiagCode;
 use crag_eval::EvalError;
 use crag_hir::{
     ImportCycle, ModuleId, NameError, Origin, Program, check_shadowing, import_graph, lower_body,
@@ -32,6 +33,7 @@ use crate::project::Project;
 /// An error at a range of a module's source.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
+    pub code: DiagCode,
     pub module: ModuleId,
     pub range: Range<u32>,
     pub message: String,
@@ -71,22 +73,25 @@ pub fn import_cycles(db: &dyn Db, program: Program) -> Vec<Diagnostic> {
 /// The errors in one module, in the order they are found.
 pub fn module_diagnostics(db: &dyn Db, program: Program, module: ModuleId) -> Vec<Diagnostic> {
     let mut out = Vec::new();
-    let at = |range: Range<u32>, message: String| Diagnostic {
+    let at = |code: DiagCode, range: Range<u32>, message: String| Diagnostic {
+        code,
         module,
         range,
         message,
     };
     for error in &parse(db, *module.file(db)).errors {
-        out.push(at(error.range.clone(), error.message.clone()));
+        out.push(at(error.code, error.range.clone(), error.message.clone()));
     }
     for error in &module_scope(db, program, module).errors {
         out.push(at(
+            crag_hir::name_code(error),
             name_error_range(db, module, error),
             name_error(db, error),
         ));
     }
     for redeclaration in check_shadowing(db, program, module) {
         out.push(at(
+            crag_diag::REDECLARED,
             redeclaration.range.clone(),
             redeclared(db, redeclaration),
         ));
@@ -95,13 +100,13 @@ pub fn module_diagnostics(db: &dyn Db, program: Program, module: ModuleId) -> Ve
         let lowered = lower_body(db, program, owner);
         for error in &lowered.errors {
             let (range, message) = lower_error(db, error);
-            out.push(at(range, message));
+            out.push(at(crag_hir::lower_code(error), range, message));
         }
     }
     for (owner, error) in crag_types::module_type_errors(db, program, module) {
         let map = &lower_body(db, program, owner).source_map;
         let range = error.site.range(map).unwrap_or(0..0);
-        out.push(at(range, error.kind.message(db)));
+        out.push(at(error.kind.code(), range, error.kind.message(db)));
     }
     for error in crag_types::final_errors(db, program, module) {
         let range = match error.origin {
@@ -109,13 +114,21 @@ pub fn module_diagnostics(db: &dyn Db, program: Program, module: ModuleId) -> Ve
             Origin::Imported(decl) => decl_range(db, module, decl),
             Origin::Prelude => 0..0,
         };
-        out.push(at(range, error.error.kind.message(db)));
+        out.push(at(
+            error.error.kind.code(),
+            range,
+            error.error.kind.message(db),
+        ));
     }
     // A type marked `is Flat` must not be boxed (Compiler Architecture
     // §A11.4.6).
     for item in &crag_hir::item_tree(db, module).items {
         for message in crag_backend::flat::check_flat(db, program, item.id) {
-            out.push(at(decl_range(db, module, item.decl), message));
+            out.push(at(
+                crag_diag::NOT_FLAT,
+                decl_range(db, module, item.decl),
+                message,
+            ));
         }
     }
     // Constants are evaluated at compile time (Specification §18.4),
@@ -139,7 +152,7 @@ pub fn module_diagnostics(db: &dyn Db, program: Program, module: ModuleId) -> Ve
                     (line, column) => format!(", at {source}:{line}:{column}"),
                 };
                 let message = format!("`{name}` cannot be embedded: {message}{place}");
-                out.push(at(range, message));
+                out.push(at(crag_diag::EMBED_FAILS, range, message));
                 continue;
             }
             EvalError::NotConstant(_) => continue,
@@ -151,7 +164,7 @@ pub fn module_diagnostics(db: &dyn Db, program: Program, module: ModuleId) -> Ve
         if let Some(inner) = stack.first().filter(|f| *f != name) {
             message += &format!(" in {inner}");
         }
-        out.push(at(range, message));
+        out.push(at(crag_diag::CONSTANT_FAILS, range, message));
     }
     out
 }
@@ -210,6 +223,7 @@ fn import_cycle(db: &dyn Db, cycle: &ImportCycle) -> Diagnostic {
         .collect();
     names.push(names[0].clone());
     Diagnostic {
+        code: crag_diag::IMPORT_CYCLE,
         module: first,
         range: decl.map_or(0..0, |d| decl_range(db, first, d)),
         message: format!("modules import each other: {}", names.join(" imports ")),
@@ -254,6 +268,8 @@ pub fn render_at(kind: &str, message: &str, file: &str, source: &str, range: Ran
 /// as `render_at` prints it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Located {
+    /// The diagnostic's code, for an error of the compiler's.
+    pub code: Option<DiagCode>,
     pub file: String,
     pub line: usize,
     pub column: usize,
@@ -263,22 +279,43 @@ pub struct Located {
     pub rendered: String,
 }
 
+/// What `render_at` names an error of a code: `error[E0301]`.
+pub fn error_kind(code: Option<DiagCode>) -> String {
+    match code {
+        Some(code) => format!("error[{code}]"),
+        None => "error".into(),
+    }
+}
+
 /// An error at a range of a file's source, placed.
-pub fn locate_error(message: &str, file: &str, source: &str, range: Range<u32>) -> Located {
+pub fn locate_error(
+    code: Option<DiagCode>,
+    message: &str,
+    file: &str,
+    source: &str,
+    range: Range<u32>,
+) -> Located {
     let (line, column) = line_col(source, range.start);
     let (end_line, end_column) = line_col(source, range.end.max(range.start));
     Located {
+        code,
         file: file.to_string(),
         line,
         column,
         end_line,
         end_column,
         message: message.to_string(),
-        rendered: render_at("error", message, file, source, range),
+        rendered: render_at(&error_kind(code), message, file, source, range),
     }
 }
 
 /// A diagnostic printed against the source of its module.
 pub fn render_diagnostic(d: &Diagnostic, file: &str, source: &str) -> String {
-    render_at("error", &d.message, file, source, d.range.clone())
+    render_at(
+        &error_kind(Some(d.code)),
+        &d.message,
+        file,
+        source,
+        d.range.clone(),
+    )
 }

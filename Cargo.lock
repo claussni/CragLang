@@ -238,6 +238,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "crag-diag"
+version = "0.0.0"
+
+[[package]]
 name = "crag-driver"
 version = "0.0.0"
 dependencies = [
@@ -248,6 +252,7 @@ dependencies = [
  "crag-budget",
  "crag-codegen",
  "crag-db",
+ "crag-diag",
  "crag-eval",
  "crag-fmt",
  "crag-hir",
@@ -296,6 +301,7 @@ name = "crag-hir"
 version = "0.0.0"
 dependencies = [
  "crag-db",
+ "crag-diag",
  "crag-syntax",
 ]
 
@@ -401,6 +407,9 @@ dependencies = [
 [[package]]
 name = "crag-syntax"
 version = "0.0.0"
+dependencies = [
+ "crag-diag",
+]
 
 [[package]]
 name = "crag-types"
@@ -408,6 +417,7 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "crag-db",
+ "crag-diag",
  "crag-hir",
 ]
 

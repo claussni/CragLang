@@ -37,7 +37,7 @@ use crag_syntax::{TokenKind, lex};
 use crag_types::{CallSite, EffectSet, Ty, TypeDefKind, type_def, written_show};
 
 use crate::debug::{Pause, Resume};
-use crate::diagnostics::{Located, check, locate_error, render_at};
+use crate::diagnostics::{Located, check, error_kind, locate_error, render_at};
 use crate::exec::Sources;
 use crate::project::Project;
 use crate::scratch::Scratch;
@@ -867,7 +867,15 @@ impl Repl {
         if !errors.is_empty() {
             return Err(errors
                 .iter()
-                .map(|e| render_at("error", &e.message, "input", text, e.range.clone()))
+                .map(|e| {
+                    render_at(
+                        &error_kind(Some(e.code)),
+                        &e.message,
+                        "input",
+                        text,
+                        e.range.clone(),
+                    )
+                })
                 .collect());
         }
         // A module of its own, which no program has, says what it declares.
@@ -993,7 +1001,7 @@ impl Repl {
             .map(|d| {
                 let (file, source, start) = self.locate(d.module, d.range.start);
                 let end = start + (d.range.end - d.range.start);
-                locate_error(&d.message, &file, source, start..end)
+                locate_error(Some(d.code), &d.message, &file, source, start..end)
             })
             .collect()
     }
@@ -1036,7 +1044,7 @@ impl Repl {
         if !errors.is_empty() {
             return errors
                 .iter()
-                .map(|e| locate_error(&e.message, "input", text, e.range.clone()))
+                .map(|e| locate_error(Some(e.code), &e.message, "input", text, e.range.clone()))
                 .collect();
         }
         let names = match self.declared(text) {
@@ -1049,7 +1057,7 @@ impl Repl {
             .find(|n| entries.iter().any(|e| self.redefines(text, e, n)))
         {
             let why = format!("{name} is already defined in this session");
-            return vec![locate_error(&why, "input", text, 0..0)];
+            return vec![locate_error(None, &why, "input", text, 0..0)];
         }
         let old = self.session.entries.clone();
         self.session.entries.push(Entry {
@@ -1176,6 +1184,7 @@ pub struct Member {
 fn unplaced(rendered: &str) -> Located {
     let message = rendered.trim().trim_start_matches("error: ");
     Located {
+        code: None,
         file: "input".into(),
         line: 1,
         column: 1,
