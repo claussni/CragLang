@@ -461,7 +461,7 @@ pub(crate) fn signature_text(db: &dyn Db, item: ItemId<'_>) -> Option<String> {
 }
 
 /// The comment lines right above a declaration: its documentation.
-fn documentation(db: &dyn Db, item: ItemId<'_>) -> Option<String> {
+pub(crate) fn documentation(db: &dyn Db, item: ItemId<'_>) -> Option<String> {
     let module = *item.module(db);
     let decl = item_decl(db, item)?;
     let root = root(db, module);
@@ -555,7 +555,12 @@ mod kind {
 /// Whether a function whose first parameter has type `param` can be called
 /// on a value of type `receiver` with `.` (§6.3): roughly, since generic
 /// parameters accept by their shape.
-fn accepts<'db>(db: &'db dyn Db, program: Program, param: Ty<'db>, receiver: Ty<'db>) -> bool {
+pub(crate) fn accepts<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    param: Ty<'db>,
+    receiver: Ty<'db>,
+) -> bool {
     match (param.kind(db), receiver.kind(db)) {
         (TyKind::Param(..), _) => true,
         (TyKind::Builtin(a, _), TyKind::Builtin(b, _)) if a == b => true,

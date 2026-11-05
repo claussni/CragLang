@@ -1,0 +1,16 @@
+[package]
+name = "crag-mcp"
+description = "Crag's facade over the Model Context Protocol SDK, for the agent server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rmcp = { version = "3.9.0", default-features = false, features = ["server"] }
+serde_json = "1.0.140"
+tokio = { version = "1", features = ["rt", "sync", "io-std", "fs"] }

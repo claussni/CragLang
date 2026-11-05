@@ -249,6 +249,35 @@ pub fn render_at(kind: &str, message: &str, file: &str, source: &str, range: Ran
     )
 }
 
+/// A message placed in the text it is about, as tools take it: the file,
+/// where in it from and to, by line and column from one, and the message
+/// as `render_at` prints it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Located {
+    pub file: String,
+    pub line: usize,
+    pub column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+    pub message: String,
+    pub rendered: String,
+}
+
+/// An error at a range of a file's source, placed.
+pub fn locate_error(message: &str, file: &str, source: &str, range: Range<u32>) -> Located {
+    let (line, column) = line_col(source, range.start);
+    let (end_line, end_column) = line_col(source, range.end.max(range.start));
+    Located {
+        file: file.to_string(),
+        line,
+        column,
+        end_line,
+        end_column,
+        message: message.to_string(),
+        rendered: render_at("error", message, file, source, range),
+    }
+}
+
 /// A diagnostic printed against the source of its module.
 pub fn render_diagnostic(d: &Diagnostic, file: &str, source: &str) -> String {
     render_at("error", &d.message, file, source, d.range.clone())

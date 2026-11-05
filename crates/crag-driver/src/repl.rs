@@ -30,14 +30,14 @@
 use std::collections::BTreeSet;
 
 use crag_db::Setter;
-use crag_hir::{ItemKind, ModuleId, Owner, SESSION, item_tree, module_scope};
+use crag_hir::{ItemId, ItemKind, ModuleId, Owner, Resolution, SESSION, item_tree, module_scope};
 use crag_mir::{InstanceKey, Tier, mir};
 use crag_session::RunResult;
 use crag_syntax::{TokenKind, lex};
-use crag_types::{CallSite, Ty, TypeDefKind, type_def, written_show};
+use crag_types::{CallSite, EffectSet, Ty, TypeDefKind, type_def, written_show};
 
 use crate::debug::{Pause, Resume};
-use crate::diagnostics::{check, render_at};
+use crate::diagnostics::{Located, check, locate_error, render_at};
 use crate::exec::Sources;
 use crate::project::Project;
 use crate::scratch::Scratch;
@@ -192,15 +192,21 @@ impl SessionModule {
     }
 }
 
-/// The body of the session's function of this name, and its result.
-fn root<'a>(project: &'a Project, module: ModuleId, name: &str) -> (InstanceKey<'a>, Ty<'a>) {
-    let (db, program) = (&project.db, project.program);
-    let item = item_tree(db, module)
+/// The session's function of that name, which the REPL wrote.
+fn function<'a>(project: &'a Project, module: ModuleId, name: &str) -> ItemId<'a> {
+    let db = &project.db;
+    item_tree(db, module)
         .items
         .iter()
         .map(|i| i.id)
         .find(|id| *id.kind(db) == ItemKind::Function && id.name(db).text(db) == name)
-        .expect("the input's function");
+        .expect("the input's function")
+}
+
+/// The body of the session's function of this name, and its result.
+fn root<'a>(project: &'a Project, module: ModuleId, name: &str) -> (InstanceKey<'a>, Ty<'a>) {
+    let (db, program) = (&project.db, project.program);
+    let item = function(project, module, name);
     let key = InstanceKey::body(db, Owner::Item(item));
     let ty = mir(db, program, key, Tier::Baseline)
         .as_ref()
@@ -975,13 +981,19 @@ impl Repl {
 
     /// The errors of the session's module, rendered.
     fn errors(&self) -> String {
+        self.located().iter().map(|l| l.rendered.as_str()).collect()
+    }
+
+    /// The errors of the session's module, each placed where the user
+    /// wrote it.
+    fn located(&self) -> Vec<Located> {
         check(&self.project)
             .iter()
             .filter(|d| d.module == self.session.module)
             .map(|d| {
                 let (file, source, start) = self.locate(d.module, d.range.start);
                 let end = start + (d.range.end - d.range.start);
-                render_at("error", &d.message, &file, source, start..end)
+                locate_error(&d.message, &file, source, start..end)
             })
             .collect()
     }
@@ -1002,6 +1014,175 @@ impl Repl {
             }
         }
         out.into_iter().collect()
+    }
+
+    /// The errors an input would have, as `eval_input` takes it, without
+    /// running it or keeping it: none when it would be accepted. A snippet
+    /// sees what the session sees (Implementation Plan §11.12.5).
+    pub fn check_input(&mut self, text: &str) -> Vec<Located> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Vec::new();
+        }
+        if !is_definition(text) {
+            self.input = Some(text.into());
+            self.apply();
+            let found = self.located();
+            self.input = None;
+            self.apply();
+            return found;
+        }
+        let (_, errors) = crag_syntax::parse(text, &lex(text));
+        if !errors.is_empty() {
+            return errors
+                .iter()
+                .map(|e| locate_error(&e.message, "input", text, e.range.clone()))
+                .collect();
+        }
+        let names = match self.declared(text) {
+            Ok(names) => names,
+            Err(e) => return vec![unplaced(&e)],
+        };
+        let entries = self.session.entries.clone();
+        if let Some(name) = names
+            .iter()
+            .find(|n| entries.iter().any(|e| self.redefines(text, e, n)))
+        {
+            let why = format!("{name} is already defined in this session");
+            return vec![locate_error(&why, "input", text, 0..0)];
+        }
+        let old = self.session.entries.clone();
+        self.session.entries.push(Entry {
+            text: text.into(),
+            names,
+        });
+        self.fresh = Some(old.len());
+        self.apply();
+        let found = self.located();
+        self.fresh = None;
+        self.session.entries = old;
+        self.apply();
+        found
+    }
+
+    /// The type of an expression and its effects, without running it.
+    pub fn type_of(&mut self, text: &str) -> Result<(String, EffectSet), Vec<Located>> {
+        let text = text.trim();
+        if text.is_empty() || is_definition(text) {
+            return Err(vec![unplaced("error: give an expression\n")]);
+        }
+        self.input = Some(text.into());
+        self.apply();
+        let found = self.located();
+        let result = match found.is_empty() {
+            true => {
+                let (db, program) = (&self.project.db, self.project.program);
+                let (_, ty) = root(&self.project, self.session.module, INPUT);
+                let item = function(&self.project, self.session.module, INPUT);
+                Ok((
+                    ty.display(db),
+                    crag_types::function_effects(db, program, item),
+                ))
+            }
+            false => Err(found),
+        };
+        self.input = None;
+        self.apply();
+        result
+    }
+
+    /// The fields of a type and the functions of the session's scope that
+    /// can be called on its values with `.` (Specification §6.3), as the
+    /// language server completes them.
+    pub fn members(&mut self, written: &str) -> Result<Vec<Member>, Vec<Located>> {
+        let written = written.trim();
+        if written.is_empty() {
+            return Err(vec![unplaced("error: give a type\n")]);
+        }
+        self.input = Some(written.into());
+        self.wrap = Wrap::Type;
+        self.apply();
+        let found = self.located();
+        let result = match found.is_empty() {
+            true => Ok(self.members_of_layout()),
+            false => Err(found),
+        };
+        self.input = None;
+        self.wrap = Wrap::Value;
+        self.apply();
+        result
+    }
+
+    fn members_of_layout(&self) -> Vec<Member> {
+        let (db, program) = (&self.project.db, self.project.program);
+        let item = item_tree(db, self.session.module)
+            .items
+            .iter()
+            .map(|i| i.id)
+            .find(|id| *id.kind(db) == ItemKind::Type && id.name(db).text(db) == LAYOUT)
+            .expect("the alias of the type");
+        let TypeDefKind::Alias(ty) = type_def(db, program, item).kind else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (name, field) in crag_types::fields_of(db, program, ty).unwrap_or_default() {
+            out.push(Member {
+                name: name.text(db).clone(),
+                field: true,
+                detail: field.display(db),
+                module: String::new(),
+            });
+        }
+        for resolution in module_scope(db, program, self.session.module)
+            .names
+            .values()
+        {
+            let Resolution::Value { functions, .. } = resolution else {
+                continue;
+            };
+            for &f in functions {
+                let sig = crag_types::signature(db, program, f);
+                let Some(first) = sig.params.first() else {
+                    continue;
+                };
+                if crate::lsp::analysis::accepts(db, program, first.ty, ty) {
+                    out.push(Member {
+                        name: f.name(db).text(db).clone(),
+                        field: false,
+                        detail: crate::lsp::analysis::signature_text(db, f).unwrap_or_default(),
+                        module: f.module(db).path(db).clone(),
+                    });
+                }
+            }
+        }
+        out.sort_by(|a, b| (!a.field, &a.name, &a.detail).cmp(&(!b.field, &b.name, &b.detail)));
+        out.dedup();
+        out
+    }
+}
+
+/// A field of a type, or a function callable on its values with `.`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Member {
+    pub name: String,
+    pub field: bool,
+    /// The field's type, or the function's signature.
+    pub detail: String,
+    /// The module that declares the function.
+    pub module: String,
+}
+
+/// A rendered error of the REPL's that has no place in the input.
+fn unplaced(rendered: &str) -> Located {
+    let message = rendered.trim().trim_start_matches("error: ");
+    Located {
+        file: "input".into(),
+        line: 1,
+        column: 1,
+        end_line: 1,
+        end_column: 1,
+        message: message.into(),
+        rendered: rendered.into(),
     }
 }
 

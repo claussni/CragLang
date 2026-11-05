@@ -31,6 +31,7 @@ crag-package = { path = "../crag-package" }
 crag-receive = { path = "../crag-receive" }
 blake3 = "1.8.7"
 crag-loader = { path = "../crag-loader" }
+crag-mcp = { path = "../crag-mcp" }
 crag-mir = { path = "../crag-mir" }
 crag-runtime = { path = "../crag-runtime" }
 crag-session = { path = "../crag-session" }

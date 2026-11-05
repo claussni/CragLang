@@ -30,7 +30,8 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-rt-receive` | The runtime archive with the receiver of code, for release executables that run received code (M7) |
 | `crates/crag-receive` | Receiving code: checking a tree again, compiling it metered against the program's own types and cells, and running it under the policy's limits and its sender's budget (M7) |
 | `crates/crag-budget` | Budgets of code transport: budget documents, tokens and token files, the bytes of code on the wire, and the process's budgets with what each has taken (M7) |
-| `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1); `build`, the release executable, and `lmt new`, the salt and token files of a budget document (M7); the UI with the built-in editor, the app image, hot reload, the debugger, the language server `crag lsp` and the debug adapter `crag dap` (M5) |
+| `crates/crag-driver` | The `crag` command: `run`, `test` and `fmt`, diagnostics (M1); `build`, the release executable, and `lmt new`, the salt and token files of a budget document (M7); the UI with the built-in editor, the app image, hot reload, the debugger, the language server `crag lsp` and the debug adapter `crag dap` (M5); the agent server `crag mcp` and its tools (M9) |
+| `crates/crag-mcp` | The facade over the Model Context Protocol SDK, on which the agent server speaks to coding agents (M9) |
 | `crates/crag-session` | Session manager: image processes and their supervision (M3) |
 | `crates/crag-eval` | Compile-time evaluation of constants, `embed`s among them, in the metered tier (M3) |
 | `crates/crag-fmt` | The formatter: the canonical layout of source files (M5) |
@@ -175,6 +176,17 @@ app's tasks at a line; `:paused`, `:locals`, `:step`, `:next`, `:out` and
 `crag dap` is the debug adapter, for editors that speak the Debug Adapter
 Protocol: `launch` with `"project"` naming the project's directory runs
 the app, with line breakpoints, stepping and locals.
+
+`crag mcp` is the agent server, for coding agents that speak the Model
+Context Protocol: `check` type-checks a snippet, a file or the project,
+`typeOf` gives an expression's type and effects, `members` and `searchStd`
+find functions, `eval` runs code in the scratch image under a time limit,
+and `test` runs the project's tests. Each tool takes an optional
+`project` directory; without it the server works in the project it was
+started in, or with `std` alone. `eval` refuses code with the `io`
+effect unless the server was started with `--allow-io`. This
+repository's `.mcp.json` registers `target/debug/crag mcp`, so agent
+sessions here use the toolchain as built.
 
     /path/to/target/debug/crag
 

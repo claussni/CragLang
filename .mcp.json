@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "crag": {
+      "command": "target/debug/crag",
+      "args": ["mcp"]
+    }
+  }
+}

@@ -45,6 +45,7 @@ const USAGE: &str = "usage: crag
        crag registry new <name> <folder> | add <name> <folder> | list | remove <name>
        crag lsp
        crag dap
+       crag mcp [--allow-io]
 ";
 
 fn main() -> ExitCode {
@@ -55,7 +56,7 @@ fn main() -> ExitCode {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     let compiles = matches!(
         words[..],
-        [] | ["build" | "run" | "test" | "dap", ..] | ["package", "pack" | "publish", ..]
+        [] | ["build" | "run" | "test" | "dap" | "mcp", ..] | ["package", "pack" | "publish", ..]
     );
     if compiles {
         crag_driver::persist::install();
@@ -105,6 +106,8 @@ fn main() -> ExitCode {
         ["registry", ref rest @ ..] => package_command(root, "registry", rest),
         ["lsp"] => ExitCode::from(crag_driver::lsp::serve(std::io::stdin(), std::io::stdout())),
         ["dap"] => dap(),
+        ["mcp"] => mcp(false),
+        ["mcp", "--allow-io"] => mcp(true),
         [crag_session::host::IMAGE_ARG, kind, socket] => image(kind, socket),
         _ => {
             eprint!("{USAGE}");
@@ -150,16 +153,35 @@ fn test(root: &std::path::Path, filter: Option<&str>) -> ExitCode {
     ExitCode::from(if report.success() { 0 } else { 1 })
 }
 
-/// `crag dap`. The protocol keeps the standard output it was started with;
-/// file descriptor 1 then refers to standard error, so the images the
-/// adapter starts, which inherit it, cannot write into the protocol.
+/// `crag dap`, the debug adapter.
 fn dap() -> ExitCode {
+    let Some((protocol, command)) = protocol_output("dap") else {
+        return ExitCode::from(1);
+    };
+    ExitCode::from(crag_driver::dap::serve(std::io::stdin(), protocol, command))
+}
+
+/// `crag mcp`, the agent server; with `--allow-io` the user lets `eval`
+/// run code with the `io` effect (Specification §20.10).
+fn mcp(io_eval: bool) -> ExitCode {
+    let Some((protocol, command)) = protocol_output("mcp") else {
+        return ExitCode::from(1);
+    };
+    let grants = crag_driver::agent::Grants { io_eval };
+    ExitCode::from(crag_driver::agent::serve(protocol, command, grants))
+}
+
+/// For a server whose images print: the standard output it was started
+/// with, for the protocol, and the command that starts images. File
+/// descriptor 1 then refers to standard error, so the images it starts,
+/// which inherit it, cannot write into the protocol.
+fn protocol_output(name: &str) -> Option<(std::fs::File, crag_session::ImageCommand)> {
     use std::os::fd::FromRawFd;
     let command = match crag_session::ImageCommand::current() {
         Ok(command) => command,
         Err(e) => {
-            eprintln!("crag dap: cannot find the crag binary: {e}");
-            return ExitCode::from(1);
+            eprintln!("crag {name}: cannot find the crag binary: {e}");
+            return None;
         }
     };
     // SAFETY: duplicating and replacing descriptors of this process, which
@@ -167,12 +189,12 @@ fn dap() -> ExitCode {
     let protocol = unsafe {
         let protocol = libc::dup(1);
         if protocol < 0 || libc::dup2(2, 1) < 0 {
-            eprintln!("crag dap: {}", std::io::Error::last_os_error());
-            return ExitCode::from(1);
+            eprintln!("crag {name}: {}", std::io::Error::last_os_error());
+            return None;
         }
         std::fs::File::from_raw_fd(protocol)
     };
-    ExitCode::from(crag_driver::dap::serve(std::io::stdin(), protocol, command))
+    Some((protocol, command))
 }
 
 fn image(kind: &str, socket: &str) -> ExitCode {

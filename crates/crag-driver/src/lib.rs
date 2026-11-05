@@ -20,6 +20,7 @@
 //! runs them in an image in its own process. `Scratch` runs code in the
 //! scratch image instead (§11.6.3).
 
+pub mod agent;
 pub mod api;
 pub mod app;
 pub mod build;
