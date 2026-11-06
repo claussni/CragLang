@@ -507,9 +507,7 @@ impl TxLog {
     /// # Safety
     ///
     /// The cells are live.
-    pub(crate) unsafe fn store_durable(
-        &mut self,
-    ) -> Result<Option<Retired>, StoreError> {
+    pub(crate) unsafe fn store_durable(&mut self) -> Result<Option<Retired>, StoreError> {
         let log = self;
         let store = log.dur_store.clone().expect("durable writes have a store");
         // The latest write of each cell, in address order.

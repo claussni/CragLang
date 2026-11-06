@@ -375,10 +375,7 @@ fn pinned(store: usize, id: u64) -> bool {
 /// roots excepted; what it freed. A freed node's children reach the free
 /// list in its place, so the sweep runs until the budget or the list,
 /// pins aside, is spent.
-pub fn sweep_free_list(
-    store: &Arc<dyn NodeStore>,
-    budget: usize,
-) -> Result<usize, StoreError> {
+pub fn sweep_free_list(store: &Arc<dyn NodeStore>, budget: usize) -> Result<usize, StoreError> {
     let key = store_key(store);
     let mut freed = 0;
     while freed < budget {
@@ -606,7 +603,8 @@ impl DurList<'_> {
                 if payload_relaxed(&node.payload)? {
                     return payload_cumulative(&node.payload, n - 1);
                 }
-                Ok((n - 1) * self.complete(h - 1) + self.child_size(&node.children[n - 1], h - 1)?)
+                Ok((n - 1) * self.complete(h - 1)
+                    + self.child_size(&node.children[n - 1], h - 1)?)
             }
         }
     }
@@ -719,7 +717,13 @@ impl DurList<'_> {
             return Err(corrupt("an inner node without children"));
         }
         let relaxed = payload_relaxed(&node.payload)?;
-        let mut children: Vec<Child> = node.header.children.iter().copied().map(Child::Stored).collect();
+        let mut children: Vec<Child> = node
+            .header
+            .children
+            .iter()
+            .copied()
+            .map(Child::Stored)
+            .collect();
         let mut payload = node.payload.to_vec();
         match self.push_node(node.header.children[n - 1], h - 1, value)? {
             Push::Grown(grown) => {
@@ -764,7 +768,13 @@ impl DurList<'_> {
         if size == 0 {
             return Ok(Node {
                 kind: LIST,
-                children: root.header.children.iter().copied().map(Child::Stored).collect(),
+                children: root
+                    .header
+                    .children
+                    .iter()
+                    .copied()
+                    .map(Child::Stored)
+                    .collect(),
                 payload: root.payload.to_vec(),
             });
         }
@@ -808,7 +818,13 @@ impl DurList<'_> {
             .get(j)
             .ok_or_else(|| corrupt("an index past its node's children"))?;
         let child = self.set_node(child, h - 1, rest, value)?;
-        let mut children: Vec<Child> = node.header.children.iter().copied().map(Child::Stored).collect();
+        let mut children: Vec<Child> = node
+            .header
+            .children
+            .iter()
+            .copied()
+            .map(Child::Stored)
+            .collect();
         children[j] = Child::Fresh(Box::new(child));
         Ok(Node {
             kind: LIST_INNER,
@@ -903,9 +919,8 @@ pub unsafe fn fault_list(
     for i in 0..len {
         if size > 0 {
             // SAFETY: the words cover `size` bytes.
-            let buf = unsafe {
-                std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), size)
-            };
+            let buf =
+                unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), size) };
             list.get(root, i, buf)?;
         }
         // SAFETY: as the caller promises, and the value holds no
@@ -1009,7 +1024,10 @@ mod tests {
         unsafe {
             let list = heap_list(&mut heap, &types, index, &model);
             let overlay = encode_list(element(&types, index), list);
-            assert_eq!(collect_overlay(&overlay).len() as u64, overlay.fresh_count());
+            assert_eq!(
+                collect_overlay(&overlay).len() as u64,
+                overlay.fresh_count()
+            );
             let (root, _) = commit(&store, &overlay, 0);
             let dur = DurList {
                 store: &*store,
@@ -1019,10 +1037,8 @@ mod tests {
             check(&dur, root, index, &model);
             let back = fault_list(&mut heap, &types, index, &dur, root).unwrap();
             for (i, v) in model.iter().enumerate() {
-                let bytes = std::slice::from_raw_parts(
-                    list::get(&types, back, i).cast::<u8>(),
-                    dur.size(),
-                );
+                let bytes =
+                    std::slice::from_raw_parts(list::get(&types, back, i).cast::<u8>(), dur.size());
                 assert_eq!(bytes, value(index, *v), "element {i}");
             }
             drop_box(&mut heap, &types, list);
