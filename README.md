@@ -20,6 +20,7 @@ The documents live as Claude Docs documents and are edited there.
 | `crates/crag-loader` | Code loader |
 | `crates/crag-db` | Salsa facade |
 | `crates/crag-store` | Artifact store: content-hashed artifacts, the file lock, project roots and garbage collection (M6) |
+| `crates/crag-dur` | Durable stores: the storage facade of persistence, its LMDB backend through heed, the memory backend of `Store.memory()` and fault injection (M8) |
 | `crates/crag-syntax` | Lexer, parser and syntax tree (M1) |
 | `crates/crag-hir` | Item trees, names and imports, and HIR lowering (M1) |
 | `crates/crag-types` | Types and core inference (M1) |
