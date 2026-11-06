@@ -33,10 +33,9 @@
 //! batch to the writer and waits.
 //!
 //! First step: a slot's value is one node holding the cell's two words,
-//! for values without references, as a counter. The structural encoding
-//! of lists and maps, the node cache and roots faulted in on demand
-//! (Plan §11.11.3) replace it slot by slot; the whole-value node stays
-//! the fallback, as boxing is for layouts.
+//! for values without references, as a counter. The structural store of
+//! `nodes` (Plan §11.11.3) replaces it slot by slot — lists are there —
+//! and the whole-value node stays the fallback, as boxing is for layouts.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};

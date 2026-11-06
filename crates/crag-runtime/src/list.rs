@@ -878,6 +878,68 @@ pub(crate) unsafe fn boxes_of(
     }
 }
 
+/// Read-only access to a list's tree for the durable encoding of Plan
+/// §11.11.3 (`crate::nodes`): the list's parts and a node's, by the same
+/// offsets the operations above use.
+pub(crate) mod parts {
+    use super::*;
+
+    /// A list's length, height and tree.
+    ///
+    /// # Safety
+    ///
+    /// `list` points at a live list.
+    pub(crate) unsafe fn list(list: *mut u8) -> (usize, usize, *mut u8) {
+        // SAFETY: as the caller promises.
+        unsafe { (len(list), height(list), tree(list)) }
+    }
+
+    /// # Safety
+    ///
+    /// `node` points at a live node.
+    pub(crate) unsafe fn slots(node: *mut u8) -> usize {
+        // SAFETY: as the caller promises.
+        unsafe { at(node, SLOTS).read() as usize }
+    }
+
+    /// # Safety
+    ///
+    /// `node` points at a live node of height `h`.
+    pub(crate) unsafe fn relaxed(node: *mut u8, h: usize) -> bool {
+        // SAFETY: as the caller promises.
+        h > 0 && unsafe { at(node, RELAXED).read() } != 0
+    }
+
+    /// # Safety
+    ///
+    /// `node` points at a live inner node with child `j`.
+    pub(crate) unsafe fn child(node: *mut u8, j: usize) -> *mut u8 {
+        // SAFETY: as the caller promises.
+        unsafe { at(node, CHILDREN + 8 * j).cast::<*mut u8>().read() }
+    }
+
+    /// The elements of a relaxed node's children `0..=j`.
+    ///
+    /// # Safety
+    ///
+    /// `node` points at a live relaxed inner node with child `j`.
+    pub(crate) unsafe fn cumulative(node: *mut u8, j: usize) -> usize {
+        // SAFETY: as the caller promises.
+        unsafe { at(node, SIZES + 8 * j).read() as usize }
+    }
+
+    /// The bytes of a leaf's `n` elements of `size` bytes, valid while the
+    /// leaf is.
+    ///
+    /// # Safety
+    ///
+    /// `leaf` points at a live leaf holding `n` elements of `size` bytes.
+    pub(crate) unsafe fn elements<'a>(leaf: *mut u8, size: usize, n: usize) -> &'a [u8] {
+        // SAFETY: as the caller promises.
+        unsafe { std::slice::from_raw_parts(leaf.add(ELEMS), size * n) }
+    }
+}
+
 system_stack_fn!(
     /// `rt_list_push(ctx, list, w0, w1)`: see `crag_abi::RuntimeFn::ListPush`.
     fn rt_list_push(ctx: *const TaskContext, list: *mut u8, w0: u64, w1: u64) -> *mut u8 {
