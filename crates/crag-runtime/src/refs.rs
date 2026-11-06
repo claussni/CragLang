@@ -131,7 +131,7 @@ pub(crate) fn back_off(spins: &mut u32) {
 
 impl Cell {
     /// A cell holding `words`, at version 0, as generated code makes one.
-    #[cfg(all(test, loom))]
+    /// Durable cells embed one (`dur`), and the loom models build them.
     pub(crate) fn new(words: [u64; 2]) -> Cell {
         Cell {
             version: AtomicU64::new(0),

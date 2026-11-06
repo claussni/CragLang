@@ -54,6 +54,7 @@ pub mod codec;
 mod collections;
 pub mod debug;
 mod deque;
+pub mod dur;
 mod env;
 mod epoch;
 mod ext;

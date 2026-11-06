@@ -47,7 +47,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crag_abi::{TX_CONFLICT, TX_OK};
+use crag_dur::{CommitBatch, CommitOutcome, HeadMove, StoreError};
 
+use crate::dur::{DurCell, DurStore};
 use crate::epoch::{pin, retire, unpin};
 use crate::fiber::{Fiber, TaskContext, Worker};
 use crate::heap::Heap;
@@ -80,7 +82,27 @@ pub(crate) struct TxLog {
     paused: bool,
     /// The state of the random backoff.
     seed: u64,
+    /// The durable cells the attempt touched: the head versions read and
+    /// the latest values written (Plan §11.11.4).
+    durable: Vec<DurAccess>,
+    /// The one store the block's durable writes may touch
+    /// (Specification §21.6).
+    dur_store: Option<Arc<DurStore>>,
 }
+
+/// A durable cell in the attempt. Inner blocks are not savepointed here
+/// yet: nothing makes durable writes under generated code until the
+/// `dur` entry points land.
+pub(crate) struct DurAccess {
+    cell: Arc<DurCell>,
+    /// The head version the attempt read, which the backend validates.
+    read: u64,
+    /// The latest value the attempt wrote, none for a plain read.
+    write: Option<[u64; 2]>,
+}
+
+/// The values a commit's cells held, with their list types, to retire.
+type Retired = Vec<([u64; 2], u64)>;
 
 struct Write {
     cell: *const Cell,
@@ -130,6 +152,8 @@ impl TxLog {
         self.drop_writes(0, heap, types);
         self.reads.clear();
         self.savepoints.clear();
+        self.durable.clear();
+        self.dur_store = None;
         self.depth = 0;
         unpin(ctx, heap);
     }
@@ -395,6 +419,207 @@ impl TxLog {
         true
     }
 
+    /// A log for a transaction driven without a fiber: the headless
+    /// update of a durable cell (`DurCell::update`), and tests. The
+    /// values such a log holds must carry no references, since nothing
+    /// releases what it drops.
+    pub(crate) fn headless() -> TxLog {
+        TxLog {
+            depth: 1,
+            read_version: clock(),
+            ..TxLog::default()
+        }
+    }
+
+    /// Reads a durable cell in the attempt: as `read`, with the head
+    /// version recorded for the commit's batch.
+    pub(crate) fn read_dur(&mut self, cell: &Arc<DurCell>) -> Option<[u64; 2]> {
+        if let Some(access) = self.durable.iter().find(|a| Arc::ptr_eq(&a.cell, cell))
+            && let Some(words) = access.write
+        {
+            return Some(words);
+        }
+        let mut spins = 0;
+        let (version, words, head) = loop {
+            match cell.snapshot() {
+                Some(read) => break read,
+                // Writes under way end soon; they make the others
+                // conflict.
+                None if self.alone => back_off(&mut spins),
+                None => return None,
+            }
+        };
+        if version > self.read_version {
+            return None;
+        }
+        self.reads.push((&cell.cell as *const Cell, version));
+        if !self.durable.iter().any(|a| Arc::ptr_eq(&a.cell, cell)) {
+            self.durable.push(DurAccess {
+                cell: cell.clone(),
+                read: head,
+                write: None,
+            });
+        }
+        Some(words)
+    }
+
+    /// Logs a write of a durable cell: the value for the in-memory cell
+    /// and the head move of the commit's batch. The block's durable
+    /// writes must stay in one store (Specification §21.6).
+    pub(crate) fn write_dur(
+        &mut self,
+        cell: &Arc<DurCell>,
+        words: [u64; 2],
+    ) -> Result<(), StoreError> {
+        match &self.dur_store {
+            None => self.dur_store = Some(cell.store.clone()),
+            Some(store) if DurStore::same(store, &cell.store) => {}
+            Some(_) => return Err(StoreError::MixedStores),
+        }
+        if !self.durable.iter().any(|a| Arc::ptr_eq(&a.cell, cell)) {
+            let (_, _, head) = cell.snapshot_blocking();
+            self.durable.push(DurAccess {
+                cell: cell.clone(),
+                read: head,
+                write: None,
+            });
+        }
+        // SAFETY: the caller's cell is live.
+        if unsafe { self.write(&cell.cell as *const Cell, words, cell.list) } {
+            let access = self
+                .durable
+                .iter_mut()
+                .find(|a| Arc::ptr_eq(&a.cell, cell))
+                .expect("entered above");
+            access.write = Some(words);
+        }
+        Ok(())
+    }
+
+    /// Commits the outermost block when it wrote durable cells: TL2's
+    /// commit with the store's writer between validation and the stores
+    /// (Plan §11.11.4). The clock ticks before the durable wait, so a
+    /// success after the writer cannot conflict in memory any more; on a
+    /// conflict or a storage error the cells unlock unchanged and the
+    /// tick lapses. `Ok(Some(old))` carries the values the cells held,
+    /// to retire; `Ok(None)` is a conflict and the block reruns.
+    ///
+    /// # Safety
+    ///
+    /// The cells are live.
+    pub(crate) unsafe fn store_durable(
+        &mut self,
+    ) -> Result<Option<Retired>, StoreError> {
+        let log = self;
+        let store = log.dur_store.clone().expect("durable writes have a store");
+        // The latest write of each cell, in address order.
+        let mut cells: Vec<usize> = (0..log.writes.len()).collect();
+        cells.sort_by_key(|&i| (log.writes[i].cell, std::cmp::Reverse(i)));
+        cells.dedup_by_key(|&mut i| log.writes[i].cell);
+        let mut locked: Vec<u64> = Vec::with_capacity(cells.len());
+        let unlock = |locked: &[u64], log: &TxLog| {
+            for (&i, &version) in cells.iter().zip(locked) {
+                // SAFETY: the cell is live; the commit holds its lock.
+                unsafe { &*log.writes[i].cell }.unlock(version);
+            }
+        };
+        for &i in &cells {
+            // SAFETY: as the caller promises, the cells are live.
+            let cell = unsafe { &*log.writes[i].cell };
+            let mut spins = 0;
+            loop {
+                let version = cell.version();
+                if version & 1 == 0 {
+                    if cell.lock(version) {
+                        locked.push(version);
+                        break;
+                    }
+                } else if !log.alone {
+                    unlock(&locked, log);
+                    return Ok(None);
+                }
+                back_off(&mut spins);
+            }
+        }
+        let version = if log.alone {
+            tick_alone()
+        } else {
+            match tick() {
+                Some(version) => version,
+                None => {
+                    unlock(&locked, log);
+                    return Ok(None);
+                }
+            }
+        };
+        if version != log.read_version + 2 {
+            let valid = log.reads.iter().all(|&(cell, read)| {
+                match cells.iter().position(|&i| log.writes[i].cell == cell) {
+                    Some(k) => locked[k] == read,
+                    // SAFETY: the cell is live.
+                    None => unsafe { &*cell }.version() == read,
+                }
+            });
+            if !valid {
+                unlock(&locked, log);
+                return Ok(None);
+            }
+        }
+        // The batch: a fresh node per written durable cell, its head
+        // moved from the version read. The cells stay locked while the
+        // writer works, so no task sees a value that is not yet durable.
+        let mut batch = CommitBatch::default();
+        for access in log.durable.iter().filter(|a| a.write.is_some()) {
+            let words = access.write.expect("filtered");
+            let id = store.nodes().allocate(1);
+            batch.nodes.push((id, access.cell.encode(words)));
+            batch.heads.push(HeadMove {
+                key: access.cell.key.clone(),
+                root: id,
+                descriptor: access.cell.descriptor,
+                read: access.read,
+            });
+        }
+        let head_version = match store.commit(batch) {
+            Ok(CommitOutcome::Committed { version }) => version,
+            Ok(CommitOutcome::Conflict { .. }) => {
+                unlock(&locked, log);
+                return Ok(None);
+            }
+            Err(e) => {
+                unlock(&locked, log);
+                return Err(e);
+            }
+        };
+        let mut old = Vec::with_capacity(cells.len());
+        for &i in &cells {
+            let w = &log.writes[i];
+            // SAFETY: the cell is live and locked by this commit.
+            let cell = unsafe { &*w.cell };
+            old.push((cell.store(w.words), w.list));
+            if let Some(access) = log
+                .durable
+                .iter()
+                .find(|a| std::ptr::eq(&a.cell.cell as *const Cell, w.cell))
+            {
+                // Under the cell's lock, so a snapshot sees the pair.
+                access.cell.head.store(head_version, Ordering::Release);
+            }
+            cell.unlock(version);
+        }
+        // The cells took the values that won; the others are given up.
+        let mut won = vec![false; log.writes.len()];
+        for &i in &cells {
+            won[i] = true;
+        }
+        let mut k = 0;
+        log.writes.retain(|_| {
+            k += 1;
+            !won[k - 1]
+        });
+        Ok(Some(old))
+    }
+
     /// Commits the outermost block's writes, TL2's commit: the values the
     /// cells held, with their list types, to retire; none on a conflict.
     /// The writes that lost to later ones of the same cell stay in the log.
@@ -402,7 +627,7 @@ impl TxLog {
     /// # Safety
     ///
     /// The cells are live.
-    unsafe fn store(&mut self) -> Option<Vec<([u64; 2], u64)>> {
+    unsafe fn store(&mut self) -> Option<Retired> {
         let log = self;
         // The latest write of each cell, in address order.
         let mut cells: Vec<usize> = (0..log.writes.len()).collect();

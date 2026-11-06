@@ -14,6 +14,7 @@ workspace = true
 libc = "0.2.190"
 crag-abi = { path = "../crag-abi" }
 crag-budget = { path = "../crag-budget" }
+crag-dur = { path = "../crag-dur" }
 
 [dev-dependencies]
 crag-codegen = { path = "../crag-codegen" }

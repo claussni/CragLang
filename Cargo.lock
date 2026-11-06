@@ -410,6 +410,7 @@ dependencies = [
  "crag-abi",
  "crag-budget",
  "crag-codegen",
+ "crag-dur",
  "crag-loader",
  "libc",
  "loom",
