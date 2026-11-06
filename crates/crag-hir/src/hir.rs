@@ -285,10 +285,14 @@ impl<'db> Body<'db> {
                 .flat_map(|s| match s {
                     Stmt::Expr(e)
                     | Stmt::Let { value: e, .. }
-                    | Stmt::Bind { value: e, .. }
                     | Stmt::Assign { value: e, .. }
                     | Stmt::Emit { value: e, .. }
                     | Stmt::On { handler: e, .. } => vec![*e],
+                    Stmt::Bind {
+                        value, otherwise, ..
+                    } => std::iter::once(*value)
+                        .chain(otherwise.map(|(_, e)| e))
+                        .collect(),
                     Stmt::LetElse {
                         value, otherwise, ..
                     } => vec![*value, *otherwise],
@@ -372,7 +376,14 @@ impl<'db> Body<'db> {
                                     self.pat_bindings(*rest, &mut declared);
                                 }
                             }
-                            Stmt::Bind { binding, .. } => declared.push(*binding),
+                            Stmt::Bind {
+                                binding, otherwise, ..
+                            } => {
+                                declared.push(*binding);
+                                if let Some((Some(rest), _)) = otherwise {
+                                    self.pat_bindings(*rest, &mut declared);
+                                }
+                            }
                             Stmt::Assign { binding, .. } => used.push(*binding),
                             Stmt::Fn { binding, function } => {
                                 declared.push(*binding);
@@ -441,6 +452,8 @@ pub enum BindingKind {
     Var,
     Ref,
     Ext,
+    /// A durable binding over a slot of a store (§21.2).
+    Dur,
     Param,
     /// A local function's name (§5.6.4).
     Fn,
@@ -614,11 +627,16 @@ pub enum Stmt {
         rest: Option<PatId>,
         otherwise: ExprId,
     },
-    /// `var`, `ref` and `ext`, told apart by the binding's kind.
+    /// `var`, `ref`, `ext` and `dur`, told apart by the binding's kind.
     Bind {
         binding: BindingId,
         ty: Option<TypeRefId>,
         value: ExprId,
+        /// The `else` part of a `dur` binding (§21.2), as in `let … else`
+        /// (§7.1.1): the pattern of `else { rest -> … }`, which receives
+        /// the value that is not the `Slot[T]` member, and the block or
+        /// closure, which must leave.
+        otherwise: Option<(Option<PatId>, ExprId)>,
     },
     /// `name = value` on a `var` (§5.2).
     Assign {

@@ -438,7 +438,8 @@ pub(crate) fn let_decl(p: &mut Parser) {
     p.finish_node();
 }
 
-/// `var`, `ref` and `ext` bindings.
+/// `var`, `ref`, `ext` and `dur` bindings. Only a `dur` takes the `else`
+/// part (§21.2); lowering reports it on the others.
 fn binding(p: &mut Parser, kind: S) {
     p.start(kind);
     p.bump();
@@ -448,6 +449,16 @@ fn binding(p: &mut Parser, kind: S) {
     }
     p.expect(T::Equals, "`=`");
     expr(p);
+    if p.at(T::Else) {
+        p.start(S::LetElse);
+        p.bump();
+        if p.at(T::LBrace) {
+            expr(p);
+        } else {
+            p.error("expected a block or a closure");
+        }
+        p.finish_node();
+    }
     p.finish_node();
 }
 
@@ -500,7 +511,7 @@ fn statement(p: &mut Parser) {
     match p.current() {
         T::Let => let_decl(p),
         T::Var => binding(p, S::VarDecl),
-        T::Ref | T::Ext => binding(p, S::RefDecl),
+        T::Ref | T::Ext | T::Dur => binding(p, S::RefDecl),
         T::Fn => fn_decl(p),
         T::For => {
             p.start(S::ForStmt);

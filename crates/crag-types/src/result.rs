@@ -18,7 +18,9 @@
 //! every call, and the errors, each at the node it is about.
 
 use crag_db::Db;
-use crag_hir::{BindingId, BodySourceMap, ExprId, ItemId, Marker, Name, PatId, TypeRefId};
+use crag_hir::{
+    BindingId, BindingKind, BodySourceMap, ExprId, ItemId, Marker, Name, PatId, TypeRefId,
+};
 
 use crate::effect::{EffectSet, Restriction};
 use crate::escape::{BindingsOnly, Escapes};
@@ -355,6 +357,15 @@ pub enum ErrorKind<'db> {
     },
     /// The `else` of a `let … else` that can finish normally (§7.1.1).
     MustLeave,
+    /// A `dur` binding without its type annotation, the schema of the
+    /// slot (§21.2).
+    DurNeedsType,
+    /// An `atomic` block whose `dur` bindings visibly come from two
+    /// different store bindings (§21.6).
+    MixedStores {
+        first: Option<Name<'db>>,
+        second: Option<Name<'db>>,
+    },
     /// A record type or a form where a value is expected.
     NotAValue {
         name: Name<'db>,
@@ -513,11 +524,11 @@ pub enum ErrorKind<'db> {
     NotTransportable {
         form: Untransported,
     },
-    /// A capture of a closure sent as an `Expr` that is a `ref` or an
-    /// `ext`, which are bindings and never values (§18.6).
+    /// A capture of a closure sent as an `Expr` that is a `ref`, an `ext`
+    /// or a `dur`, which are bindings and never values (§18.6).
     CellCapture {
         name: Name<'db>,
-        ext: bool,
+        kind: BindingKind,
     },
     /// A local function from outside a closure sent as an `Expr`, which
     /// its tree cannot carry yet (§18.6).
@@ -618,6 +629,8 @@ impl<'db> ErrorKind<'db> {
             ErrorKind::RecursiveGroup { .. } => crag_diag::RECURSIVE_GROUP,
             ErrorKind::ValueCycle { .. } => crag_diag::VALUE_CYCLE,
             ErrorKind::MustLeave { .. } => crag_diag::MUST_LEAVE,
+            ErrorKind::DurNeedsType => crag_diag::DUR_NEEDS_TYPE,
+            ErrorKind::MixedStores { .. } => crag_diag::MIXED_STORES,
             ErrorKind::NotAValue { .. } => crag_diag::NOT_A_VALUE,
             ErrorKind::NotDiscrete { .. } => crag_diag::NOT_DISCRETE,
             ErrorKind::Decreasing { .. } => crag_diag::DECREASING,
@@ -802,6 +815,21 @@ impl<'db> ErrorKind<'db> {
                 format!("the value `{}` depends on itself", item(value))
             }
             ErrorKind::MustLeave => "the `else` of a `let … else` must leave".into(),
+            ErrorKind::DurNeedsType => {
+                "a `dur` binding needs its type annotation, the schema of the slot".into()
+            }
+            ErrorKind::MixedStores { first, second } => {
+                let of = |n: &Option<Name<'db>>| match n {
+                    Some(n) => format!("`{}`", name(n)),
+                    None => "another binding".into(),
+                };
+                format!(
+                    "this `atomic` block touches `dur` bindings of two stores, {} and {}; \
+                     a storage transaction never spans two stores",
+                    of(first),
+                    of(second)
+                )
+            }
             ErrorKind::NotAValue { name: n } => format!("`{}` is not a value", name(n)),
             ErrorKind::NotDiscrete { ty } => {
                 format!("{} is not Discrete, so it forms no range", ty.display(db))
@@ -837,9 +865,13 @@ impl<'db> ErrorKind<'db> {
             ErrorKind::NotTransportable { form } => {
                 format!("code sent as an `Expr` cannot hold {}", form.text())
             }
-            ErrorKind::CellCapture { name, ext } => format!(
+            ErrorKind::CellCapture { name, kind } => format!(
                 "code sent as an `Expr` cannot capture the {} `{}`, which is a binding and not a value",
-                if *ext { "`ext`" } else { "`ref`" },
+                match kind {
+                    BindingKind::Ext => "`ext`",
+                    BindingKind::Dur => "`dur`",
+                    _ => "`ref`",
+                },
                 name.text(db)
             ),
             ErrorKind::OuterFunction { name } => format!(
@@ -983,6 +1015,8 @@ impl<'db> ErrorKind<'db> {
                 let what = match what {
                     BindingsOnly::Ref => "a ref",
                     BindingsOnly::Ext => "an `ext` cell",
+                    BindingsOnly::Dur => "a `dur` cell",
+                    BindingsOnly::Slot => "a slot",
                     BindingsOnly::Closure => "a closure that carries a ref",
                     BindingsOnly::Lazy => "a `lazy` value that carries a ref",
                 };

@@ -192,6 +192,8 @@ pub(crate) fn counted<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bo
                 | Builtin::Set
                 | Builtin::Ref
                 | Builtin::Ext
+                | Builtin::Dur
+                | Builtin::Slot
                 | Builtin::Lazy
                 | Builtin::Expr
                 | Builtin::RuntimeStream

@@ -1055,7 +1055,9 @@ impl<'a, 'db> Reify<'a, 'db> {
                     ],
                 )
             }
-            Stmt::Bind { binding, ty, value } => {
+            Stmt::Bind {
+                binding, ty, value, ..
+            } => {
                 if self.body.binding(*binding).kind != BindingKind::Var {
                     return Err("a form a tree may not hold".into());
                 }

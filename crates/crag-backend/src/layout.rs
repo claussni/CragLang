@@ -79,6 +79,8 @@ pub fn layout<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> Option<Lay
             | Builtin::Set
             | Builtin::Ref
             | Builtin::Ext
+            | Builtin::Dur
+            | Builtin::Slot
             | Builtin::Lazy
             | Builtin::RuntimeStream
             | Builtin::RuntimeHub

@@ -125,6 +125,12 @@ pub enum LowerError<'db> {
     Marker {
         range: Range<u32>,
     },
+    /// An `else` part on a binding that takes none: a `ref`, or an `ext`
+    /// until its component lands (§21.2, §23.3.1).
+    BindElse {
+        ext: bool,
+        range: Range<u32>,
+    },
 }
 
 pub(crate) struct Lowerer<'a, 'db> {
@@ -780,9 +786,10 @@ impl<'a, 'db> Lowerer<'a, 'db> {
                 let kind = match first_token(node).map(|t| t.kind()) {
                     Some(LeafKind::Token(T::Var)) => BindingKind::Var,
                     Some(LeafKind::Token(T::Ext)) => BindingKind::Ext,
+                    Some(LeafKind::Token(T::Dur)) => BindingKind::Dur,
                     _ => BindingKind::Ref,
                 };
-                let mut nodes = node.children();
+                let mut nodes = node.children().filter(|n| n.kind() != S::LetElse);
                 let has_type = node.tokens().any(|t| t.kind() == LeafKind::Token(T::Colon));
                 let ty = if has_type {
                     nodes.next().map(|t| self.type_node(&t))
@@ -790,11 +797,30 @@ impl<'a, 'db> Lowerer<'a, 'db> {
                     None
                 };
                 let value = self.boundary_or_missing(nodes.next().as_ref(), node);
+                // Only a `dur` binding takes an `else` part (§21.2); for
+                // an `ext` it waits for its component (§23.3.1).
+                let else_part = child(node, S::LetElse).and_then(|n| n.children().next());
+                let otherwise = match (kind, else_part) {
+                    (BindingKind::Dur, Some(n)) => Some(self.otherwise(&n)),
+                    (_, Some(n)) => {
+                        self.errors.push(LowerError::BindElse {
+                            ext: kind == BindingKind::Ext,
+                            range: n.range(),
+                        });
+                        None
+                    }
+                    (_, None) => None,
+                };
                 let binding = match ident(node) {
                     Some(token) => self.bind_token(&token, kind),
                     None => self.alloc_binding(None, kind, node.range()),
                 };
-                Stmt::Bind { binding, ty, value }
+                Stmt::Bind {
+                    binding,
+                    ty,
+                    value,
+                    otherwise,
+                }
             }
             S::Assign => {
                 let value = self.boundary_or_missing(node.children().next().as_ref(), node);

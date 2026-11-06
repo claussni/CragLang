@@ -344,6 +344,8 @@ fn builtin(b: Builtin) -> Option<Layout<'static>> {
         Builtin::List | Builtin::Map | Builtin::Set => Layout::boxed(BoxReason::Collection),
         Builtin::Ref
         | Builtin::Ext
+        | Builtin::Dur
+        | Builtin::Slot
         | Builtin::Lazy
         | Builtin::RuntimeStream
         | Builtin::RuntimeHub

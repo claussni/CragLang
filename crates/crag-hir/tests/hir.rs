@@ -81,6 +81,13 @@ fn lower(text: &str) -> (Vec<String>, Vec<String>) {
                 LowerError::ExpectedType { range } => ("expected a type".into(), range),
                 LowerError::ExpectedValue { range } => ("expected a value".into(), range),
                 LowerError::Marker { range } => ("not a function marker".into(), range),
+                LowerError::BindElse { ext, range } => (
+                    match ext {
+                        true => "no ext else yet".into(),
+                        false => "no else on this binding".into(),
+                    },
+                    range,
+                ),
             };
             errors.push(format!("line {}: {what}", line(range.start)));
         }

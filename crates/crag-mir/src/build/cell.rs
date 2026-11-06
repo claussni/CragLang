@@ -147,7 +147,10 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         }
         let sig = self.instance_signature(instance);
         let first = sig.params.first()?.ty;
-        if !matches!(first.as_builtin(db), Some((Builtin::Ref | Builtin::Ext, _))) {
+        if !matches!(
+            first.as_builtin(db),
+            Some((Builtin::Ref | Builtin::Ext | Builtin::Dur, _))
+        ) {
             return None;
         }
         Some(
@@ -174,9 +177,17 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
         let db = self.db;
         let sig = self.instance_signature(instance);
         let cell_ty = sig.params[0].ty;
-        let Some((builtin @ (Builtin::Ref | Builtin::Ext), &[ty])) = cell_ty.as_builtin(db) else {
+        let Some((builtin @ (Builtin::Ref | Builtin::Ext | Builtin::Dur), &[ty])) =
+            cell_ty.as_builtin(db)
+        else {
             return self.trap(TrapKind::Error, Some(expr));
         };
+        // A `dur` access goes through the store (§21.6) once the slot
+        // table of the Implementation Plan §11.11.7 wires the
+        // `rt_store_*` entry points; until then it traps.
+        if builtin == Builtin::Dur {
+            return self.trap(TrapKind::Error, Some(expr));
+        }
         if positional.len() != sig.params.len() {
             return self.trap(TrapKind::Error, Some(expr));
         }

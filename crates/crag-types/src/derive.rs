@@ -269,7 +269,7 @@ fn derives<'db>(
             Builtin::List => parts(seen, args.clone()),
             // Maps and sets have no order.
             Builtin::Map | Builtin::Set => form != "Ordered" && parts(seen, args.clone()),
-            Builtin::Ref | Builtin::Ext | Builtin::Lazy => false,
+            Builtin::Ref | Builtin::Ext | Builtin::Dur | Builtin::Slot | Builtin::Lazy => false,
             // A 32-bit float's bits do not order it.
             Builtin::CF32 => form != "Ordered",
             _ => true,

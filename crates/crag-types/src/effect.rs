@@ -265,17 +265,20 @@ pub fn intrinsic_effects<'db>(
     )))
 }
 
-/// The kind of cell a prelude access function reaches (§9.3).
+/// The kind of cell a prelude access function reaches (§9.3, §21.2).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cell {
     Ref,
     Ext,
+    /// A `dur` access counts as the `ref` effect (§21.2); its commit's
+    /// I/O belongs to the runtime and runs after the block (§21.6).
+    Dur,
 }
 
 impl Cell {
     fn bits(self) -> u8 {
         match self {
-            Cell::Ref => REF,
+            Cell::Ref | Cell::Dur => REF,
             Cell::Ext => IO | EXT,
         }
     }
@@ -293,6 +296,7 @@ fn cell_access<'db>(db: &'db dyn Db, program: Program, function: ItemId<'db>) ->
     match signature(db, program, function).params.first()?.ty.kind(db) {
         TyKind::Builtin(Builtin::Ref, _) => Some(Cell::Ref),
         TyKind::Builtin(Builtin::Ext, _) => Some(Cell::Ext),
+        TyKind::Builtin(Builtin::Dur, _) => Some(Cell::Dur),
         _ => None,
     }
 }
@@ -327,6 +331,8 @@ pub struct Walker<'a, 'db> {
     by_expr: HashMap<ExprId, usize>,
     /// The value each simple `let` binds.
     values: HashMap<BindingId, ExprId>,
+    /// The slot value each `dur` binding consumes (§21.2).
+    dur_values: HashMap<BindingId, ExprId>,
     /// The local function each binding names.
     local_fns: HashMap<BindingId, ExprId>,
     /// The effects of each closure and local function walked, with what
@@ -351,6 +357,7 @@ impl<'a, 'db> Walker<'a, 'db> {
             .map(|(i, (e, _))| (*e, i))
             .collect();
         let mut values = HashMap::new();
+        let mut dur_values = HashMap::new();
         let mut local_fns = HashMap::new();
         for expr in &body.exprs {
             let Expr::Block { stmts, .. } = expr else {
@@ -362,6 +369,11 @@ impl<'a, 'db> Walker<'a, 'db> {
                         if let Pat::Bind { binding, sub: None } = body.pat(*pat) {
                             values.insert(*binding, *value);
                         }
+                    }
+                    Stmt::Bind { binding, value, .. }
+                        if body.binding(*binding).kind == BindingKind::Dur =>
+                    {
+                        dur_values.insert(*binding, *value);
                     }
                     Stmt::Fn { binding, function } => {
                         if let Some(root) = function.body {
@@ -382,6 +394,7 @@ impl<'a, 'db> Walker<'a, 'db> {
             effects_of,
             by_expr,
             values,
+            dur_values,
             local_fns,
             deferred: HashMap::new(),
             errors: Vec::new(),
@@ -544,6 +557,7 @@ impl<'a, 'db> Walker<'a, 'db> {
                 let mut inside = Vec::new();
                 self.walk(*inner, &mut inside);
                 self.restrict(&inside, Restriction::Atomic);
+                self.one_store(&inside);
                 found.extend(inside);
                 return;
             }
@@ -869,6 +883,83 @@ impl<'a, 'db> Walker<'a, 'db> {
         }
     }
 
+    /// The store-provenance check of an `atomic` block (§21.6): the `dur`
+    /// bindings it touches must come from one store binding. Two visibly
+    /// different store bindings are a compile error. A `dur` that arrives
+    /// as a parameter, or whose slot call names no store binding, is
+    /// checked at run time instead, where a violation makes the commit
+    /// return `MixedStores` (§21.6, Plan §11.11.4).
+    fn one_store(&mut self, found: &[Occurrence]) {
+        let mut first: Option<BindingId> = None;
+        for o in found {
+            let Some(cell) = o.cell else {
+                continue;
+            };
+            if !self.is_dur(cell) {
+                continue;
+            }
+            let Some(store) = self.store_of(cell) else {
+                continue;
+            };
+            match first {
+                None => first = Some(store),
+                Some(f) if f == store => {}
+                Some(f) => {
+                    self.errors.push(TypeError {
+                        site: Site::Expr(o.site),
+                        kind: ErrorKind::MixedStores {
+                            first: self.body.binding(f).name,
+                            second: self.body.binding(store).name,
+                        },
+                    });
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Whether a binding is a `dur` cell: declared `dur`, or a parameter
+    /// of type `Dur[T]`.
+    fn is_dur(&self, binding: BindingId) -> bool {
+        if self.body.binding(binding).kind == BindingKind::Dur {
+            return true;
+        }
+        let ty = self.bindings.get(binding.index()).copied().flatten();
+        ty.is_some_and(|t| matches!(t.kind(self.db), TyKind::Builtin(Builtin::Dur, _)))
+    }
+
+    /// The store binding a `dur` binding's slot call names: the receiver
+    /// of a call of a function named `slot` (§21.4), followed through
+    /// simple `let` aliases. None leaves the check to the runtime.
+    fn store_of(&self, dur: BindingId) -> Option<BindingId> {
+        let mut value = *self.dur_values.get(&dur)?;
+        while let Expr::Name { local: Some(b), .. } = self.body.expr(value) {
+            value = *self.values.get(b)?;
+        }
+        let i = *self.by_expr.get(&value)?;
+        let function = match &self.callees[i].1 {
+            Callee::Function(f) => *f,
+            Callee::Instance(instance) => instance.function,
+            _ => return None,
+        };
+        if function.name(self.db).text(self.db).as_str() != "slot" {
+            return None;
+        }
+        let (positional, _) = self.args(value);
+        let mut store = *positional.first()?;
+        loop {
+            let Expr::Name { local: Some(b), .. } = self.body.expr(store) else {
+                return None;
+            };
+            match self.values.get(b).copied() {
+                Some(v) if matches!(self.body.expr(v), Expr::Name { local: Some(_), .. }) => {
+                    store = v;
+                }
+                _ => return Some(*b),
+            }
+        }
+    }
+
     /// The rules of a closure passed to an access function: an `update`
     /// closure of a ref does no `io` and resolves no other ref (§9.5); a
     /// closure of an `ext` accesses no other `ext` (§9.6).
@@ -891,10 +982,10 @@ impl<'a, 'db> Walker<'a, 'db> {
         });
         for o in found {
             match cell {
-                Cell::Ref if update && o.effects.has_io() => {
+                Cell::Ref | Cell::Dur if update && o.effects.has_io() => {
                     self.restrict(&[o], Restriction::Update);
                 }
-                Cell::Ref
+                Cell::Ref | Cell::Dur
                     if update && o.effects.has_ref() && (o.cell.is_none() || o.cell != own) =>
                 {
                     self.errors.push(TypeError {

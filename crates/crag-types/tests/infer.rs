@@ -62,6 +62,14 @@ pub fn use[T, U](r: Ext[T], f: (T) -> U) -> U
 pub fn update[T, R](r: Ext[T], f: (T) -> R) -> () | Errs[R]
 pub fn swap[T](r: Ext[T], new: T) -> T
 pub fn empty[T](r: Ext[Option[T]]) -> Option[T]
+pub type Dur[T]
+pub type Slot[T]
+pub distinct type StoreError(..Error)
+pub fn use[T](d: Dur[T]) -> T
+pub fn use[T, U](d: Dur[T], f: (T) -> U) -> U
+pub fn update[T, R](d: Dur[T], f: (T) -> R) -> () | Errs[R] | StoreError
+pub fn swap[T](d: Dur[T], new: T) -> T | StoreError
+pub fn empty[T](d: Dur[Option[T]]) -> Option[T] | StoreError
 pub distinct type Signal
 pub fn entries[K, V](m: Map[K, V]) -> List[(key: K, value: V)]
 pub fn toList[T](s: Set[T]) -> List[T]
@@ -1634,6 +1642,88 @@ fn f() {
             "`hits.update { n -> \"x\" }`: expected Int, found Str",
             "`Note(text: \"n\")`: expected Signal, found Note",
             "`hits`: expected Int, found Ref[Int]",
+        ]
+    );
+}
+
+#[test]
+fn dur_bindings_are_typed() {
+    // §21.2: the annotation names the slot's value type, the initializer
+    // is checked against `Slot[T] | StoreError` with the `else` part as
+    // in `let … else`, and the binding is the cell, of type `Dur[T]`.
+    // An `atomic` block that touches a `dur` adds `StoreError` (§21.7).
+    let text = "fn f(s: Slot[Int] | StoreError) -> () | StoreError {
+  dur n: Int = s else { e -> return e }
+  let v = n.use()
+  let doubled = n.use { x -> x * 2 }
+  let r = atomic { n.update { x -> x + 1 } }
+}";
+    assert_eq!(
+        ok(text).last().unwrap(),
+        "s: Slot[Int] | StoreError, e: StoreError, n: Dur[Int], v: Int, x: Int, doubled: Int, \
+         x: Int, r: () | StoreError, -> () | StoreError"
+    );
+}
+
+#[test]
+fn dur_bindings_are_checked() {
+    // §21.2: the annotation is required; without `else` the initializer
+    // must be exactly the slot; the slot's value type is invariant.
+    let text = "fn f(s: Slot[Int] | StoreError) -> () | StoreError {
+  dur a = s else { e -> return e }
+  dur b: Int = s
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`a`: a `dur` binding needs its type annotation, the schema of the slot",
+            "`s`: expected Slot[Int], found Slot[Int] | StoreError",
+        ]
+    );
+}
+
+#[test]
+fn an_atomic_block_stays_within_one_store() {
+    // §21.6: the `dur` bindings one `atomic` block touches must come
+    // from one store binding; two visibly different ones are refused.
+    let text = "type StoreA
+type StoreB
+fn slot(s: StoreA, v: Slot[Int] | StoreError) -> Slot[Int] | StoreError { v }
+fn slot(s: StoreB, v: Slot[Int] | StoreError) -> Slot[Int] | StoreError { v }
+fn f(a: StoreA, b: StoreB, va: Slot[Int] | StoreError, vb: Slot[Int] | StoreError) -> () | StoreError {
+  dur x: Int = a.slot(va) else { e -> return e }
+  dur y: Int = b.slot(vb) else { e -> return e }
+  atomic {
+    x.update { v -> v + 1 }
+    y.update { v -> v + 1 }
+  }
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`y.update { v -> v + 1 }`: this `atomic` block touches `dur` bindings of two stores, \
+          `a` and `b`; a storage transaction never spans two stores"
+        ]
+    );
+}
+
+#[test]
+fn storable_is_inferred_from_the_type() {
+    // §21.5: a type is `Storable` when it is `Solid`, is not `Secret`,
+    // and every opaque type in it has a codec pair (§18.9); a plain
+    // closure is never storable.
+    let text = "opaque type Token(raw: Int)
+distinct type Keep(id: Int)
+fn keep[T](x: T) -> T where T is { Storable } { x }
+fn f() {
+  let a = keep(Keep(id: 1))
+  let b = keep(Token(raw: 1))
+}";
+    assert_eq!(
+        errors(text),
+        [
+            "`keep(Token(raw: 1))`: the requirement `T is Storable` does not hold: \
+          Token is not Storable: it is an opaque type without an `Encode`/`Decode` pair"
         ]
     );
 }

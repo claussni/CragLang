@@ -79,7 +79,9 @@ fn subtype<'db>(db: &'db dyn Db, program: Program, s: Ty<'db>, t: Ty<'db>, depth
             }
         }
         (TyKind::Builtin(a, a_args), TyKind::Builtin(b, b_args)) if a == b => {
-            if *a == Builtin::Ref {
+            // Cells are written through, so their types are invariant
+            // (§9.2, §21.2), and a slot's type is the schema it opened.
+            if matches!(a, Builtin::Ref | Builtin::Dur | Builtin::Slot) {
                 a_args == b_args
             } else {
                 a_args.iter().zip(b_args).all(|(&x, &y)| fits(x, y))

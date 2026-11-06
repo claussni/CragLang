@@ -106,6 +106,13 @@ impl<'a, 'db> MirBuilder<'a, 'db> {
                         };
                         self.push(Statement::Assign(local, Rvalue::Intrinsic(new, vec![op])));
                     }
+                    // A `dur` binding runs once the slot table of the
+                    // Implementation Plan §11.11.7 wires the `rt_store_*`
+                    // entry points; until then it traps.
+                    BindingKind::Dur => {
+                        self.expr(*value);
+                        self.trap(TrapKind::Error, Some(*value));
+                    }
                     _ => {
                         self.trap(TrapKind::Error, Some(*value));
                     }

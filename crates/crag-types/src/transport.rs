@@ -40,6 +40,7 @@ use crate::{body_types, result_type};
 pub enum Untransported {
     Ref,
     Ext,
+    Dur,
     Atomic,
     Embed,
     On,
@@ -51,6 +52,7 @@ impl Untransported {
         match self {
             Untransported::Ref => "a `ref` binding",
             Untransported::Ext => "an `ext` binding",
+            Untransported::Dur => "a `dur` binding",
             Untransported::Atomic => "an `atomic` block",
             Untransported::Embed => "an `embed`",
             Untransported::On => "an `on` handler",
@@ -82,6 +84,7 @@ pub(crate) fn literal_errors<'db>(
                         Stmt::Bind { binding, .. } => match body.binding(*binding).kind {
                             BindingKind::Ref => (Site::Binding(*binding), Untransported::Ref),
                             BindingKind::Ext => (Site::Binding(*binding), Untransported::Ext),
+                            BindingKind::Dur => (Site::Binding(*binding), Untransported::Dur),
                             _ => continue,
                         },
                         Stmt::On { handler, .. } => (Site::Expr(*handler), Untransported::On),
@@ -104,9 +107,8 @@ pub(crate) fn literal_errors<'db>(
             continue;
         };
         match declared.kind {
-            BindingKind::Ref | BindingKind::Ext => {
-                let ext = declared.kind == BindingKind::Ext;
-                error(Site::Expr(closure), ErrorKind::CellCapture { name, ext });
+            kind @ (BindingKind::Ref | BindingKind::Ext | BindingKind::Dur) => {
+                error(Site::Expr(closure), ErrorKind::CellCapture { name, kind });
             }
             // A local function is code, which the tree does not bundle.
             BindingKind::Fn => {

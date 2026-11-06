@@ -38,7 +38,7 @@ use crag_hir::{
 
 use crate::def::{SigParam, TypeLowerer, own_type_params, signature, type_header};
 use crate::group::result_type;
-use crate::marker::{NotSolid, Why, carries, solid};
+use crate::marker::{NotSolid, NotStorable, Why, carries, solid, storable};
 use crate::overload::{Ranked, most_specific};
 use crate::relate::{is_subtype, join, normalize, parent, subst};
 use crate::result::{ErrorKind, Site, TypeError};
@@ -213,6 +213,13 @@ pub enum FitError<'db> {
         arg: Ty<'db>,
         why: NotSolid<'db>,
     },
+    /// A type argument is not `Storable` where its parameter is required
+    /// to be (§21.5, §4.2).
+    NotStorable {
+        param: Name<'db>,
+        arg: Ty<'db>,
+        why: NotStorable<'db>,
+    },
     /// A type argument does not carry or lack a marker as its parameter
     /// is required to, or is a type parameter not known to (§4.2).
     Marker {
@@ -231,6 +238,7 @@ impl<'db> FitError<'db> {
             FitError::NoneOf { .. } => crag_diag::NONE_OF_FORMS,
             FitError::NotDerived { .. } => crag_diag::NOT_DERIVED,
             FitError::NotSolid { .. } => crag_diag::PARAM_NOT_SOLID,
+            FitError::NotStorable { .. } => crag_diag::PARAM_NOT_STORABLE,
             FitError::Marker { .. } => crag_diag::MARKER_NOT_MET,
         }
     }
@@ -274,6 +282,11 @@ impl<'db> FitError<'db> {
             ),
             FitError::NotSolid { param, arg, why } => format!(
                 "the requirement `{} is Solid` does not hold: {}",
+                param.text(db),
+                why.message(db, *arg)
+            ),
+            FitError::NotStorable { param, arg, why } => format!(
+                "the requirement `{} is Storable` does not hold: {}",
                 param.text(db),
                 why.message(db, *arg)
             ),
@@ -390,11 +403,6 @@ fn requirement<'db>(lower: &mut TypeLowerer<'_, 'db>, req: &Requirement) -> Opti
     } = lower.body.type_ref(req.ty)
     {
         let marker = *marker;
-        if marker == Marker::Storable && req.marker.is_some() {
-            let kind = ErrorKind::Unsupported("`Storable` requirements, until stores are built");
-            lower.error(Site::Type(req.ty), kind);
-            return None;
-        }
         return match (req.param, req.marker) {
             (Some(i), Some(polarity)) => Some(Req::Marker(MarkerBound::new(i, marker, polarity))),
             (Some(i), None) => {
@@ -521,7 +529,7 @@ fn check_marker<'db>(
     if arg.is_error(db) {
         return Ok(());
     }
-    // What makes a type not `Solid` is worth naming.
+    // What makes a type not `Solid` or not `Storable` is worth naming.
     if bound.marker == Marker::Solid
         && bound.polarity == Polarity::Carries
         && let Err(why) = solid(db, program, arg)
@@ -529,6 +537,14 @@ fn check_marker<'db>(
     {
         let why = why.clone();
         return Err(FitError::NotSolid { param, arg, why });
+    }
+    if bound.marker == Marker::Storable
+        && bound.polarity == Polarity::Carries
+        && let Err(why) = storable(db, program, arg)
+        && !why.why.unknown()
+    {
+        let why = why.clone();
+        return Err(FitError::NotStorable { param, arg, why });
     }
     let wanted = bound.polarity == Polarity::Carries;
     if carries(db, program, arg, bound.marker) != Some(wanted) {

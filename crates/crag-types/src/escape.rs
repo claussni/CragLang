@@ -98,7 +98,7 @@ pub fn intrinsic_escapes<'db>(
             .map(|p| match p.ty.kind(db) {
                 // Reading a lazy value keeps it no more than an access
                 // keeps a cell.
-                TyKind::Builtin(Builtin::Ref | Builtin::Ext | Builtin::Lazy, _)
+                TyKind::Builtin(Builtin::Ref | Builtin::Ext | Builtin::Dur | Builtin::Lazy, _)
                 | TyKind::Fn { .. }
                     if prelude =>
                 {
@@ -130,6 +130,8 @@ pub fn intrinsic_escapes<'db>(
 pub enum BindingsOnly {
     Ref,
     Ext,
+    Dur,
+    Slot,
     Closure,
     Lazy,
 }
@@ -486,11 +488,24 @@ impl<'a, 'db> EscapeWalker<'a, 'db> {
                     self.walk(*otherwise, Local);
                 }
             }
-            Stmt::Bind { binding, value, .. } => match body.binding(*binding).kind {
-                // What a cell holds is stored (§3.12).
-                BindingKind::Ref | BindingKind::Ext => self.walk(*value, Escaping),
-                _ => self.walk_at(*value, self.levels[binding.index()], false),
-            },
+            Stmt::Bind {
+                binding,
+                value,
+                otherwise,
+                ..
+            } => {
+                match body.binding(*binding).kind {
+                    // What a cell holds is stored (§3.12). A `dur`
+                    // consumes its slot, which the store holds (§21.4).
+                    BindingKind::Ref | BindingKind::Ext | BindingKind::Dur => {
+                        self.walk(*value, Escaping);
+                    }
+                    _ => self.walk_at(*value, self.levels[binding.index()], false),
+                }
+                if let Some((_, otherwise)) = otherwise {
+                    self.walk(*otherwise, Local);
+                }
+            }
             Stmt::Assign { binding, value } => {
                 self.walk_at(*value, self.levels[binding.index()], false);
             }
@@ -562,6 +577,7 @@ impl<'a, 'db> EscapeWalker<'a, 'db> {
         match self.body.binding(binding).kind {
             BindingKind::Ref => return Some(BindingsOnly::Ref),
             BindingKind::Ext => return Some(BindingsOnly::Ext),
+            BindingKind::Dur => return Some(BindingsOnly::Dur),
             _ => {}
         }
         match self
@@ -573,6 +589,8 @@ impl<'a, 'db> EscapeWalker<'a, 'db> {
         {
             Some(TyKind::Builtin(Builtin::Ref, _)) => return Some(BindingsOnly::Ref),
             Some(TyKind::Builtin(Builtin::Ext, _)) => return Some(BindingsOnly::Ext),
+            Some(TyKind::Builtin(Builtin::Dur, _)) => return Some(BindingsOnly::Dur),
+            Some(TyKind::Builtin(Builtin::Slot, _)) => return Some(BindingsOnly::Slot),
             _ => {}
         }
         if let Some((&root, _)) = self.local_fns.iter().find(|(_, b)| **b == binding) {

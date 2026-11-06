@@ -85,6 +85,10 @@ pub enum Builtin {
     Ref,
     /// The locking ref of an `ext` binding (§9.6).
     Ext,
+    /// The durable cell of a `dur` binding, and the slot it consumes
+    /// (§21.2, §21.4). Both are bindings-only, like `Ref`.
+    Dur,
+    Slot,
     Lazy,
     /// `Expr[F]`, a closure of the `is Pure` function type `F` that carries
     /// its code as data (§18.6), which only `std.transport` declares.
@@ -131,6 +135,8 @@ impl Builtin {
             "Set" => (Builtin::Set, 1),
             "Ref" => (Builtin::Ref, 1),
             "Ext" => (Builtin::Ext, 1),
+            "Dur" => (Builtin::Dur, 1),
+            "Slot" => (Builtin::Slot, 1),
             "Lazy" => (Builtin::Lazy, 1),
             "Expr" => (Builtin::Expr, 1),
             "RuntimeStream" => (Builtin::RuntimeStream, 0),
@@ -165,6 +171,8 @@ impl Builtin {
             Builtin::Set => "Set",
             Builtin::Ref => "Ref",
             Builtin::Ext => "Ext",
+            Builtin::Dur => "Dur",
+            Builtin::Slot => "Slot",
             Builtin::Lazy => "Lazy",
             Builtin::Expr => "Expr",
             Builtin::RuntimeStream => "RuntimeStream",

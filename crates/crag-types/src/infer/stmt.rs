@@ -98,7 +98,15 @@ impl<'a, 'db> Infer<'a, 'db> {
                 }
                 unit
             }
-            Stmt::Bind { binding, ty, value } => {
+            Stmt::Bind {
+                binding,
+                ty,
+                value,
+                otherwise,
+            } => {
+                if self.body.binding(*binding).kind == BindingKind::Dur {
+                    return self.dur_bind(*binding, *ty, *value, otherwise);
+                }
                 let ty = match self.written(*ty) {
                     Some(ty) => {
                         self.check(*value, ty);
@@ -207,6 +215,79 @@ impl<'a, 'db> Infer<'a, 'db> {
                 unit
             }
         }
+    }
+
+    /// A `dur` binding (§21.2): the annotation names the slot's value
+    /// type `T`, the right-hand side is checked against
+    /// `Slot[T] | StoreError`, and the `else` part receives what is not
+    /// the `Slot[T]` member and must leave, as in `let … else` (§7.1.1).
+    /// Without `else`, the right-hand side must be exactly `Slot[T]`.
+    /// The binding is the cell, of type `Dur[T]`.
+    fn dur_bind(
+        &mut self,
+        binding: BindingId,
+        ty: Option<TypeRefId>,
+        value: ExprId,
+        otherwise: &Option<(Option<PatId>, ExprId)>,
+    ) -> Ty<'db> {
+        let db = self.db;
+        let unit = Ty::unit(db);
+        // The annotation is required: it is the schema of the slot.
+        let Some(inner) = self.written(ty) else {
+            self.error(Site::Binding(binding), ErrorKind::DurNeedsType);
+            self.synth(value);
+            let err = Ty::error(db);
+            if let Some((rest, otherwise)) = otherwise {
+                let start = self.narrowed.clone();
+                if let Some(rest) = rest {
+                    self.pattern(*rest, err);
+                }
+                let leaves = self.synth(*otherwise);
+                if !leaves.is_never(db) && !leaves.is_error(db) {
+                    self.error(Site::Expr(*otherwise), ErrorKind::MustLeave);
+                }
+                self.narrowed = start;
+            }
+            self.bindings[binding.index()] = Some(self.builtin_of(Builtin::Dur, vec![err]));
+            return unit;
+        };
+        let slot = self.builtin_of(Builtin::Slot, vec![inner]);
+        let store_error = prelude_item(db, self.program, "StoreError")
+            .map(|_| prelude_type(db, self.program, "StoreError"));
+        match otherwise {
+            None => {
+                // Without `else`, the initializer's type must have no
+                // other members.
+                self.check(value, slot);
+            }
+            Some((rest, otherwise)) => {
+                let expected = match store_error {
+                    Some(error) => self.join(slot, error),
+                    None => slot,
+                };
+                let value_ty = self.check(value, expected);
+                if !value_ty.is_error(db) && self.refine(value_ty, slot).is_none() {
+                    let kind = ErrorKind::NeverMatches {
+                        pattern: slot,
+                        subject: value_ty,
+                    };
+                    self.error(Site::Expr(value), kind);
+                }
+                // The `else` part sees the members the slot is not.
+                let unmatched = self.rest(value_ty, slot);
+                let start = self.narrowed.clone();
+                if let Some(rest) = rest {
+                    self.pattern(*rest, unmatched);
+                }
+                let leaves = self.synth(*otherwise);
+                if !leaves.is_never(db) && !leaves.is_error(db) {
+                    self.error(Site::Expr(*otherwise), ErrorKind::MustLeave);
+                }
+                self.narrowed = start;
+            }
+        }
+        self.bindings[binding.index()] = Some(self.builtin_of(Builtin::Dur, vec![inner]));
+        unit
     }
 
     fn frame_site(&self) -> Site {

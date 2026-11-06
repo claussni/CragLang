@@ -370,6 +370,32 @@ impl<'a, 'db> Infer<'a, 'db> {
         Ty::builtin(self.db, builtin)
     }
 
+    /// Whether an expression names a `dur` binding anywhere inside it:
+    /// one declared `dur`, or a parameter of type `Dur[T]` (§21.2). The
+    /// bindings inside `root` are typed when this runs, after the body.
+    fn touches_dur(&self, root: ExprId) -> bool {
+        let mut pending = vec![root];
+        while let Some(e) = pending.pop() {
+            if let Expr::Name {
+                local: Some(binding),
+                ..
+            } = self.body.expr(e)
+            {
+                if self.body.binding(*binding).kind == BindingKind::Dur {
+                    return true;
+                }
+                let ty = self.bindings.get(binding.index()).copied().flatten();
+                if let Some(ty) = ty
+                    && matches!(ty.as_builtin(self.db), Some((Builtin::Dur, _)))
+                {
+                    return true;
+                }
+            }
+            pending.extend(self.body.children(e));
+        }
+        false
+    }
+
     fn builtin_of(&self, builtin: Builtin, args: Vec<Ty<'db>>) -> Ty<'db> {
         Ty::new(self.db, TyKind::Builtin(builtin, args))
     }
@@ -890,8 +916,20 @@ impl<'a, 'db> Infer<'a, 'db> {
                 self.err_ty()
             }
             // A transaction: its value, an error aborting it, and a
-            // `return` ends it with its value (§9.5.1).
-            Expr::Atomic(inner) => self.frame(expected, *inner, false),
+            // `return` ends it with its value (§9.5.1). One that touches
+            // a `dur` commits to the store, which can fail, so its result
+            // includes `StoreError` (§21.7).
+            Expr::Atomic(inner) => {
+                let ty = self.frame(expected, *inner, false);
+                if self.touches_dur(*inner)
+                    && prelude_item(db, self.program, "StoreError").is_some()
+                {
+                    let error = prelude_type(db, self.program, "StoreError");
+                    self.join(ty, error)
+                } else {
+                    ty
+                }
+            }
             Expr::Lazy(inner) => {
                 let wanted = expected.and_then(|e| self.member_builtin(e, &[Builtin::Lazy]));
                 let ty = match wanted {

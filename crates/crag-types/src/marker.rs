@@ -112,43 +112,52 @@ impl<'db> NotSolid<'db> {
     /// its field `s` may hold a Round, whose field `f` holds () -> Int,
     /// which is a function that is not `is Pure``.
     pub fn message(&self, db: &'db dyn Db, ty: Ty<'db>) -> String {
-        let mut out = format!("{} is not Solid: ", ty.display(db));
-        let mut fields: Vec<&str> = Vec::new();
-        let mut whose = false;
-        let flush = |out: &mut String, fields: &mut Vec<&str>, whose: bool| {
-            if !fields.is_empty() {
-                let lead = if whose { "whose" } else { "its" };
-                out.push_str(&format!("{lead} field `{}` ", fields.join(".")));
-                fields.clear();
-            } else if whose {
-                out.push_str("which ");
-            } else {
-                out.push_str("it ");
-            }
-        };
-        for step in &self.path {
-            match step {
-                SolidStep::Field(name) => fields.push(name.text(db)),
-                SolidStep::Subtype(sub) => {
-                    flush(&mut out, &mut fields, whose);
-                    out.push_str(&format!("may hold a {}, ", sub.display(db)));
-                    whose = true;
-                }
-            }
-        }
-        let at_part = fields.is_empty();
-        flush(&mut out, &mut fields, whose);
-        if at_part {
-            out.push_str(self.why.predicate());
-        } else {
-            out.push_str(&format!(
-                "holds {}, which {}",
-                self.part.display(db),
-                self.why.predicate()
-            ));
-        }
-        out
+        part_message(db, ty, "Solid", &self.path, self.part, self.why.predicate())
     }
+}
+
+/// What a part is, and where it is in `ty`, for the message of a marker
+/// the type does not carry.
+fn part_message<'db>(
+    db: &'db dyn Db,
+    ty: Ty<'db>,
+    marker: &str,
+    path: &[SolidStep<'db>],
+    part: Ty<'db>,
+    predicate: &str,
+) -> String {
+    let mut out = format!("{} is not {marker}: ", ty.display(db));
+    let mut fields: Vec<&str> = Vec::new();
+    let mut whose = false;
+    let flush = |out: &mut String, fields: &mut Vec<&str>, whose: bool| {
+        if !fields.is_empty() {
+            let lead = if whose { "whose" } else { "its" };
+            out.push_str(&format!("{lead} field `{}` ", fields.join(".")));
+            fields.clear();
+        } else if whose {
+            out.push_str("which ");
+        } else {
+            out.push_str("it ");
+        }
+    };
+    for step in path {
+        match step {
+            SolidStep::Field(name) => fields.push(name.text(db)),
+            SolidStep::Subtype(sub) => {
+                flush(&mut out, &mut fields, whose);
+                out.push_str(&format!("may hold a {}, ", sub.display(db)));
+                whose = true;
+            }
+        }
+    }
+    let at_part = fields.is_empty();
+    flush(&mut out, &mut fields, whose);
+    if at_part {
+        out.push_str(predicate);
+    } else {
+        out.push_str(&format!("holds {}, which {}", part.display(db), predicate));
+    }
+    out
 }
 
 /// Whether a type is `Solid`, or the first part that is not.
@@ -213,7 +222,9 @@ impl<'db> Walk<'db> {
             TyKind::Builtin(builtin, args) => match builtin {
                 Builtin::List | Builtin::Map | Builtin::Set => self.all(args.clone()),
                 Builtin::Lazy => self.not(ty, Why::Lazy),
-                Builtin::Ref | Builtin::Ext => self.not(ty, Why::Cell),
+                Builtin::Ref | Builtin::Ext | Builtin::Dur | Builtin::Slot => {
+                    self.not(ty, Why::Cell)
+                }
                 Builtin::RuntimeStream | Builtin::RuntimeHub | Builtin::RuntimeSocket => {
                     self.not(ty, Why::Handle)
                 }
@@ -344,6 +355,212 @@ fn secret_path<'db>(
     found
 }
 
+/// Why a type is not `Storable` (§21.5): the part that is not, reached
+/// through `path`, and the reason.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
+pub struct NotStorable<'db> {
+    pub path: Vec<SolidStep<'db>>,
+    pub part: Ty<'db>,
+    pub why: WhyNotStorable<'db>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, crag_db::SalsaValue)]
+pub enum WhyNotStorable<'db> {
+    /// The part is not `Solid`.
+    NotSolid(Why),
+    /// The part is or holds a `Secret`.
+    Secret,
+    /// An opaque type without an `Encode`/`Decode` pair (§18.9); runtime
+    /// handles declare none.
+    Opaque,
+    /// A plain closure is compiled code: of function values, only `Expr`
+    /// values are storable (§21.5).
+    Function(Ty<'db>),
+    /// `is not Storable`, or a type parameter required not to be.
+    Marked,
+    /// A type parameter not required to be `Storable`.
+    Param,
+}
+
+impl<'db> WhyNotStorable<'db> {
+    fn predicate(&self, db: &'db dyn Db) -> String {
+        match self {
+            WhyNotStorable::NotSolid(why) => why.predicate().into(),
+            WhyNotStorable::Secret => "is marked `Secret`".into(),
+            WhyNotStorable::Opaque => "is an opaque type without an `Encode`/`Decode` pair".into(),
+            WhyNotStorable::Function(ty) => format!(
+                "is a function; of function values, only `Expr[{}]` values are storable",
+                ty.display(db)
+            ),
+            WhyNotStorable::Marked => "is marked or required `not Storable`".into(),
+            WhyNotStorable::Param => "is a type parameter not required to be `Storable`".into(),
+        }
+    }
+
+    /// Whether the reason depends on a type parameter, so the type may
+    /// still be `Storable` for some arguments.
+    pub fn unknown(&self) -> bool {
+        matches!(
+            self,
+            WhyNotStorable::Param | WhyNotStorable::NotSolid(Why::Param)
+        )
+    }
+}
+
+impl<'db> NotStorable<'db> {
+    /// What the part is, and where it is in `ty`, as `NotSolid::message`
+    /// spells it.
+    pub fn message(&self, db: &'db dyn Db, ty: Ty<'db>) -> String {
+        part_message(
+            db,
+            ty,
+            "Storable",
+            &self.path,
+            self.part,
+            &self.why.predicate(db),
+        )
+    }
+}
+
+/// Whether a type is `Storable` (§21.5), or the first part that is not:
+/// it is `Solid`, it is not `Secret` and holds none, and every opaque
+/// type in it declares an `Encode`/`Decode` pair (§18.9). A plain
+/// closure is compiled code and never storable; refs never occur in
+/// values (§9.2), so they need no rule of their own.
+#[crag_db::tracked(returns(ref))]
+pub fn storable<'db>(
+    db: &'db dyn Db,
+    program: Program,
+    ty: Ty<'db>,
+) -> Result<(), NotStorable<'db>> {
+    if let Err(why) = solid(db, program, ty) {
+        return Err(NotStorable {
+            path: why.path.clone(),
+            part: why.part,
+            why: WhyNotStorable::NotSolid(why.why),
+        });
+    }
+    if let Some(path) = holds_secret(db, program, ty) {
+        return Err(NotStorable {
+            path: path.iter().map(|&n| SolidStep::Field(n)).collect(),
+            part: ty,
+            why: WhyNotStorable::Secret,
+        });
+    }
+    let mut walk = StorableWalk {
+        db,
+        program,
+        seen: Vec::new(),
+        path: Vec::new(),
+    };
+    walk.storable(ty)
+}
+
+/// The walk for what solidity does not already decide: opaque types
+/// without codecs, function types, bans and parameters.
+struct StorableWalk<'db> {
+    db: &'db dyn Db,
+    program: Program,
+    seen: Vec<Ty<'db>>,
+    path: Vec<SolidStep<'db>>,
+}
+
+impl<'db> StorableWalk<'db> {
+    fn not(&self, part: Ty<'db>, why: WhyNotStorable<'db>) -> Result<(), NotStorable<'db>> {
+        Err(NotStorable {
+            path: self.path.clone(),
+            part,
+            why,
+        })
+    }
+
+    fn all(&mut self, parts: impl IntoIterator<Item = Ty<'db>>) -> Result<(), NotStorable<'db>> {
+        parts.into_iter().try_for_each(|t| self.storable(t))
+    }
+
+    fn storable(&mut self, ty: Ty<'db>) -> Result<(), NotStorable<'db>> {
+        if self.seen.contains(&ty) {
+            return Ok(());
+        }
+        self.seen.push(ty);
+        let found = self.parts(ty);
+        self.seen.pop();
+        found
+    }
+
+    fn parts(&mut self, ty: Ty<'db>) -> Result<(), NotStorable<'db>> {
+        let db = self.db;
+        match ty.kind(db) {
+            TyKind::Error => Ok(()),
+            TyKind::Fn { .. } => self.not(ty, WhyNotStorable::Function(ty)),
+            TyKind::Union(members) => self.all(members.clone()),
+            TyKind::Record { fields, .. } => self.fields(fields.clone()),
+            TyKind::Builtin(builtin, args) => match builtin {
+                Builtin::List | Builtin::Map | Builtin::Set => self.all(args.clone()),
+                // An `Expr` carries its code as data (§18.6, §21.5).
+                _ => Ok(()),
+            },
+            TyKind::Param(owner, index, _) => {
+                match param_marker(db, self.program, ty, Marker::Storable) {
+                    Some(true) => return Ok(()),
+                    Some(false) => return self.not(ty, WhyNotStorable::Marked),
+                    None => {}
+                }
+                let Some(owner) = *owner else {
+                    return self.not(ty, WhyNotStorable::Param);
+                };
+                match param_bound(db, self.program, owner, *index) {
+                    Some(bound) => self.storable(bound),
+                    None => self.not(ty, WhyNotStorable::Param),
+                }
+            }
+            TyKind::Named(item, args) => {
+                if bans(db, self.program, ty, Marker::Storable.name()) {
+                    return self.not(ty, WhyNotStorable::Marked);
+                }
+                // An opaque type travels through its own codec pair, so
+                // its hidden fields are its handlers' business (§18.9).
+                if type_def(db, self.program, *item).opaque {
+                    let has = |kind| crate::lifecycle_handler(db, self.program, ty, kind).is_some();
+                    return match has("Encode") && has("Decode") {
+                        true => Ok(()),
+                        false => self.not(ty, WhyNotStorable::Opaque),
+                    };
+                }
+                match &type_def(db, self.program, *item).kind {
+                    TypeDefKind::Alias(target) | TypeDefKind::Refined(target) => {
+                        let target = subst(db, self.program, *target, *item, args);
+                        self.storable(target)
+                    }
+                    TypeDefKind::Record { .. } => {
+                        if let Some(fields) = fields_of(db, self.program, ty) {
+                            self.fields(fields)?;
+                        }
+                        for sub in record_subtypes(db, self.program, ty) {
+                            self.path.push(SolidStep::Subtype(sub));
+                            let found = self.storable(sub);
+                            self.path.pop();
+                            found?;
+                        }
+                        Ok(())
+                    }
+                    TypeDefKind::Builtin(_) | TypeDefKind::Tag | TypeDefKind::Form => Ok(()),
+                }
+            }
+        }
+    }
+
+    fn fields(&mut self, fields: Vec<(Name<'db>, Ty<'db>)>) -> Result<(), NotStorable<'db>> {
+        for (name, ty) in fields {
+            self.path.push(SolidStep::Field(name));
+            let found = self.storable(ty);
+            self.path.pop();
+            found?;
+        }
+        Ok(())
+    }
+}
+
 /// Whether a value of a type may hold a function value, in any part or
 /// any subtype of one: a type parameter, a cell or a lazy value may.
 pub fn holds_function<'db>(db: &'db dyn Db, program: Program, ty: Ty<'db>) -> bool {
@@ -370,7 +587,7 @@ fn function_in<'db>(
         TyKind::Record { fields, .. } => any(fields.iter().map(|(_, t)| *t).collect(), seen),
         TyKind::Builtin(builtin, args) => match builtin {
             Builtin::List | Builtin::Map | Builtin::Set => any(args.clone(), seen),
-            Builtin::Lazy | Builtin::Ref | Builtin::Ext => true,
+            Builtin::Lazy | Builtin::Ref | Builtin::Ext | Builtin::Dur | Builtin::Slot => true,
             _ => false,
         },
         TyKind::Named(item, args) => match &type_def(db, program, *item).kind {
@@ -475,8 +692,15 @@ pub fn carries<'db>(
             _ => Some(false),
         },
         Marker::Deferred => carries(db, program, ty, Marker::Immediate).map(|i| !i),
-        // Not required yet: stores are not built (§21.5).
-        Marker::Storable => None,
+        Marker::Storable => match storable(db, program, ty) {
+            // A `Secret` part may still hide in a type parameter.
+            Ok(()) => match unknown_secret(db, program, ty) {
+                true => None,
+                false => Some(true),
+            },
+            Err(why) if why.why.unknown() => None,
+            Err(_) => Some(false),
+        },
     }
 }
 

@@ -361,7 +361,7 @@ impl<'a> Printer<'a> {
             S::FormDecl => self.braced_lines(node),
             S::TypeDecl => self.type_decl(node, cx),
             S::FnDecl => self.fn_decl(node, cx),
-            S::LetDecl => self.let_decl(node, cx),
+            S::LetDecl | S::RefDecl => self.let_decl(node, cx),
             S::PrefixExpr => self.prefix(node, cx),
             S::StrExpr => flat(self.generic(node, IN_BRACKETS)),
             _ => self.generic(node, cx),
@@ -1000,17 +1000,17 @@ impl<'a> Printer<'a> {
         concat(docs)
     }
 
-    /// `let pattern = value`, with an `else` part that moves to the next
-    /// line when the whole does not fit.
+    /// `let pattern = value`, or a `dur` binding, with an `else` part
+    /// that moves to the next line when the whole does not fit.
     fn let_decl(&mut self, node: &SyntaxNode, cx: Cx) -> Doc {
         let elements = elements(node);
         let split = elements
             .iter()
             .position(|e| matches!(e, SyntaxElement::Node(n) if n.kind() == S::LetElse));
         let Some(split) = split else {
-            return self.row(S::LetDecl, &elements, cx);
+            return self.row(node.kind(), &elements, cx);
         };
-        let head = self.row(S::LetDecl, &elements[..split], cx);
+        let head = self.row(node.kind(), &elements[..split], cx);
         let rest = self.element(&elements[split], cx);
         concat([head, text(" "), rest])
     }

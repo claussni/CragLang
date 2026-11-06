@@ -206,7 +206,7 @@ struct Walk<'a> {
 /// # Safety
 ///
 /// `ptr` is a live box.
-unsafe fn box_index(ptr: *const u8) -> u32 {
+pub(crate) unsafe fn box_index(ptr: *const u8) -> u32 {
     // SAFETY: as the caller promises.
     unsafe { ptr.offset(TYPE_INDEX_OFFSET as isize).cast::<u32>().read() }
 }
@@ -514,4 +514,23 @@ impl Walk<'_> {
             }
         }
     }
+}
+
+/// The order of two values of the shape, as structural `compare` orders
+/// them (§4.7); none when the shape has no order. The key encoding's
+/// property test holds its bytes against this (Plan §11.11.6).
+///
+/// # Safety
+///
+/// Both are live values of the shape of `shapes`, which the caller holds.
+pub unsafe fn compare_values(
+    shapes: &Shapes,
+    types: &Types,
+    a: &[u64],
+    b: &[u64],
+    shape: u32,
+) -> Option<Ordering> {
+    let walk = Walk { shapes, types };
+    // SAFETY: as the caller promises.
+    unsafe { walk.compare(a, b, shape) }
 }

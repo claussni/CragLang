@@ -302,14 +302,25 @@ impl Printer<'_, '_> {
                 rest.map_or(String::new(), |r| format!("{} -> ", self.pat(r))),
                 self.expr(*otherwise)
             ),
-            Stmt::Bind { binding, ty, value } => format!(
-                "({:?} {}{} {})",
-                self.body.binding(*binding).kind,
+            Stmt::Bind {
+                binding,
+                ty,
+                value,
+                otherwise,
+            } => format!(
+                "({} {}{} {}{})",
+                format!("{:?}", self.body.binding(*binding).kind).to_lowercase(),
                 self.binding(*binding),
                 self.annotation(*ty),
-                self.expr(*value)
-            )
-            .to_lowercase(),
+                self.expr(*value),
+                otherwise
+                    .as_ref()
+                    .map_or(String::new(), |(rest, e)| format!(
+                        " else {}{}",
+                        rest.map_or(String::new(), |r| format!("{} -> ", self.pat(r))),
+                        self.expr(*e)
+                    ))
+            ),
             Stmt::Assign { binding, value } => {
                 format!("(set {} {})", self.binding(*binding), self.expr(*value))
             }

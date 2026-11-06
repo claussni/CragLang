@@ -67,6 +67,7 @@ test "addition works" {
   total = total + a
   ref counter = 0
   ext shared = 1
+  dur hits: Int = db.slot(HitsKey, 0) else { e -> return e }
   let names = people
     .filter { p -> p.age >= 18 }
     .map { p -> p.name }
@@ -470,4 +471,15 @@ fn deep_nesting_is_reported_instead_of_overflowing_the_stack() {
         ")".repeat(100)
     ));
     assert_eq!(errors, []);
+}
+
+#[test]
+fn dur_bindings_take_an_else_part() {
+    // §21.2: `dur` is the fifth binding kind; only it takes the `else`
+    // part here, typed later as in `let … else`.
+    assert_eq!(
+        expr("dur n: Int = s else { e -> return e }"),
+        "(RefDecl dur n : (NamedType Int) = (NameRef s) (LetElse else (Closure { \
+         (ClosureParams (ClosureParam (NamePat e))) -> (ReturnStmt return (NameRef e)) })))"
+    );
 }

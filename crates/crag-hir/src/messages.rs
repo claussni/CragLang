@@ -136,6 +136,13 @@ pub fn lower_message(db: &dyn Db, error: &LowerError) -> (Range<u32>, String) {
             range.clone(),
             "only `Pure` marks a function or a function type".into(),
         ),
+        LowerError::BindElse { ext, range } => (
+            range.clone(),
+            match ext {
+                true => "the `else` part of an `ext` binding is not supported yet".into(),
+                false => "only a `dur` binding takes an `else` part here".into(),
+            },
+        ),
     }
 }
 
@@ -180,5 +187,6 @@ pub fn lower_code(error: &LowerError) -> DiagCode {
         LowerError::ExpectedType { .. } => crag_diag::EXPECTED_TYPE,
         LowerError::ExpectedValue { .. } => crag_diag::EXPECTED_VALUE,
         LowerError::Marker { .. } => crag_diag::MISPLACED_MARKER,
+        LowerError::BindElse { .. } => crag_diag::BIND_ELSE,
     }
 }

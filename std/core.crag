@@ -585,6 +585,27 @@ pub fn update[T, R](r: Ext[T], f: (T) -> R) -> () | Errs[R]
 pub fn swap[T](r: Ext[T], new: T) -> T
 pub fn empty[T](r: Ext[Option[T]]) -> Option[T]
 
+// Durable state (§21): the cell of a `dur` binding, the slot a `dur`
+// consumes, and the errors of persistence (§21.7). Only an access that
+// commits can fail with a `StoreError`; `use` reads a snapshot (§21.7).
+pub type Dur[T]
+pub type Slot[T]
+pub fn use[T](d: Dur[T]) -> T
+pub fn use[T, U](d: Dur[T], f: (T) -> U) -> U
+pub fn update[T, R](d: Dur[T], f: (T) -> R) -> () | Errs[R] | StoreError
+pub fn swap[T](d: Dur[T], new: T) -> T | StoreError
+pub fn empty[T](d: Dur[Option[T]]) -> Option[T] | StoreError
+
+pub distinct type StoreError(..Error)
+pub type AlreadyOpen(..StoreError)
+pub type SchemaMismatch(..StoreError, stored: Str, declared: Str)
+pub type NoMigration(..StoreError, stored: Str)
+pub type KeyTypeClash(..StoreError)
+pub type MixedStores(..StoreError)
+pub type StoreFull(..StoreError)
+pub type StoreFault(..StoreError, message: Str)
+pub type ReadOnly(..StoreError)
+
 // The parent of every signal type (§11.1).
 pub distinct type Signal
 

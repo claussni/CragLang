@@ -62,6 +62,7 @@ mod ffi;
 pub mod fiber;
 pub mod heap;
 mod io;
+pub mod key;
 mod lazy;
 pub mod list;
 pub mod map;
@@ -100,6 +101,7 @@ pub use codec::{DecodeError, NotSolid, decode_value, encode_value};
 pub use env::set_program_args;
 pub use fiber::{Fiber, FiberConfig, FiberState, TaskContext, Worker};
 pub use heap::{Heap, alloc_box};
+pub use key::{Unkeyable, encode_key};
 pub use meter::Meter;
 pub use print::{PrintLimits, print_value, record_field, release_value, retain_value};
 pub use rc::{Disposal, Types, next_disposal, release_box};
@@ -108,6 +110,7 @@ pub use sentinel::{StopHandle, StopReason, request_stop};
 pub use system::Words;
 pub use timer::{TimerId, TimerWheel};
 pub use unwind::{CodeMap, Trap};
+pub use values::compare_values;
 
 use crag_abi::RuntimeFn;
 
